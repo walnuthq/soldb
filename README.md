@@ -21,6 +21,8 @@ Before installing SolDB, ensure you have the following:
 
 - **Python 3.7+** (for SolDB itself)
 - **Solidity compiler** (version 0.8.29+ for ETHDebug support)
+
+For testing infrastructure, we need:
 - **Foundry** (for contract deployment and Anvil node)
 
 **Install Solidity:**
@@ -45,166 +47,26 @@ foundryup
 
 ### 2. Install SolDB
 
-You can install SolDB either from source (recommended) or from PyPI.
-
-#### **A. Install from Source (Recommended)**
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/yourusername/soldb.git
-   cd soldb
-   ```
-2. **Set up a Python virtual environment:**
-   ```bash
-   python3 -m venv MyEnv
-   source MyEnv/bin/activate
-   ```
-3. **Install Python dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. **Install SolDB in editable mode:
-   ```bash
-   pip install -e .
-   ```
-
-#### **B. Install from PyPI**
-> **Note:** The PyPI package may be less up-to-date.
-```bash
-pip install soldb
-```
-
----
-
-### 3. Initial Setup
-
-After installation, run the setup script to configure your environment:
-
-- **If running from source:**
-  ```bash
-  ./setup-soldb.sh
-  ```
-- **If installed via PyPI:**
-  ```bash
-  soldb-setup
-  ```
-
-This will:
-- Check for Solidity compiler with ETHDebug support (0.8.29+)
-- Configure RPC endpoint (default: http://localhost:8545 for Anvil)
-- Configure private key (default: Anvil's test account #0)
-- Create `soldb.config.local` with your settings
-
----
-
-### 4. Verify Your Setup
+#### **Install from GitHub**
 
 ```bash
-./test-setup.sh   # Test configuration (if running from source)
+pip install git+https://github.com/walnuthq/soldb.git
 ```
 
----
-
-### 5. Next Steps
-
-- See [Usage](#usage) for how to deploy, interact, and debug contracts.
-- See [Configuration](#configuration) for advanced settings.
+NOTE: Since we are still in BETA, the PyPI package is not available at the moment.
 
 ---
-
-## Configuration
-
-Configuration is stored in `soldb.config.local` (gitignored). You can also:
-
-- Override settings with environment variables
-- Use command-line options for specific tools
-
-### Configuration Options
-
-```bash
-# Ethereum RPC endpoint
-RPC_URL="http://localhost:8545"
-
-# Private key for deployments (default: Anvil's test account #0)
-PRIVATE_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-
-# Debug output directory
-DEBUG_DIR="debug"
-```
 
 ## Usage
 
-### 1. Run Anvil node with tracing enabled
-
-```bash
-# Run Anvil with step tracing enabled (required for debugging)
-$ anvil --fork-url https://reth-ethereum.ithaca.xyz/rpc --optimism --steps-tracing
-```
-
-**Important**: The `--steps-tracing` flag is required for SolDB to get execution traces.
-
-### 2. Deploy a Contract
-
-Deploy a Solidity contract with debug information:
-
-```bash
-# Deploy TestContract example
-./scripts/deploy-contract.sh TestContract examples/TestContract.sol
-
-# Deploy your own contract
-./scripts/deploy-contract.sh Counter src/Counter.sol
-
-# # Deploy Contract with Constructor Arguments
-./scripts/deploy-contract.sh Ballot examples/Ballot.sol \                                                                                     
-    '[0x416c696365000000000000000000000000000000000000000000000000000000, 0x426f620000000000000000000000000000000000000000000000000000000000, 0x436861726c696500000000000000000000000000000000000000000000000000]'
-
-# With custom settings
-./scripts/deploy-contract.sh \
-  --solc=/path/to/custom/solc \
-  --rpc=http://localhost:8545 \
-  --debug-dir=my-debug \
-  Counter src/Counter.sol
-```
-
-This will:
-- Compile with ETHDebug support: `solc --via-ir --debug-info ethdebug --ethdebug`
-- Deploy to the blockchain
-- Save ETHDebug JSON files to `./debug/`
-- Generate deployment info
-
-### 2. Interact with Contract
-
-Execute transactions and get transaction hashes for debugging:
-
-```bash
-# Get current value
-./scripts/interact-contract.sh get
-
-# Set a value
-./scripts/interact-contract.sh set 42
-
-# Increment
-./scripts/interact-contract.sh inc 5
-
-# Call arbitrary function
-./scripts/interact-contract.sh call "myFunction(uint256,address)" 100 0x1234...
-```
-Or:
-
-```
-../scripts/interact-contract.sh send "complexCalculation(uint256,uint256)" 4 5
-```
-
-Each transaction returns a hash that can be debugged.
-
-### 3. Debug a Transaction
+### 1. Debug a Transaction
 
 ```bash
 # Debug with ETHDebug information
 soldb trace 0x123... --ethdebug-dir ./debug
 
-# Or if soldb.config.yaml is configured correctly
-soldb trace 0x123...
+# Set up RPC
+soldb trace 0x123... --rpc http://localhost:8545
 
 # Show raw execution trace
 soldb trace 0x123... --raw
@@ -215,7 +77,7 @@ soldb trace 0x123... --ethdebug-dir ./debug --json
 
 This shows a high-level function call trace with gas usage and source mappings.
 
-### 4. Debug Multi-Contract Transactions
+### 2. Debug Multi-Contract Transactions
 
 SolDB supports debugging transactions that involve multiple contracts, providing seamless source-level debugging across contract boundaries.
 
@@ -290,7 +152,7 @@ Call Stack:
 ```
 
 
-### 5. Simulate a Transaction
+### 3. Simulate a Transaction
 
 You can simulate a contract call (without sending a real transaction) using the `simulate` command. Supports all Solidity argument types, including structs/tuples.
 
@@ -352,13 +214,11 @@ soldb simulate --raw-data 0x785bd74f00000000000000000000000000000000000000000000
   --from 0x286AF310eA3303c80eBE9a66F6998B21Bd8c1c29 
 ```
 
-## Debug Information Formats
+## Debug Information Format
 
-### ETHDebug Format
+SolDB relies on the standard ETHDebug format from the Solidity compiler (requires Solidity 0.8.29+):
 
-This approach is to use the standard ethdebug format from the Solidity compiler (requires Solidity 0.8.29+):
-
-1. **Generate ethdebug information**:
+1. **Generate ETHDebug information**:
    ```bash
    # Requires solc 0.8.29 or higher
    solc --via-ir --debug-info ethdebug --ethdebug -o /tmp/ethdebug-output MyContract.sol
@@ -368,71 +228,14 @@ This approach is to use the standard ethdebug format from the Solidity compiler 
    - `MyContract_ethdebug.json` - Constructor/creation debug info
    - `MyContract_ethdebug-runtime.json` - Runtime debug info
 
-2. **Trace transactions with ethdebug**:
+2. **Trace transactions with ETHDebug**:
    ```bash
    soldb trace 0x123...abc --ethdebug-dir /tmp/ethdebug-output
    ```
+### One example of a workflow
 
-### Other formats
-
-Currently, SolDB supports the standard ETHDebug format. Additional formats may be added in the future.
-
-### Using SolDB after installation
-
-After running `pip install -e .`, you can use SolDB directly from anywhere:
-
-```bash
-# The commands are available globally
-soldb trace 0x123...
-soldb trace 0x123...
-soldb-setup          # Setup wizard
-```
-
-## Debugging Workflow
-
-### Using Helper Scripts (Recommended)
-
-1. **Write your contract**:
-   ```solidity
-   // src/Counter.sol
-   contract Counter {
-       uint256 public counter;
-       
-       function setNumber(uint256 newNumber) public {
-           counter = newNumber;
-       }
-       
-       function increment(uint256 amount) public {
-           counter += amount;
-       }
-   }
-   ```
-
-2. **Deploy with debug info**:
-   ```bash
-   ./scripts/deploy-contract.sh Counter src/Counter.sol
-   
-   # Output:
-   # Transaction: 0x123...
-   # Contract deployed at: 0xabc...
-   # ETHDebug files created in: debug/
-   ```
-
-3. **Interact and get transaction hash**:
-   ```bash
-   ./scripts/interact-contract.sh set 42
-   # Returns: Transaction: 0x123...
-   ```
-
-4. **Debug the transaction**:
-   ```bash
-   soldb trace 0x123... --ethdebug-dir ./debug
-   # Shows function call trace with proper function names
-   ```
-
-### Manual Workflow (Without Scripts)
-
-If you prefer to compile, deploy, and interact manually:
+There are some helper scripts in `test/` for deploying and interacting between contracts.
+But, if you prefer to compile, deploy, and interact manually:
 
 1. **Compile with ETHDebug support**:
    ```bash
@@ -474,7 +277,7 @@ If you prefer to compile, deploy, and interact manually:
 4. **Debug the transaction**:
    ```bash
    # Use the transaction hash from step 3
-   soldb trace 0xYOUR_TX_HASH --ethdebug-dir ./debug
+   soldb trace 0xYOUR_TX_HASH --ethdebug-dir ./debug --rpc-url http://localhost:8545
    ```
 
 ### Reading contract state (view functions):
@@ -569,7 +372,6 @@ Call Stack:
 Use --raw flag to see detailed instruction trace
 ```
 
-
 ## Run tests
 
 ```bash
@@ -580,6 +382,34 @@ cd test
 It expects RPC at `http://localhost:8545` (Anvil default) and uses Anvil's test account private key by default.
 Also, it uses LLVM's `lit` and `FileCheck` tools, so please install it.
 
+## Advanced Setup
+
+### Install from Source
+
+For development or contributing to SolDB:
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/yourusername/soldb.git
+   cd soldb
+   ```
+
+2. **Set up a Python virtual environment:**
+   ```bash
+   python3 -m venv MyEnv
+   source MyEnv/bin/activate
+   ```
+
+3. **Install Python dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Install SolDB in editable mode:**
+   ```bash
+   pip install -e .
+   ```
+
 ## License
 
 SolDB is licensed under the Business Source License 1.1 (BSL). You may use, self-host, and modify SolDB for non-commercial purposes.
@@ -588,4 +418,3 @@ To use SolDB in a commercial product or service (e.g. as a SaaS offering), you m
 
 📄 [Full license text](./LICENSE.md)  
 📬 Contact: hi@walnut.dev
-

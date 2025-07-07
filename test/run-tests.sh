@@ -71,7 +71,7 @@ if [ "${NEED_DEPLOY}" = true ]; then
         # Fallback to direct deployment
         cd "${PROJECT_DIR}/examples"
         rm -rf test_debug
-        "${PROJECT_DIR}/scripts/deploy-contract.sh" --solc="${SOLC_PATH}" --rpc="${RPC_URL}" --private-key="${PRIVATE_KEY}" TestContract TestContract.sol --debug-dir=test_debug
+        "${SCRIPT_DIR}/deploy-contract.sh" --solc="${SOLC_PATH}" --rpc="${RPC_URL}" --private-key="${PRIVATE_KEY}" TestContract TestContract.sol --debug-dir=test_debug
     fi
     
     # Check deployment succeeded
@@ -101,7 +101,7 @@ fi
 if [ -z "$TEST_TX" ] && [ -n "$CONTRACT_ADDRESS" ]; then
     echo -e "${YELLOW}Creating fresh test transaction...${NC}"
     # Send an increment transaction and capture the TX hash
-    TX_OUTPUT=$(cd "${PROJECT_DIR}/examples" && DEBUG_DIR="${TEST_DEBUG_REL}" RPC_URL="${RPC_URL}" PRIVATE_KEY="${PRIVATE_KEY}" "${PROJECT_DIR}/scripts/interact-contract.sh" send "increment(uint256)" 4 2>&1)
+    TX_OUTPUT=$(cd "${PROJECT_DIR}/examples" && DEBUG_DIR="${TEST_DEBUG_REL}" RPC_URL="${RPC_URL}" PRIVATE_KEY="${PRIVATE_KEY}" "${SCRIPT_DIR}/interact-contract.sh" send "increment(uint256)" 4 2>&1)
     TEST_TX=$(echo "$TX_OUTPUT" | grep -o '0x[a-fA-F0-9]\{64\}' | head -1)
     if [ -z "$TEST_TX" ]; then
         echo -e "${RED}Failed to create test transaction${NC}"

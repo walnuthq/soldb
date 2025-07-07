@@ -2,8 +2,6 @@ cache/
 debug/
 debug*/
 out/
-soldb.config.yaml
-soldb.config.local
 __pycache__/
 *.txt
 src/soldb.egg-info/PKG-INFO

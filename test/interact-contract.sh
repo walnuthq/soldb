@@ -7,22 +7,10 @@ set -e
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SOLDB_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Save environment variables before loading config
-SAVED_DEBUG_DIR="${DEBUG_DIR}"
-SAVED_RPC_URL="${RPC_URL}"
-SAVED_PRIVATE_KEY="${PRIVATE_KEY}"
-
-# Load configuration if exists
-if [ -f "$SOLDB_DIR/soldb.config.local" ]; then
-    source "$SOLDB_DIR/soldb.config.local"
-elif [ -f "$SOLDB_DIR/soldb.config" ]; then
-    source "$SOLDB_DIR/soldb.config"
-fi
-
-# Configuration (prefer environment variables over config file)
-RPC_URL="${SAVED_RPC_URL:-${RPC_URL:-http://localhost:8545}}"
-PRIVATE_KEY="${SAVED_PRIVATE_KEY:-${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}}"
-DEBUG_DIR="${SAVED_DEBUG_DIR:-${DEBUG_DIR:-debug}}"
+# Configuration - uses environment variables or defaults
+RPC_URL="${RPC_URL:-http://localhost:8545}"
+PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+DEBUG_DIR="${DEBUG_DIR:-debug}"
 
 # Function to get the debug command for soldb
 get_debug_command() {

@@ -21,7 +21,7 @@ config.private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7b
 config.test_contracts = {
     "contract_address": "0xc44c2b82dbeef6ddb195e0432fa5e755c345d1e3",
     "deploy_tx": "0xeed596ae4c269248a885766c7c08ee4d2050d84af9114ccd1a372baa9e62128d",
-    "test_tx": "0x35394e9628f00b78fb73b992654a1b799e08fc5fa202e84c812b108e18663bbb",
+    "test_tx": "0x9cd679e2ea810c0a9ff038cd80106a5a016fa9a7ba4f2ce03ba13de71a145301",
     "ethdebug_dir": os.path.join(project_dir, "examples", "test_debug")
 }
 # Determine solc path dynamically

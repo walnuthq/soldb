@@ -16,27 +16,21 @@ echo -e "${BLUE}Testing SolDB EVM Debugger Setup${NC}"
 echo "=================================="
 echo
 
-# Load configuration
-CONFIG_FILE=""
-if [ -f "$SCRIPT_DIR/soldb.config.local" ]; then
-    CONFIG_FILE="$SCRIPT_DIR/soldb.config.local"
-    source "$CONFIG_FILE"
-    echo -e "${GREEN}✓ Found configuration: soldb.config.local${NC}"
-elif [ -f "$SCRIPT_DIR/soldb.config" ]; then
-    CONFIG_FILE="$SCRIPT_DIR/soldb.config"
-    source "$CONFIG_FILE"
-    echo -e "${GREEN}✓ Found configuration: soldb.config${NC}"
-else
-    echo -e "${RED}✗ No configuration file found${NC}"
-    echo "  Run ./setup-soldb.sh to create one"
-    exit 1
-fi
+# Configuration - uses environment variables or defaults
+RPC_URL="${RPC_URL:-http://localhost:8545}"
+PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+DEBUG_DIR="${DEBUG_DIR:-debug}"
+SOLC_PATH="${SOLC_PATH:-solc}"
 
+echo -e "${BLUE}Configuration:${NC}"
+echo "  RPC_URL: $RPC_URL"
+echo "  DEBUG_DIR: $DEBUG_DIR"
+echo "  SOLC_PATH: $SOLC_PATH"
 echo
 
 # Test Solidity compiler
 echo -n "Testing solc... "
-if [ -n "$SOLC_PATH" ] && [ -x "$SOLC_PATH" ]; then
+if command -v "$SOLC_PATH" &> /dev/null; then
     if "$SOLC_PATH" --version > /dev/null 2>&1; then
         VERSION=$("$SOLC_PATH" --version | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2)
         echo -e "${GREEN}✓ OK${NC} (version $VERSION)"

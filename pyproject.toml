@@ -51,7 +51,6 @@ Issues = "https://github.com/yourusername/soldb/issues"
 
 [project.scripts]
 soldb = "soldb.main:main"
-soldb-setup = "soldb.setup:main"
 
 [tool.setuptools]
 packages = ["soldb"]

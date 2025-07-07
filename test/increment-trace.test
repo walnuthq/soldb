@@ -1,7 +1,7 @@
 # Test tracing of increment function call
 # REQUIRES: soldb
 # First deploy the contract, then send an increment transaction, then trace it
-# RUN: cd %S/../examples && rm -rf debug && %S/../scripts/deploy-contract.sh --solc=%{solc_path} --rpc=%{rpc_url} TestContract TestContract.sol --debug-dir=debug >/dev/null 2>&1 && TX=$(DEBUG_DIR=debug RPC_URL=%{rpc_url} %S/../scripts/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && %soldb trace $TX --ethdebug-dir %S/../examples/debug --rpc %{rpc_url} 2>&1 | FileCheck %s
+# RUN: cd %S/../examples && rm -rf debug && %S/deploy-contract.sh --solc=%{solc_path} --rpc=%{rpc_url} TestContract TestContract.sol --debug-dir=debug >/dev/null 2>&1 && TX=$(DEBUG_DIR=debug RPC_URL=%{rpc_url} %S/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && %soldb trace $TX --ethdebug-dir %S/../examples/debug --rpc %{rpc_url} 2>&1 | FileCheck %s
 
 # Check for the specific function calls we expect
 # CHECK: Loading transaction
