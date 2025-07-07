@@ -2,6 +2,8 @@
 
 > **Note**: SolDB is in public beta; expect ongoing changes and occasional inaccuracies.  
 
+> **Note**: SolDB relies on ETHDebug metadata. Complete, accurate debug info implies better breakpoints/stepping/variable views; incomplete info can cause gaps or inconsistencies.
+
 SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
 
 ![example](example.gif)
