@@ -1,19 +1,19 @@
-# Walnut-CLI Architecture: Blockchain Transaction Debugging
+# SolDB Architecture: Blockchain Transaction Debugging
 
 ## Overview
 
-Walnut-CLI implements blockchain transaction debugging by leveraging the Ethereum node's built-in replay capabilities combined with source code mapping. Unlike traditional debuggers that need to copy the entire blockchain state, walnut-cli uses the node's `debug_traceTransaction` RPC method to replay transactions in their original context.
+SolDB implements blockchain transaction debugging by leveraging the Ethereum node's built-in replay capabilities combined with source code mapping. Unlike traditional debuggers that need to copy the entire blockchain state, SolDB uses the node's `debug_traceTransaction` RPC method to replay transactions in their original context.
 
 ## Core Architecture Components
 
 ### 1. Transaction Replay via RPC
 
-The key insight is that Ethereum nodes (like offchainlabs/nitro-node) already have the capability to replay transactions with full execution traces. Walnut-CLI leverages this instead of reimplementing blockchain state management.
+The key insight is that Ethereum nodes (like offchainlabs/nitro-node) already have the capability to replay transactions with full execution traces. SolDB leverages this instead of reimplementing blockchain state management.
 
 ```
 User provides transaction hash
     ↓
-Walnut-CLI connects to Ethereum node (RPC)
+SolDB connects to Ethereum node (RPC)
     ↓
 Calls debug_traceTransaction(txHash)
     ↓
@@ -23,7 +23,7 @@ Returns step-by-step execution trace
 ```
 
 **Key Files:**
-- `src/walnut_cli/transaction_tracer.py` - Handles RPC communication and trace retrieval
+- `src/soldb/transaction_tracer.py` - Handles RPC communication and trace retrieval
 
 ### 2. Execution Trace Structure
 
@@ -211,7 +211,7 @@ def analyze_function_calls(trace, ethdebug):
 
 When you run:
 ```bash
-walnut-cli 0x35ffb6c4... --ethdebug-dir ./debug --rpc http://localhost:8547
+soldb trace 0x35ffb6c4... --ethdebug-dir ./debug --rpc http://localhost:8547
 ```
 
 The flow is:

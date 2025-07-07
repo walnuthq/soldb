@@ -1,18 +1,38 @@
 import sys
 import os
+import shutil
 
-config.walnut_cli_dir = "/Users/djtodorovic/projects/crypto/SOLIDITY/walnut-cli"
-config.walnut_cli = "walnut-cli"
+# Get the test directory and project directory dynamically
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_dir = os.path.dirname(script_dir)
+
+config.soldb_dir = project_dir
+
+# Find soldb dynamically
+if shutil.which('soldb'):
+    config.soldb = shutil.which('soldb')
+elif os.path.exists(os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')):
+    config.soldb = os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')
+else:
+    config.soldb = "soldb"
 config.rpc_url = "http://localhost:8545"
 config.chain_id = "1"
 config.private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 config.test_contracts = {
-    "contract_address": "0x2a08133a3355634e46e3ba8d6e15d5c35f0202e4",
-    "deploy_tx": "0x219555b420eb6924aceef9633171ef0f10f3b8c5ad5582a9201d287bdb42a59a",
-    "test_tx": "0x08aca7e46db0d619e5e08cea5d13ced62036b79d1da9228df56806ca3c4d913b",
-    "ethdebug_dir": "/Users/djtodorovic/projects/crypto/SOLIDITY/walnut-cli/examples/debug"
+    "contract_address": "0xc44c2b82dbeef6ddb195e0432fa5e755c345d1e3",
+    "deploy_tx": "0xeed596ae4c269248a885766c7c08ee4d2050d84af9114ccd1a372baa9e62128d",
+    "test_tx": "0x35394e9628f00b78fb73b992654a1b799e08fc5fa202e84c812b108e18663bbb",
+    "ethdebug_dir": os.path.join(project_dir, "examples", "test_debug")
 }
-config.solc_path = "/Users/djtodorovic/projects/crypto/SOLIDITY/OPTIMISM/solidity/build/solc/solc"
+# Determine solc path dynamically
+solc_path = os.environ.get('SOLC_PATH')
+if not solc_path:
+    # Try to find solc in PATH
+    solc_path = shutil.which('solc')
+if not solc_path:
+    # Fallback to a default
+    solc_path = 'solc'
+config.solc_path = solc_path
 
 # Load the main config
-lit_config.load_config(config, "/Users/djtodorovic/projects/crypto/SOLIDITY/walnut-cli/test/lit.cfg.py")
+lit_config.load_config(config, os.path.join(script_dir, "lit.cfg.py"))

@@ -1,4 +1,4 @@
-# Python dependencies for Walnut EVM Debugger
+# Python dependencies for SolDB EVM Debugger
 
 # Core dependencies for transaction debugging
 web3>=6.0.0           # For connecting to Ethereum nodes

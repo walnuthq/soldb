@@ -1,5 +1,5 @@
 """
-Color utilities for the Walnut EVM Debugger
+Color utilities for the SolDB EVM Debugger
 
 Provides ANSI color codes for terminal output.
 """

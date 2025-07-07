@@ -1,6 +1,6 @@
 # Test raw instruction trace functionality
-# REQUIRES: walnut-cli
-# RUN: %walnut-cli trace %{test_tx} --ethdebug-dir %{ethdebug_dir} --rpc %{rpc_url} --raw 2>&1 | FileCheck %s
+# REQUIRES: soldb
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{ethdebug_dir} --rpc %{rpc_url} --raw 2>&1 | FileCheck %s
 
 # When using --raw flag, we should see individual EVM instructions
 # CHECK: Loading transaction

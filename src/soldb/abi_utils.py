@@ -1,5 +1,5 @@
 """
-ABI/type parsing and matching utilities for Walnut CLI.
+ABI/type parsing and matching utilities for SolDB.
 """
 import re
 import ast

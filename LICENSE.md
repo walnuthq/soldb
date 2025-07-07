@@ -2,7 +2,7 @@
 
 **Licensor**: Wido Inc.
 
-**Licensed Work**: walnut-cli (all code in this repository)
+**Licensed Work**: soldb (all code in this repository)
 
 **Additional Use Grant**:  
 You may use, copy, modify, and self-host the Licensed Work for non-commercial purposes, including development and internal use, provided that you do not offer the Licensed Work as part of a paid product or service to third parties.
@@ -60,6 +60,6 @@ Terms:
 
 ---
 
-To obtain a commercial license to use Walnut in a paid service or product, or to resell Walnut in any form, please contact:
+To obtain a commercial license to use SolDB in a paid service or product, or to resell SolDB in any form, please contact:
 
 **hi@walnut.dev**

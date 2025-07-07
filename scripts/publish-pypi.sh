@@ -1,9 +1,9 @@
 #!/bin/bash
-# Publish Walnut CLI to PyPI
+# Publish SolDB to PyPI
 
 set -e
 
-echo "Publishing Walnut CLI to PyPI..."
+echo "Publishing SolDB to PyPI..."
 
 # Clean previous builds
 rm -rf dist build *.egg-info
@@ -22,4 +22,4 @@ echo "Uploading to PyPI..."
 twine upload dist/*
 
 echo "Package published successfully!"
-echo "Users can now install with: pip install walnut-cli"
+echo "Users can now install with: pip install soldb"

@@ -1,5 +1,5 @@
 """
-JSON Serialization for Walnut CLI trace output
+JSON Serialization for SolDB trace output
 
 Provides serialization of trace data into TypeScript-compatible JSON format
 for web app consumption.

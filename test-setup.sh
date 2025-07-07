@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test Walnut EVM Debugger setup
+# Test SolDB EVM Debugger setup
 
 set -e
 
@@ -12,23 +12,23 @@ BLUE='\033[0;34m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-echo -e "${BLUE}Testing Walnut EVM Debugger Setup${NC}"
+echo -e "${BLUE}Testing SolDB EVM Debugger Setup${NC}"
 echo "=================================="
 echo
 
 # Load configuration
 CONFIG_FILE=""
-if [ -f "$SCRIPT_DIR/walnut.config.local" ]; then
-    CONFIG_FILE="$SCRIPT_DIR/walnut.config.local"
+if [ -f "$SCRIPT_DIR/soldb.config.local" ]; then
+    CONFIG_FILE="$SCRIPT_DIR/soldb.config.local"
     source "$CONFIG_FILE"
-    echo -e "${GREEN}✓ Found configuration: walnut.config.local${NC}"
-elif [ -f "$SCRIPT_DIR/walnut.config" ]; then
-    CONFIG_FILE="$SCRIPT_DIR/walnut.config"
+    echo -e "${GREEN}✓ Found configuration: soldb.config.local${NC}"
+elif [ -f "$SCRIPT_DIR/soldb.config" ]; then
+    CONFIG_FILE="$SCRIPT_DIR/soldb.config"
     source "$CONFIG_FILE"
-    echo -e "${GREEN}✓ Found configuration: walnut.config${NC}"
+    echo -e "${GREEN}✓ Found configuration: soldb.config${NC}"
 else
     echo -e "${RED}✗ No configuration file found${NC}"
-    echo "  Run ./setup-walnut.sh to create one"
+    echo "  Run ./setup-soldb.sh to create one"
     exit 1
 fi
 
@@ -90,16 +90,39 @@ echo "  SOLC_PATH=${SOLC_PATH:-"(will use system solc)"}"
 echo "  RPC_URL=$RPC_URL"
 echo "  DEBUG_DIR=$DEBUG_DIR"
 
+# Deploy test contract if requested
+if [ "$1" = "--deploy-test" ] || [ "$1" = "-d" ]; then
+    echo
+    echo -e "${BLUE}Deploying TestContract for tests...${NC}"
+    if [ -x "$SCRIPT_DIR/test/deploy-test-contract.sh" ]; then
+        # Ensure SOLC_PATH is properly set
+        if [ -z "$SOLC_PATH" ] && command -v solc &> /dev/null; then
+            SOLC_PATH=$(which solc)
+        fi
+        SOLC_PATH="$SOLC_PATH" RPC_URL="$RPC_URL" PRIVATE_KEY="$PRIVATE_KEY" \
+            "$SCRIPT_DIR/test/deploy-test-contract.sh"
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✓ Test contract deployed successfully${NC}"
+        else
+            echo -e "${RED}✗ Test contract deployment failed${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Test deployment script not found or not executable${NC}"
+    fi
+fi
+
 echo
 echo -e "${BLUE}Next steps:${NC}"
 echo "1. Start Anvil with tracing:"
 echo "   anvil --fork-url <YOUR_RPC> --steps-tracing"
 echo
-echo "2. Deploy a contract:"
-echo "   ./scripts/deploy-contract.sh TestContract examples/TestContract.sol"
+echo "2. Deploy test contract:"
+echo "   ./test-setup.sh --deploy-test"
+echo "   OR"
+echo "   ./test/deploy-test-contract.sh"
 echo
-echo "3. Interact with contract:"
-echo "   ./scripts/interact-contract.sh increment 5"
+echo "3. Run tests:"
+echo "   ./test/run-tests.sh"
 echo
 echo "4. Debug a transaction:"
-echo "   ./walnut-cli.py <tx_hash>"
+echo "   soldb trace <tx_hash>"

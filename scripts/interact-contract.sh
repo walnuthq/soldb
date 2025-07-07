@@ -5,21 +5,26 @@ set -e
 
 # Get script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-WALNUT_DIR="$(dirname "$SCRIPT_DIR")"
+SOLDB_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Save environment variables before loading config
+SAVED_DEBUG_DIR="${DEBUG_DIR}"
+SAVED_RPC_URL="${RPC_URL}"
+SAVED_PRIVATE_KEY="${PRIVATE_KEY}"
 
 # Load configuration if exists
-if [ -f "$WALNUT_DIR/walnut.config.local" ]; then
-    source "$WALNUT_DIR/walnut.config.local"
-elif [ -f "$WALNUT_DIR/walnut.config" ]; then
-    source "$WALNUT_DIR/walnut.config"
+if [ -f "$SOLDB_DIR/soldb.config.local" ]; then
+    source "$SOLDB_DIR/soldb.config.local"
+elif [ -f "$SOLDB_DIR/soldb.config" ]; then
+    source "$SOLDB_DIR/soldb.config"
 fi
 
-# Configuration (can be overridden by config file or environment)
-RPC_URL="${RPC_URL:-http://localhost:8545}"
-PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
-DEBUG_DIR="${DEBUG_DIR:-debug}"
+# Configuration (prefer environment variables over config file)
+RPC_URL="${SAVED_RPC_URL:-${RPC_URL:-http://localhost:8545}}"
+PRIVATE_KEY="${SAVED_PRIVATE_KEY:-${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}}"
+DEBUG_DIR="${SAVED_DEBUG_DIR:-${DEBUG_DIR:-debug}}"
 
-# Function to get the debug command for walnut-cli
+# Function to get the debug command for soldb
 get_debug_command() {
     local tx_hash="$1"
     
@@ -33,10 +38,10 @@ get_debug_command() {
     
     # Check if ethdebug format is available
     if [ -f "$abs_debug_dir/ethdebug.json" ]; then
-        echo "walnut-cli trace $tx_hash --ethdebug-dir $abs_debug_dir --rpc $RPC_URL"
+        echo "soldb trace $tx_hash --ethdebug-dir $abs_debug_dir --rpc $RPC_URL"
     else
         # Default to simple trace without debug info
-        echo "walnut-cli trace $tx_hash --rpc $RPC_URL"
+        echo "soldb trace $tx_hash --rpc $RPC_URL"
     fi
 }
 
@@ -95,10 +100,17 @@ case "$COMMAND" in
             --private-key "$PRIVATE_KEY" \
             --json)
         
-        TX_HASH=$(echo "$TX_OUTPUT" | jq -r '.transactionHash')
-        echo -e "${GREEN}Transaction: $TX_HASH${NC}"
-        DEBUG_CMD=$(get_debug_command "$TX_HASH")
-        echo -e "To debug: ${BLUE}$DEBUG_CMD${NC}"
+        # Check if transaction succeeded
+        if echo "$TX_OUTPUT" | jq -e '.transactionHash' > /dev/null 2>&1; then
+            TX_HASH=$(echo "$TX_OUTPUT" | jq -r '.transactionHash')
+            echo -e "${GREEN}Transaction: $TX_HASH${NC}"
+            DEBUG_CMD=$(get_debug_command "$TX_HASH")
+            echo -e "To debug: ${BLUE}$DEBUG_CMD${NC}"
+        else
+            echo -e "${RED}Transaction failed:${NC}"
+            echo "$TX_OUTPUT"
+            exit 1
+        fi
         ;;
     
     inc|increment)
@@ -112,10 +124,17 @@ case "$COMMAND" in
             --private-key "$PRIVATE_KEY" \
             --json)
         
-        TX_HASH=$(echo "$TX_OUTPUT" | jq -r '.transactionHash')
-        echo -e "${GREEN}Transaction: $TX_HASH${NC}"
-        DEBUG_CMD=$(get_debug_command "$TX_HASH")
-        echo -e "To debug: ${BLUE}$DEBUG_CMD${NC}"
+        # Check if transaction succeeded
+        if echo "$TX_OUTPUT" | jq -e '.transactionHash' > /dev/null 2>&1; then
+            TX_HASH=$(echo "$TX_OUTPUT" | jq -r '.transactionHash')
+            echo -e "${GREEN}Transaction: $TX_HASH${NC}"
+            DEBUG_CMD=$(get_debug_command "$TX_HASH")
+            echo -e "To debug: ${BLUE}$DEBUG_CMD${NC}"
+        else
+            echo -e "${RED}Transaction failed:${NC}"
+            echo "$TX_OUTPUT"
+            exit 1
+        fi
         ;;
     
     call)
@@ -160,12 +179,20 @@ case "$COMMAND" in
             "$SIG" "$@" \
             --rpc-url "$RPC_URL" \
             --private-key "$PRIVATE_KEY" \
-            --json)
+            --gas-limit 1000000 \
+            --json 2>&1)
         
-        TX_HASH=$(echo "$TX_OUTPUT" | jq -r '.transactionHash')
-        echo -e "${GREEN}Transaction: $TX_HASH${NC}"
-        DEBUG_CMD=$(get_debug_command "$TX_HASH")
-        echo -e "To debug: ${BLUE}$DEBUG_CMD${NC}"
+        # Check if transaction succeeded
+        if echo "$TX_OUTPUT" | jq -e '.transactionHash' > /dev/null 2>&1; then
+            TX_HASH=$(echo "$TX_OUTPUT" | jq -r '.transactionHash')
+            echo -e "${GREEN}Transaction: $TX_HASH${NC}"
+            DEBUG_CMD=$(get_debug_command "$TX_HASH")
+            echo -e "To debug: ${BLUE}$DEBUG_CMD${NC}"
+        else
+            echo -e "${RED}Transaction failed:${NC}"
+            echo "$TX_OUTPUT"
+            exit 1
+        fi
         ;;
     
     trace|debug)

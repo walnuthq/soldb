@@ -15,7 +15,11 @@ from .colors import *
 class EVMDebugger(cmd.Cmd):
     """Interactive EVM debugger REPL."""
     
-    prompt = f'{cyan("(walnut-cli)")} '
+    intro = f"""
+{bold('SolDB EVM Debugger')} - Solidity Debugger
+Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging.
+    """
+    prompt = f'{cyan("(soldb)")} '
     
     def __init__(self, contract_address: str = None, debug_file: str = None, 
                  rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
@@ -1417,7 +1421,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
             cmd.Cmd.do_help(self, arg)
         else:
             # Show formatted help menu
-            print(f"\n{bold('Walnut EVM Debugger Commands')}")
+            print(f"\n{bold('SolDB EVM Debugger Commands')}")
             print(dim("=" * 60))
             
             # Execution Control

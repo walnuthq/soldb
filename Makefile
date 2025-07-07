@@ -1,12 +1,14 @@
-.PHONY: help install dev test publish clean
+.PHONY: help install dev test test-setup test-deploy publish clean
 
 help:
-	@echo "Walnut CLI - Build and Distribution"
+	@echo "SolDB - Build and Distribution"
 	@echo ""
 	@echo "Available commands:"
 	@echo "  make install         Install package locally"
 	@echo "  make dev            Install in development mode"
 	@echo "  make test           Run tests"
+	@echo "  make test-setup     Setup and verify test environment"
+	@echo "  make test-deploy    Deploy test contracts"
 	@echo "  make publish        Publish to PyPI"
 	@echo "  make clean          Clean build artifacts"
 
@@ -18,7 +20,13 @@ dev:
 	pip install -r requirements.txt
 
 test:
-	python -m pytest tests/
+	./run-tests.sh
+
+test-setup:
+	./test-setup.sh
+
+test-deploy:
+	./test-setup.sh --deploy-test
 
 publish:
 	./scripts/publish-pypi.sh

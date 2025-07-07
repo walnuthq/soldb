@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run walnut-cli tests
+# Run soldb tests
 
 set -e
 
@@ -25,33 +25,61 @@ CHAIN_ID="${CHAIN_ID:-1}"
 PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 SOLC_PATH="${SOLC_PATH:-solc}"
 
+# Export SOLC_PATH so it's available to the Python config
+export SOLC_PATH
+
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-echo -e "${GREEN}=== Walnut CLI Test Suite ===${NC}"
+echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
 
-# Check if test deployment exists
-# First check the new ETHDebug location
-if [ -f "${PROJECT_DIR}/examples/debug/ethdebug_output/deployment.json" ]; then
-    DEPLOYMENT_JSON="${PROJECT_DIR}/examples/debug/ethdebug_output/deployment.json"
-elif [ -f "${PROJECT_DIR}/examples/debug/deployment.json" ]; then
-    DEPLOYMENT_JSON="${PROJECT_DIR}/examples/debug/deployment.json"
-else
-    echo -e "${YELLOW}No deployment found. Deploying TestContract...${NC}"
-    # Deploy the contract automatically
-    cd "${PROJECT_DIR}/examples"
-    "${PROJECT_DIR}/scripts/deploy-contract.sh" --solc="${SOLC_PATH}" --rpc="${RPC_URL}" --private-key="${PRIVATE_KEY}" TestContract TestContract.sol --debug-dir=debug
-    
-    # Check again after deployment
-    if [ -f "${PROJECT_DIR}/examples/debug/deployment.json" ]; then
-        DEPLOYMENT_JSON="${PROJECT_DIR}/examples/debug/deployment.json"
+# Test-specific debug directory (relative to examples)
+TEST_DEBUG_REL="test_debug"
+TEST_DEBUG_DIR="${PROJECT_DIR}/examples/${TEST_DEBUG_REL}"
+
+# Check if test deployment exists and is for TestContract
+DEPLOYMENT_JSON="${TEST_DEBUG_DIR}/deployment.json"
+NEED_DEPLOY=false
+
+if [ -f "${DEPLOYMENT_JSON}" ]; then
+    # Check if it's the right contract
+    DEPLOYED_CONTRACT=$(jq -r '.contract // empty' "${DEPLOYMENT_JSON}")
+    if [ "${DEPLOYED_CONTRACT}" != "TestContract" ]; then
+        echo -e "${YELLOW}Found deployment for ${DEPLOYED_CONTRACT}, but need TestContract${NC}"
+        NEED_DEPLOY=true
     else
+        echo -e "${GREEN}Found existing TestContract deployment${NC}"
+    fi
+else
+    echo -e "${YELLOW}No test deployment found${NC}"
+    NEED_DEPLOY=true
+fi
+
+if [ "${NEED_DEPLOY}" = true ]; then
+    echo -e "${YELLOW}Deploying TestContract for tests...${NC}"
+    
+    # Use the dedicated test deployment script if it exists
+    if [ -x "${SCRIPT_DIR}/deploy-test-contract.sh" ]; then
+        # Use dedicated test deployment script
+        SOLC_PATH="${SOLC_PATH}" RPC_URL="${RPC_URL}" PRIVATE_KEY="${PRIVATE_KEY}" \
+            DEBUG_DIR="test_debug" CONTRACT_NAME="TestContract" CONTRACT_FILE="TestContract.sol" \
+            "${SCRIPT_DIR}/deploy-test-contract.sh"
+    else
+        # Fallback to direct deployment
+        cd "${PROJECT_DIR}/examples"
+        rm -rf test_debug
+        "${PROJECT_DIR}/scripts/deploy-contract.sh" --solc="${SOLC_PATH}" --rpc="${RPC_URL}" --private-key="${PRIVATE_KEY}" TestContract TestContract.sol --debug-dir=test_debug
+    fi
+    
+    # Check deployment succeeded
+    if [ ! -f "${DEPLOYMENT_JSON}" ]; then
         echo -e "${RED}Deployment failed!${NC}"
         exit 1
     fi
+    echo -e "${GREEN}✓ TestContract deployed successfully${NC}"
 fi
 
 # Load deployment info
@@ -73,7 +101,7 @@ fi
 if [ -z "$TEST_TX" ] && [ -n "$CONTRACT_ADDRESS" ]; then
     echo -e "${YELLOW}Creating fresh test transaction...${NC}"
     # Send an increment transaction and capture the TX hash
-    TX_OUTPUT=$(cd "${PROJECT_DIR}/examples" && DEBUG_DIR=debug RPC_URL="${RPC_URL}" "${PROJECT_DIR}/scripts/interact-contract.sh" send "increment(uint256)" 4 2>&1)
+    TX_OUTPUT=$(cd "${PROJECT_DIR}/examples" && DEBUG_DIR="${TEST_DEBUG_REL}" RPC_URL="${RPC_URL}" PRIVATE_KEY="${PRIVATE_KEY}" "${PROJECT_DIR}/scripts/interact-contract.sh" send "increment(uint256)" 4 2>&1)
     TEST_TX=$(echo "$TX_OUTPUT" | grep -o '0x[a-fA-F0-9]\{64\}' | head -1)
     if [ -z "$TEST_TX" ]; then
         echo -e "${RED}Failed to create test transaction${NC}"
@@ -90,24 +118,44 @@ echo "Using contract: ${CONTRACT_ADDRESS}"
 echo "Using transaction: ${TEST_TX}"
 echo ""
 
-# Find walnut-cli
-if command -v walnut-cli &> /dev/null; then
-    WALNUT_CLI="walnut-cli"
-elif [ -f "${PROJECT_DIR}/MyEnv/bin/walnut-cli" ]; then
-    WALNUT_CLI="${PROJECT_DIR}/MyEnv/bin/walnut-cli"
+# Find soldb - prefer system-wide installation
+SOLDB_CMD=""
+SOLDB_TYPE=""
+if command -v soldb &> /dev/null; then
+    # Use system soldb if available
+    SOLDB_CMD="soldb"
+    SOLDB_TYPE="system"
+    echo -e "${GREEN}Using system soldb${NC}"
+elif [ -f "${PROJECT_DIR}/MyEnv/bin/soldb" ]; then
+    # Fall back to virtual environment
+    SOLDB_CMD="MyEnv/bin/soldb"
+    SOLDB_TYPE="venv"
+    echo -e "${GREEN}Using venv soldb${NC}"
 else
-    echo -e "${RED}Error: walnut-cli not found${NC}"
+    echo -e "${RED}Error: soldb not found${NC}"
     echo "Install with: pip install -e ${PROJECT_DIR}"
     exit 1
 fi
 
-# Create lit config
+# Create lit config with relative paths
 cat > "${SCRIPT_DIR}/lit.site.cfg.py" << EOF
 import sys
 import os
+import shutil
 
-config.walnut_cli_dir = "${PROJECT_DIR}"
-config.walnut_cli = "${WALNUT_CLI}"
+# Get the test directory and project directory dynamically
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_dir = os.path.dirname(script_dir)
+
+config.soldb_dir = project_dir
+
+# Find soldb dynamically
+if shutil.which('soldb'):
+    config.soldb = shutil.which('soldb')
+elif os.path.exists(os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')):
+    config.soldb = os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')
+else:
+    config.soldb = "${SOLDB_CMD}"
 config.rpc_url = "${RPC_URL}"
 config.chain_id = "${CHAIN_ID}"
 config.private_key = "${PRIVATE_KEY}"
@@ -115,12 +163,20 @@ config.test_contracts = {
     "contract_address": "${CONTRACT_ADDRESS}",
     "deploy_tx": "${DEPLOY_TX}",
     "test_tx": "${TEST_TX}",
-    "ethdebug_dir": "${PROJECT_DIR}/examples/debug"
+    "ethdebug_dir": os.path.join(project_dir, "examples", "${TEST_DEBUG_REL}")
 }
-config.solc_path = "${SOLC_PATH}"
+# Determine solc path dynamically
+solc_path = os.environ.get('SOLC_PATH')
+if not solc_path:
+    # Try to find solc in PATH
+    solc_path = shutil.which('solc')
+if not solc_path:
+    # Fallback to a default
+    solc_path = 'solc'
+config.solc_path = solc_path
 
 # Load the main config
-lit_config.load_config(config, "${SCRIPT_DIR}/lit.cfg.py")
+lit_config.load_config(config, os.path.join(script_dir, "lit.cfg.py"))
 EOF
 
 # Check for lit

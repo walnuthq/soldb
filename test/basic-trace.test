@@ -1,6 +1,6 @@
-# Test basic walnut-cli tracing functionality
-# REQUIRES: walnut-cli
-# RUN: %walnut-cli trace %{test_tx} --ethdebug-dir %{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck %s
+# Test basic soldb tracing functionality
+# REQUIRES: soldb
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck %s
 
 # Check that we get the basic tracing output structure
 # CHECK: Loading transaction

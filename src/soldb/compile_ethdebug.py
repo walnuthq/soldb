@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Command-line tool for compiling Solidity contracts with ETHDebug support.
-Can be used standalone or integrated into the walnut-cli workflow.
+Can be used standalone or integrated into the soldb workflow.
 """
 
 import argparse
@@ -57,7 +57,7 @@ def main(args=None):
     parser.add_argument(
         "--save-config",
         action="store_true",
-        help="Save configuration to walnut.config.yaml"
+        help="Save configuration to soldb.config.yaml"
     )
     
     parser.add_argument(
@@ -95,9 +95,9 @@ def main(args=None):
     # Save configuration if requested
     if args.save_config:
         try:
-            config.save_to_walnut_config()
+            config.save_to_soldb_config()
             if not args.json:
-                print("✓ Configuration saved to walnut.config.yaml")
+                print("✓ Configuration saved to soldb.config.yaml")
         except Exception as e:
             print(f"Error saving configuration: {e}", file=sys.stderr)
             return 1

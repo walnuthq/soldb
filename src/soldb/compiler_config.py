@@ -187,8 +187,8 @@ class CompilerConfig:
             return {"supported": False, "error": str(e)}
     
     @classmethod
-    def from_walnut_config(cls, config_file: str = "walnut.config.yaml") -> "CompilerConfig":
-        """Load configuration from walnut config file."""
+    def from_soldb_config(cls, config_file: str = "soldb.config.yaml") -> "CompilerConfig":
+        """Load configuration from soldb config file."""
         if not Path(config_file).exists():
             # Return default config if file doesn't exist
             return cls()
@@ -205,8 +205,8 @@ class CompilerConfig:
             build_dir=config_data.get('build_dir', './build')
         )
     
-    def save_to_walnut_config(self, config_file: str = "walnut.config.yaml"):
-        """Save configuration to walnut config file."""
+    def save_to_soldb_config(self, config_file: str = "soldb.config.yaml"):
+        """Save configuration to soldb config file."""
         import yaml
         
         config_data = {}

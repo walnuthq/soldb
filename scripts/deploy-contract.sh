@@ -6,13 +6,13 @@ set -e
 
 # Get script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-WALNUT_DIR="$(dirname "$SCRIPT_DIR")"
+SOLDB_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Load configuration if exists
-if [ -f "$WALNUT_DIR/walnut.config.local" ]; then
-    source "$WALNUT_DIR/walnut.config.local"
-elif [ -f "$WALNUT_DIR/walnut.config" ]; then
-    source "$WALNUT_DIR/walnut.config"
+if [ -f "$SOLDB_DIR/soldb.config.local" ]; then
+    source "$SOLDB_DIR/soldb.config.local"
+elif [ -f "$SOLDB_DIR/soldb.config" ]; then
+    source "$SOLDB_DIR/soldb.config"
 fi
 
 # Default configuration
@@ -340,12 +340,12 @@ cat > "$DEBUG_DIR/deployment.json" <<EOF
 }
 EOF
 
-# Create walnut.config.yaml if it doesn't exist
-WALNUT_CONFIG="$WALNUT_DIR/walnut.config.yaml"
-if [ ! -f "$WALNUT_CONFIG" ]; then
-    echo -e "\n${BLUE}Creating walnut.config.yaml...${NC}"
-    cat > "$WALNUT_CONFIG" <<EOF
-# Walnut CLI Configuration
+# Create soldb.config.yaml if it doesn't exist
+SOLDB_CONFIG="$SOLDB_DIR/soldb.config.yaml"
+if [ ! -f "$SOLDB_CONFIG" ]; then
+    echo -e "\n${BLUE}Creating soldb.config.yaml...${NC}"
+    cat > "$SOLDB_CONFIG" <<EOF
+# SolDB Configuration
 debug:
   ethdebug:
     enabled: true
@@ -359,13 +359,13 @@ debug:
 build_dir: "build"
 rpc_url: "$RPC_URL"
 EOF
-    echo -e "${GREEN}✓ Created walnut.config.yaml${NC}"
+    echo -e "${GREEN}✓ Created soldb.config.yaml${NC}"
 fi
 
 echo -e "\n${GREEN}Deployment complete!${NC}"
 echo -e "\n${BLUE}ETHDebug files location:${NC} $DEBUG_DIR"
 echo -e "\n${BLUE}To trace with ETHDebug:${NC}"
-echo -e "  $WALNUT_DIR/walnut-cli.py $TX_HASH --ethdebug-dir $DEBUG_DIR"
+echo -e "  soldb trace $TX_HASH --ethdebug-dir $DEBUG_DIR"
 echo -e "\n${BLUE}Or simply:${NC}"
-echo -e "  $WALNUT_DIR/walnut-cli.py $TX_HASH"
-echo -e "  (if walnut.config.yaml is configured correctly)"
+echo -e "  soldb trace $TX_HASH"
+echo -e "  (if soldb.config.yaml is configured correctly)"

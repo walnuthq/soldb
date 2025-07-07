@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main entry point for walnut-cli
+Main entry point for soldb
 """
 
 import sys
@@ -57,7 +57,7 @@ def trace_command(args):
         if args.json:
             # Output minimal JSON with error
             json_output = {
-                "walnutCLIFailed": "debug_traceTransaction unavailable",
+                "soldbFailed": "debug_traceTransaction unavailable",
                 "tx_hash": trace.tx_hash,
                 "from": trace.from_addr,
                 "to": trace.to_addr,
@@ -592,7 +592,7 @@ def debug_command(args):
     return 0
 
 def main():
-    parser = argparse.ArgumentParser(description='Walnut CLI - Ethereum transaction analysis tool')
+    parser = argparse.ArgumentParser(description='SolDB - Ethereum transaction analysis tool')
     parser.add_argument('--version', '-v', action='version', version='%(prog)s 0.1.0')
     
     # Create subparsers for different commands

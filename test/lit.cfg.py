@@ -10,7 +10,7 @@ import lit.formats
 # Configuration file for the 'lit' test runner.
 
 # name: The name of this test suite.
-config.name = 'walnut-cli'
+config.name = 'soldb'
 
 # testFormat: The test format to use to interpret tests.
 config.test_format = lit.formats.ShTest(True)
@@ -27,21 +27,21 @@ config.test_exec_root = os.path.join(config.test_source_root, 'Output')
 # Substitutions
 import shutil
 
-# Find walnut-cli
-if hasattr(config, 'walnut_cli') and config.walnut_cli:
-    walnut_cli_path = config.walnut_cli
+# Find soldb
+if hasattr(config, 'soldb') and config.soldb:
+    soldb_path = config.soldb
 else:
-    walnut_cli_path = shutil.which('walnut-cli')
-    if not walnut_cli_path and hasattr(config, 'walnut_cli_dir'):
+    soldb_path = shutil.which('soldb')
+    if not soldb_path and hasattr(config, 'soldb_dir'):
         # Try to find it in the virtual environment
-        venv_path = os.path.join(config.walnut_cli_dir, 'MyEnv', 'bin', 'walnut-cli')
+        venv_path = os.path.join(config.soldb_dir, 'MyEnv', 'bin', 'soldb')
         if os.path.exists(venv_path):
-            walnut_cli_path = venv_path
+            soldb_path = venv_path
 
-if walnut_cli_path:
-    config.substitutions.append(('%walnut-cli', walnut_cli_path))
+if soldb_path:
+    config.substitutions.append(('%soldb', soldb_path))
 else:
-    config.substitutions.append(('%walnut-cli', 'walnut-cli'))
+    config.substitutions.append(('%soldb', 'soldb'))
 
 # RPC and chain configuration
 config.substitutions.append(('%{rpc_url}', getattr(config, 'rpc_url', 'http://localhost:8547')))
@@ -70,18 +70,18 @@ if platform.system() == 'Darwin':
 elif platform.system() == 'Linux':
     config.available_features.add('linux')
 
-# Check if walnut-cli is available
-def check_walnut_cli():
+# Check if soldb is available
+def check_soldb():
     try:
-        if walnut_cli_path:
-            subprocess.run([walnut_cli_path, '--help'], check=True, capture_output=True)
+        if soldb_path:
+            subprocess.run([soldb_path, '--help'], check=True, capture_output=True)
             return True
     except:
         pass
     return False
 
-if check_walnut_cli():
-    config.available_features.add('walnut-cli')
+if check_soldb():
+    config.available_features.add('soldb')
 
 # Add 'not' command
 not_path = shutil.which('not')
