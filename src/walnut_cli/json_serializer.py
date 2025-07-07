@@ -433,7 +433,17 @@ class TraceSerializer:
             trace_call["isRevertedFrame"] = True
         
         # Add isVerified field for all call types
-        if multi_parser and call.contract_address:
+        # For entry points, check if debug info is available
+        if call.call_type == "entry":
+            # Entry point is verified if we have debug info for the contract
+            has_debug_info = False
+            if multi_parser and call.contract_address:
+                target_contract = multi_parser.get_contract_at_address(call.contract_address)
+                has_debug_info = target_contract is not None and target_contract.ethdebug_info is not None
+            elif tracer_instance and hasattr(tracer_instance, 'ethdebug_info'):
+                has_debug_info = tracer_instance.ethdebug_info is not None
+            trace_call["isVerified"] = has_debug_info
+        elif multi_parser and call.contract_address:
             target_contract = multi_parser.get_contract_at_address(call.contract_address)
             trace_call["isVerified"] = target_contract is not None
         else:
