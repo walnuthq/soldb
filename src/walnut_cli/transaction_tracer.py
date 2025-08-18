@@ -1317,11 +1317,28 @@ class TransactionTracer:
         # Track parent-child relationships properly
         active_parents = []  # Stack of active parent call IDs
 
+        # Helper function to insert calls in sorted order by entry_step
+        def insert_call_sorted(call):
+            """Insert a call into function_calls list maintaining sorted order by entry_step."""
+            if call.entry_step is None:
+                # If no entry_step yet, append to end
+                function_calls.append(call)
+                return
+            
+            # Find the right position to insert based on entry_step
+            insert_pos = len(function_calls)
+            for i, existing_call in enumerate(function_calls):
+                if existing_call.entry_step is not None and existing_call.entry_step > call.entry_step:
+                    insert_pos = i
+                    break
+            
+            function_calls.insert(insert_pos, call)
+
         # Initialize with dispatcher
         dispatcher_call = self._create_dispatcher_call(trace)
         dispatcher_call.call_id = next_call_id
         next_call_id += 1
-        function_calls.append(dispatcher_call)
+        insert_call_sorted(dispatcher_call)
         call_stack.append(dispatcher_call)
         active_parents.append(dispatcher_call.call_id)
         current_depth += 1
@@ -1337,6 +1354,43 @@ class TransactionTracer:
             else:
                 input_hex = trace.input_data
             main_selector = input_hex[:10]  # First 4 bytes (0x + 8 chars)
+
+        # Create main function call early to ensure it gets call_id = 1
+        main_call = None
+        if main_selector:
+            function_info = self.function_signatures.get(main_selector)
+            if function_info:
+                main_function_name = function_info['name']
+            else:
+                # Try to look up from 4byte.directory
+                signature = self.lookup_function_signature(main_selector)
+                if signature:
+                    main_function_name = signature
+                else:
+                    main_function_name = f"function_{main_selector}"
+            
+            # Create main function call with call_id = 1
+            main_call = FunctionCall(
+                name=main_function_name,
+                selector=main_selector,
+                entry_step=None,  # Will be set later
+                exit_step=None,
+                gas_used=0,
+                depth=1,  # Depth 1 since it's under dispatcher
+                args=[],  # Will be decoded later
+                source_line=None,
+                call_type="external",  # Main entry from transaction
+                call_id=next_call_id,  # This will be 1
+                parent_call_id=dispatcher_call.call_id,
+                children_call_ids=[]
+            )
+            next_call_id += 1
+            # Add to function_calls and call_stack
+            # Note: main_call.entry_step is None, so it will be appended to end for now
+            function_calls.append(main_call)
+            call_stack.append(main_call)
+            # Update dispatcher to have main as child
+            dispatcher_call.children_call_ids.append(main_call.call_id)
 
         
         # Find the main function entry
@@ -1372,19 +1426,37 @@ class TransactionTracer:
                     call.call_id = next_call_id
                     call.parent_call_id = call_stack[-1].call_id if call_stack else None
                     if call_stack:
-                        # Only add as child if the depth is greater than parent
-                        parent_call = call_stack[-1]
-                        if call.depth > parent_call.depth:
-                            parent_call.children_call_ids.append(call.call_id)
-                        else:
-                            # Find the correct parent based on depth
-                            for j in range(len(call_stack) - 1, -1, -1):
-                                potential_parent = call_stack[j]
-                                if call.depth > potential_parent.depth:
-                                    potential_parent.children_call_ids.append(call.call_id)
+                        # Find the appropriate parent for this call
+                        # For calls at depth 1, they should be children of the main function if it exists
+                        if call.depth == 1 and len(call_stack) > 1:
+                            # Check if we have a main function call (depth 1, call_type external)
+                            main_func = None
+                            for stack_call in call_stack:
+                                if stack_call.depth == 1 and stack_call.call_type == "external":
+                                    main_func = stack_call
                                     break
+                            
+                            if main_func:
+                                # Add as child of main function
+                                main_func.children_call_ids.append(call.call_id)
+                                call.parent_call_id = main_func.call_id
+                            else:
+                                # Fallback to dispatcher
+                                call_stack[-1].children_call_ids.append(call.call_id)
+                        else:
+                            # Only add as child if the depth is greater than parent
+                            parent_call = call_stack[-1]
+                            if call.depth > parent_call.depth:
+                                parent_call.children_call_ids.append(call.call_id)
+                            else:
+                                # Find the correct parent based on depth
+                                for j in range(len(call_stack) - 1, -1, -1):
+                                    potential_parent = call_stack[j]
+                                    if call.depth > potential_parent.depth:
+                                        potential_parent.children_call_ids.append(call.call_id)
+                                        break
                     next_call_id += 1
-                    function_calls.append(call)
+                    insert_call_sorted(call)
                     call_stack.append(call)
                     context_stack.append({
                         'contract': current_contract,
@@ -1412,7 +1484,7 @@ class TransactionTracer:
                         parent_call = call_stack[-1]
                         parent_call.children_call_ids.append(call.call_id)
                     next_call_id += 1
-                    function_calls.append(call)
+                    insert_call_sorted(call)
                     call_stack.append(call)
                     context_stack.append({
                         'contract': current_contract,
@@ -1545,19 +1617,37 @@ class TransactionTracer:
                                         
                                     call.args = args
                     if call_stack:
-                        # Only add as child if the depth is greater than parent
-                        parent_call = call_stack[-1]
-                        if call.depth > parent_call.depth:
-                            parent_call.children_call_ids.append(call.call_id)
-                        else:
-                            # Find the correct parent based on depth
-                            for j in range(len(call_stack) - 1, -1, -1):
-                                potential_parent = call_stack[j]
-                                if call.depth > potential_parent.depth:
-                                    potential_parent.children_call_ids.append(call.call_id)
+                        # Find the appropriate parent for this call
+                        # For calls at depth 1, they should be children of the main function if it exists
+                        if call.depth == 1 and len(call_stack) > 1:
+                            # Check if we have a main function call (depth 1, call_type external)
+                            main_func = None
+                            for stack_call in call_stack:
+                                if stack_call.depth == 1 and stack_call.call_type == "external":
+                                    main_func = stack_call
                                     break
+                            
+                            if main_func:
+                                # Add as child of main function
+                                main_func.children_call_ids.append(call.call_id)
+                                call.parent_call_id = main_func.call_id
+                            else:
+                                # Fallback to dispatcher
+                                call_stack[-1].children_call_ids.append(call.call_id)
+                        else:
+                            # Only add as child if the depth is greater than parent
+                            parent_call = call_stack[-1]
+                            if call.depth > parent_call.depth:
+                                parent_call.children_call_ids.append(call.call_id)
+                            else:
+                                # Find the correct parent based on depth
+                                for j in range(len(call_stack) - 1, -1, -1):
+                                    potential_parent = call_stack[j]
+                                    if call.depth > potential_parent.depth:
+                                        potential_parent.children_call_ids.append(call.call_id)
+                                        break
                     next_call_id += 1
-                    function_calls.append(call)
+                    insert_call_sorted(call)
                     call_stack.append(call)
             # Exit from function
             elif step.op in ["RETURN", "REVERT", "STOP"]:
@@ -1570,7 +1660,7 @@ class TransactionTracer:
                 while call_stack:
                     call = call_stack.pop()
                     call.exit_step = i
-                    if call.entry_step < len(trace.steps):
+                    if call.entry_step is not None and call.entry_step < len(trace.steps):
                         call.gas_used = trace.steps[call.entry_step].gas - step.gas
                     else:
                         call.gas_used = 0
@@ -1595,7 +1685,7 @@ class TransactionTracer:
          
         for call in call_stack:
             call.exit_step = len(trace.steps) - 1 if trace.steps else 0
-            if trace.steps and call.entry_step < len(trace.steps):
+            if trace.steps and call.entry_step is not None and call.entry_step < len(trace.steps):
                 call.gas_used = trace.steps[call.entry_step].gas - trace.steps[-1].gas
             else:
                 call.gas_used = 0
@@ -1652,42 +1742,29 @@ class TransactionTracer:
                                     if gas_consumed_so_far < trace.steps[0].gas * 0.1:
                                         should_add_main_function = True
                         
-                        if should_add_main_function:
+                        if should_add_main_function and main_call:
+                            # Update the existing main call with proper entry/exit info
+                            main_call.entry_step = i
+                            main_call.exit_step = len(trace.steps) - 1  # Main function runs to the end
+                            main_call.gas_used = trace.steps[i].gas - trace.steps[-1].gas if trace.steps else 0
+                            main_call.source_line = source_line
+                            
                             # Decode parameters from calldata
                             decoded_params = self.decode_function_parameters(main_selector, trace.input_data)
+                            main_call.args = decoded_params
                             
-                            # Insert at beginning (after dispatcher)
-                            main_call = FunctionCall(
-                                name=main_function_name,
-                                selector=main_selector,
-                                entry_step=i,
-                                exit_step=len(trace.steps) - 1,  # Main function runs to the end
-                                gas_used=trace.steps[i].gas - trace.steps[-1].gas if trace.steps else 0,
-                                depth=1,  # Depth 1 since it's under dispatcher
-                                args=decoded_params,
-                                source_line=source_line,
-                                call_type="external",  # Main entry from transaction
-                                call_id=next_call_id,
-                                parent_call_id=function_calls[0].call_id if function_calls else None,
-                                children_call_ids=[]
-                            )
-                            next_call_id += 1
+                            # Re-sort the main call now that it has entry_step
+                            function_calls.remove(main_call)
+                            insert_call_sorted(main_call)
                             
-                            # Insert after dispatcher
-                            if len(function_calls) > 0:
-                                function_calls.insert(1, main_call)
-                                # Update dispatcher to have main as child
-                                function_calls[0].children_call_ids.append(main_call.call_id)
-                                # Update subsequent calls to be children of main instead of dispatcher
-                                for j in range(2, len(function_calls)):
-                                    if function_calls[j].parent_call_id == function_calls[0].call_id and function_calls[j].depth == 1:
-                                        function_calls[j].parent_call_id = main_call.call_id
-                                        main_call.children_call_ids.append(function_calls[j].call_id)
-                                        # Remove from dispatcher's children
-                                        if function_calls[j].call_id in function_calls[0].children_call_ids:
-                                            function_calls[0].children_call_ids.remove(function_calls[j].call_id)
-                            else:
-                                function_calls.append(main_call)
+                            # Update subsequent calls to be children of main instead of dispatcher
+                            for j in range(2, len(function_calls)):
+                                if function_calls[j].parent_call_id == function_calls[0].call_id and function_calls[j].depth == 1:
+                                    function_calls[j].parent_call_id = main_call.call_id
+                                    main_call.children_call_ids.append(function_calls[j].call_id)
+                                    # Remove from dispatcher's children
+                                    if function_calls[j].call_id in function_calls[0].children_call_ids:
+                                        function_calls[0].children_call_ids.remove(function_calls[j].call_id)
                             break
 
         return function_calls
@@ -2400,8 +2477,9 @@ class TransactionTracer:
             print(f"#0 {cyan('Contract::fallback()')} {dim('(no function selector matched)')}")
         else:
             # Sort calls by entry_step to ensure proper ordering
-            sorted_calls = sorted(function_calls, key=lambda x: x.entry_step)
-            
+            # Handle None entry_step values by treating them as -1 (before all others)
+            # sorted_calls = sorted(function_calls, key=lambda x: x.entry_step if x.entry_step is not None else -1)
+            sorted_calls = function_calls
             for i, call in enumerate(sorted_calls):
                 indent = "  " * call.depth
                 
@@ -2461,14 +2539,14 @@ class TransactionTracer:
                 if call.source_line:
                     if self.ethdebug_info or self.multi_contract_parser:
                         # Try to get more detailed source info
-                        step = trace.steps[call.entry_step] if call.entry_step < len(trace.steps) else None
+                        step = trace.steps[call.entry_step] if call.entry_step is not None and call.entry_step < len(trace.steps) else None
                         if step:
                             # Determine contract address for multi-contract mode
                             address = None
                             if call.contract_address:
                                 address = call.contract_address
                             else:
-                                address = self.get_current_contract_address(trace, call.entry_step)
+                                address = self.get_current_contract_address(trace, call.entry_step) if call.entry_step is not None else None
                             context = self.get_source_context_for_step(step, address, context_lines=0)
                             if context:
                                 source_info = dim(f" @ {os.path.basename(context['file'])}:{context['line']}")
@@ -2497,8 +2575,15 @@ class TransactionTracer:
                 
                 # Show entry/exit steps for non-entry-point functions
                 if call.depth > 0:  # Show steps for actual function calls, not dispatcher
-                    step_info = dim(f"   steps: {call.entry_step}-{call.exit_step}")
-                    print(f"{indent}{step_info}")
+                    if call.entry_step is not None and call.exit_step is not None:
+                        step_info = dim(f"   steps: {call.entry_step}-{call.exit_step}")
+                        print(f"{indent}{step_info}")
+                    elif call.entry_step is not None:
+                        step_info = dim(f"   steps: {call.entry_step}-?")
+                        print(f"{indent}{step_info}")
+                    else:
+                        step_info = dim(f"   steps: ?-?")
+                        print(f"{indent}{step_info}")
                 
                 if call.args:
                     # Display parameters with names and values

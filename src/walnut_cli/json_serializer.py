@@ -273,7 +273,7 @@ class TraceSerializer:
             gas = trace.steps[0].gas
         else:
             # For internal calls, try to get gas from the step where the call starts
-            if call.entry_step < len(trace.steps):
+            if call.entry_step is not None and call.entry_step < len(trace.steps):
                 gas = trace.steps[call.entry_step].gas
             else:
                 gas = None
@@ -362,14 +362,18 @@ class TraceSerializer:
         elif trace_type == "INTERNALCALL":
             if hasattr(call, 'contract_address'):
                 trace_call["contractAddress"] = call.contract_address
+                # For internal calls, set 'to' to the contract address
+                trace_call["to"] = call.contract_address
+                # For internal calls, set 'from' to the contract address (same contract)
+                trace_call["from"] = call.contract_address
         elif trace_type in ["CREATE", "CREATE2"]:
             # For CREATE/CREATE2, include the deployed contract address
             if hasattr(call, 'contract_address') and call.contract_address:
                 trace_call["deployedContractAddress"] = call.contract_address
             # Set from address
-            trace_call["from"] = trace.from_addr if call.depth == 0 else None
+            trace_call["from"] = trace.from_addr if call.depth == 0 else call.contract_address
         # Gas and gasUsed logic
-        if call.entry_step < len(trace.steps):
+        if call.entry_step is not None and call.entry_step < len(trace.steps):
             trace_call["gas"] = hex(trace.steps[call.entry_step].gas)
         if call.gas_used is not None:
             trace_call["gasUsed"] = hex(call.gas_used)
@@ -377,12 +381,12 @@ class TraceSerializer:
         call_logs = []
         for step_index, log in logs_with_steps:
             # Check if this log belongs to this function call
-            if (step_index >= call.entry_step and 
+            if (call.entry_step is not None and step_index >= call.entry_step and
                 (call.exit_step is None or step_index <= call.exit_step)):
                 is_child_log = False
                 for child_id in call.children_call_ids:
                     child = next((c for c in all_calls if c.call_id == child_id), None)
-                    if child and child.entry_step <= step_index <= (child.exit_step or step_index):
+                    if child and child.entry_step is not None and child.entry_step <= step_index <= (child.exit_step or step_index):
                         is_child_log = True
                         break
                 if not is_child_log:
@@ -409,11 +413,15 @@ class TraceSerializer:
         if "to" not in trace_call or not trace_call["to"]:
             if hasattr(call, 'contract_address') and call.contract_address:
                 trace_call["to"] = call.contract_address
+            else:
+                trace_call["to"] = trace.to_addr
         if "from" not in trace_call or not trace_call["from"]:
             if call.depth == 0:
                 trace_call["from"] = trace.from_addr
             elif hasattr(call, 'contract_address') and call.contract_address:
                 trace_call["from"] = call.contract_address
+            else:
+                trace_call["from"] = trace.to_addr
 
         # Normalize addresses to checksum format for 'to', 'from', 'contractAddress'
         for addr_field in ["to", "from", "contractAddress"]:
@@ -550,7 +558,7 @@ class TraceSerializer:
             
             # Sort calls within each depth by entry step
             for depth_calls in calls_by_depth.values():
-                depth_calls.sort(key=lambda c: c.entry_step)
+                depth_calls.sort(key=lambda c: c.entry_step if c.entry_step is not None else -1)
             
             # Process in depth-first order
             def process_call(call, idx):
@@ -562,7 +570,8 @@ class TraceSerializer:
                 if child_depth in calls_by_depth:
                     for child in calls_by_depth[child_depth]:
                         # Check if child is within parent's range
-                        if (call.entry_step <= child.entry_step and 
+                        if (call.entry_step is not None and child.entry_step is not None and 
+                            call.entry_step <= child.entry_step and 
                             (call.exit_step is None or child.entry_step <= call.exit_step)):
                             idx = process_call(child, idx)
                 
@@ -588,7 +597,7 @@ class TraceSerializer:
             deepest_depth = -1
             
             for call in function_calls:
-                if (call.entry_step <= i and 
+                if (call.entry_step is not None and call.entry_step <= i and 
                     (call.exit_step is None or i <= call.exit_step) and
                     call.depth > deepest_depth):
                     containing_call = call
