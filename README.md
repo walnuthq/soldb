@@ -1,6 +1,6 @@
 # Walnut EVM Debugger
 
-A transaction-based debugger for the EVM and Solidity smart contracts.
+A CLI debugger for the EVM and Solidity.
 
 ![screenshot](reverted_transaction.png)
 
