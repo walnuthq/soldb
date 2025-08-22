@@ -1373,7 +1373,7 @@ class TransactionTracer:
             main_call = FunctionCall(
                 name=main_function_name,
                 selector=main_selector,
-                entry_step=None,  # Will be set later
+                entry_step=0,  # Default to 0, will be updated later if found
                 exit_step=None,
                 gas_used=0,
                 depth=1,  # Depth 1 since it's under dispatcher

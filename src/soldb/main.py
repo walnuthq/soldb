@@ -554,6 +554,8 @@ def debug_command(args):
         if not args.ethdebug_dir:
             print(error("Error: --ethdebug-dir is required when using --contract-address."))
             return 1
+        if args.constructor_args:
+            print(error("Warning: --constructor-args ignored when using --contract-address (contract is already deployed)."))
         contract_address = args.contract_address
         ethdebug_dir = args.ethdebug_dir
     else:
@@ -610,7 +612,7 @@ def main():
     debug_parser.add_argument('--ethdebug-dir', '-e', help='ETHDebug directory (required if using --contract-address)')
     debug_parser.add_argument('--function', '-f', help='Function to simulate on start.')
     debug_parser.add_argument('--args', nargs='*', default=[], help='A list of arguments for the function.')
-    debug_parser.add_argument('--constructor-args', nargs='*', default=[], help='A list of arguments for the contract constructor.')
+    debug_parser.add_argument('--constructor-args', nargs='*', default=[], help='Constructor arguments (only used with --contract-file)')
     debug_parser.add_argument('--solc-path', '-solc', default='solc', help='Path to solc binary (default: solc)')
     debug_parser.add_argument('--dual-compile', action='store_true', help='Create both optimized production and debug builds')
     debug_parser.add_argument('--keep-build', action='store_true', help='Keep build directory after compilation (default: False)')

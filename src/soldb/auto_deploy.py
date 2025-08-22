@@ -30,7 +30,7 @@ class AutoDeployDebugger:
         save_config: bool = False,
         json_output: bool = False,
         use_cache: bool = True,
-        cache_dir: str = ".walnut_cache",
+        cache_dir: str = ".soldb_cache",
         fork_url: str = None,
         fork_block: int = None,
         auto_snapshot: bool = True,
@@ -53,12 +53,21 @@ class AutoDeployDebugger:
         self.json_output = json_output
         self.constructor_args = constructor_args
 
-        # Temp directory for ETHDebug artifacts
-        self.temp_dir = Path(tempfile.mkdtemp(prefix=f"walnut-{self.contract_name}-"))
-        self.debug_output_dir = self.temp_dir  # always store debug artifacts here
-        # Production artifacts (if dual) go to a sibling dir
-        self.production_dir = self.temp_dir / "prod"
-        self.production_dir.mkdir(parents=True, exist_ok=True)
+        # Use provided directories or create temp ones
+        if self.keep_build:
+            # Create contract-specific subdirectories to avoid conflicts
+            base_debug_dir = Path(output_dir)
+            base_production_dir = Path(production_dir)
+            self.debug_output_dir = base_debug_dir / self.contract_name
+            self.production_dir = base_production_dir / self.contract_name
+            self.debug_output_dir.mkdir(parents=True, exist_ok=True)
+            self.production_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # Temp directory for ETHDebug artifacts when not keeping build
+            self.temp_dir = Path(tempfile.mkdtemp(prefix=f"soldb-{self.contract_name}-"))
+            self.debug_output_dir = self.temp_dir
+            self.production_dir = self.temp_dir / "prod"
+            self.production_dir.mkdir(parents=True, exist_ok=True)
 
         self._compile_result = None
         self.contract_address = None

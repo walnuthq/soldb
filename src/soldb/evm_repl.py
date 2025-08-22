@@ -131,20 +131,20 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
         """Set the intro message based on command used."""
         if self.command_debug:
             self.intro = f"""
-{bold('Walnut EVM Debugger')} - Solidity Debugger
+{bold('SolDB EVM Debugger')} - Solidity Debugger
 Type {info('help')} for commands. Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('where')} to see call stack.
 """
             return
         if self.current_trace:
             # Trace is already loaded
             self.intro = f"""
-{bold('Walnut EVM Debugger')} - Solidity Debugger
+{bold('SoldDB EVM Debugger')} - Solidity Debugger
 Trace loaded and ready for debugging. Type {info('help')} for commands.
 Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('where')} to see call stack.
     """
         else:
             # No trace loaded, need to load one               
-            self.intro = f"""{bold('Walnut EVM Debugger')} - Solidity Debugger
+            self.intro = f"""{bold('SoldDB EVM Debugger')} - Solidity Debugger
 Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific transaction for debugging.
 """
 
@@ -1388,6 +1388,23 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
         
         return " ".join(items)
     
+    def cmdloop(self, intro=None):
+        """Override cmdloop to show current state after intro but before first prompt."""
+        if self.command_debug:
+            # Call parent cmdloop with intro
+            if intro is not None:
+                self.intro = intro
+            # Print intro if it exists
+            if self.intro:
+                self.stdout.write(str(self.intro)+"\n")
+            # Show current state after intro but before first prompt
+            if self.current_trace:
+                self._show_current_state()
+            # Start the command loop without intro (already printed)
+            super().cmdloop(intro="")
+        else:
+            super().cmdloop(intro=self.intro)
+
     def emptyline(self):
         """Handle empty line (don't repeat last command)"""
         pass
