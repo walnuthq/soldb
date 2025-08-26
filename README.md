@@ -76,7 +76,7 @@ pip install git+https://github.com/walnuthq/soldb.git
 soldb trace <tx_hash> --ethdebug-dir /tmp/ethdebug-output/ --rpc http://localhost:8545
 ```
 
-Where `/tmp/ethdebug` contains debug information for contracts inside of the TX.
+Where `/tmp/ethdebug-output` contains debug information for contracts inside of the transaction.
 
 Example output:
 
