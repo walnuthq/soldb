@@ -160,8 +160,40 @@ Common commands inside the debugger: `next`, `nexti`, `continue`, `break <pc>`, 
 TBD
 
 ### Interactive Debugger for a Solidity Project
+Debug a Solidity project
+```bash
+# Debug deployed contract
+soldb debug --contract-address <contract-address>
+--function getCount
+--ethdebug-dir /debug/ethdebug/
 
-TBD
+# Compile and deploy a contract to debug it
+soldb debug --contract-file Counter.sol
+--function getCount
+--output-dir /debug/ethdebug/
+```
+Where `/debug/ethdebug` contains debug information.
+
+Example output:
+```
+Starting debugger...
+Loaded 1363 PC mappings from ethdebug
+Contract: Counter
+Environment: runtime
+Loaded source: Counter.sol
+Contract loaded: 0xb3DA7a34921a292b30A903dE88ad5b74b760F345
+[SNAPSHOT] Created snapshot 0x7e
+Simulating getCount()...
+Simulation complete. 1944 steps.
+
+SolDB EVM Debugger - Solidity Debugger
+Type help for commands. Use next/nexti to step, continue to run, where to see call stack.
+
+
+Counter.sol:4 in getCount()
+=> contract Counter {
+[ Step 0 | Gas: 44891048 | PC:    0 | PUSH1 ]
+```
 
 ## Advanced
 
