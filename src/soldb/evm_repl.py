@@ -26,7 +26,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
                  multi_contract_parser = None,function_name: str = None, function_args: List[str] = [],
                  command_debug: bool = False, abi_path: str = None):
         super().__init__()
-        
+
         self.tracer = TransactionTracer(rpc_url)
         
         # Set multi-contract parser if provided
@@ -55,6 +55,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
         self.contract_address = contract_address
         self.constructor_args = constructor_args or []
         self.debug_file = debug_file
+        self.rpc_url = rpc_url
         self.ethdebug_dir = ethdebug_dir
         self.source_map = {}
         self.source_mapper = None
@@ -150,6 +151,9 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
 
     def do_run(self, tx_hash: str):
         """Run/load a transaction for debugging. Usage: run <tx_hash>"""
+        
+        if self.command_debug:
+            return
         
         if not tx_hash:
             print("Usage: run <tx_hash>")
@@ -264,9 +268,8 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
                 converted_arg = self._convert_argument(arg, param_type)
                 converted_args.append(converted_arg)
             
-            # Create a dummy contract to encode the function call
-            w3 = Web3()
-            contract = w3.eth.contract(abi=[func_abi])
+            # Create a dummy contract to encode the function call using tracer's Web3 instance
+            contract = self.tracer.w3.eth.contract(abi=[func_abi])
             
             # Get the function and encode the call
             func = getattr(contract.functions, function_name)
