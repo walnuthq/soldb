@@ -73,14 +73,9 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
                 
             # Load ABI from ethdebug directory
             if self.tracer.ethdebug_info:
-                if self.abi_path is not None and os.path.exists(self.abi_path):
-                    self.tracer.load_abi(self.abi_path)
-                else:
-                    # Fallback to any ABI file in the directory
-                    for file in os.listdir(ethdebug_dir):
-                        if file.endswith('.abi'):
-                            self.abi_path = os.path.join(ethdebug_dir, file)
-                            self.tracer.load_abi(self.abi_path)
+                abi_path = os.path.join(ethdebug_dir, f"{self.tracer.ethdebug_info.contract_name}.abi")
+                if os.path.exists(abi_path):
+                    self.tracer.load_abi(abi_path)
         
         elif debug_file:
             self.source_map = self.tracer.load_debug_info(debug_file)
@@ -181,7 +176,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
     
     def _do_interactive(self):
         """Simulate a function call for debugging. Usage: interactive <function_name> [args...]"""
- 
+        
         if not self.contract_address:
             print(f"{warning('Warning:')} No contract address set. Using default for simulation.")
             return
@@ -240,7 +235,25 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
             print(f"{error('No ABI information available.')}")
             return None
 
-        function_name = function_name.split('(')[0]  # Remove any parameter list
+        # Parse function signature with optional parameter types
+        original_function_name = function_name
+        expected_param_types = None
+        
+        if '(' in function_name and ')' in function_name:
+            # Extract function name and parameter types: "increment(uint256)" -> "increment", ["uint256"]
+            base_name = function_name.split('(')[0]
+            params_part = function_name.split('(')[1].split(')')[0]
+            
+            if params_part.strip():
+                # Parse parameter types from brackets
+                expected_param_types = [t.strip() for t in params_part.split(',')]
+            else:
+                expected_param_types = []  # Empty parentheses: func()
+            
+            function_name = base_name
+        else:
+            # Just function name without brackets
+            function_name = function_name
         
         if function_name not in self.tracer.function_abis_by_name:
             print(f"{error('Function not found:')} {function_name}")
@@ -252,6 +265,36 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
         func_abi = self.tracer.function_abis_by_name[function_name]
         inputs = func_abi.get('inputs', [])
         
+        # Check if function requires parameters but no brackets were provided
+        if expected_param_types is None and len(inputs) > 0:
+            # Function has parameters but no brackets were provided
+            param_types = [inp['type'] for inp in inputs]
+            print(f"{error('Function requires parameters but no signature provided.')}")
+            print(f"Required signature: {function_name}({', '.join(param_types)})")
+            param_str = ', '.join([f"{inp['type']} {inp['name']}" for inp in inputs])
+            print(f"Full signature: {function_name}({param_str})")
+            return None
+        
+        # Validate parameter types if specified in brackets
+        if expected_param_types is not None:
+            actual_param_types = [inp['type'] for inp in inputs]
+            
+            if len(expected_param_types) != len(actual_param_types):
+                print(f"{error('Parameter count mismatch.')} Expected {len(actual_param_types)} parameters, got {len(expected_param_types)}")
+                param_str = ', '.join([f"{inp['type']} {inp['name']}" for inp in inputs])
+                print(f"Correct signature: {function_name}({', '.join(actual_param_types)})")
+                return None
+            
+            # Check if parameter types match
+            for i, (expected, actual) in enumerate(zip(expected_param_types, actual_param_types)):
+                if expected != actual:
+                    print(f"{error('Parameter type mismatch at position')} {i}")
+                    print(f"Expected: {actual}, got: {expected}")
+                    param_str = ', '.join([f"{inp['type']} {inp['name']}" for inp in inputs])
+                    print(f"Correct signature: {function_name}({', '.join(actual_param_types)})")
+                    return None
+        
+        # Validate argument count
         if len(args) != len(inputs):
             param_str = ', '.join([f"{inp['type']} {inp['name']}" for inp in inputs])
             print(f"{error('Argument count mismatch.')} Expected: {function_name}({param_str})")
