@@ -260,6 +260,9 @@ def trace_command(args):
 
 def simulate_command(args):
     """Execute the simulate command."""
+    if args.interactive:
+        interactive_mode(args)
+        return 0
 
     # If --raw-data is provided, do not provide function_signature or function_args
     if getattr(args, 'raw_data', None):
@@ -514,17 +517,48 @@ def simulate_command(args):
         tracer.print_function_trace(trace, function_calls)
     return 0
 
-def debug_command(args):
+def interactive_mode(args):
     """Execute the debug command."""
     contract_address = None
     ethdebug_dir = None
     abi_path = None
     session = None
-    if args.contract_file:
+
+     # Validate required arguments when not in interactive mode
+    if not getattr(args, 'contract_address', None):
+        print('Error: contract address or file is required')
+        sys.exit(1)
+
+    # Detect whether the contract argument is an address or a file path
+    contract_arg = args.contract_address
+    is_contract_file = False
+    is_contract_address = False
+    
+    # Check if it's a file path (exists and ends with .sol)
+    if os.path.exists(contract_arg) and contract_arg.endswith('.sol'):
+        is_contract_file = True
+        args.contract_file = contract_arg
+    # Check if it's an Ethereum address (starts with 0x and right length)
+    elif contract_arg.startswith('0x') and len(contract_arg) == 42:
+        try:
+            # Validate it's a valid hex address
+            int(contract_arg[2:], 16)
+            is_contract_address = True
+            args.contract_address = contract_arg
+        except ValueError:
+            print(f'Error: Invalid contract address format: {contract_arg}')
+            sys.exit(1)
+    else:
+        print(f'Error: Could not determine if "{contract_arg}" is a contract address (0x...) or Solidity file (.sol)')
+        print('  - Contract addresses should start with 0x and be 42 characters long')
+        print('  - Solidity files should end with .sol and exist on the filesystem')
+        sys.exit(1)
+
+    if is_contract_file:
         try:
             session = AutoDeployDebugger(
                 contract_file=args.contract_file,
-                rpc_url=args.rpc,
+                rpc_url=args.rpc_url,
                 constructor_args=getattr(args, 'constructor_args', []),
                 solc_path=args.solc_path,
                 dual_compile=args.dual_compile,
@@ -550,14 +584,14 @@ def debug_command(args):
         except Exception as e:
             print(error(f"Debug session failed: {e}"))
             return 1
-    elif args.contract_address:
+    elif is_contract_address:
         if not args.ethdebug_dir:
             print(error("Error: --ethdebug-dir is required when using --contract-address."))
             return 1
         if args.constructor_args:
             print(error("Warning: --constructor-args ignored when using --contract-address (contract is already deployed)."))
         contract_address = args.contract_address
-        ethdebug_dir = args.ethdebug_dir
+        ethdebug_dir = args.ethdebug_dir[0] if isinstance(args.ethdebug_dir, list) else args.ethdebug_dir
     else:
         print(error("Either --contract-file or --contract-address required"))
         return 1
@@ -565,11 +599,11 @@ def debug_command(args):
     print("\nStarting debugger...")
     debugger = EVMDebugger(
         contract_address=str(contract_address),
-        rpc_url=(session.rpc_url if session else args.rpc),
+        rpc_url=(session.rpc_url if session else args.rpc_url),
         ethdebug_dir=ethdebug_dir,
-        function_name=getattr(args, 'function', None),
-        function_args=getattr(args, 'args', []),
-        command_debug=True,
+        function_name=getattr(args, 'function_signature', None),
+        function_args=getattr(args, 'function_args', []),
+        interactive_mode=True,
         abi_path=abi_path
     )
 
@@ -601,35 +635,6 @@ def main():
     subparsers = parser.add_subparsers(dest='command', help='Commands')
     subparsers.required = True
     
-    # Create the 'debug' subcommand for standalone interactive debugging
-    debug_parser = subparsers.add_parser('debug', help='Compile, deploy, and debug a contract, or attach to an existing one.')
-    debug_parser.add_argument('--rpc', '-r', default='http://localhost:8545', help='RPC URL')
-
-    # Use a mutually exclusive group to ensure user provides either a file to deploy or an address to attach to
-    contract_group = debug_parser.add_mutually_exclusive_group(required=True)
-    contract_group.add_argument('--contract-file', '-c', help='Path to Solidity source file to auto-compile and deploy.')
-    contract_group.add_argument('--contract-address', help='Address of an already deployed contract to attach to.')
-    debug_parser.add_argument('--ethdebug-dir', '-e', help='ETHDebug directory (required if using --contract-address)')
-    debug_parser.add_argument('--function', '-f', help='Function to simulate on start.')
-    debug_parser.add_argument('--args', nargs='*', default=[], help='A list of arguments for the function.')
-    debug_parser.add_argument('--constructor-args', nargs='*', default=[], help='Constructor arguments (only used with --contract-file)')
-    debug_parser.add_argument('--solc-path', '-solc', default='solc', help='Path to solc binary (default: solc)')
-    debug_parser.add_argument('--dual-compile', action='store_true', help='Create both optimized production and debug builds')
-    debug_parser.add_argument('--keep-build', action='store_true', help='Keep build directory after compilation (default: False)')
-    debug_parser.add_argument('--output-dir', '-o', default='./build/debug/ethdebug', help='Output directory for ETHDebug files (default: ./build/debug/ethdebug)')
-    debug_parser.add_argument('--production-dir', default='./build/contracts', help='Production directory for compiled contracts (default: ./build/contracts)')
-    debug_parser.add_argument('--json', action='store_true', help='Output results as JSON')
-    debug_parser.add_argument('--save-config', action='store_true', help='Save configuration to walnut.config.yaml')
-    debug_parser.add_argument('--verify-version', action='store_true', help='Verify solc version supports ETHDebug and exit')
-    debug_parser.add_argument('--no-cache', action='store_true', default=False, help='Enable deployment cache')
-    debug_parser.add_argument('--cache-dir', default='.walnut_cache', help='Cache directory')
-    debug_parser.add_argument('--fork-url', help='Upstream RPC URL to fork (launch anvil)')
-    debug_parser.add_argument('--fork-block', type=int, help='Specific block number to fork')
-    debug_parser.add_argument('--fork-port', type=int, default=8545, help='Local fork port (default: 8545)')
-    debug_parser.add_argument('--keep-fork', action='store_true', help='Do not terminate the forked node on exit')
-    debug_parser.add_argument('--reuse-fork', action='store_true', help='Reuse an existing local fork if available on --fork-port')
-    debug_parser.add_argument('--no-snapshot', action='store_true',default=False, help='Disable automatic initial snapshot')
-    
     # Create the 'trace' subcommand
     trace_parser = subparsers.add_parser('trace', help='Trace and debug an Ethereum transaction')
     trace_parser.add_argument('tx_hash', help='Transaction hash to trace')
@@ -645,10 +650,14 @@ def main():
     
     # Create the 'simulate' subcommand
     simulate_parser = subparsers.add_parser('simulate', help='Simulate and debug an Ethereum transaction')
-    simulate_parser.add_argument('contract_address', help='Contract address (0x...)')
+    interactive_group = simulate_parser.add_mutually_exclusive_group(required=True)
+    interactive_group.add_argument('--from', dest='from_addr', help='Sender address')
+    interactive_group.add_argument('--interactive', '-i', action='store_true', help='Start interactive debugger after simulation')
+
+    # Single positional argument that can be either contract address or contract file
+    simulate_parser.add_argument('contract_address', nargs='?', help='Contract address (0x...) or path to Solidity source file (.sol)')
     simulate_parser.add_argument('function_signature', nargs='?', help='Function signature, e.g. increment(uint256)')
     simulate_parser.add_argument('function_args', nargs='*', help='Arguments for the function')
-    simulate_parser.add_argument('--from', dest='from_addr', required=True, help='Sender address')
     simulate_parser.add_argument('--block', type=int, default=None, help='Block number or tag (default: latest)')
     simulate_parser.add_argument('--tx-index', type=int, default=None, help='Transaction index in block (optional)')
     simulate_parser.add_argument('--value', type=int, default=0, help='ETH value to send (in wei)')
@@ -657,14 +666,29 @@ def main():
     simulate_parser.add_argument('--multi-contract', action='store_true', help='Enable multi-contract debugging mode')
     simulate_parser.add_argument('--rpc-url', default='http://localhost:8545', help='RPC URL')
     simulate_parser.add_argument('--json', action='store_true', help='Output trace data as JSON for web app consumption')
-    simulate_parser.add_argument('--raw-data', dest='raw_data', default=None, help='Raw calldata to send (hex string, 0x...)')
-    
+    simulate_parser.add_argument('--raw-data', dest='raw_data', default=None, help='Raw calldata to send (hex string, 0x...)')    
+    simulate_parser.add_argument('--constructor-args', nargs='*', default=[], help='Constructor arguments (only used with --contract-file)')
+    simulate_parser.add_argument('--solc-path', '-solc', default='solc', help='Path to solc binary (default: solc)')
+    simulate_parser.add_argument('--dual-compile', action='store_true', help='Create both optimized production and debug builds')
+    simulate_parser.add_argument('--keep-build', action='store_true', help='Keep build directory after compilation (default: False)')
+    simulate_parser.add_argument('--output-dir', '-o', default='./build/debug/ethdebug', help='Output directory for ETHDebug files (default: ./build/debug/ethdebug)')
+    simulate_parser.add_argument('--production-dir', default='./build/contracts', help='Production directory for compiled contracts (default: ./build/contracts)')
+    simulate_parser.add_argument('--save-config', action='store_true', help='Save configuration to walnut.config.yaml')
+    simulate_parser.add_argument('--verify-version', action='store_true', help='Verify solc version supports ETHDebug and exit')
+    simulate_parser.add_argument('--no-cache', action='store_true', default=False, help='Enable deployment cache')
+    simulate_parser.add_argument('--cache-dir', default='.walnut_cache', help='Cache directory')
+    simulate_parser.add_argument('--fork-url', help='Upstream RPC URL to fork (launch anvil)')
+    simulate_parser.add_argument('--fork-block', type=int, help='Specific block number to fork')
+    simulate_parser.add_argument('--fork-port', type=int, default=8545, help='Local fork port (default: 8545)')
+    simulate_parser.add_argument('--keep-fork', action='store_true', help='Do not terminate the forked node on exit')
+    simulate_parser.add_argument('--reuse-fork', action='store_true', help='Reuse an existing local fork if available on --fork-port')
+    simulate_parser.add_argument('--no-snapshot', action='store_true',default=False, help='Disable automatic initial snapshot')
+
+
+
     args = parser.parse_args()
     
-    # Handle commands
-    if args.command == 'debug':
-        return debug_command(args)
-    elif args.command == 'trace':
+    if args.command == 'trace':
         return trace_command(args)
     elif args.command == 'simulate':
         return simulate_command(args)

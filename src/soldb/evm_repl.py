@@ -24,7 +24,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
     def __init__(self, contract_address: str = None, debug_file: str = None, 
                  rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
                  multi_contract_parser = None,function_name: str = None, function_args: List[str] = [],
-                 command_debug: bool = False, abi_path: str = None):
+                 interactive_mode: bool = False, abi_path: str = None):
         super().__init__()
 
         self.tracer = TransactionTracer(rpc_url)
@@ -64,7 +64,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
         self.current_function = None  # Current function context
         self.function_name = function_name
         self.function_args = function_args
-        self.command_debug = command_debug
+        self.interactive_mode = interactive_mode
         self.abi_path = abi_path
 
         # Load ETHDebug info if available
@@ -130,7 +130,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
 
     def _set_intro_message(self):
         """Set the intro message based on command used."""
-        if self.command_debug:
+        if self.interactive_mode:
             self.intro = f"""
 {bold('SolDB EVM Debugger')} - Solidity Debugger
 Type {info('help')} for commands. Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('where')} to see call stack.
@@ -152,7 +152,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
     def do_run(self, tx_hash: str):
         """Run/load a transaction for debugging. Usage: run <tx_hash>"""
         
-        if self.command_debug:
+        if self.interactive_mode:
             return
         
         if not tx_hash:
@@ -1393,7 +1393,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
     
     def cmdloop(self, intro=None):
         """Override cmdloop to show current state after intro but before first prompt."""
-        if self.command_debug:
+        if self.interactive_mode:
             # Call parent cmdloop with intro
             if intro is not None:
                 self.intro = intro
