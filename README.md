@@ -2,9 +2,7 @@
 
 > **Note**: SolDB is in public beta; expect ongoing changes and occasional inaccuracies.  
 
-Solidity developers today lack a true local debugger. Existing tools (Tenderly, Remix) rely on cloud services and don’t provide the CLI-first, LLDB-style debugging experience developers expect.  
-
-**SolDB** is an open-source, LLDB-inspired debugger for the Ethereum Virtual Machine (EVM). It runs fully locally, with no third-party servers.  
+SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
 
 ![screenshot](reverted_transaction.png)
 
