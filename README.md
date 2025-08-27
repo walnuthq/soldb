@@ -163,10 +163,9 @@ TBD
 Debug a Solidity project
 ```bash
 # Debug deployed contract
-soldb debug --contract-address <contract-address>
---function increment
---args 23
---ethdebug-dir /debug/ethdebug/
+soldb simulate <contract-address> "increment" 23
+   --interactive
+   --ethdebug-dir /debug/ethdebug/
 ```
 Where `/debug/ethdebug` contains debug information.
 
@@ -177,8 +176,8 @@ Loaded 451 PC mappings from ethdebug
 Contract: Counter
 Environment: runtime
 Loaded source: Counter.sol
-Contract loaded: 0x5ce32f0D42cdcb274d7faD13e4186A28A6552ae0
-[SNAPSHOT] Created snapshot 0x87
+Contract loaded: 0x0B306BF915C4d645ff596e518fAf3F9669b97016
+[SNAPSHOT] Created snapshot 0x1e
 Simulating increment(34)...
 Simulation complete. 258 steps.
 
@@ -190,12 +189,12 @@ Counter.sol:4 in increment(uint256)
 => contract Counter {
 Parameters:
   value: 34
-[ Step 0 | Gas: 44890908 | PC:    0 | PUSH1 ]
+[ Step 0 | Gas: 29978796 | PC:    0 | PUSH1 ]
 (soldb) s
 
 Counter.sol:7 in Counter::runtime_dispatcher
 =>     function increment(uint256 value) public {
-[ Step 89 | Gas: 44890562 | PC:  626 | JUMPDEST ]
+[ Step 89 | Gas: 29978450 | PC:  626 | JUMPDEST ]
 (soldb) 
 ```
 
