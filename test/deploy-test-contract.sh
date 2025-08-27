@@ -21,7 +21,7 @@ PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae
 SOLC_PATH="${SOLC_PATH:-solc}"
 CONTRACT_NAME="${CONTRACT_NAME:-TestContract}"
 CONTRACT_FILE="${CONTRACT_FILE:-TestContract.sol}"
-DEBUG_DIR="${DEBUG_DIR:-test_debug}"
+DEBUG_DIR="${DEBUG_DIR:-out}"
 
 echo -e "${BLUE}Deploying ${CONTRACT_NAME} for tests...${NC}"
 

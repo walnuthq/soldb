@@ -19,7 +19,7 @@ echo
 # Configuration - uses environment variables or defaults
 RPC_URL="${RPC_URL:-http://localhost:8545}"
 PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
-DEBUG_DIR="${DEBUG_DIR:-debug}"
+DEBUG_DIR="${DEBUG_DIR:-out}"
 SOLC_PATH="${SOLC_PATH:-solc}"
 
 echo -e "${BLUE}Configuration:${NC}"
