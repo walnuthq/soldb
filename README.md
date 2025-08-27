@@ -61,22 +61,22 @@ pip install git+https://github.com/walnuthq/soldb.git
 
   ```bash
   solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime \
-       --bin --abi --overwrite -o /tmp/ethdebug-output examples/Counter.sol
+       --bin --abi --overwrite -o out examples/Counter.sol
   ```
 
   This will:
   - Compile contract with ETHDebug support: `solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime`
-  - Save ETHDebug JSON files to `/tmp/ethdebug-output`
+  - Save ETHDebug JSON files to `./out`
 
 </details>
 
 ### Get a Full Trace of a Transaction
 
 ```bash
-soldb trace <tx_hash> --ethdebug-dir /tmp/ethdebug-output/ --rpc http://localhost:8545
+soldb trace <tx_hash> --ethdebug-dir ./out --rpc http://localhost:8545
 ```
 
-Where `/tmp/ethdebug-output` contains debug information for contracts inside of the transaction.
+Where `./out` contains debug information for contracts inside of the transaction.
 
 Example output:
 
@@ -111,12 +111,12 @@ Test contract functions without sending transactions on chain.
 # Simple function call
 soldb simulate <contract_address> "increment(uint256)" 10 \
     --from <sender_address> \
-    --ethdebug-dir /tmp/ethdebug-output \
+    --ethdebug-dir ./out \
     --rpc http://localhost:8545
 
 # Function with struct arguments
 soldb simulate <contract_address> "submitPerson((string,uint256))" '("Alice", 30)' \
-    --ethdebug-dir /tmp/ethdebug-output \
+    --ethdebug-dir ./out \
     --from <sender_address> \
     --rpc http://localhost:8545
 
@@ -125,14 +125,14 @@ soldb simulate \
   <contract_address> \
   "submitCompany((string,(string,uint256)))" \
   '("Acme Corp", ("Bob", 42))' \
-  --ethdebug-dir /tmp/ethdebug-output \
+  --ethdebug-dir ./out \
   --rpc http://localhost:8545
 
 # Raw data
 soldb simulate --raw-data \
 0x785bd74f000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000941636d6520436f727000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000002a0000000000000000000000000000000000000000000000000000000000000003426f620000000000000000000000000000000000000000000000000000000000 \
   <contract_address> \
-  --ethdebug-dir /tmp/ethdebug-output \
+  --ethdebug-dir ./out \
   --from <sender_address> \
   --rpc http://localhost:8545 
 ```
@@ -148,7 +148,7 @@ Start an interactive REPL to step through a transaction at source or instruction
 
 ```bash
 soldb trace <tx_hash> \
-  --ethdebug-dir /tmp/ethdebug-output \
+  --ethdebug-dir ./out \
   --rpc http://localhost:8545 \
   --interactive
 ```
