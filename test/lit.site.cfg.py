@@ -14,14 +14,24 @@ if shutil.which('soldb'):
 elif os.path.exists(os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')):
     config.soldb = os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')
 else:
+<<<<<<< HEAD
     config.soldb = "soldb"
+=======
+    config.soldb = "MyEnv/bin/soldb"
+>>>>>>> upstream/main
 config.rpc_url = "http://localhost:8545"
 config.chain_id = "1"
 config.private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 config.test_contracts = {
+<<<<<<< HEAD
     "contract_address": "0xc44c2b82dbeef6ddb195e0432fa5e755c345d1e3",
     "deploy_tx": "0xeed596ae4c269248a885766c7c08ee4d2050d84af9114ccd1a372baa9e62128d",
     "test_tx": "0x9cd679e2ea810c0a9ff038cd80106a5a016fa9a7ba4f2ce03ba13de71a145301",
+=======
+    "contract_address": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+    "deploy_tx": "0xe330dabe8d052687fb32549e8ee88472defc8a635acc06e6f5d494338655cb97",
+    "test_tx": "0xc019ce682b36617beb62fb5f611e79290c088ab145ab82787bc8b6e0664a97db",
+>>>>>>> upstream/main
     "ethdebug_dir": os.path.join(project_dir, "examples", "test_debug")
 }
 # Determine solc path dynamically

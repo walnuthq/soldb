@@ -1,3 +1,5 @@
+> ⚠️ SolDB is currently in **public beta** – not yet recommended for production use. Expect bugs, missing features, and breaking changes.
+
 # SolDB EVM Debugger
 
 A CLI debugger for the EVM and Solidity.
@@ -11,292 +13,76 @@ A CLI debugger for the EVM and Solidity.
 3. Transaction simulation
 4. Suport for custom RPC including local node (Anvil) or hosted
 
-**Requirements**: Solidity compiler 0.8.29+ (for ETHDebug support)
+## Table of Contents
 
-## Installation Guide
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Get a Full Trace of a Transaction](#get-a-full-trace-of-a-transaction)
+  - [Get a Full Trace of a Transaction Simulation](#get-a-full-trace-of-a-transaction-simulation)
+  - [Interactive Debugger for a Transaction](#interactive-debugger-for-a-transaction)
+  - [Interactive Debugger for a Transaction Simulation](#interactive-debugger-for-a-transaction-simulation)
+  - [Interactive Debugger for a Solidity Project](#interactive-debugger-for-a-solidity-project)
+- [Advanced](#advanced)
+  - [Install From Source](#install-from-source)
+  - [Run Automated Tests](#run-automated-tests)
+- [License](#license)
 
-### 1. Prerequisites
+## Installation
 
-Before installing SolDB, ensure you have the following:
+Before installing, ensure you have the following requirements:
 
-- **Python 3.7+** (for SolDB itself)
-- **Solidity compiler** (version 0.8.29+ for ETHDebug support)
+- **Python 3.7+** - For SolDB
+- **Foundry** - For contract development and Anvil node
+- **Solidity compiler** - Version 0.8.29+ with ETHDebug support
 
-For testing infrastructure, we need:
-- **Foundry** (for contract deployment and Anvil node)
-
-**Install Solidity:**
-```bash
-# macOS
-brew install solidity
-# Ubuntu
-sudo apt-get install solc
-# Or download from https://github.com/ethereum/solidity/releases
-
-# Verify version (must be 0.8.29 or higher)
-solc --version
-```
-
-**Install Foundry:**
-```bash
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
-```
-
----
-
-### 2. Install SolDB
-
-#### **Install from GitHub**
-
+**Install SolDB:**
 ```bash
 pip install git+https://github.com/walnuthq/soldb.git
 ```
 
-NOTE: Since we are still in BETA, the PyPI package is not available at the moment.
-
----
-
 ## Usage
 
-### 1. Debug a Transaction
+> **NOTE**: SolDB is primarily intended for local debugging. While Anvil (local node) is recommended for development, SolDB supports any RPC endpoint. The examples below use `http://localhost:8545` (Anvil's default).
+
+<details>
+  <summary><strong>Prerequisites (expand if needed)</strong></summary>
+
+  **Run Anvil with tracing enabled**
+
+  Ensure your node has tracing enabled, which is required by the debugger to function correctly.
+
+  ```bash
+  anvil --steps-tracing
+  ```
+
+  **Compile with ETHDebug**
+
+  SolDB relies on the standard [ETHDebug format](https://ethdebug.github.io/format/spec/overview) from the Solidity compiler (requires Solidity 0.8.29+):
+
+  ```bash
+  solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime \
+       --bin --abi --overwrite -o out examples/Counter.sol
+  ```
+
+  This will:
+  - Compile contract with ETHDebug support: `solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime`
+  - Save ETHDebug JSON files to `./out`
+
+</details>
+
+### Get a Full Trace of a Transaction
 
 ```bash
-# Debug with ETHDebug information
-soldb trace 0x123... --ethdebug-dir ./debug
-
-# Set up RPC
-soldb trace 0x123... --rpc http://localhost:8545
-
-# Show raw execution trace
-soldb trace 0x123... --raw
-
-# Output in JSON format
-soldb trace 0x123... --ethdebug-dir ./debug --json
+soldb trace <tx_hash> --ethdebug-dir ./out --rpc http://localhost:8545
 ```
 
-This shows a high-level function call trace with gas usage and source mappings.
+Where `./out` contains debug information for contracts inside of the transaction.
 
-### 2. Debug Multi-Contract Transactions
-
-SolDB supports debugging transactions that involve multiple contracts, providing seamless source-level debugging across contract boundaries.
-
-#### Loading Multiple Contracts
-
-**Option 1: Multiple debug directories**
-```bash
-# Auto-detect contracts from deployment.json files
-soldb trace 0x123... \
-    --ethdebug-dir ./debug_controller \
-    --ethdebug-dir ./debug_counter
-
-# Specify address:path mapping
-soldb trace 0x123... \
-    --ethdebug-dir 0x44c4...9d64:./debug_controller \
-    --ethdebug-dir 0x82e8...43fb:./debug_counter
-
-# Or specify address:contract_name:path mapping
-soldb trace 0x123... \
-    --ethdebug-dir 0x44c4...9d64:Controller:./debug_controller \
-    --ethdebug-dir 0x82e8...43fb:Counter:./debug_counter
-```
-
-**Option 2: Contract mapping file**
-```bash
-# Create a mapping file
-cat > contracts.json << EOF
-{
-  "contracts": [
-    {
-      "address": "0x44c4caf8f075607deadf02dc7bf7f0166a209d64",
-      "name": "Controller",
-      "debug_dir": "./debug_controller"
-    },
-    {
-      "address": "0x82e8f00d62fa200af7cfcc8f072ae0525e1a43fb",
-      "name": "Counter",
-      "debug_dir": "./debug_counter"
-    }
-  ]
-}
-EOF
-
-# Use the mapping file
-soldb trace 0x123... --contracts contracts.json
-```
-
-**Option 3: Enable multi-contract mode**
-```bash
-soldb trace 0x123... --multi-contract --ethdebug-dir ./debug/
-```
-
-#### Multi-Contract Output
-
-When debugging multi-contract transactions, you'll see enhanced output:
+Example output:
 
 ```
-Function Call Trace: 0x123...
-Loaded contracts:
-  Controller (0x44c4caf8f075607deadf02dc7bf7f0166a209d64)
-  Counter (0x82e8f00d62fa200af7cfcc8f072ae0525e1a43fb)
-Gas used: 72000
-
-Call Stack:
-------------------------------------------------------------
-#0 Controller::runtime_dispatcher [entry] gas: 72000 @ Controller.sol:1
-  #1 Controller::callIncrement [internal] gas: 65000 @ Controller.sol:15
-    #2 call_to_Counter (0x82e8...43fb) [CALL → Counter] gas: 50000
-      #3 Counter::increment [internal] gas: 45000 @ Counter.sol:8
-        #4 Counter::_updateValue [internal] gas: 20000 @ Counter.sol:20
-------------------------------------------------------------
-```
-
-
-### 3. Simulate a Transaction
-
-You can simulate a contract call (without sending a real transaction) using the `simulate` command. Supports all Solidity argument types, including structs/tuples.
-
-#### Basic usage
-
-```bash
-soldb simulate <contract_address> <function_signature> [function_args ...] --from <sender_address> --ethdebug-dir <debug_dir> [--block <block_number>] [--tx-index <index>] [--rpc-url <rpc_url>]
-```
-
-#### Example: Simple increment function
-
-```bash
-soldb simulate \
-    0x5FbDB2315678afecb367f032d93F642f64180aa3 "increment(uint256)" 10 \
-    --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
-    --ethdebug-dir ./debug \
-    --rpc-url "http://localhost:8545"
-```
-
-#### Example: Function with address argument
-
-```bash
-soldb simulate \
-  0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9 \
-  "giveRightToVote(address)" \
-  0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
-  --from 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC \
-  --ethdebug-dir ./debug_ballot
-```
-
-#### Example: Function with struct/tuple argument
-
-```bash
-soldb simulate \
-  0x0165878a594ca255338adfa4d48449f69242eb8f \
-  "submitPerson((string,uint256))" \
-  '("Alice", 30)' \
-  --ethdebug-dir ./debug_struct \
-  --from 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
-```
-
-#### Example: Nested struct/tuple argument
-
-```bash
-soldb simulate \
-  0x0165878a594ca255338adfa4d48449f69242eb8f \
-  "submitCompany((string,(string,uint256)))" \
-  '("Acme Corp", ("Bob", 42))' \
-  --ethdebug-dir ./debug_struct \
-  --from 0x286AF310eA3303c80eBE9a66F6998B21Bd8c1c29
-```
-> Argument format is fully compatible with Foundry's `cast send` command (e.g. for structs: `'("Alice", 30)'`, for arrays: `'[("Alice", 30), ("Bob", 42)]'`).
-
-#### Example: Using raw calldata
-
-```bash
-soldb simulate --raw-data 0x785bd74f000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000941636d6520436f727000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000002a0000000000000000000000000000000000000000000000000000000000000003426f620000000000000000000000000000000000000000000000000000000000 0xD7B5004e4124d26df1b03f3541e9653E706CCC40 \
-  --ethdebug-dir ./debug_example \
-  --from 0x286AF310eA3303c80eBE9a66F6998B21Bd8c1c29 
-```
-
-## Debug Information Format
-
-SolDB relies on the standard ETHDebug format from the Solidity compiler (requires Solidity 0.8.29+):
-
-1. **Generate ETHDebug information**:
-   ```bash
-   # Requires solc 0.8.29 or higher
-   solc --via-ir --debug-info ethdebug --ethdebug -o /tmp/ethdebug-output MyContract.sol
-   ```
-   This generates:
-   - `ethdebug.json` - Compilation metadata
-   - `MyContract_ethdebug.json` - Constructor/creation debug info
-   - `MyContract_ethdebug-runtime.json` - Runtime debug info
-
-2. **Trace transactions with ETHDebug**:
-   ```bash
-   soldb trace 0x123...abc --ethdebug-dir /tmp/ethdebug-output
-   ```
-### One example of a workflow
-
-There are some helper scripts in `test/` for deploying and interacting between contracts.
-But, if you prefer to compile, deploy, and interact manually:
-
-1. **Compile with ETHDebug support**:
-   ```bash
-   # Create debug directory
-   mkdir -p debug
-   
-   # Compile with ETHDebug (requires solc 0.8.29+)
-   solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime \
-        --bin --abi --overwrite -o debug \
-        examples/TestContract.sol
-   ```
-
-2. **Deploy using cast (Foundry)**:
-   ```bash
-   # Get the bytecode
-   BYTECODE=$(cat debug/TestContract.bin)
-   
-   # Deploy (using Anvil's default account)
-   cast send --rpc-url http://localhost:8545 \
-             --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-             --create "0x$BYTECODE" \
-             --json
-   
-   # Note the contractAddress from the output
-   ```
-
-3. **Interact with the contract**:
-   ```bash
-   # Call a function (e.g., increment with value 5)
-   # Replace CONTRACT_ADDRESS with your deployed address
-   cast send CONTRACT_ADDRESS "increment(uint256)" 5 \
-        --rpc-url http://localhost:8545 \
-        --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-        --json
-   
-   # Note the transactionHash from the output
-   ```
-
-4. **Debug the transaction**:
-   ```bash
-   # Use the transaction hash from step 3
-   soldb trace 0xYOUR_TX_HASH --ethdebug-dir ./debug --rpc-url http://localhost:8545
-   ```
-
-### Reading contract state (view functions):
-```bash
-# Read public variables or view functions
-cast call CONTRACT_ADDRESS "counter()(uint256)" --rpc-url http://localhost:8545
-```
-
-## Example Output
-
-```
-soldb trace 0x2832a995d3e50c85599e7aa0343e93aa77460d6069466be4b81dbc1ea21a3994 --ethdebug-dir debug --rpc http://localhost:8545
-Loading transaction 0x2832a995d3e50c85599e7aa0343e93aa77460d6069466be4b81dbc1ea21a3994...
-Loaded 1833 PC mappings from ethdebug
-Contract: TestContract
-Environment: runtime
-
 Function Call Trace: 0x2832a995d3e50c85599e7aa0343e93aa77460d6069466be4b81dbc1ea21a3994
-Contract: 0x380A1C6b118036364d84C3ecD305C2C11761A26c
+Contract: TestContract
 Gas used: 50835
 Status: SUCCESS
 
@@ -317,70 +103,118 @@ Call Stack:
 Use --raw flag to see detailed instruction trace
 ```
 
-The raw output:
-```
-$ soldb trace 0x123...abc --ethdebug-dir debug --raw
+### Get a Full Trace of a Transaction Simulation
 
-Loaded 300 PC mappings from ethdebug
-Contract: HelloWorld
-Environment: runtime
+Test contract functions without sending transactions on chain.
 
-Tracing transaction: 0x123...abc
-Gas used: 21234
+```bash
+# Simple function call
+soldb simulate <contract_address> "increment(uint256)" 10 \
+    --from <sender_address> \
+    --ethdebug-dir ./out \
+    --rpc http://localhost:8545
 
-Execution trace (first 50 steps):
---------------------------------------------------------------------------------
-Step | PC   | Op              | Gas     | Stack
---------------------------------------------------------------------------------
-   0   0     PUSH1            1000000  [empty] <- HelloWorld.sol:4:1
-   1   2     PUSH1            999997   [0] 0x80... <- HelloWorld.sol:4:1
-   2   4     MSTORE           999994   [0] 0x80... [1] 0x40... <- HelloWorld.sol:4:1
-   3   5     PUSH1            999991   [empty] <- HelloWorld.sol:4:1
-   4   7     CALLDATASIZE     999989   [0] 0x04... <- HelloWorld.sol:4:1
-   5   8     LT               999987   [0] 0x04... [1] 0x24 <- HelloWorld.sol:4:1
-...
-```
+# Function with struct arguments
+soldb simulate <contract_address> "submitPerson((string,uint256))" '("Alice", 30)' \
+    --ethdebug-dir ./out \
+    --from <sender_address> \
+    --rpc http://localhost:8545
 
-The output of reverted transaction
+# Nested struct/tuple argument
+soldb simulate \
+  <contract_address> \
+  "submitCompany((string,(string,uint256)))" \
+  '("Acme Corp", ("Bob", 42))' \
+  --ethdebug-dir ./out \
+  --rpc http://localhost:8545
 
-```
-soldb trace 0x9b0a8e0776cea556b7bb0c7946bf917ebaf5cb403ed3179e84c44c188c694db3 --ethdebug-dir debug_order --ethdebug-dir debug_payment --ethdebug-dir debug_logger --ethdebug-dir debug_shipping_manager --ethdebug-dir debug_tax_calculator --rpc http://localhost:8545
-Loading transaction 0x9b0a8e0776cea556b7bb0c7946bf917ebaf5cb403ed3179e84c44c188c694db3...
-
-Function Call Trace: 0x9b0a8e0776cea556b7bb0c7946bf917ebaf5cb403ed3179e84c44c188c694db3
-  OrderProcessor (0x59A714559B46c823d87986b5c5B7C630e2f5668d)
-  PaymentProcessor (0xf776FF56e2400e31f3070c1ac70Ab80433B01823)
-  Logger (0xdcDd1dd0ff17043f8bCD1AC9E5Be20BBEd4FAc0A)
-  ShippingManager (0xbE734aD6434E16f6bE04706005faED6fD38eb2B2)
-  TaxCalculator (0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd)
-Gas used: 38039
-Status: REVERTED
-Error: Order value must be positive
-
-Call Stack:
-------------------------------------------------------------
-#0 OrderProcessor::runtime_dispatcher [entry] gas: 15851 @ OrderProcessor.sol:1
-    #1 CALL → Logger::log(string) [0x41304fac] [CALL] → Logger gas: 3937
-       steps: 397-658
-       message: Starting order processing
-    #2 CALL → TaxCalculator::calculateTax(uint256,string) [0x55ec8a03] [CALL] → TaxCalculator gas: 4600 !!!
-       steps: 965-1241
-       value: 0
-       orderType: physical
-------------------------------------------------------------
-
-Use --raw flag to see detailed instruction trace
+# Raw data
+soldb simulate --raw-data \
+0x785bd74f000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000941636d6520436f727000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000002a0000000000000000000000000000000000000000000000000000000000000003426f620000000000000000000000000000000000000000000000000000000000 \
+  <contract_address> \
+  --ethdebug-dir ./out \
+  --from <sender_address> \
+  --rpc http://localhost:8545 
 ```
 
-## Run tests
+Example output:
+```
+TBD - maybe use failed simulation output
+```
+
+### Interactive Debugger for a Transaction
+
+Start an interactive REPL to step through a transaction at source or instruction level, set breakpoints, inspect variables, and more.
+
+```bash
+soldb trace <tx_hash> \
+  --ethdebug-dir ./out \
+  --rpc http://localhost:8545 \
+  --interactive
+```
+
+Common commands inside the debugger: `next`, `nexti`, `continue`, `break <pc>`, `where`, `vars`, `print <expr>`.
+
+### Interactive Debugger for a Transaction Simulation
+
+TBD
+
+### Interactive Debugger for a Solidity Project
+
+TBD
+
+## Advanced
+
+### Install From Source
+
+For development or contributing to SolDB:
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/walnuthq/soldb.git
+   cd soldb
+   ```
+2. **Set up a Python virtual environment:**
+   ```bash
+   python3 -m venv MyEnv
+   source MyEnv/bin/activate
+   ```
+
+3. **Install Python dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Install SolDB in editable mode:**
+   ```bash
+   pip install -e .
+   ```
+
+### Run Automated Tests
+
+**Prerequisites**
+
+Tests expect RPC at `http://localhost:8545` (Anvil default) and use Anvil's test account private key. Also, it uses LLVM's `lit` and `FileCheck` tools, so before running tests, you need to install LLVM tools:
+
+```bash
+# macOS
+brew install llvm
+
+# Ubuntu
+sudo apt-get install llvm-dev
+```
+
+**Running Tests**
 
 ```bash
 cd test
 ./run-tests.sh SOLC_PATH=/path/to/solc
 ```
 
-It expects RPC at `http://localhost:8545` (Anvil default) and uses Anvil's test account private key by default.
-Also, it uses LLVM's `lit` and `FileCheck` tools, so please install it.
+**NOTE**: Make sure Anvil is running with tracing enabled before running tests:
+```bash
+anvil --steps-tracing
+```
 
 ## Advanced Setup
 
@@ -412,9 +246,7 @@ For development or contributing to SolDB:
 
 ## License
 
-SolDB is licensed under the Business Source License 1.1 (BSL). You may use, self-host, and modify SolDB for non-commercial purposes.
-
-To use SolDB in a commercial product or service (e.g. as a SaaS offering), you must obtain a commercial license.
+SolDB is licensed under the GNU General Public License v3.0 (GPL-3.0), the same license used by Solidity and other Ethereum Foundation projects.
 
 📄 [Full license text](./LICENSE.md)  
 📬 Contact: hi@walnut.dev
