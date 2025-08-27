@@ -4,7 +4,7 @@
 
 SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
 
-![screenshot](reverted_transaction.png)
+![example](example.gif)
 
 ---
 
@@ -22,7 +22,7 @@ anvil --steps-tracing
 
 Compile your contracts with ETHDebug (Solidity 0.8.29+):
 ```bash
-solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime      --bin --abi --overwrite -o out examples/Counter.sol
+solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime --bin --abi --overwrite -o out examples/Counter.sol
 ```
 
 Trace a transaction:
@@ -58,7 +58,7 @@ soldb trace <tx_hash> --ethdebug-dir ./out --rpc http://localhost:8545 --interac
 
 Inside REPL:
 ```
-(soldb) break MyContract.sol:42
+(soldb) break TestContract.sol:42
 (soldb) next
 (soldb) print balance
 ```
@@ -70,12 +70,20 @@ Inside REPL:
 Test contract functions without sending transactions on chain.
 
 ```bash
-soldb simulate <contract_address> "increment(uint256)" 10     --from <sender_address>     --ethdebug-dir ./out     --rpc http://localhost:8545
+soldb simulate <contract_address> "increment(uint256)" 10 --from <sender_address> --ethdebug-dir ./out --rpc http://localhost:8545
 ```
 
 Output containing a simulation failure:
 ```
-TBD
+Contract: TestContract
+Gas used: 27157
+Status: REVERTED
+Error: Value must be even
+
+Call Stack:
+#0 TestContract::runtime_dispatcher [entry] @ TestContract.sol:1
+  #1 increment [external] gas: 20835 @ TestContract.sol:23 
+    #2 isEven [internal] gas: 6322 @ TestContract.sol:38 !!!
 ```
 
 You can also pass complex types (structs, tuples):
@@ -91,7 +99,7 @@ soldb simulate <contract_address> "increment(uint256)" 5     --from <sender_addr
 
 Inside REPL:
 ```
-(soldb) break MyContract.sol:23
+(soldb) break TestContract.sol:38
 (soldb) step
 (soldb) vars
 ```
@@ -142,15 +150,13 @@ pip install -e .
   anvil --steps-tracing
   ```
 - LLVM tools (`lit`, `FileCheck`)  
-
-Install LLVM:
-```bash
-# macOS
-brew install llvm
-
-# Ubuntu
-sudo apt-get install llvm-dev
-```
+  ```bash
+    # Install LLVM
+    # macOS
+    brew install llvm
+    # Ubuntu
+    sudo apt-get install llvm-dev
+  ```
 
 Run tests:
 ```bash
