@@ -21,11 +21,7 @@ PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae
 SOLC_PATH="${SOLC_PATH:-solc}"
 CONTRACT_NAME="${CONTRACT_NAME:-TestContract}"
 CONTRACT_FILE="${CONTRACT_FILE:-TestContract.sol}"
-<<<<<<< HEAD
-DEBUG_DIR="${DEBUG_DIR:-test_debug}"
-=======
 DEBUG_DIR="${DEBUG_DIR:-out}"
->>>>>>> upstream/main
 
 echo -e "${BLUE}Deploying ${CONTRACT_NAME} for tests...${NC}"
 
@@ -37,11 +33,7 @@ rm -rf "${DEBUG_DIR}"
 
 # Deploy the contract
 echo -e "${YELLOW}Running deployment script...${NC}"
-<<<<<<< HEAD
-"${PROJECT_DIR}/scripts/deploy-contract.sh" \
-=======
 "${PROJECT_DIR}/test/deploy-contract.sh" \
->>>>>>> upstream/main
     --solc="${SOLC_PATH}" \
     --rpc="${RPC_URL}" \
     --private-key="${PRIVATE_KEY}" \

@@ -260,9 +260,6 @@ def trace_command(args):
 
 def simulate_command(args):
     """Execute the simulate command."""
-    if args.interactive:
-        interactive_mode(args)
-        return 0
 
     # If --raw-data is provided, do not provide function_signature or function_args
     if getattr(args, 'raw_data', None):
@@ -350,7 +347,7 @@ def simulate_command(args):
             abi_path = contract_info.debug_dir / f"{contract_info.name}.abi"
             if abi_path.exists():
                 tracer.load_abi(str(abi_path))
-                
+        
     elif ethdebug_dirs:
         # Single contract mode (backward compatibility)
         ethdebug_dir = ethdebug_dirs[0]
@@ -371,6 +368,11 @@ def simulate_command(args):
             for abi_file in Path(".").glob("*.abi"):
                 tracer.load_abi(str(abi_file))
                 break
+    
+    if args.interactive:
+        # Start interactive debugger
+        interactive_mode(args,tracer)
+        return 0
     # If raw_data is provided, use it directly as calldata
     if getattr(args, 'raw_data', None):
         calldata = args.raw_data
@@ -517,19 +519,19 @@ def simulate_command(args):
         tracer.print_function_trace(trace, function_calls)
     return 0
 
-def interactive_mode(args):
+def interactive_mode(args,tracer):
     """Execute the debug command."""
     contract_address = None
     ethdebug_dir = None
     abi_path = None
     session = None
 
-     # Validate required arguments when not in interactive mode
+     # Validate required arguments when in interactive mode
     if not getattr(args, 'contract_address', None):
-        print('Error: contract address or file is required')
+        print('Error: contract address is required')
         sys.exit(1)
 
-    # Detect whether the contract argument is an address or a file path
+    # Detect whether on the contract address position is an address or a file path
     contract_arg = args.contract_address
     is_contract_file = False
     is_contract_address = False
@@ -552,6 +554,10 @@ def interactive_mode(args):
         print(f'Error: Could not determine if "{contract_arg}" is a contract address (0x...) or Solidity file (.sol)')
         print('  - Contract addresses should start with 0x and be 42 characters long')
         print('  - Solidity files should end with .sol and exist on the filesystem')
+        sys.exit(1)
+
+    if not getattr(args, 'function_signature', None):
+        print('Error: function signature is required')
         sys.exit(1)
 
     if is_contract_file:
@@ -604,7 +610,10 @@ def interactive_mode(args):
         function_name=getattr(args, 'function_signature', None),
         function_args=getattr(args, 'function_args', []),
         interactive_mode=True,
-        abi_path=abi_path
+        abi_path=abi_path,
+        from_addr=args.from_addr,
+        block=args.block,
+        tracer=tracer
     )
 
     # Baseline snapshot (unless disabled)
@@ -650,9 +659,8 @@ def main():
     
     # Create the 'simulate' subcommand
     simulate_parser = subparsers.add_parser('simulate', help='Simulate and debug an Ethereum transaction')
-    interactive_group = simulate_parser.add_mutually_exclusive_group(required=True)
-    interactive_group.add_argument('--from', dest='from_addr', help='Sender address')
-    interactive_group.add_argument('--interactive', '-i', action='store_true', help='Start interactive debugger after simulation')
+    simulate_parser.add_argument('--from', dest='from_addr', required=True, help='Sender address')
+    simulate_parser.add_argument('--interactive', '-i', action='store_true', help='Start interactive debugger after simulation')
 
     # Single positional argument that can be either contract address or contract file
     simulate_parser.add_argument('contract_address', nargs='?', help='Contract address (0x...) or path to Solidity source file (.sol)')
@@ -671,7 +679,7 @@ def main():
     simulate_parser.add_argument('--solc-path', '-solc', default='solc', help='Path to solc binary (default: solc)')
     simulate_parser.add_argument('--dual-compile', action='store_true', help='Create both optimized production and debug builds')
     simulate_parser.add_argument('--keep-build', action='store_true', help='Keep build directory after compilation (default: False)')
-    simulate_parser.add_argument('--output-dir', '-o', default='./build/debug/ethdebug', help='Output directory for ETHDebug files (default: ./build/debug/ethdebug)')
+    simulate_parser.add_argument('--output-dir', '-o', default='./out', help='Output directory for ETHDebug files (default: ./out)')
     simulate_parser.add_argument('--production-dir', default='./build/contracts', help='Production directory for compiled contracts (default: ./build/contracts)')
     simulate_parser.add_argument('--save-config', action='store_true', help='Save configuration to walnut.config.yaml')
     simulate_parser.add_argument('--verify-version', action='store_true', help='Verify solc version supports ETHDebug and exit')

@@ -11,6 +11,8 @@ from typing import Optional, Dict, List, Tuple
 from .transaction_tracer import TransactionTracer, TransactionTrace, SourceMapper
 from .dwarf_parser import load_dwarf_info, DwarfParser
 from .colors import *
+from web3 import Web3
+from web3.main import to_checksum_address
 
 class EVMDebugger(cmd.Cmd):
     """Interactive EVM debugger REPL."""
@@ -24,11 +26,14 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
     def __init__(self, contract_address: str = None, debug_file: str = None, 
                  rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
                  multi_contract_parser = None,function_name: str = None, function_args: List[str] = [],
-                 interactive_mode: bool = False, abi_path: str = None):
+                 interactive_mode: bool = False, abi_path: str = None, from_addr: str = None, block: int = None,
+                 tracer: TransactionTracer = None):
         super().__init__()
 
-        self.tracer = TransactionTracer(rpc_url)
+        if not tracer:
+            tracer = TransactionTracer(rpc_url)
         
+        self.tracer = tracer
         # Set multi-contract parser if provided
         if multi_contract_parser:
             self.tracer.multi_contract_parser = multi_contract_parser
@@ -66,9 +71,18 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
         self.function_args = function_args
         self.interactive_mode = interactive_mode
         self.abi_path = abi_path
+        self.from_addr = from_addr
+        self.block = block
+
+        if not self.tracer.is_contract_deployed(self.contract_address):
+            print(error(f"Error: No contract found at address {self.contract_address}"))
+            print(f"{self.tracer.ethdebug_info}")
+            sys.exit(1)
 
         # Load ETHDebug info if available
         if ethdebug_dir:
+            if ethdebug_dir.startswith("0x"):
+                ethdebug_dir = ethdebug_dir.split(":")[2]
             self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir)
                 
             # Load ABI from ethdebug directory
@@ -97,7 +111,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
         self._load_source_files()
         
         if contract_address:
-            print(f"Contract loaded: {address(contract_address)}")
+            print(f"Contract found: {address(contract_address)}")
         
         # Only print debug mappings message if we loaded them here (not passed from main)
         if self.source_map and not ethdebug_dir:
@@ -175,7 +189,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
             print(f"{error('Error loading transaction:')} {e}")
     
     def _do_interactive(self):
-        """Simulate a function call for debugging. Usage: interactive <function_name> [args...]"""
+        """Simulate a function call for debugging."""
         
         if not self.contract_address:
             print(f"{warning('Warning:')} No contract address set. Using default for simulation.")
@@ -186,24 +200,22 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
         try:
             # Parse function call
             function_name = str(self.function_name)
-            function_args = self.function_args
-            
 
-            print(f"Simulating {info(function_name)}({', '.join(function_args)})...")
-            
+            function_args = f"({', '.join(self.function_args)})"
+            print(f"Simulating {info(function_name.split('(')[0])}{info(function_args)}...")
+
             # Encode function call
-            calldata = self._encode_function_call(function_name, function_args)
+            calldata = self._encode_function_call(function_name, self.function_args)
             if not calldata:
                 print(f"{error('Failed to encode function call.')} Check function name and arguments.")
                 return
             
             # Create simulation using tracer
-            from_addr = "0x" + "0" * 40  # Default sender address
             self.current_trace = self.tracer.simulate_call_trace(
                 to=contract_addr,
-                from_=from_addr, 
+                from_=self.from_addr,
                 calldata=calldata,
-                block=None  # Use latest block
+                block=self.block
             )
             
             if not self.current_trace:

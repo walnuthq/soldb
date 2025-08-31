@@ -38,11 +38,7 @@ make test-deploy
 
 ### Test Infrastructure
 - `run-tests.sh` - Main test runner that ensures TestContract is deployed
-<<<<<<< HEAD
-- `deploy-test-contract.sh` - Deploys TestContract.sol to `test_debug` directory
-=======
 - `deploy-test-contract.sh` - Deploys TestContract.sol to `out` directory
->>>>>>> upstream/main
 - `lit.cfg.py` - Test framework configuration
 - `lit.site.cfg.py` - Generated site-specific configuration (gitignored)
 
@@ -53,11 +49,7 @@ The tests use `examples/TestContract.sol` which includes:
 - Events and state changes
 - Function overloading
 
-<<<<<<< HEAD
-Test deployments are kept in `examples/test_debug/` separate from regular deployments.
-=======
 Test deployments are kept in `examples/out/` separate from regular deployments.
->>>>>>> upstream/main
 
 ## Requirements
 
@@ -92,21 +84,13 @@ Test deployments are kept in `examples/out/` separate from regular deployments.
 
 ### Tests Failing
 1. Ensure Anvil is running: `anvil --steps-tracing`
-<<<<<<< HEAD
-2. Check test deployment: `cat examples/test_debug/deployment.json`
-=======
 2. Check test deployment: `cat examples/out/deployment.json`
->>>>>>> upstream/main
 3. Verify soldb is installed: `make dev`
 
 ### Wrong Contract Deployed
 The test suite automatically deploys TestContract.sol. If you see a different contract:
 ```bash
 # Clean and redeploy
-<<<<<<< HEAD
-rm -rf examples/test_debug
-=======
 rm -rf examples/out
->>>>>>> upstream/main
 ./test/deploy-test-contract.sh
 ```

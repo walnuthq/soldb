@@ -157,6 +157,12 @@ class TransactionTracer:
                 print(warning("RPC does not support evm_revert"))
             return False
 
+    def is_contract_deployed(self, contract_address: str) -> bool:
+        """Check if a contract is deployed at the given address."""
+        contract_address = Web3.to_checksum_address(contract_address)
+        code = self.w3.eth.get_code(contract_address)
+        return code != b'' and code != '0x'
+
     def _encode_function_call(self, function_name: str, args: list) -> str:
         """Encode calldata for a loaded ABI function by name."""
         # Find ABI item
@@ -191,11 +197,7 @@ class TransactionTracer:
         High-level helper: encode and simulate a function call using debug_traceCall.
         """
         if not from_addr:
-            # pick first unlocked account if available
-            try:
-                from_addr = self.w3.eth.accounts[0]
-            except Exception:
-                raise RuntimeError("No from address provided and no local accounts available")
+            raise RuntimeError("No from address provided")
         calldata = self._encode_function_call(function_name, args)
         return self.simulate_call_trace(
             to=contract_address,

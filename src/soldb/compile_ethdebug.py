@@ -32,8 +32,8 @@ def main(args=None):
     
     parser.add_argument(
         "--output-dir", "-o",
-        default="./build/debug/ethdebug",
-        help="Output directory for ETHDebug files (default: ./build/debug/ethdebug)"
+        default="./out",
+        help="Output directory for ETHDebug files (default: ./out)"
     )
     
     parser.add_argument(
@@ -44,8 +44,8 @@ def main(args=None):
     
     parser.add_argument(
         "--production-dir",
-        default="./build/contracts",
-        help="Output directory for production build (default: ./build/contracts)"
+        default="/build/contracts",
+        help="Output directory for production build (default: /build/contracts)"
     )
     
     parser.add_argument(
@@ -186,7 +186,7 @@ def main(args=None):
 def compile_ethdebug_run(
     contract_file: str,
     solc_path: str = "solc",
-    debug_output_dir: str = "./build/debug/ethdebug",
+    debug_output_dir: str = "./out",
     production_dir: str = "./build/contracts",
     dual: bool = False,
     verify_version: bool = False,
@@ -194,8 +194,7 @@ def compile_ethdebug_run(
     json_mode: bool = False
 ) -> dict:
     """
-    Programmatic API. Returns result dict (same structure as CLI).
-    Does NOT call sys.exit.
+    Runs ETHDebug compilation. Returns dict with compilation results.
     """
     config = CompilerConfig(
         solc_path=solc_path,
@@ -213,7 +212,7 @@ def compile_ethdebug_run(
         
 
     if save_config:
-        config.save_to_walnut_config()
+        config.save_to_soldb_config()
         return {"mode": "save_config", "saved": True}
 
     if not Path(contract_file).exists():

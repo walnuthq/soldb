@@ -37,11 +37,7 @@ NC='\033[0m'
 echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
 
 # Test-specific debug directory (relative to examples)
-<<<<<<< HEAD
-TEST_DEBUG_REL="test_debug"
-=======
 TEST_DEBUG_REL="out"
->>>>>>> upstream/main
 TEST_DEBUG_DIR="${PROJECT_DIR}/examples/${TEST_DEBUG_REL}"
 
 # Check if test deployment exists and is for TestContract
@@ -69,22 +65,13 @@ if [ "${NEED_DEPLOY}" = true ]; then
     if [ -x "${SCRIPT_DIR}/deploy-test-contract.sh" ]; then
         # Use dedicated test deployment script
         SOLC_PATH="${SOLC_PATH}" RPC_URL="${RPC_URL}" PRIVATE_KEY="${PRIVATE_KEY}" \
-<<<<<<< HEAD
-            DEBUG_DIR="test_debug" CONTRACT_NAME="TestContract" CONTRACT_FILE="TestContract.sol" \
-=======
             DEBUG_DIR="out" CONTRACT_NAME="TestContract" CONTRACT_FILE="TestContract.sol" \
->>>>>>> upstream/main
             "${SCRIPT_DIR}/deploy-test-contract.sh"
     else
         # Fallback to direct deployment
         cd "${PROJECT_DIR}/examples"
-<<<<<<< HEAD
-        rm -rf test_debug
-        "${SCRIPT_DIR}/deploy-contract.sh" --solc="${SOLC_PATH}" --rpc="${RPC_URL}" --private-key="${PRIVATE_KEY}" TestContract TestContract.sol --debug-dir=test_debug
-=======
         rm -rf out
         "${SCRIPT_DIR}/deploy-contract.sh" --solc="${SOLC_PATH}" --rpc="${RPC_URL}" --private-key="${PRIVATE_KEY}" TestContract TestContract.sol --debug-dir=out
->>>>>>> upstream/main
     fi
     
     # Check deployment succeeded
