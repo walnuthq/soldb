@@ -419,12 +419,12 @@ class TransactionTracer:
                     string_hex = data[128:128+length*2]
                     error_msg = bytes.fromhex(string_hex).decode('utf-8')
                 except:
-                    error_msg = "Unknown revert reason"
+                    error_msg = "Execution reverted"
             elif return_value:
                 # Other revert types (custom errors, etc.)
                 error_msg = f"Reverted with data: 0x{return_value}"
             else:
-                error_msg = "Transaction reverted without reason"
+                error_msg = "Execution reverted"
         
         return TransactionTrace(
             tx_hash=tx_hash,
@@ -501,12 +501,12 @@ class TransactionTracer:
                     string_hex = data[128:128+length*2]
                     error_msg = bytes.fromhex(string_hex).decode('utf-8')
                 except:
-                    error_msg = "Unknown revert reason"
+                    error_msg = "Execution reverted"
             elif return_value:
                 # Other revert types (custom errors, etc.)
                 error_msg = f"Reverted with data: 0x{return_value}"
             else:
-                error_msg = "Call failed without reason"
+                error_msg = "Execution reverted"
         
         # Compose TransactionTrace (simulate, so tx_hash is None)
         return TransactionTrace(
