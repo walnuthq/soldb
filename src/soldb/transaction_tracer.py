@@ -1800,7 +1800,10 @@ class TransactionTracer:
     def _process_external_call(self, step: TraceStep, step_idx: int, 
                             current_contract: str, current_depth: int) -> Optional[FunctionCall]:
         """Process CALL/DELEGATECALL/STATICCALL operations."""
-        if len(step.stack) < 7:
+        # CALL requires 7 stack items (gas, to, value, argsOffset, argsSize, retOffset, retSize)
+        # DELEGATECALL and STATICCALL require 6 (gas, to, argsOffset, argsSize, retOffset, retSize)
+        required_stack_size = 7 if step.op == "CALL" else 6
+        if len(step.stack) < required_stack_size:
             return None
 
         # Extract call parameters
