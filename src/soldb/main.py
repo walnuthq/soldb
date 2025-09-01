@@ -426,42 +426,85 @@ def simulate_command(args):
                     if converted_types == abi_input_types:
                         abi_item = item
                         break
-    if not abi_item:
-        print(f'Function {args.function_signature} not found in ABI')
-        print(f'Available functions: {[item["name"] for item in tracer.function_abis.values()]}')
-        sys.exit(1)
-    input_types = [inp['type'] for inp in abi_item['inputs']]
+    # Check if we have any ABI loaded
+    has_abi = len(tracer.function_abis) > 0
     
-    # Parse function_args from CLI to correct types
-    if len(args.function_args) != len(input_types):
-        print(f'Function {args.function_signature} expects {len(input_types)} arguments, got {len(args.function_args)}')
-        sys.exit(1)
-    parsed_args = []
-    for val, typ, abi_input in zip(args.function_args, input_types, abi_item['inputs']):
-        if typ.startswith('uint') or typ.startswith('int'):
-            parsed_args.append(int(val, 0))
-        elif typ == 'address':
-            parsed_args.append(val)
-        elif typ.startswith('bytes'):
-            if val.startswith('0x'):
-                parsed_args.append(bytes.fromhex(val[2:]))
-            else:
-                parsed_args.append(bytes.fromhex(val))
-        elif typ.startswith('tuple'):
-            try:
-                parsed_val = ast.literal_eval(val)
-                if 'components' in abi_input:
-                    parsed_args.append(parse_tuple_arg(parsed_val, abi_input))
-                else:
-                    parsed_args.append(parsed_val)
-            except Exception as e:
-                print(f"Error parsing tuple argument: {val} ({e})")
-                sys.exit(1)
+    if has_abi and not abi_item:
+        print(f'Function {args.function_signature} not found in ABI')
+        available_functions = [item["name"] for item in tracer.function_abis.values()]
+        if available_functions:
+            print(f'Available functions: {available_functions}')
         else:
-            parsed_args.append(val)
+            print('No functions found in any loaded ABI files.')
+        print('')
+        print('Try one of these solutions:')
+        print('1. Use --raw-data instead of function signature')
+        print('2. Provide debug information: --ethdebug-dir <path>')
+        print('3. Ensure ABI files are in the current directory or subdirectories')
+        sys.exit(1)
+    
+    # If no ABI available, we can still proceed with function signature parsing
+    if not has_abi:
+        print(f'No ABI files found. Proceeding with function signature: {args.function_signature}')
+        print('Note: Parameter validation will be based on function signature types only.')
+    # Parse function_args from CLI to correct types
+    if has_abi and abi_item:
+        # Use ABI for type information
+        input_types = [inp['type'] for inp in abi_item['inputs']]
+        if len(args.function_args) != len(input_types):
+            print(f'Function {args.function_signature} expects {len(input_types)} arguments, got {len(args.function_args)}')
+            sys.exit(1)
+        
+        parsed_args = []
+        for val, typ, abi_input in zip(args.function_args, input_types, abi_item['inputs']):
+            if typ.startswith('uint') or typ.startswith('int'):
+                parsed_args.append(int(val, 0))
+            elif typ == 'address':
+                parsed_args.append(val)
+            elif typ.startswith('bytes'):
+                if val.startswith('0x'):
+                    parsed_args.append(bytes.fromhex(val[2:]))
+                else:
+                    parsed_args.append(bytes.fromhex(val))
+            elif typ.startswith('tuple'):
+                try:
+                    parsed_val = ast.literal_eval(val)
+                    if 'components' in abi_input:
+                        parsed_args.append(parse_tuple_arg(parsed_val, abi_input))
+                    else:
+                        parsed_args.append(parsed_val)
+                except Exception as e:
+                    print(f"Error parsing tuple argument: {val} ({e})")
+                    sys.exit(1)
+            else:
+                parsed_args.append(val)
+    else:
+        # No ABI available - parse arguments based on function signature types
+        if len(args.function_args) != len(func_types):
+            print(f'Function {args.function_signature} expects {len(func_types)} arguments, got {len(args.function_args)}')
+            sys.exit(1)
+        
+        parsed_args = []
+        for val, typ in zip(args.function_args, func_types):
+            if typ.startswith('uint') or typ.startswith('int'):
+                parsed_args.append(int(val, 0))
+            elif typ == 'address':
+                parsed_args.append(val)
+            elif typ.startswith('bytes'):
+                if val.startswith('0x'):
+                    parsed_args.append(bytes.fromhex(val[2:]))
+                else:
+                    parsed_args.append(bytes.fromhex(val))
+            elif typ == 'string':
+                parsed_args.append(val)
+            elif typ == 'bool':
+                parsed_args.append(val.lower() in ('true', '1', 'yes'))
+            else:
+                # For unknown types, try to parse as string
+                parsed_args.append(val)
     from eth_abi.abi import encode
     try:
-        # For tuple types, we need to pass the full ABI input structure
+        # Use func_types for encoding (works with or without ABI)
         encoded_args = encode(func_types, parsed_args)
     except Exception as e:
         print(f'Error encoding arguments: {e}')
