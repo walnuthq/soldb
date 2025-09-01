@@ -131,9 +131,6 @@ implementation is available to the public in source code form.  A
 (if any) on which the executable work runs, or a compiler used to
 produce the work, or an object code interpreter used to run it.
 
-<<<<<<< HEAD
-To obtain a commercial license to use SolDB in a paid service or product, or to resell SolDB in any form, please contact:
-=======
   The "Corresponding Source" for a work in object code form means all
 the source code needed to generate, install, and (for an executable
 work) run the object code and to modify the work, including scripts to
@@ -146,7 +143,6 @@ the work, and the source code for shared libraries and dynamically
 linked subprograms that the work is specifically designed to require,
 such as by intimate data communication or control flow between those
 subprograms and other parts of the work.
->>>>>>> upstream/main
 
   The Corresponding Source need not include anything that users
 can regenerate automatically from other parts of the Corresponding

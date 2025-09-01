@@ -76,7 +76,6 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
 
         if not self.tracer.is_contract_deployed(self.contract_address):
             print(error(f"Error: No contract found at address {self.contract_address}"))
-            print(f"{self.tracer.ethdebug_info}")
             sys.exit(1)
 
         # Load ETHDebug info if available

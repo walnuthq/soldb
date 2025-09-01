@@ -238,17 +238,10 @@ def trace_command(args):
         debugger.current_step = 0
         debugger.function_trace = function_calls
         
-        # Set dynamic intro message based on pre-loaded trace
-        debugger._set_intro_message()
-        
-        # Start at first meaningful function, but be conservative
+        # Start at first function after dispatcher
         if len(function_calls) > 1:
-            # Check if the first function after dispatcher is reasonable
-            first_func = function_calls[1]
-            if first_func.entry_step < len(trace.steps) - 10:  # Leave some room at the end
-                debugger.current_step = first_func.entry_step
-                debugger.current_function = first_func
-            # Otherwise, stay at step 0
+            debugger.current_step = function_calls[1].entry_step
+            debugger.current_function = function_calls[1]
         
         # Start REPL
         try:
@@ -257,6 +250,7 @@ def trace_command(args):
             print("\nInterrupted")
     
     return 0
+
 
 def simulate_command(args):
     """Execute the simulate command."""
