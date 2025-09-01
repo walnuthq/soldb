@@ -1229,6 +1229,7 @@ class TransactionTracer:
         current_depth = 0
         context_stack = []
         revert_already_marked = False  # Track if we've already marked a revert frame
+        missing_mappings_warned = False  # Track if we've already warned about missing mappings
         
         # Track parent-child relationships properly
         active_parents = []  # Stack of active parent call IDs
@@ -1412,159 +1413,167 @@ class TransactionTracer:
                     current_depth += 1
             # Internal functions
             elif step.op == "JUMPDEST":
-                call = self._detect_internal_call(step, i, current_contract, call_stack)
-                if call:
-                    call.call_id = next_call_id
-                    call.parent_call_id = call_stack[-1].call_id if call_stack else None
-                    if call and hasattr(self, 'ethdebug_info') and self.ethdebug_info and call.call_type != "internal":
-                        # For external calls, try ETHDebug first
-                        # Skip ETHDebug for internal calls as we'll handle them differently
-                        # Find ABI entry by name using the name-based mapping
-                        abi_entry = self.function_abis_by_name.get(call.name)
-                        if abi_entry:
-                            args = []
-                            for param in abi_entry.get('inputs', []):
-                                value = self.find_parameter_value_from_ethdebug(trace, i, param['name'], param['type'])
-                                args.append((param['name'], value))
-                            call.args = args
+                result = self._detect_internal_call(step, i, current_contract, call_stack, missing_mappings_warned)
+                if result:
+                    # Check if we detected missing mappings
+                    if isinstance(result, tuple):
+                        call, missing_mappings_warned = result
+                    else:
+                        call = result
                     
-                    # For internal calls, parameters are passed via the stack
-                    if call and call.call_type == "internal":
-                        # Check if we have a parent call with known argument types
-                        parent_call = call_stack[-1] if call_stack else None
-                        inherited_args = {}
-                        
-                        # If parent is an external CALL with the same function name, inherit its arguments
-                        if (parent_call and parent_call.call_type in ["CALL", "DELEGATECALL", "STATICCALL"] 
-                            and parent_call.args and parent_call.name and call.name
-                            and parent_call.name.split("::")[1].split("(")[0] == call.name):
-                            # Build a dict of inherited args
-                            for name, value in parent_call.args:
-                                if value is not None:
-                                    inherited_args[name] = value
-                            # Clear existing args to avoid duplication
-                            call.args = []
-                        # Don't inherit from internal function parents as they may have modified the parameters
-                        
-                        # Now process all parameters, using inherited values when available
-                        # and falling back to stack decoding when not
-                        # Find ABI entry by name using the name-based mapping
-                        abi_entry = self.function_abis_by_name.get(call.name)
-                        
-                        if abi_entry:
-                            # Clear any existing args to avoid duplication
-                            call.args = []
-                            
-                            if step.stack:
-                                # First check if any parameter is a complex type
-                                has_complex_types = False
+                    # Only process if we actually have a call
+                    if call:
+                        call.call_id = next_call_id
+                        call.parent_call_id = call_stack[-1].call_id if call_stack else None
+                        if hasattr(self, 'ethdebug_info') and self.ethdebug_info and call.call_type != "internal":
+                            # For external calls, try ETHDebug first
+                            # Skip ETHDebug for internal calls as we'll handle them differently
+                            # Find ABI entry by name using the name-based mapping
+                            abi_entry = self.function_abis_by_name.get(call.name)
+                            if abi_entry:
+                                args = []
                                 for param in abi_entry.get('inputs', []):
-                                    param_type = param['type']
-                                    if (param_type.startswith('tuple') or '(' in param_type or 
-                                        param_type.endswith('[]') or '[' in param_type or
-                                        param_type in ['string', 'bytes']):
-                                        has_complex_types = True
-                                        break
+                                    value = self.find_parameter_value_from_ethdebug(trace, i, param['name'], param['type'])
+                                    args.append((param['name'], value))
+                                call.args = args
+                        
+                        # For internal calls, parameters are passed via the stack
+                        if call.call_type == "internal":
+                            # Check if we have a parent call with known argument types
+                            parent_call = call_stack[-1] if call_stack else None
+                            inherited_args = {}
+                            
+                            # If parent is an external CALL with the same function name, inherit its arguments
+                            if (parent_call and parent_call.call_type in ["CALL", "DELEGATECALL", "STATICCALL"] 
+                                and parent_call.args and parent_call.name and call.name
+                                and parent_call.name.split("::")[1].split("(")[0] == call.name):
+                                # Build a dict of inherited args
+                                for name, value in parent_call.args:
+                                    if value is not None:
+                                        inherited_args[name] = value
+                                # Clear existing args to avoid duplication
+                                call.args = []
+                            # Don't inherit from internal function parents as they may have modified the parameters
+                            
+                            # Now process all parameters, using inherited values when available
+                            # and falling back to stack decoding when not
+                            # Find ABI entry by name using the name-based mapping
+                            abi_entry = self.function_abis_by_name.get(call.name)
+                            
+                            if abi_entry:
+                                # Clear any existing args to avoid duplication
+                                call.args = []
                                 
-                                # If there are complex types, we can't reliably read any parameters
-                                # because we don't know how many stack slots they occupy
-                                if has_complex_types:
-                                    # For complex types, still try to inherit from external CALL parent if available
-                                    if inherited_args:
+                                if step.stack:
+                                    # First check if any parameter is a complex type
+                                    has_complex_types = False
+                                    for param in abi_entry.get('inputs', []):
+                                        param_type = param['type']
+                                        if (param_type.startswith('tuple') or '(' in param_type or 
+                                            param_type.endswith('[]') or '[' in param_type or
+                                            param_type in ['string', 'bytes']):
+                                            has_complex_types = True
+                                            break
+                                    
+                                    # If there are complex types, we can't reliably read any parameters
+                                    # because we don't know how many stack slots they occupy
+                                    if has_complex_types:
+                                        # For complex types, still try to inherit from external CALL parent if available
+                                        if inherited_args:
+                                            args = []
+                                            for param in abi_entry.get('inputs', []):
+                                                param_name = param['name']
+                                                if param_name in inherited_args:
+                                                    args.append((param_name, inherited_args[param_name]))
+                                                else:
+                                                    args.append((param_name, None))
+                                            call.args = args
+                                        else:
+                                            # Keep empty args for complex types when we can't decode them
+                                            pass
+                                    else:
                                         args = []
-                                        for param in abi_entry.get('inputs', []):
+                                        # For internal calls, parameters are typically at the end of the stack
+                                        # The stack grows from left to right, so parameters are at higher indices
+                                        num_params = len(abi_entry.get('inputs', []))
+                                        
+                                        # For internal calls, parameters are at the end of the stack in reverse order
+                                        # Due to LIFO nature: increment3(arg1, arg2) -> stack has [.., arg1, arg2] 
+                                        # where arg2 is at the top (higher index)
+                                        
+                                        for i, param in enumerate(abi_entry.get('inputs', [])):
                                             param_name = param['name']
+                                            param_type = param['type']
+                                            
+                                            # First check if we have an inherited value
                                             if param_name in inherited_args:
                                                 args.append((param_name, inherited_args[param_name]))
+                                                continue
+                                            
+                                            # Parameters are at the end of stack in reverse order due to LIFO
+                                            # First parameter is deepest, last parameter is at top
+                                            stack_idx = len(step.stack) - 1 - i
+                                            if 0 <= stack_idx < len(step.stack):
+                                                try:
+                                                    raw_value = step.stack[stack_idx]
+                                                    decoded_value = self.decode_value(raw_value, param_type)
+                                                    args.append((param_name, decoded_value))
+                                                except:
+                                                    # If that doesn't work, try looking for the value elsewhere in stack
+                                                    # Sometimes the parameter is at a different position
+                                                    found = False
+                                                    for j in range(len(step.stack)-1, -1, -1):
+                                                        try:
+                                                            raw_value = step.stack[j]
+                                                            # Check if this could be our parameter (for uint256, should be reasonable)
+                                                            if param_type.startswith('uint') and raw_value.startswith('0x'):
+                                                                val = int(raw_value, 16)
+                                                                if val > 0 and val < 1000000:  # Reasonable range
+                                                                    decoded_value = self.decode_value(raw_value, param_type)
+                                                                    args.append((param_name, decoded_value))
+                                                                    found = True
+                                                                    break
+                                                        except:
+                                                            continue
+                                                    if not found:
+                                                        args.append((param_name, None))
                                             else:
                                                 args.append((param_name, None))
+                                            
                                         call.args = args
-                                    else:
-                                        # Keep empty args for complex types when we can't decode them
-                                        pass
-                                else:
-                                    args = []
-                                    # For internal calls, parameters are typically at the end of the stack
-                                    # The stack grows from left to right, so parameters are at higher indices
-                                    num_params = len(abi_entry.get('inputs', []))
-                                    
-                                    # For internal calls, parameters are at the end of the stack in reverse order
-                                    # Due to LIFO nature: increment3(arg1, arg2) -> stack has [.., arg1, arg2] 
-                                    # where arg2 is at the top (higher index)
-                                    
-                                    for i, param in enumerate(abi_entry.get('inputs', [])):
-                                        param_name = param['name']
-                                        param_type = param['type']
-                                        
-                                        # First check if we have an inherited value
-                                        if param_name in inherited_args:
-                                            args.append((param_name, inherited_args[param_name]))
-                                            continue
-                                        
-                                        # Parameters are at the end of stack in reverse order due to LIFO
-                                        # First parameter is deepest, last parameter is at top
-                                        stack_idx = len(step.stack) - 1 - i
-                                        if 0 <= stack_idx < len(step.stack):
-                                            try:
-                                                raw_value = step.stack[stack_idx]
-                                                decoded_value = self.decode_value(raw_value, param_type)
-                                                args.append((param_name, decoded_value))
-                                            except:
-                                                # If that doesn't work, try looking for the value elsewhere in stack
-                                                # Sometimes the parameter is at a different position
-                                                found = False
-                                                for j in range(len(step.stack)-1, -1, -1):
-                                                    try:
-                                                        raw_value = step.stack[j]
-                                                        # Check if this could be our parameter (for uint256, should be reasonable)
-                                                        if param_type.startswith('uint') and raw_value.startswith('0x'):
-                                                            val = int(raw_value, 16)
-                                                            if val > 0 and val < 1000000:  # Reasonable range
-                                                                decoded_value = self.decode_value(raw_value, param_type)
-                                                                args.append((param_name, decoded_value))
-                                                                found = True
-                                                                break
-                                                    except:
-                                                        continue
-                                                if not found:
-                                                    args.append((param_name, None))
-                                        else:
-                                            args.append((param_name, None))
-                                        
-                                    call.args = args
-                    if call_stack:
-                        # Find the appropriate parent for this call
-                        # For calls at depth 1, they should be children of the main function if it exists
-                        if call.depth == 1 and len(call_stack) > 1:
-                            # Check if we have a main function call (depth 1, call_type external)
-                            main_func = None
-                            for stack_call in call_stack:
-                                if stack_call.depth == 1 and stack_call.call_type == "external":
-                                    main_func = stack_call
-                                    break
-                            
-                            if main_func:
-                                # Add as child of main function
-                                main_func.children_call_ids.append(call.call_id)
-                                call.parent_call_id = main_func.call_id
-                            else:
-                                # Fallback to dispatcher
-                                call_stack[-1].children_call_ids.append(call.call_id)
-                        else:
-                            # Only add as child if the depth is greater than parent
-                            parent_call = call_stack[-1]
-                            if call.depth > parent_call.depth:
-                                parent_call.children_call_ids.append(call.call_id)
-                            else:
-                                # Find the correct parent based on depth
-                                for j in range(len(call_stack) - 1, -1, -1):
-                                    potential_parent = call_stack[j]
-                                    if call.depth > potential_parent.depth:
-                                        potential_parent.children_call_ids.append(call.call_id)
+                        if call_stack:
+                            # Find the appropriate parent for this call
+                            # For calls at depth 1, they should be children of the main function if it exists
+                            if call.depth == 1 and len(call_stack) > 1:
+                                # Check if we have a main function call (depth 1, call_type external)
+                                main_func = None
+                                for stack_call in call_stack:
+                                    if stack_call.depth == 1 and stack_call.call_type == "external":
+                                        main_func = stack_call
                                         break
-                    next_call_id += 1
-                    insert_call_sorted(call)
-                    call_stack.append(call)
+                                
+                                if main_func:
+                                    # Add as child of main function
+                                    main_func.children_call_ids.append(call.call_id)
+                                    call.parent_call_id = main_func.call_id
+                                else:
+                                    # Fallback to dispatcher
+                                    call_stack[-1].children_call_ids.append(call.call_id)
+                        else:
+                                # Only add as child if the depth is greater than parent
+                                parent_call = call_stack[-1]
+                                if call.depth > parent_call.depth:
+                                    parent_call.children_call_ids.append(call.call_id)
+                                else:
+                                    # Find the correct parent based on depth
+                                    for j in range(len(call_stack) - 1, -1, -1):
+                                        potential_parent = call_stack[j]
+                                        if call.depth > potential_parent.depth:
+                                            potential_parent.children_call_ids.append(call.call_id)
+                                            break
+                        next_call_id += 1
+                        insert_call_sorted(call)
+                        call_stack.append(call)
             # Exit from function
             elif step.op in ["RETURN", "REVERT", "STOP"]:
                 # If this is a REVERT, find and mark the deepest active frame (only once)
@@ -1686,17 +1695,33 @@ class TransactionTracer:
         return function_calls
 
    
-    def _detect_internal_call(self, step, step_idx, current_contract, call_stack):
+    def _detect_internal_call(self, step, step_idx, current_contract, call_stack, missing_mappings_warned=False):
         """Detect internal function calls using proper execution context."""
         # Get source context
         context = self.get_source_context_for_step(step, current_contract)
+        
+        # NOTE: Some functions may have missing source mappings in the ETHDebug metadata
+        # This is a known issue with Solidity compiler optimization where certain function
+        # entry points don't get proper source mappings. See: https://github.com/ethereum/solidity/issues/...
         if not context:
-            return None
+            # Only emit warning if we have ETHDebug info but it's incomplete
+            # If there's no ETHDebug at all, we don't need to warn
+            # Check if ETHDebug was actually loaded (not just parser created)
+            if (self.ethdebug_info or (self.ethdebug_parser and self.ethdebug_parser.debug_info)) and not missing_mappings_warned:
+                import sys
+                from .colors import yellow, dim
+                print(f"\n{yellow('Warning:')} Detected incomplete ETHDebug metadata", file=sys.stderr)
+                print(f"{dim('  Some JUMPDEST instructions lack source mappings, which may result in an incomplete trace.')}", file=sys.stderr)
+                print(f"{dim('  This is typically caused by compiler optimizations. Consider recompiling with different settings.')}\n", file=sys.stderr)
+                missing_mappings_warned = True
+            
+            # Return with the warning flag
+            return None, missing_mappings_warned
 
         # Get function name safely
         func_name = self._extract_function_name(context.get('content', ''))
         if not func_name:
-            return None
+            return (None, missing_mappings_warned) if missing_mappings_warned else None
 
         # Avoid duplicate entries for the same function at the same contract that are not closed
         already_open = any(
@@ -1704,10 +1729,10 @@ class TransactionTracer:
             for fc in call_stack
         )
         if already_open:
-            return None
+            return (None, missing_mappings_warned) if missing_mappings_warned else None
         current_func = call_stack[-1].name if call_stack else None
 
-        return FunctionCall(
+        call = FunctionCall(
             name=func_name,
             selector="",
             entry_step=step_idx,
@@ -1719,6 +1744,9 @@ class TransactionTracer:
             contract_address=current_contract,
             source_line=context.get('line')
         )
+        
+        # Return with warning flag if it was set
+        return (call, missing_mappings_warned) if missing_mappings_warned else call
 
     # Helper Methods
     def _track_return_location(self, return_pc: int):
