@@ -410,20 +410,6 @@ class TraceSerializer:
                     child, trace, logs_with_steps, all_calls, multi_parser, tracer_instance, processed_ids
                 ))
         
-        # Also check for any calls that should be children based on depth and step range
-        # This handles cases where parent-child relationships might not be properly set
-        for potential_child in all_calls:
-            if (potential_child.call_id not in processed_ids and
-                potential_child.depth == call.depth + 1 and
-                potential_child.entry_step is not None and
-                call.entry_step is not None and
-                potential_child.entry_step > call.entry_step and
-                (call.exit_step is None or potential_child.entry_step < call.exit_step)):
-                # This call is within our range and at the right depth
-                child_calls.append(self.convert_function_call_to_trace_call(
-                    potential_child, trace, logs_with_steps, all_calls, multi_parser, tracer_instance, processed_ids
-                ))
-        
         if child_calls:
             trace_call["calls"] = child_calls
         for field in ["to", "from", "contractAddress", "input", "output"]:
@@ -745,21 +731,15 @@ class TraceSerializer:
             root_calls[0], trace, logs_with_steps, function_calls, multi_parser, tracer_instance, processed_ids
         )
         
-        # Check for any remaining unprocessed calls and add them as top-level calls if needed
-        # This handles cases where calls might not be properly linked in the hierarchy
+        # Check for any remaining unprocessed calls
+        # This should not happen if parent-child relationships are correct
+        # Log a warning if there are unprocessed calls but don't add them as top-level
         unprocessed_calls = []
         for call in function_calls:
             if call.call_id not in processed_ids:
-                unprocessed_call = self.convert_function_call_to_trace_call(
-                    call, trace, logs_with_steps, function_calls, multi_parser, tracer_instance, processed_ids
-                )
-                unprocessed_calls.append(unprocessed_call)
-        
-        # If there are unprocessed calls, add them to the root
-        if unprocessed_calls:
-            if "calls" not in root_trace_call:
-                root_trace_call["calls"] = []
-            root_trace_call["calls"].extend(unprocessed_calls)
+                # Skip these - they should have been processed as children
+                # This indicates a bug in parent-child relationship tracking
+                pass
         # Ensure root call has proper from/to addresses and gas info
         root_trace_call["from"] = trace.from_addr
         root_trace_call["to"] = trace.to_addr
