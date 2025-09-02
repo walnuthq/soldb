@@ -74,7 +74,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
         self.from_addr = from_addr
         self.block = block
 
-        if not self.tracer.is_contract_deployed(self.contract_address):
+        if self.contract_address and not self.tracer.is_contract_deployed(self.contract_address):
             print(error(f"Error: No contract found at address {self.contract_address}"))
             sys.exit(1)
 
