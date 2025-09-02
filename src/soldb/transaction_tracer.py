@@ -12,7 +12,8 @@ from eth_utils import decode_hex
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from web3 import Web3
-from eth_utils import to_hex, to_checksum_address
+from eth_utils import to_hex, to_checksum_address,keccak
+from eth_abi.abi import encode as abi_encode
 from .colors import *
 from .ethdebug_parser import ETHDebugParser, ETHDebugInfo
 from .multi_contract_ethdebug_parser import MultiContractETHDebugParser, ExecutionContext
@@ -148,6 +149,92 @@ class TransactionTracer:
         self.function_abis = {}  # selector -> full ABI item
         self.function_params = {}  # function name -> parameter info
         self.function_abis_by_name = {}  # function name -> full ABI item
+        self._initial_snapshot_id: Optional[str] = None
+        self._last_snapshot_id: Optional[str] = None
+
+    def snapshot_state(self) -> Optional[str]:
+        """Take an EVM snapshot (Hardhat/Anvil/Ganache). Returns snapshot id or None if unsupported."""
+        try:
+            result = self.w3.provider.make_request("evm_snapshot", [])
+            snap_id = result.get("result")
+            if not self._initial_snapshot_id:
+                self._initial_snapshot_id = snap_id
+            self._last_snapshot_id = snap_id
+            if not self.quiet_mode:
+                print(info(f"[SNAPSHOT] Created snapshot {snap_id}"))
+            return snap_id
+        except Exception:
+            if not self.quiet_mode:
+                print(warning("RPC does not support evm_snapshot"))
+            return None
+
+    def revert_state(self, snapshot_id: Optional[str] = None) -> bool:
+        """Revert to a snapshot. If snapshot_id omitted, reverts to initial snapshot."""
+        target = snapshot_id or self._initial_snapshot_id
+        if not target:
+            if not self.quiet_mode:
+                print(warning("No snapshot available to revert"))
+            return False
+        try:
+            result = self.w3.provider.make_request("evm_revert", [target])
+            ok = result.get("result", False)
+            if ok and not self.quiet_mode:
+                print(info(f"[SNAPSHOT] Reverted to {target}"))
+            return ok
+        except Exception:
+            if not self.quiet_mode:
+                print(warning("RPC does not support evm_revert"))
+            return False
+
+    def is_contract_deployed(self, contract_address: str) -> bool:
+        """Check if a contract is deployed at the given address."""
+        contract_address = Web3.to_checksum_address(contract_address)
+        code = self.w3.eth.get_code(contract_address)
+        return code != b'' and code != '0x'
+
+    def _encode_function_call(self, function_name: str, args: list) -> str:
+        """Encode calldata for a loaded ABI function by name."""
+        # Find ABI item
+        abi_item = None
+        for sel, item in self.function_abis.items():
+            if item.get("name") == function_name:
+                if len(item.get("inputs", [])) == len(args):
+                    abi_item = item
+                    break
+        if not abi_item:
+            raise ValueError(f"Function {function_name}({len(args)} args) not found in loaded ABI")
+        types = [self.format_abi_type(inp) for inp in abi_item.get("inputs", [])]
+        # Basic normalization
+        norm_args = []
+        for val, typ in zip(args, types):
+            if typ.startswith("uint") or typ.startswith("int"):
+                norm_args.append(int(val))
+            elif typ == "address":
+                norm_args.append(Web3.to_checksum_address(val))
+            else:
+                norm_args.append(val)
+        # selector
+        signature = f"{abi_item['name']}({','.join(types)})"
+        selector = keccak(text=signature)[:4].hex()
+        encoded_args = abi_encode(types, norm_args).hex()
+        return "0x" + selector + encoded_args
+
+    def simulate_function(self, contract_address: str, function_name: str, args: list,
+                          from_addr: Optional[str] = None, value: int = 0,
+                          block: Optional[int] = None) -> TransactionTrace:
+        """
+        High-level helper: encode and simulate a function call using debug_traceCall.
+        """
+        if not from_addr:
+            raise RuntimeError("No from address provided")
+        calldata = self._encode_function_call(function_name, args)
+        return self.simulate_call_trace(
+            to=contract_address,
+            from_=from_addr,
+            calldata=calldata,
+            block=block,
+            value=value
+        )
     
     def _log(self, message: str, level: str = "info"):
         """Log a message to stderr if not in quiet mode."""

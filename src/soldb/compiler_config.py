@@ -16,7 +16,7 @@ class CompilerConfig:
     """Configuration for Solidity compilation with ETHDebug support."""
     
     solc_path: str = "solc"
-    debug_output_dir: str = "./build/debug/ethdebug"
+    debug_output_dir: str = "./out"
     contracts_dir: str = "./contracts"
     build_dir: str = "./build"
     
@@ -35,8 +35,9 @@ class CompilerConfig:
                 "--ethdebug-runtime",
                 "--bin",
                 "--abi",
-                "--optimize",
-                "--optimize-runs", "200"
+                #"--optimize",
+                #"--optimize-runs", "200",
+                "--overwrite"
             ]
         
         if self.production_flags is None:
@@ -201,7 +202,7 @@ class CompilerConfig:
         
         return cls(
             solc_path=debug_config.get('solc_path', 'solc'),
-            debug_output_dir=debug_config.get('path', './build/debug/ethdebug'),
+            debug_output_dir=debug_config.get('path', './out'),
             build_dir=config_data.get('build_dir', './build')
         )
     

@@ -5,6 +5,7 @@ Can be used standalone or integrated into the soldb workflow.
 """
 
 import argparse
+from logging import info
 import sys
 import json
 from pathlib import Path
@@ -31,8 +32,8 @@ def main():
     
     parser.add_argument(
         "--output-dir", "-o",
-        default="./build/debug/ethdebug",
-        help="Output directory for ETHDebug files (default: ./build/debug/ethdebug)"
+        default="./out",
+        help="Output directory for ETHDebug files (default: ./out)"
     )
     
     parser.add_argument(
@@ -181,6 +182,45 @@ def main():
             print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+def compile_ethdebug_run(
+    contract_file: str,
+    solc_path: str = "solc",
+    debug_output_dir: str = "./out",
+    production_dir: str = "./build/contracts",
+    dual: bool = False,
+    verify_version: bool = False,
+    save_config: bool = False,
+    json_mode: bool = False
+) -> dict:
+    """
+    Runs ETHDebug compilation. Returns dict with compilation results.
+    """
+    config = CompilerConfig(
+        solc_path=solc_path,
+        debug_output_dir=debug_output_dir,
+        build_dir=production_dir
+    )
+
+    if verify_version:
+        version_info = config.verify_solc_version()
+        res = {"mode": "verify_version", **version_info}
+        if not res.get("supported"):
+            raise CompilationError(version_info.get("error", "Unsupported solc version"))
+        print(info(f"solc {version_info['version']} OK (ETHDebug supported)"))
+
+
+
+    if save_config:
+        config.save_to_soldb_config()
+        return {"mode": "save_config", "saved": True}
+
+    if not Path(contract_file).exists():
+        raise FileNotFoundError(f"Contract file '{contract_file}' not found")
+
+    if dual:
+        return dual_compile(contract_file, config)
+    else:
+        return config.compile_with_ethdebug(contract_file)
 
 if __name__ == "__main__":
     main()
