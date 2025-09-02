@@ -1341,37 +1341,33 @@ class TransactionTracer:
                 call = self._process_external_call(step, i, current_contract, current_depth)
                 if call:
                     call.call_id = next_call_id
-                    call.parent_call_id = call_stack[-1].call_id if call_stack else None
+                    
+                    # Find the appropriate parent for this call
                     if call_stack:
-                        # Find the appropriate parent for this call
-                        # For calls at depth 1, they should be children of the main function if it exists
-                        if call.depth == 1 and len(call_stack) > 1:
-                            # Check if we have a main function call (depth 1, call_type external)
-                            main_func = None
-                            for stack_call in call_stack:
-                                if stack_call.depth == 1 and stack_call.call_type == "external":
-                                    main_func = stack_call
-                                    break
-                            
-                            if main_func:
-                                # Add as child of main function
-                                main_func.children_call_ids.append(call.call_id)
-                                call.parent_call_id = main_func.call_id
-                            else:
-                                # Fallback to dispatcher
-                                call_stack[-1].children_call_ids.append(call.call_id)
-                        else:
-                            # Only add as child if the depth is greater than parent
-                            parent_call = call_stack[-1]
-                            if call.depth > parent_call.depth:
-                                parent_call.children_call_ids.append(call.call_id)
-                            else:
-                                # Find the correct parent based on depth
-                                for j in range(len(call_stack) - 1, -1, -1):
-                                    potential_parent = call_stack[j]
-                                    if call.depth > potential_parent.depth:
-                                        potential_parent.children_call_ids.append(call.call_id)
-                                        break
+                        # Find parent based on depth - parent should have depth < current call depth
+                        parent_found = False
+                        for j in range(len(call_stack) - 1, -1, -1):
+                            potential_parent = call_stack[j]
+                            if call.depth > potential_parent.depth:
+                                call.parent_call_id = potential_parent.call_id
+                                potential_parent.children_call_ids.append(call.call_id)
+                                parent_found = True
+                                break
+                        
+                        # If no suitable parent found, use the dispatcher (first element)
+                        if not parent_found and call_stack:
+                            call.parent_call_id = call_stack[0].call_id
+                            call_stack[0].children_call_ids.append(call.call_id)
+                    else:
+                        # If call_stack is empty, this shouldn't happen after dispatcher is added
+                        # Set parent to dispatcher (call_id = 0)
+                        call.parent_call_id = 0
+                        # Find dispatcher in function_calls and add as child
+                        for fc in function_calls:
+                            if fc.call_id == 0:
+                                fc.children_call_ids.append(call.call_id)
+                                break
+                    
                     next_call_id += 1
                     insert_call_sorted(call)
                     call_stack.append(call)
@@ -1582,8 +1578,24 @@ class TransactionTracer:
                     call_stack[-1].caused_revert = True
                     revert_already_marked = True
                 
-                while call_stack:
-                    call = call_stack.pop()
+                # Find which call is returning based on depth
+                # Pop calls from the stack that are at or deeper than the current depth
+                # But never pop the dispatcher (depth 0, entry type)
+                calls_to_pop = []
+                for j in range(len(call_stack) - 1, -1, -1):
+                    call_to_check = call_stack[j]
+                    # Never pop the dispatcher
+                    if call_to_check.depth == 0 and call_to_check.call_type == "entry":
+                        break
+                    if call_to_check.depth >= current_depth:
+                        calls_to_pop.append(j)
+                    else:
+                        break
+                
+                # Pop the deepest call that matches our depth
+                if calls_to_pop:
+                    pop_index = calls_to_pop[0]  # Get the deepest matching call
+                    call = call_stack.pop(pop_index)
                     call.exit_step = i
                     if call.entry_step is not None and call.entry_step < len(trace.steps):
                         call.gas_used = trace.steps[call.entry_step].gas - step.gas
@@ -1601,7 +1613,6 @@ class TransactionTracer:
                             if 'ethdebug_parser' in context:
                                 self.ethdebug_parser = context['ethdebug_parser']
                             self._track_return_location(context['return_pc'])
-                        break
                     else:
                         current_depth = max(0, current_depth - 1)
             
