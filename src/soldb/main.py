@@ -290,9 +290,11 @@ def simulate_command(args):
                 address = None
                 name = None
                 path = ethdebug_spec
+                
+                # Try to parse as address:name:path or address:path
                 parts = ethdebug_spec.split(':', 2)
                 if len(parts) == 3:
-                    address, name, path = parts
+                    address, name, path = parts                    
                 elif len(parts) == 2:
                     address, path = parts
                 # Call load_contract with address, path, name
@@ -436,11 +438,6 @@ def simulate_command(args):
             print(f'Available functions: {available_functions}')
         else:
             print('No functions found in any loaded ABI files.')
-        print('')
-        print('Try one of these solutions:')
-        print('1. Use --raw-data instead of function signature')
-        print('2. Provide debug information: --ethdebug-dir <path>')
-        print('3. Ensure ABI files are in the current directory or subdirectories')
         sys.exit(1)
     
     # If no ABI available, we can still proceed with function signature parsing
