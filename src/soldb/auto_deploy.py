@@ -191,11 +191,11 @@ class AutoDeployDebugger:
             on_chain_code = w3.eth.get_code(addr).hex()
             if on_chain_code != info_json.get("runtime_code", ""):
                 return False
-            # hydrate
+            
             self.contract_address = addr
-            self.debug_dir = entry / "debug"
-            self.abi_path = entry / "artifacts" / f"{self.contract_name}.abi"
-            self.bin_path = entry / "artifacts" / f"{self.contract_name}.bin"
+            self.debug_dir = entry
+            self.abi_path = entry / f"{self.contract_name}.abi"
+            self.bin_path = entry / f"{self.contract_name}.bin"
             if not (self.abi_path.exists() and self.bin_path.exists()):
                 return False
             print(info(f"[CACHE] hit -> {addr}"))
@@ -210,14 +210,14 @@ class AutoDeployDebugger:
         entry = self._cache_entry_path()
         if entry.exists():
             return
-        (entry / "artifacts").mkdir(parents=True, exist_ok=True)
-        (entry / "debug").mkdir(exist_ok=True)
+        (entry).mkdir(parents=True, exist_ok=True)
+        (entry).mkdir(exist_ok=True)
         # copy artifacts
-        shutil.copy2(self.abi_path, entry / "artifacts" / self.abi_path.name)
-        shutil.copy2(self.bin_path, entry / "artifacts" / self.bin_path.name)
+        shutil.copy2(self.abi_path, entry / self.abi_path.name)
+        shutil.copy2(self.bin_path, entry / self.bin_path.name)
         # copy debug json files
         for f in Path(self.debug_dir).glob("*ethdebug*.json"):
-            shutil.copy2(f, entry / "debug" / f.name)
+            shutil.copy2(f, entry / f.name)
         w3 = Web3(Web3.HTTPProvider(self.rpc_url))
         runtime_code = w3.eth.get_code(self.contract_address).hex()
         meta = {
