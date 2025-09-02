@@ -428,6 +428,8 @@ def simulate_command(args):
                 tracer
             )
             print(json.dumps(json_output, indent=2))
+        elif getattr(args, 'raw', False):
+            tracer.print_trace(trace, source_map, args.max_steps)
         else:
             tracer.print_function_trace(trace, function_calls)
         return 0
@@ -577,6 +579,8 @@ def simulate_command(args):
             tracer
         )
         print(json.dumps(json_output, indent=2))
+    elif getattr(args, 'raw', False):
+        tracer.print_trace(trace, source_map, args.max_steps)
     else:
         tracer.print_function_trace(trace, function_calls)
     return 0
@@ -738,6 +742,8 @@ def main():
     simulate_parser.add_argument('--multi-contract', action='store_true', help='Enable multi-contract debugging mode')
     simulate_parser.add_argument('--rpc-url', default='http://localhost:8545', help='RPC URL')
     simulate_parser.add_argument('--json', action='store_true', help='Output trace data as JSON for web app consumption')
+    simulate_parser.add_argument('--raw', action='store_true', help='Show raw instruction trace instead of function call trace')
+    simulate_parser.add_argument('--max-steps', '-m', type=int, default=50, help='Maximum steps to show (use 0 or -1 for all steps)')
     simulate_parser.add_argument('--raw-data', dest='raw_data', default=None, help='Raw calldata to send (hex string, 0x...)')
     simulate_parser.add_argument('--constructor-args', nargs='*', default=[], help='Constructor arguments (only used with --contract-file)')
     simulate_parser.add_argument('--solc-path', '-solc', default='solc', help='Path to solc binary (default: solc)')

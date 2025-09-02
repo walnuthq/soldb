@@ -1,0 +1,15 @@
+# Test JSON output functionality for simulate command
+# REQUIRES: soldb
+# First deploy the contract, then simulate a function call with --json flag
+# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir %{ethdebug_dir} --rpc %{rpc_url} --json 2>&1 | FileCheck %s
+
+# When using --json flag, we should get valid JSON output
+# CHECK: {
+# CHECK:   "status": "success"
+# CHECK:   "traceCall": {
+# CHECK:     "type": "ENTRY"
+# CHECK:     "input": "0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004"
+# CHECK:     "callId": 0
+# CHECK:   }
+# CHECK:   "function_name": "increment(uint256)"
+# CHECK:   "isVerified": false
