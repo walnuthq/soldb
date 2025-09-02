@@ -105,9 +105,38 @@ class TransactionTracer:
     """
     
     def __init__(self, rpc_url: str = "http://localhost:8545", quiet_mode: bool = False):
+        self.rpc_url = rpc_url
         self.w3 = Web3(Web3.HTTPProvider(rpc_url))
-        if not self.w3.is_connected():
-            raise ConnectionError(f"Failed to connect to {rpc_url}")
+        
+        try:
+            if not self.w3.is_connected():
+                if rpc_url == "http://localhost:8545":
+                    raise ConnectionError(
+                        f"{error('Failed to connect to')} {error(rpc_url)}\n"
+                        f"{'This is the default Anvil RPC URL. Make sure Anvil is running:'}\n"
+                        f"{bullet_point('anvil')}"
+                    )
+                else:
+                    raise ConnectionError(
+                        f"{error('Failed to connect to')} {error(rpc_url)}\n"
+                        f"{error('Please check if the RPC endpoint is running and accessible')}"
+                    )
+        except Exception as e:
+            if isinstance(e, ConnectionError):
+                raise
+            # Handle other connection errors 
+            if rpc_url == "http://localhost:8545":
+                raise ConnectionError(
+                    f"{error('Failed to connect to')} {error(rpc_url)}\n"
+                    f"{'This is the default Anvil RPC URL. Make sure Anvil is running:'}\n"
+                    f"{bullet_point('anvil')}"
+                )
+            else:
+                raise ConnectionError(
+                    f"{error('Failed to connect to')} {error(rpc_url)}\n"
+                    f"{'Please check if the RPC endpoint is running and accessible'}"
+                )
+        
         self.quiet_mode = quiet_mode
         
         self.source_maps = {}
@@ -371,8 +400,24 @@ class TransactionTracer:
             tx_hash = '0x' + tx_hash
         
         # Get transaction receipt - web3.py accepts hex strings
-        receipt = self.w3.eth.get_transaction_receipt(tx_hash)
-        tx = self.w3.eth.get_transaction(tx_hash)
+        try:
+            receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+            tx = self.w3.eth.get_transaction(tx_hash)
+        except Exception as e:
+            # Handle transaction not found errors with clearer messages
+            if "not found" in str(e).lower() or "transaction" in str(e).lower():
+                raise ValueError(
+                    f"{error('Transaction not found:')} {error(tx_hash)}\n"
+                    f"{'Connected to RPC:'} {self.rpc_url}\n"
+                    f"{'Please verify:'}\n"
+                    f"{bullet_point('The transaction hash is correct')}\n"
+                    f"{bullet_point('You\'re connected to the right network')}"
+                )
+            else:
+                raise ValueError(
+                    f"{error('Failed to fetch transaction')} {error(tx_hash)}: {error(str(e))}\n"
+                    f"{'Connected to RPC:'} {self.rpc_url}"
+                )
         
         # Use debug_traceTransaction if available
         debug_trace_available = True
