@@ -15,7 +15,7 @@ from .evm_repl import EVMDebugger
 from .abi_utils import match_abi_types, match_single_type, parse_signature, parse_tuple_arg
 from .multi_contract_ethdebug_parser import MultiContractETHDebugParser
 from .json_serializer import TraceSerializer
-from .colors import error
+from .colors import error, info
 
 
 def find_debug_file(contract_addr: str) -> str:
@@ -42,14 +42,27 @@ def find_debug_file(contract_addr: str) -> str:
 def trace_command(args):
     """Execute the trace command."""
     
+    # Show RPC URL being used
+    if not args.json:
+        print(f"Connecting to RPC: {info(args.rpc)}")
+    
     # Create tracer
-    tracer = TransactionTracer(args.rpc, quiet_mode=args.json)
+    try:
+        tracer = TransactionTracer(args.rpc, quiet_mode=args.json)
+    except ConnectionError as e:
+        print(f"{error(e)}")
+        return 1
     
     # Trace transaction
     if not args.json:
         print(f"Loading transaction {args.tx_hash}...")
         sys.stdout.flush()  # Ensure output order
-    trace = tracer.trace_transaction(args.tx_hash)
+    
+    try:
+        trace = tracer.trace_transaction(args.tx_hash)
+    except ValueError as e:
+        print(f"{error(e)}")
+        return 1
     
     # Check if debug trace is available
     if not trace.debug_trace_available:
@@ -259,8 +272,16 @@ def simulate_command(args):
             print("Error: When using --raw-data, do not provide function_signature or function_args.")
             sys.exit(1)
 
+    # Show RPC URL being used
+    if not getattr(args, 'json', False):
+        print(f"Connecting to RPC: {info(args.rpc_url)}")
+
     # Create tracer
-    tracer = TransactionTracer(args.rpc_url)
+    try:
+        tracer = TransactionTracer(args.rpc_url)
+    except ConnectionError as e:
+        print(f"{error(e)}")
+        return 1
     source_map = {}
 
     # Multi-contract mode detection (same as trace_command)

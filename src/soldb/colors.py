@@ -167,3 +167,7 @@ def gas_value(gas: int) -> str:
 def function_name(name: str) -> str:
     """Format function name."""
     return f"{Colors.BRIGHT_MAGENTA}{name}{Colors.RESET}"
+
+def bullet_point(text: str) -> str:
+    """Format bullet point text."""
+    return f"{Colors.DIM}  - {Colors.RESET}{Colors.BRIGHT_WHITE}{text}{Colors.RESET}"
