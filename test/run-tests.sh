@@ -7,11 +7,52 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse command line arguments
+RUN_TRACE_TESTS=true
+RUN_SIMULATE_TESTS=true
+VERBOSE=false
+
 for arg in "$@"; do
     case $arg in
         SOLC_PATH=*)
             SOLC_PATH="${arg#*=}"
             shift
+            ;;
+        --trace-only)
+            RUN_SIMULATE_TESTS=false
+            shift
+            ;;
+        --simulate-only)
+            RUN_TRACE_TESTS=false
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --trace-only       Run only trace tests (from test/trace/)"
+            echo "  --simulate-only    Run only simulate tests (from test/simulate/)"
+            echo "  -v, --verbose      Run tests with verbose output"
+            echo "  -h, --help         Show this help message"
+            echo ""
+            echo "Test Structure:"
+            echo "  test/trace/        Contains trace command tests"
+            echo "  test/simulate/     Contains simulate command tests"
+            echo ""
+            echo "Environment variables:"
+            echo "  RPC_URL            RPC endpoint (default: http://localhost:8545)"
+            echo "  SOLC_PATH          Path to solc binary (default: solc)"
+            echo "  TEST_TX            Specific transaction hash to test"
+            echo ""
+            echo "Examples:"
+            echo "  $0                           # Run all tests"
+            echo "  $0 --trace-only              # Run only trace tests"
+            echo "  $0 --simulate-only           # Run only simulate tests"
+            echo "  $0 -v                        # Run all tests with verbose output"
+            exit 0
             ;;
         *)
             # Unknown option
@@ -35,6 +76,9 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
+echo -e "${GREEN}Organized test structure:${NC}"
+echo -e "${GREEN}  - test/trace/     : Trace command tests${NC}"
+echo -e "${GREEN}  - test/simulate/  : Simulate command tests${NC}"
 
 # Test-specific debug directory (relative to examples)
 TEST_DEBUG_REL="out"
@@ -204,6 +248,31 @@ fi
 
 # Run tests
 echo -e "${YELLOW}Running tests...${NC}"
-"$LIT_CMD" -v "${SCRIPT_DIR}"
+
+# Set up lit command with verbose flag if requested
+LIT_VERBOSE=""
+if [ "$VERBOSE" = true ]; then
+    LIT_VERBOSE="-v"
+fi
+
+# Run trace tests
+if [ "$RUN_TRACE_TESTS" = true ]; then
+    echo -e "${YELLOW}Running trace tests...${NC}"
+    if [ -d "${SCRIPT_DIR}/trace" ]; then
+        "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/trace"
+    else
+        echo -e "${YELLOW}Warning: trace directory not found${NC}"
+    fi
+fi
+
+# Run simulate tests
+if [ "$RUN_SIMULATE_TESTS" = true ]; then
+    echo -e "${YELLOW}Running simulate tests...${NC}"
+    if [ -d "${SCRIPT_DIR}/simulate" ]; then
+        "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/simulate"
+    else
+        echo -e "${YELLOW}Warning: simulate directory not found${NC}"
+    fi
+fi
 
 echo -e "${GREEN}Test suite completed!${NC}"
