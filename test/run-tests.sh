@@ -61,7 +61,9 @@ for arg in "$@"; do
 done
 
 # Configuration
-RPC_URL="${RPC_URL:-http://localhost:8545}"
+# Set fixed RPC URL for tests
+RPC_URL="http://localhost:8545"
+echo -e "${BLUE}Using RPC: ${RPC_URL}${NC}"
 CHAIN_ID="${CHAIN_ID:-1}"
 PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 SOLC_PATH="${SOLC_PATH:-solc}"
