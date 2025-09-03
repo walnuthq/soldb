@@ -600,11 +600,16 @@ def interactive_mode(args,tracer):
                 is_contract_address = True
                 args.contract_address = contract_arg
             else:
-                print(f'Error: Invalid contract address format: {contract_arg}')
+                print(error(f'Contract not found: {contract_arg}'))
+                print("Please verify:")
+                print("  - The address is correct")
+                print("  - You're connected to the right network and your contract is deployed")
                 sys.exit(1)
     else:
-        print(f'Error: Invalid contract address')
-        print('  - Contract addresses should start with 0x and be 42 characters long')
+        print(error(f'Contract not found: {contract_arg}'))
+        print("Please verify:")
+        print("  - The address is correct")
+        print("  - You're connected to the right network and your contract is deployed")
         sys.exit(1)
 
     if not getattr(args, 'function_signature', None):
