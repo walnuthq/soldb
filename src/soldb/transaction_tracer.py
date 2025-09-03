@@ -818,27 +818,58 @@ class TransactionTracer:
         except Exception as e:
             print(f"Warning: Could not load ABI: {e}")
     
-    def lookup_function_signature(self, selector: str) -> Optional[str]:
+    def lookup_function_signature(self, selector: str, contract_address: str = None) -> Optional[str]:
+        """Look up function signature from multiple sources."""
+        # Clean up selector format
+        if selector.startswith('0x'):
+            selector = selector[2:]
+        
+        # Try OpenChain (Sourcify) first - filters junk data
+        signature = self._lookup_openchain(selector)
+        if signature:
+            return signature
+        
+        # Try 4byte.directory as fallback
+        signature = self._lookup_4byte(selector)
+        if signature:
+            return signature
+        
+        return None
+    
+    def _lookup_4byte(self, selector: str) -> Optional[str]:
         """Look up function signature from 4byte.directory."""
         try:
-            # Clean up selector format
-            if selector.startswith('0x'):
-                selector = selector[2:]
-            
             # Query 4byte.directory API
             url = f"https://www.4byte.directory/api/v1/signatures/?hex_signature=0x{selector}"
+            response = requests.get(url, timeout=5)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('results'):
+                    results = data['results']
+                    # Sort by id (lower id = older entry)
+                    sorted_results = sorted(results, key=lambda x: x.get('id', 0))
+                    return sorted_results[0]['text_signature']
+        except Exception as e:
+             # Silently fail - don't interrupt execution for API failures
+            pass
+    
+    def _lookup_openchain(self, selector: str) -> Optional[str]:
+        """Look up function signature from OpenChain (Sourcify)."""
+        try:
+            url = f"https://api.openchain.xyz/signature-database/v1/lookup?function=0x{selector}"
+            
             response = requests.get(url, timeout=5)
             
             if response.status_code == 200:
                 data = response.json()
-                if data.get('results'):
-                    # Return the first (most common) signature
-                    return data['results'][0]['text_signature']
+                if data.get('result') and data['result'].get('function'):
+                    signatures = data['result']['function'].get('0x' + selector, [])
+                    if signatures:
+                        return signatures[0]['name']
         except Exception as e:
             # Silently fail - don't interrupt execution for API failures
             pass
-        
-        return None
     
     def decode_function_parameters(self, selector: str, calldata: str) -> List[Tuple[str, Any]]:
         """Decode function parameters from calldata using ABI."""
@@ -1994,7 +2025,12 @@ class TransactionTracer:
         
         if calldata and len(calldata) >= 10:  # 0x + 4 bytes
             selector = calldata[:10]
-            if selector in self.function_signatures:
+            
+            # Handle special case: 0x00000000 selector (no valid function)
+            if selector == '0x00000000':
+                func_name = "function_0x"
+                decoded_params = []
+            elif selector in self.function_signatures:
                 func_name = self.function_signatures[selector]['name']
                 # Decode the actual function parameters from calldata
                 decoded_params = self.decode_function_parameters(selector, calldata)
