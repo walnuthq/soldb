@@ -286,6 +286,14 @@ def simulate_command(args):
         return 1
     source_map = {}
 
+    if args.contract_address and not args.interactive:
+        if not is_address(args.contract_address):
+            print(error(f'Contract not found: {args.contract_address}'))
+            print("Please verify:")
+            print("  - The address is correct")
+            print("  - You're connected to the right network and your contract is deployed")
+            sys.exit(1)
+        
     # Multi-contract mode detection (same as trace_command)
     multi_contract_mode = False
     ethdebug_dirs = []
