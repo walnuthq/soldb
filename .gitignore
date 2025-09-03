@@ -8,3 +8,4 @@ src/soldb.egg-info/PKG-INFO
 
 examples/test_debug/
 test/Output/
+.soldb_cache/
