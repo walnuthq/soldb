@@ -17,6 +17,7 @@ from .multi_contract_ethdebug_parser import MultiContractETHDebugParser
 from .json_serializer import TraceSerializer
 from .colors import error, info
 from .auto_deploy import AutoDeployDebugger
+from eth_utils.address import is_address
 
 
 def find_debug_file(contract_addr: str) -> str:
@@ -594,19 +595,16 @@ def interactive_mode(args,tracer):
         is_contract_file = True
         args.contract_file = contract_arg
     # Check if it's an Ethereum address (starts with 0x and right length)
-    elif contract_arg.startswith('0x') and len(contract_arg) == 42:
-        try:
-            # Validate it's a valid hex address
-            int(contract_arg[2:], 16)
-            is_contract_address = True
-            args.contract_address = contract_arg
-        except ValueError:
-            print(f'Error: Invalid contract address format: {contract_arg}')
-            sys.exit(1)
+    elif contract_arg.startswith('0x'):
+            if is_address(contract_arg):
+                is_contract_address = True
+                args.contract_address = contract_arg
+            else:
+                print(f'Error: Invalid contract address format: {contract_arg}')
+                sys.exit(1)
     else:
-        print(f'Error: Could not determine if "{contract_arg}" is a contract address (0x...) or Solidity file (.sol)')
+        print(f'Error: Invalid contract address')
         print('  - Contract addresses should start with 0x and be 42 characters long')
-        print('  - Solidity files should end with .sol and exist on the filesystem')
         sys.exit(1)
 
     if not getattr(args, 'function_signature', None):
@@ -737,7 +735,7 @@ def main():
     simulate_parser.add_argument('--save-config', action='store_true', help='Save configuration to walnut.config.yaml')
     simulate_parser.add_argument('--verify-version', action='store_true', help='Verify solc version supports ETHDebug and exit')
     simulate_parser.add_argument('--no-cache', action='store_true', default=False, help='Enable deployment cache')
-    simulate_parser.add_argument('--cache-dir', default='.walnut_cache', help='Cache directory')
+    simulate_parser.add_argument('--cache-dir', default='.soldb_cache', help='Cache directory')
     simulate_parser.add_argument('--fork-url', help='Upstream RPC URL to fork (launch anvil)')
     simulate_parser.add_argument('--fork-block', type=int, help='Specific block number to fork')
     simulate_parser.add_argument('--fork-port', type=int, default=8545, help='Local fork port (default: 8545)')
