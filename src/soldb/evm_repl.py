@@ -18,14 +18,15 @@ class EVMDebugger(cmd.Cmd):
     
     intro = f"""
 {bold('SolDB EVM Debugger')} - Solidity Debugger
-Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging.
-    """
+Type {info('help')} for commands.
+Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('where')} to see call stack.
+"""
     prompt = f'{cyan("(soldb)")} '
     
     def __init__(self, contract_address: str = None, debug_file: str = None, 
                  rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
                  multi_contract_parser = None,function_name: str = None, function_args: List[str] = [],
-                 interactive_mode: bool = False, abi_path: str = None, from_addr: str = None, block: int = None,
+                 abi_path: str = None, from_addr: str = None, block: int = None,
                  tracer: TransactionTracer = None):
         super().__init__()
 
@@ -69,7 +70,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
         self.current_function = None  # Current function context
         self.function_name = function_name
         self.function_args = function_args
-        self.interactive_mode = interactive_mode
+        self.init = False
         self.abi_path = abi_path
         self.from_addr = from_addr
         self.block = block
@@ -114,9 +115,6 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
         # Only print debug mappings message if we loaded them here (not passed from main)
         if self.source_map and not ethdebug_dir:
             print(f"Loaded {success(str(len(self.source_map)))} debug mappings")
-
-        # Set initial message
-        self._set_intro_message()
     
     def _load_source_files(self):
         """Load all source files referenced in debug info."""
@@ -134,40 +132,14 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to start debugging
                 with open(source_file, 'r') as f:
                     self.source_lines[source_file] = f.readlines()
                 print(f"Loaded source: {info(source_file)}")
-
-    def _set_intro_message(self):
-        """Set the intro message based on command used."""
-        if self.interactive_mode:
-            self.intro = f"""
-{bold('SolDB EVM Debugger')} - Solidity Debugger
-Type {info('help')} for commands. Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('where')} to see call stack.
-"""
-            return
-        if self.current_trace:
-            # Trace is already loaded
-            self.intro = f"""
-{bold('SoldDB EVM Debugger')} - Solidity Debugger
-Trace loaded and ready for debugging. Type {info('help')} for commands.
-Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('where')} to see call stack.
-    """
-        else:
-            # No trace loaded, need to load one               
-            self.intro = f"""{bold('SoldDB EVM Debugger')} - Solidity Debugger
-Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific transaction for debugging.
-"""
-
     
     def do_run(self, tx_hash: str):
         """Run/load a transaction for debugging. Usage: run <tx_hash>"""
 
-        if self.interactive_mode:
-            return
-            
-        if not tx_hash:
-            print("Usage: run <tx_hash>")
+        # Skip if debug session already started
+        if self.init:
             return
         
-        print(f"Loading transaction {info(tx_hash)}...")
         try:
             self.current_trace = self.tracer.trace_transaction(tx_hash)
             self.current_step = 0
@@ -176,14 +148,13 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
             self.function_trace = self.tracer.analyze_function_calls(self.current_trace)
             
             print(f"{success('Transaction loaded.')} {highlight(str(len(self.current_trace.steps)))} steps.")
-            print(f"Type {info('continue')} to run, {info('next')} to step by source line, {info('nexti')} to step by instruction")
             
             # Start at the first function call after dispatcher
             if len(self.function_trace) > 1:
                 self.current_step = self.function_trace[1].entry_step
                 self.current_function = self.function_trace[1]
-            
-            self._show_current_state()
+
+            self.init = True
         except Exception as e:
             print(f"{error('Error loading transaction:')} {e}")
 
@@ -235,6 +206,7 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
                 # If no function dispatcher, start at beginning but avoid end-of-execution
                 self.current_step = 0
 
+            self.init = True
         except Exception as e:
             print(f"{error('Error in simulation:')} {e}")
             import traceback
@@ -1543,12 +1515,12 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
 
     def cmdloop(self, intro=None):
         """Override cmdloop to show current state after intro but before first prompt."""
-        if self.interactive_mode:
+        if self.init:
             # Call parent cmdloop with intro
             if intro is not None:
                 self.intro = intro
             # Print intro if it exists
-            if self.intro:
+            if self.intro:    
                 self.stdout.write(str(self.intro)+"\n")
             # Show current state after intro but before first prompt
             if self.current_trace:
