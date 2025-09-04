@@ -660,7 +660,7 @@ def interactive_mode(args,tracer):
             print(error(f"Debug session failed: {e}"))
             return 1
     elif is_contract_address:
-        if not args.ethdebug_dir:
+        if not args.ethdebug_dir and not args.contracts:
             print(error("Error: --ethdebug-dir is required when using --contract-address."))
             return 1
         if args.constructor_args:
