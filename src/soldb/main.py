@@ -57,7 +57,7 @@ def trace_command(args):
     
     # Trace transaction
     if not args.json:
-        print(f"Loading transaction {args.tx_hash}...")
+        print(f"Loading transaction {info(args.tx_hash)}...")
         sys.stdout.flush()  # Ensure output order
     
     try:
@@ -257,6 +257,7 @@ def trace_command(args):
             debugger.current_step = function_calls[1].entry_step
             debugger.current_function = function_calls[1]
         
+        debugger.do_run(trace.tx_hash)
         # Start REPL
         try:
             debugger.cmdloop()
@@ -677,7 +678,6 @@ def interactive_mode(args,tracer):
         ethdebug_dir=ethdebug_dir,
         function_name=getattr(args, 'function_signature', None),
         function_args=getattr(args, 'function_args', []),
-        interactive_mode=True,
         abi_path=abi_path,
         from_addr=args.from_addr,
         block=args.block,
