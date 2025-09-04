@@ -551,13 +551,30 @@ Type {info('help')} for commands. Use {info('run <tx_hash>')} to load a specific
         
         if source_info:
             _, line_num = source_info
-            # Show 5 lines before and after
-            start = max(0, line_num - 5)
-            end = min(len(self.source_lines), line_num + 5)
             
-            for i in range(start, end):
-                marker = "=>" if i + 1 == line_num else "  "
-                print(f"{marker} {i+1:4d}: {self.source_lines[i].rstrip()}")
+            # Find the source file that contains this line number
+            source_lines = None
+            source_file = None
+            for file_path, lines in self.source_lines.items():
+                if 0 < line_num <= len(lines):
+                    source_lines = lines
+                    source_file = file_path
+                    break
+            
+            if source_lines:
+                # Show 5 lines before and after
+                start = max(0, line_num - 5)
+                end = min(len(source_lines), line_num + 5)
+                
+                # Show filename if multiple files
+                if len(self.source_lines) > 1:
+                    print(f"File: {os.path.basename(source_file)}")
+                
+                for i in range(start, end):
+                    marker = "=>" if i + 1 == line_num else "  "
+                    print(f"{marker} {i+1:4d}: {source_lines[i].rstrip()}")
+            else:
+                print(f"No source file found for line {line_num}")
         else:
             print(f"No source mapping for PC {step.pc}")
     
