@@ -1450,6 +1450,18 @@ class TransactionTracer:
                     main_function_name = f"function_{main_selector}"
             
             # Create main function call with call_id = 1
+            # Try to get source line for the main function if we have debug info
+            main_source_line = None
+            if self.multi_contract_parser:
+                # In multi-contract mode, check if we have debug info for the target contract
+                target_contract = self.multi_contract_parser.get_contract_at_address(trace.to_addr)
+                if target_contract:
+                    # We have debug info for this contract, mark it as verified
+                    main_source_line = 1  # Use a placeholder to indicate we have debug info
+            elif self.ethdebug_info:
+                # Single contract mode with debug info
+                main_source_line = 1  # Use a placeholder to indicate we have debug info
+            
             main_call = FunctionCall(
                 name=main_function_name,
                 selector=main_selector,
@@ -1458,7 +1470,7 @@ class TransactionTracer:
                 gas_used=0,
                 depth=1,  # Depth 1 since it's under dispatcher
                 args=[],  # Will be decoded later
-                source_line=None,
+                source_line=main_source_line,
                 call_type="external",  # Main entry from transaction
                 call_id=next_call_id,  # This will be 1
                 parent_call_id=dispatcher_call.call_id,
@@ -1825,7 +1837,14 @@ class TransactionTracer:
                         
                         if self.ethdebug_info:
                             context = self.ethdebug_parser.get_source_context(step.pc, context_lines=0)
-                            if context and context['line'] > 8:
+                            if context and context.get('line'):
+                                source_line = context['line']
+                                should_add_main_function = True
+                        elif self.multi_contract_parser:
+                            # Multi-contract mode: get source info for the contract being called
+                            contract_address = self.get_current_contract_address(trace, i)
+                            context = self.multi_contract_parser.get_source_info_for_address(contract_address, step.pc)
+                            if context and context.get('line'):
                                 source_line = context['line']
                                 should_add_main_function = True
                         else:
