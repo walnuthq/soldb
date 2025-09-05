@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from soldb.colors import warning
+
 
 @dataclass
 class SourceLocation:
@@ -142,8 +144,30 @@ class ETHDebugParser:
         environment = None
 
         if contract_name:
-            runtime_file = debug_dir / f"{contract_name}_ethdebug-runtime.json"
-            create_file = debug_dir / f"{contract_name}_ethdebug.json"
+            # Find source that contains contract_name in its path
+            target_source_id = None
+            for source_id, source_path in sources.items():
+                if contract_name.lower() in source_path.lower():
+                    target_source_id = source_id
+                    break
+            
+            if target_source_id is None:
+                # Fallback: try to find by filename
+                for source_id, source_path in sources.items():
+                    filename = os.path.splitext(os.path.basename(source_path))[0]
+                    if filename.lower() == contract_name.lower():
+                        target_source_id = source_id
+                        break
+            
+            if target_source_id is None:
+                raise FileNotFoundError(f"No source found containing contract name '{contract_name}' in sources: {list(sources.values())}")
+            
+            # Use the found source to determine contract name
+            target_source_path = sources[target_source_id]
+            contract_name_from_source = os.path.splitext(os.path.basename(target_source_path))[0]
+            
+            runtime_file = debug_dir / f"{contract_name_from_source}_ethdebug-runtime.json"
+            create_file = debug_dir / f"{contract_name_from_source}_ethdebug.json"
             if runtime_file.exists():
                 debug_file = runtime_file
                 environment = 'runtime'
@@ -151,7 +175,7 @@ class ETHDebugParser:
                 debug_file = create_file
                 environment = 'create'
             else:
-                raise FileNotFoundError(f"No ethdebug file found for contract {contract_name} in {debug_dir}")
+                raise FileNotFoundError(f"No ethdebug file found for contract {contract_name_from_source} in {debug_dir}")
         else:
             ethdebug_files = list(debug_dir.glob("*_ethdebug.json"))
             runtime_files = list(debug_dir.glob("*_ethdebug-runtime.json"))
@@ -192,9 +216,12 @@ class ETHDebugParser:
         # Parse variable locations (if available)
         variable_locations = self._parse_variable_locations(contract_data)
         
+        # Use provided contract_name or fallback to filename
+        final_contract_name = contract_name if contract_name else contract_name_from_file
+        
         self.debug_info = ETHDebugInfo(
             compilation=compilation_data['compilation'],
-            contract_name=contract_name_from_file,
+            contract_name=final_contract_name,
             environment=environment,
             instructions=instructions,
             sources=sources,
@@ -262,56 +289,142 @@ class ETHDebugParser:
     def load_source_file(self, source_path: str) -> List[str]:
         """Load and cache source file lines."""
         if source_path not in self.source_cache:
-            found = False
-            
-            # Try to find the source file
-            if os.path.exists(source_path):
-                with open(source_path) as f:
-                    self.source_cache[source_path] = f.readlines()
-                found = True
-            else:
-                # If we have debug directory info, try relative to that first
-                if hasattr(self, 'debug_dir') and self.debug_dir:
-                    debug_relative_path = os.path.join(self.debug_dir, '..', source_path)
-                    debug_relative_path = os.path.normpath(debug_relative_path)
-                    if os.path.exists(debug_relative_path):
-                        with open(debug_relative_path) as f:
-                            self.source_cache[source_path] = f.readlines()
-                        found = True
-                
-                if not found:
-                    # Try walking up parent directories to find the file
-                    filename = os.path.basename(source_path)
-                    current_dir = os.getcwd()
-                    
-                    # Check current directory and up to 3 levels of parent directories
-                    for _ in range(4):
-                        # Also check subdirectories at each level
-                        for root, dirs, files in os.walk(current_dir):
-                            if filename in files:
-                                full_path = os.path.join(root, filename)
-                                with open(full_path) as f:
-                                    self.source_cache[source_path] = f.readlines()
-                                found = True
-                                break
-                            # Don't go too deep
-                            if root.count(os.sep) - current_dir.count(os.sep) > 2:
-                                break
-                        
-                        if found:
-                            break
-                        
-                        # Move up one directory
-                        parent = os.path.dirname(current_dir)
-                        if parent == current_dir:  # Reached root
-                            break
-                        current_dir = parent
-                
-                if not found:
-                    #print(f"Warning: Source file not found: {source_path}")
-                    self.source_cache[source_path] = []
-        
+            self.source_cache[source_path] = self._find_and_load_source_file(source_path)
         return self.source_cache[source_path]
+    
+    def _find_and_load_source_file(self, source_path: str) -> List[str]:
+        """Find and load a source file from various possible locations."""
+        # Try direct path first
+        result = self._try_load_file(Path(source_path))
+        if result:
+            return result
+        
+        # If we have debug directory info, try relative to that first
+        if hasattr(self, 'debug_dir') and self.debug_dir:
+            debug_relative_path = os.path.join(self.debug_dir, '..', source_path)
+            debug_relative_path = os.path.normpath(debug_relative_path)
+            if os.path.exists(debug_relative_path):
+                with open(debug_relative_path) as f:
+                    return f.readlines()
+            
+            # Fallback to the old method
+            debug_dir = Path(self.debug_dir)
+            filename = os.path.basename(source_path)
+            contract_name = filename.replace('.sol', '')
+            
+            # Get all possible search locations
+            search_locations = self._get_source_search_locations(debug_dir, filename, source_path)
+            
+            # Try each location
+            for location in search_locations:
+                result = self._try_load_file(location)
+                if result:
+                    return result
+                
+                # If it's a directory, try to find matching .sol file
+                if location.exists() and location.is_dir():
+                    result = self._find_matching_sol_file(location, contract_name)
+                    if result:
+                        return result
+        
+        # Fallback: search in current directory and parent directories
+        filename = os.path.basename(source_path)
+        current_dir = os.getcwd()
+        
+        for _ in range(4):
+            for root, dirs, files in os.walk(current_dir):
+                if filename in files:
+                    full_path = Path(root) / filename
+                    result = self._try_load_file(full_path)
+                    if result:
+                        return result
+                # Don't go too deep
+                if root.count(os.sep) - current_dir.count(os.sep) > 2:
+                    break
+            
+            # Move up one directory
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir:  # Reached root
+                break
+            current_dir = parent
+        
+        # Not found
+        print(warning(f"Warning: Source file not found: {source_path}"))
+        print(f"  Searched in debug directory: {getattr(self, 'debug_dir', 'None')}")
+        return []
+    
+    def _get_source_search_locations(self, debug_dir: Path, filename: str, source_path: str) -> List[Path]:
+        """Get all possible locations to search for source files."""
+        locations = []
+        
+        
+        # Direct file paths
+        locations.extend([
+            debug_dir / filename,
+            debug_dir.parent / filename,
+            debug_dir.parent.parent / filename,
+            debug_dir.parent.parent / source_path,  # Try the full source path from parent
+        ])
+        
+        # Common source directory patterns
+        base_paths = [
+            debug_dir.parent / "src",
+            debug_dir.parent.parent / "src", 
+            debug_dir.parent.parent / "contracts",
+            debug_dir.parent.parent / "contracts" / "src",
+            debug_dir.parent.parent / "src" / "contracts",
+            debug_dir.parent.parent / "src" / "contracts" / "src",
+        ]
+        
+        
+        for base_path in base_paths:
+            locations.extend([
+                base_path / filename,
+                base_path / source_path,  # Original source path
+            ])
+        
+        # Generic fallback: try to find files with similar names in parent directories
+        # This handles cases where source paths in metadata don't match actual file locations
+        if "/" in source_path:
+            # Try to find files with the same name in sibling directories
+            source_parts = source_path.split("/")
+            if len(source_parts) >= 2:
+                # Get the directory structure up to the filename
+                for i in range(len(source_parts) - 1):
+                    # Try different variations of the path
+                    for j in range(i + 1, len(source_parts)):
+                        # Create alternative path by replacing directory names
+                        alt_parts = source_parts[:i] + source_parts[j:]
+                        alt_path = "/".join(alt_parts)
+                        locations.append(debug_dir.parent.parent / alt_path)
+                        
+                        # Also try with just the filename in the parent directory
+                        parent_dir = "/".join(source_parts[:i]) if i > 0 else ""
+                        if parent_dir:
+                            locations.append(debug_dir.parent.parent / parent_dir / filename)
+        
+        return locations
+    
+    def _try_load_file(self, file_path: Path) -> Optional[List[str]]:
+        """Try to load a file and return its contents or None if failed."""
+        if file_path.exists() and file_path.is_file():
+            try:
+                with open(file_path) as f:
+                    return f.readlines()
+            except (IsADirectoryError, PermissionError, UnicodeDecodeError) as e:
+                print(warning(f"Warning: Cannot read source file {file_path}: {e}"))
+        return None
+    
+    def _find_matching_sol_file(self, directory: Path, contract_name: str) -> Optional[List[str]]:
+        """Find a matching .sol file in a directory by contract name."""
+        try:
+            for file in directory.iterdir():
+                if file.is_file() and file.suffix == '.sol':
+                    if contract_name in file.stem or file.stem in contract_name:
+                        return self._try_load_file(file)
+        except (OSError, PermissionError) as e:
+            print(warning(f"Warning: Cannot list directory {directory}: {e}"))
+        return None
     
     def offset_to_line_col(self, source_path: str, offset: int) -> Tuple[int, int]:
         """Convert byte offset to line and column in source file."""
