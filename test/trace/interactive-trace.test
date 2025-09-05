@@ -1,0 +1,16 @@
+# Test soldb trace interactive mode
+# REQUIRES: soldb
+# Trace a transaction in interactive mode and check initial output
+# RUN: echo "quit" | %soldb trace %{test_tx} --rpc %{rpc_url} -i 2>&1 | FileCheck %s
+
+# Check for interactive debugger startup
+# CHECK: Starting interactive debugger...
+# CHECK: Contract found: {{0x[a-fA-F0-9]+}}
+# CHECK: Transaction loaded. {{[0-9]+}} steps.
+
+
+# Check for initial step display with proper formatting
+# CHECK: Step 0/{{[0-9]+}}
+# CHECK: PC: {{[0-9]+}} | {{[A-Z0-9]+}} | Gas: {{[0-9]+}} |
+
+
