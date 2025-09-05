@@ -1,6 +1,6 @@
 cache/
-debug/
-debug*/
+examples/debug/
+examples/debug*/
 out/
 __pycache__/
 *.txt
@@ -10,3 +10,4 @@ examples/test_debug/
 test/Output/
 test/lit.site.cfg.py
 .soldb_cache/
+.DS_Store

@@ -2031,12 +2031,13 @@ class TransactionTracer:
         to_addr = self.extract_address_from_stack(step.stack[-2])
         calldata = self.extract_calldata_from_step(step)
 
-        # Get contract name if available
+        # Get contract name and check if we have debug info for target contract
         contract_name = self.format_address_display(to_addr)
+        target_contract_info = None
         if self.multi_contract_parser:
-            contract_info = self.multi_contract_parser.get_contract_at_address(to_addr)
-            if contract_info:
-                contract_name = contract_info.name
+            target_contract_info = self.multi_contract_parser.get_contract_at_address(to_addr)
+            if target_contract_info:
+                contract_name = target_contract_info.name
 
         # Try to decode function signature
         decoded_params = []
@@ -2049,15 +2050,25 @@ class TransactionTracer:
             if selector == '0x00000000':
                 func_name = "function_0x"
                 decoded_params = []
-            elif selector in self.function_signatures:
-                func_name = self.function_signatures[selector]['name']
-                # Decode the actual function parameters from calldata
-                decoded_params = self.decode_function_parameters(selector, calldata)
             else:
-                # Try 4byte directory lookup
-                func_name = self.lookup_function_signature(selector) or f"function_{selector}"
-                # For unknown functions, return empty decoded_params
-                decoded_params = []
+                # Try main contract's function signatures first
+                if selector in self.function_signatures:
+                    func_name = self.function_signatures[selector]['name']
+                    # Decode the actual function parameters from calldata
+                    decoded_params = self.decode_function_parameters(selector, calldata)
+                else:
+                    # Try 4byte directory lookup
+                    func_name = self.lookup_function_signature(selector)
+                    if not func_name:
+                        # Unknown function
+                        func_name = f"function_{selector}"
+                    
+                    # For any function where we don't have full ABI to decode params,
+                    # show raw arguments (especially important for verified contracts)
+                    if calldata and not decoded_params:
+                        param_data_hex = calldata[10:]  # Skip selector
+                        if param_data_hex:
+                            decoded_params = [("arguments", f"0x{param_data_hex}")]
         else:
             # No calldata, show empty selector instead of unknown
             func_name = "function_0x"

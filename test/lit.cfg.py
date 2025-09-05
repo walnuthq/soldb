@@ -45,6 +45,7 @@ else:
 
 # RPC and chain configuration
 config.substitutions.append(('%{rpc_url}', getattr(config, 'rpc_url', 'http://localhost:8547')))
+config.substitutions.append(('%{sepolia_rpc_url}', getattr(config, 'sepolia_rpc_url', '')))
 config.substitutions.append(('%{chain_id}', getattr(config, 'chain_id', '412346')))
 config.substitutions.append(('%{private_key}', getattr(config, 'private_key', '')))
 
@@ -64,6 +65,10 @@ config.substitutions.append(('%S', config.test_source_root))
 config.substitutions.append(('%p', config.test_source_root))
 config.substitutions.append(('%{inputs}', os.path.join(config.test_source_root, 'Inputs')))
 
+# Project root directory (parent of test directory)
+project_root = os.path.dirname(config.test_source_root)
+config.substitutions.append(('%{project_root}', project_root))
+
 # Platform-specific features
 if platform.system() == 'Darwin':
     config.available_features.add('darwin')
@@ -82,6 +87,10 @@ def check_soldb():
 
 if check_soldb():
     config.available_features.add('soldb')
+
+# Check if Sepolia RPC is configured
+if hasattr(config, 'sepolia_rpc_url') and config.sepolia_rpc_url:
+    config.available_features.add('sepolia-rpc')
 
 # Add 'not' command
 not_path = shutil.which('not')
