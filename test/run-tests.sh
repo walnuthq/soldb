@@ -10,11 +10,16 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 RUN_TRACE_TESTS=true
 RUN_SIMULATE_TESTS=true
 VERBOSE=false
+SEPOLIA_KEY=""
 
 for arg in "$@"; do
     case $arg in
         SOLC_PATH=*)
             SOLC_PATH="${arg#*=}"
+            shift
+            ;;
+        --sepolia-key=*)
+            SEPOLIA_KEY="${arg#*=}"
             shift
             ;;
         --trace-only)
@@ -35,6 +40,7 @@ for arg in "$@"; do
             echo "Options:"
             echo "  --trace-only       Run only trace tests (from test/trace/)"
             echo "  --simulate-only    Run only simulate tests (from test/simulate/)"
+            echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
             echo "  -v, --verbose      Run tests with verbose output"
             echo "  -h, --help         Show this help message"
             echo ""
@@ -46,6 +52,7 @@ for arg in "$@"; do
             echo "  RPC_URL            RPC endpoint (default: http://localhost:8545)"
             echo "  SOLC_PATH          Path to solc binary (default: solc)"
             echo "  TEST_TX            Specific transaction hash to test"
+            echo "  SEPOLIA_KEY        Optimism Sepolia API key (can also use --sepolia-key)"
             echo ""
             echo "Examples:"
             echo "  $0                           # Run all tests"
@@ -67,6 +74,18 @@ echo -e "${BLUE}Using RPC: ${RPC_URL}${NC}"
 CHAIN_ID="${CHAIN_ID:-1}"
 PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 SOLC_PATH="${SOLC_PATH:-solc}"
+
+# Use environment variable if no command line option provided
+SEPOLIA_KEY="${SEPOLIA_KEY:-${SEPOLIA_KEY_ENV:-}}"
+
+# Construct Sepolia RPC URL if key is provided
+if [ -n "$SEPOLIA_KEY" ]; then
+    SEPOLIA_RPC_URL="https://opt-sepolia.g.alchemy.com/v2/${SEPOLIA_KEY}"
+    echo -e "${GREEN}Sepolia RPC configured${NC}"
+else
+    SEPOLIA_RPC_URL=""
+    echo -e "${YELLOW}No Sepolia API key provided (use --sepolia-key=KEY to enable remote tests)${NC}"
+fi
 
 # Export SOLC_PATH so it's available to the Python config
 export SOLC_PATH
@@ -203,6 +222,7 @@ elif os.path.exists(os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')):
 else:
     config.soldb = "${SOLDB_CMD}"
 config.rpc_url = "${RPC_URL}"
+config.sepolia_rpc_url = "${SEPOLIA_RPC_URL}"
 config.chain_id = "${CHAIN_ID}"
 config.private_key = "${PRIVATE_KEY}"
 config.test_contracts = {

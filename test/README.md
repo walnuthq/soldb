@@ -51,6 +51,16 @@ cd test
 ./run-tests.sh -v
 ```
 
+### Run Remote Tests with Sepolia API Key
+```bash
+# Via command line option
+./run-tests.sh --sepolia-key=YOUR_API_KEY
+
+# Via environment variable
+export SEPOLIA_KEY_ENV=YOUR_API_KEY
+./run-tests.sh
+```
+
 ### Run Individual Tests
 ```bash
 # Run a specific test file
@@ -75,6 +85,7 @@ lit simulate/
 
 The tests use the following environment:
 - **RPC URL**: `http://localhost:8545` (configurable via `RPC_URL` environment variable)
+- **Sepolia RPC**: Optimism Sepolia testnet (requires API key via `--sepolia-key` or `SEPOLIA_KEY_ENV`)
 - **Private Key**: Default Anvil private key for deployment
 - **Contract**: TestContract from `examples/TestContract.sol`
 - **Debug Format**: ETHDebug for source mapping
@@ -100,7 +111,9 @@ The test suite uses the following configuration files:
    - `%{test_tx}` - Test transaction hash
    - `%{ethdebug_dir}` - ETHDebug directory path
    - `%{rpc_url}` - RPC endpoint URL
-   - {contract_address}` - Contract address
+   - `%{sepolia_rpc_url}` - Optimism Sepolia RPC URL (when API key is provided)
+   - `%{contract_address}` - Contract address
+   - `%{project_root}` - Project root directory path
 
 ### Test Format Example
 ```bash
