@@ -7,9 +7,11 @@ Interactive REPL for debugging EVM transactions with source mapping.
 import cmd
 import os
 import json
+from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from .transaction_tracer import TransactionTracer, TransactionTrace, SourceMapper
 from .dwarf_parser import load_dwarf_info, DwarfParser
+from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from .colors import *
 from web3 import Web3
 
@@ -45,7 +47,18 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
                     self.tracer.ethdebug_info = main_contract.ethdebug_info
                     self.tracer.ethdebug_parser = main_contract.parser
                     # Load source_map from the main contract
-                    self.source_map = main_contract.ethdebug_info.pc_to_line if main_contract.ethdebug_info else {}
+                    self.source_map = main_contract.parser.get_source_mapping() if main_contract.parser else {}
+                    
+                    # Load ABI for the main contract using ETHDebugDirParser
+                    abi_path = ETHDebugDirParser.find_abi_file(
+                        ETHDebugSpec(path=str(main_contract.debug_dir)), 
+                        main_contract.name
+                    )
+                    if abi_path:
+                        self.tracer.load_abi(abi_path)
+                else:
+                    # No debug info for this contract
+                    self.source_map = {}
         self.current_trace = None
         self.current_step = 0
         self.breakpoints = set()
@@ -92,18 +105,24 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         if ethdebug_dir and not multi_contract_parser:
             # Use provided contract_name or extract from ethdebug_dir if in address:name:path format
             if not self.contract_name and ":" in ethdebug_dir and ethdebug_dir.startswith("0x"):
-                parts = ethdebug_dir.split(":")
-                if len(parts) >= 3:
-                    self.contract_name = parts[1]  # Extract name part
-                    ethdebug_dir = parts[2]  # Extract path part
-                elif len(parts) == 2:
-                    ethdebug_dir = parts[1]  # Extract path part
+                try:
+                    spec = ETHDebugDirParser.parse_single_contract(ethdebug_dir)
+                    self.contract_name = spec.name
+                    ethdebug_dir = spec.path
+                except ValueError:
+                    # Fallback to old parsing for backward compatibility
+                    parts = ethdebug_dir.split(":")
+                    if len(parts) >= 3:
+                        self.contract_name = parts[1]  # Extract name part
+                        ethdebug_dir = parts[2]  # Extract path part
+                    elif len(parts) == 2:
+                        ethdebug_dir = parts[1]  # Extract path part
             self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir, self.contract_name)
             # Load ABI from ethdebug directory
-            if self.tracer.ethdebug_info:
-                abi_path = os.path.join(ethdebug_dir, f"{self.tracer.ethdebug_info.contract_name}.abi")
-                if os.path.exists(abi_path):
-                    self.tracer.load_abi(abi_path)
+            contract_name = self.tracer.ethdebug_info.contract_name if self.tracer.ethdebug_info else None
+            abi_path = ETHDebugDirParser.find_abi_file(ETHDebugSpec(path=ethdebug_dir), contract_name)
+            if abi_path:
+                self.tracer.load_abi(abi_path)
             
         elif debug_file:
             self.source_map = self.tracer.load_debug_info(debug_file)

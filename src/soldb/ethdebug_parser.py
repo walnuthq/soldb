@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from soldb.colors import warning
+from soldb.source_file_loader import source_loader
 
 
 @dataclass
@@ -287,144 +288,9 @@ class ETHDebugParser:
         return variable_locations
     
     def load_source_file(self, source_path: str) -> List[str]:
-        """Load and cache source file lines."""
-        if source_path not in self.source_cache:
-            self.source_cache[source_path] = self._find_and_load_source_file(source_path)
-        return self.source_cache[source_path]
+        """Load and cache source file lines using centralized loader."""
+        return source_loader.load_source_file(source_path, getattr(self, 'debug_dir', None))
     
-    def _find_and_load_source_file(self, source_path: str) -> List[str]:
-        """Find and load a source file from various possible locations."""
-        # Try direct path first
-        result = self._try_load_file(Path(source_path))
-        if result:
-            return result
-        
-        # If we have debug directory info, try relative to that first
-        if hasattr(self, 'debug_dir') and self.debug_dir:
-            debug_relative_path = os.path.join(self.debug_dir, '..', source_path)
-            debug_relative_path = os.path.normpath(debug_relative_path)
-            if os.path.exists(debug_relative_path):
-                with open(debug_relative_path) as f:
-                    return f.readlines()
-            
-            # Fallback to the old method
-            debug_dir = Path(self.debug_dir)
-            filename = os.path.basename(source_path)
-            contract_name = filename.replace('.sol', '')
-            
-            # Get all possible search locations
-            search_locations = self._get_source_search_locations(debug_dir, filename, source_path)
-            
-            # Try each location
-            for location in search_locations:
-                result = self._try_load_file(location)
-                if result:
-                    return result
-                
-                # If it's a directory, try to find matching .sol file
-                if location.exists() and location.is_dir():
-                    result = self._find_matching_sol_file(location, contract_name)
-                    if result:
-                        return result
-        
-        # Fallback: search in current directory and parent directories
-        filename = os.path.basename(source_path)
-        current_dir = os.getcwd()
-        
-        for _ in range(4):
-            for root, dirs, files in os.walk(current_dir):
-                if filename in files:
-                    full_path = Path(root) / filename
-                    result = self._try_load_file(full_path)
-                    if result:
-                        return result
-                # Don't go too deep
-                if root.count(os.sep) - current_dir.count(os.sep) > 2:
-                    break
-            
-            # Move up one directory
-            parent = os.path.dirname(current_dir)
-            if parent == current_dir:  # Reached root
-                break
-            current_dir = parent
-        
-        # Not found
-        print(warning(f"Warning: Source file not found: {source_path}"))
-        print(f"  Searched in debug directory: {getattr(self, 'debug_dir', 'None')}")
-        return []
-    
-    def _get_source_search_locations(self, debug_dir: Path, filename: str, source_path: str) -> List[Path]:
-        """Get all possible locations to search for source files."""
-        locations = []
-        
-        
-        # Direct file paths
-        locations.extend([
-            debug_dir / filename,
-            debug_dir.parent / filename,
-            debug_dir.parent.parent / filename,
-            debug_dir.parent.parent / source_path,  # Try the full source path from parent
-        ])
-        
-        # Common source directory patterns
-        base_paths = [
-            debug_dir.parent / "src",
-            debug_dir.parent.parent / "src", 
-            debug_dir.parent.parent / "contracts",
-            debug_dir.parent.parent / "contracts" / "src",
-            debug_dir.parent.parent / "src" / "contracts",
-            debug_dir.parent.parent / "src" / "contracts" / "src",
-        ]
-        
-        
-        for base_path in base_paths:
-            locations.extend([
-                base_path / filename,
-                base_path / source_path,  # Original source path
-            ])
-        
-        # Generic fallback: try to find files with similar names in parent directories
-        # This handles cases where source paths in metadata don't match actual file locations
-        if "/" in source_path:
-            # Try to find files with the same name in sibling directories
-            source_parts = source_path.split("/")
-            if len(source_parts) >= 2:
-                # Get the directory structure up to the filename
-                for i in range(len(source_parts) - 1):
-                    # Try different variations of the path
-                    for j in range(i + 1, len(source_parts)):
-                        # Create alternative path by replacing directory names
-                        alt_parts = source_parts[:i] + source_parts[j:]
-                        alt_path = "/".join(alt_parts)
-                        locations.append(debug_dir.parent.parent / alt_path)
-                        
-                        # Also try with just the filename in the parent directory
-                        parent_dir = "/".join(source_parts[:i]) if i > 0 else ""
-                        if parent_dir:
-                            locations.append(debug_dir.parent.parent / parent_dir / filename)
-        
-        return locations
-    
-    def _try_load_file(self, file_path: Path) -> Optional[List[str]]:
-        """Try to load a file and return its contents or None if failed."""
-        if file_path.exists() and file_path.is_file():
-            try:
-                with open(file_path) as f:
-                    return f.readlines()
-            except (IsADirectoryError, PermissionError, UnicodeDecodeError) as e:
-                print(warning(f"Warning: Cannot read source file {file_path}: {e}"))
-        return None
-    
-    def _find_matching_sol_file(self, directory: Path, contract_name: str) -> Optional[List[str]]:
-        """Find a matching .sol file in a directory by contract name."""
-        try:
-            for file in directory.iterdir():
-                if file.is_file() and file.suffix == '.sol':
-                    if contract_name in file.stem or file.stem in contract_name:
-                        return self._try_load_file(file)
-        except (OSError, PermissionError) as e:
-            print(warning(f"Warning: Cannot list directory {directory}: {e}"))
-        return None
     
     def offset_to_line_col(self, source_path: str, offset: int) -> Tuple[int, int]:
         """Convert byte offset to line and column in source file."""

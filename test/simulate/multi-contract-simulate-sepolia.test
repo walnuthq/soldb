@@ -1,5 +1,5 @@
 # Test multi-contract simulation functionality
-# REQUIRES: soldb
+# REQUIRES: soldb, sepolia-rpc
 # RUN: %soldb simulate 0x59A714559B46c823d87986b5c5B7C630e2f5668d "processOrder(uint256,string,string)" 10 "express" "electronic" --from 0x286AF310eA3303c80eBE9a66F6998B21Bd8c1c29 --rpc %{sepolia_rpc_url} --ethdebug-dir 0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd:TaxCalculator:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd/debug --ethdebug-dir 0xbE734aD6434E16f6bE04706005faED6fD38eb2B2:ShippingManager:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xbE734aD6434E16f6bE04706005faED6fD38eb2B2/debug 2>&1 | FileCheck %s
 
 # CHECK: Function Call Trace: None
