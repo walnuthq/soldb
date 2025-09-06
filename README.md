@@ -29,7 +29,7 @@ solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime --bin --abi --
 
 Trace a transaction:
 ```bash
-soldb trace <tx_hash> --ethdebug-dir ./out --rpc http://localhost:8545
+soldb trace <tx_hash> --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
 
 ---
@@ -37,7 +37,7 @@ soldb trace <tx_hash> --ethdebug-dir ./out --rpc http://localhost:8545
 ## Example: Debugging a Transaction
 
 ```bash
-soldb trace 0x2832...3994 --ethdebug-dir ./out --rpc http://localhost:8545
+soldb trace 0x2832...3994 --ethdebug-dir 0x3aa5ebb10dc797cac828524e59a333d0a371443c:TestContract:./out --rpc http://localhost:8545
 ```
 
 Output:
@@ -55,7 +55,7 @@ Call Stack:
 
 Interactive mode:
 ```bash
-soldb trace <tx_hash> --ethdebug-dir ./out --rpc http://localhost:8545 --interactive
+soldb trace <tx_hash> --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545 --interactive
 ```
 
 Inside REPL:
@@ -72,7 +72,7 @@ Inside REPL:
 Test contract functions without sending transactions on chain.
 
 ```bash
-soldb simulate <contract_address> "increment(uint256)" 10 --from <sender_address> --ethdebug-dir ./out --rpc http://localhost:8545
+soldb simulate <contract_address> "increment(uint256)" 10 --from <sender_address> --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
 
 Output containing a simulation failure:
@@ -90,13 +90,13 @@ Call Stack:
 
 You can also pass complex types (structs, tuples):
 ```bash
-soldb simulate <contract_address> "submitPerson((string,uint256))" '("Alice", 30)'     --from <sender_address>     --ethdebug-dir ./out     --rpc http://localhost:8545
+soldb simulate <contract_address> "submitPerson((string,uint256))" '("Alice", 30)'     --from <sender_address>     --ethdebug-dir <contract_address>:<contract_name>:./out     --rpc http://localhost:8545
 ```
 
 You can also debug simulations interactively using the `--interactive` flag:
 
 ```bash
-soldb simulate <contract_address> "increment(uint256)" 5     --from <sender_address>     --ethdebug-dir ./out     --rpc http://localhost:8545     --interactive
+soldb simulate <contract_address> "increment(uint256)" 5     --from <sender_address>     --ethdebug-dir <contract_address>:<contract_name>:./out     --rpc http://localhost:8545     --interactive
 ```
 
 Inside REPL:

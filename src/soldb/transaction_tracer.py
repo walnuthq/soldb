@@ -151,6 +151,7 @@ class TransactionTracer:
         self.function_abis_by_name = {}  # function name -> full ABI item
         self._initial_snapshot_id: Optional[str] = None
         self._last_snapshot_id: Optional[str] = None
+        self.missing_mappings_warned = False  # Track if we've already warned about missing mappings
 
     def snapshot_state(self) -> Optional[str]:
         """Take an EVM snapshot (Hardhat/Anvil/Ganache). Returns snapshot id or None if unsupported."""
@@ -288,10 +289,10 @@ class TransactionTracer:
         print(f"Loaded {success(str(len(pc_to_source)))} PC mappings")
         return pc_to_source
     
-    def load_ethdebug_info(self, ethdebug_dir: str) -> Dict[int, Tuple[str, int]]:
+    def load_ethdebug_info(self, ethdebug_dir: str, contract_name: Optional[str] = None) -> Dict[int, Tuple[str, int]]:
         """Load ethdebug format debug information."""
         try:
-            self.ethdebug_info = self.ethdebug_parser.load_ethdebug_files(ethdebug_dir)
+            self.ethdebug_info = self.ethdebug_parser.load_ethdebug_files(ethdebug_dir, contract_name)
             pc_to_source = {}
             
             # Convert ethdebug info to simple PC to source mapping
@@ -308,14 +309,19 @@ class TransactionTracer:
             return pc_to_source
             
         except Exception as e:
-            self._log(f"Warning: Failed to load ethdebug info: {e}")
+            self._log(warning(f"Warning: Failed to load ethdebug info: {e}"))
             return {}
     
     def get_source_context_for_step(self, step: TraceStep, address: Optional[str] = None, context_lines: int = 2) -> Optional[Dict[str, Any]]:
         """Get source context for a step, handling multi-contract scenarios."""
-        if self.multi_contract_parser and address:
-            # Multi-contract mode: get context from specific contract
-            return self.multi_contract_parser.get_source_info_for_address(address, step.pc)
+        if self.multi_contract_parser:
+            # Multi-contract mode: try to get context from specific contract
+            if address:
+                return self.multi_contract_parser.get_source_info_for_address(address, step.pc)
+            else:
+                # Try to detect which contract is executing
+                # This is a fallback when address is not provided
+                return None
         elif self.ethdebug_parser and self.ethdebug_info:
             # Single contract mode
             return self.ethdebug_parser.get_source_context(step.pc, context_lines)
@@ -1392,7 +1398,7 @@ class TransactionTracer:
         current_depth = 0
         context_stack = []
         revert_already_marked = False  # Track if we've already marked a revert frame
-        missing_mappings_warned = False  # Track if we've already warned about missing mappings
+        # Use instance variable to track missing mappings warning
         
         # Track parent-child relationships properly
         active_parents = []  # Stack of active parent call IDs
@@ -1584,11 +1590,11 @@ class TransactionTracer:
                     current_depth += 1
             # Internal functions
             elif step.op == "JUMPDEST":
-                result = self._detect_internal_call(step, i, current_contract, call_stack, missing_mappings_warned)
+                result = self._detect_internal_call(step, i, current_contract, call_stack, self.missing_mappings_warned)
                 if result:
                     # Check if we detected missing mappings
                     if isinstance(result, tuple):
-                        call, missing_mappings_warned = result
+                        call, self.missing_mappings_warned = result
                     else:
                         call = result
                     
@@ -1900,21 +1906,21 @@ class TransactionTracer:
             # Only emit warning if we have ETHDebug info but it's incomplete
             # If there's no ETHDebug at all, we don't need to warn
             # Check if ETHDebug was actually loaded (not just parser created)
-            if (self.ethdebug_info or (self.ethdebug_parser and self.ethdebug_parser.debug_info)) and not missing_mappings_warned:
+            if (self.ethdebug_info or (self.ethdebug_parser and self.ethdebug_parser.debug_info)) and not self.missing_mappings_warned:
                 import sys
                 from .colors import yellow, dim
                 print(f"\n{yellow('Warning:')} Detected incomplete ETHDebug metadata", file=sys.stderr)
                 print(f"{dim('  Some JUMPDEST instructions lack source mappings, which may result in an incomplete trace.')}", file=sys.stderr)
                 print(f"{dim('  This is typically caused by compiler optimizations. Consider recompiling with different settings.')}\n", file=sys.stderr)
-                missing_mappings_warned = True
+                self.missing_mappings_warned = True
             
             # Return with the warning flag
-            return None, missing_mappings_warned
+            return None, self.missing_mappings_warned
 
         # Get function name safely
         func_name = self._extract_function_name(context.get('content', ''))
         if not func_name:
-            return (None, missing_mappings_warned) if missing_mappings_warned else None
+            return (None, self.missing_mappings_warned) if self.missing_mappings_warned else None
 
         # Avoid duplicate entries for the same function at the same contract that are not closed
         already_open = any(
@@ -1922,7 +1928,7 @@ class TransactionTracer:
             for fc in call_stack
         )
         if already_open:
-            return (None, missing_mappings_warned) if missing_mappings_warned else None
+            return (None, self.missing_mappings_warned) if self.missing_mappings_warned else None
         current_func = call_stack[-1].name if call_stack else None
 
         call = FunctionCall(
@@ -1939,7 +1945,7 @@ class TransactionTracer:
         )
         
         # Return with warning flag if it was set
-        return (call, missing_mappings_warned) if missing_mappings_warned else call
+        return (call, self.missing_mappings_warned) if self.missing_mappings_warned else call
 
     # Helper Methods
     def _track_return_location(self, return_pc: int):

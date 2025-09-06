@@ -7,9 +7,11 @@ Interactive REPL for debugging EVM transactions with source mapping.
 import cmd
 import os
 import json
+from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from .transaction_tracer import TransactionTracer, TransactionTrace, SourceMapper
 from .dwarf_parser import load_dwarf_info, DwarfParser
+from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from .colors import *
 from web3 import Web3
 
@@ -27,7 +29,7 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
                  rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
                  multi_contract_parser = None,function_name: str = None, function_args: List[str] = [],
                  abi_path: str = None, from_addr: str = None, block: int = None,
-                 tracer: TransactionTracer = None):
+                 tracer: TransactionTracer = None, contract_name: str = None):
         super().__init__()
 
         if not tracer:
@@ -38,6 +40,25 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         # Set multi-contract parser if provided
         if multi_contract_parser:
             self.tracer.multi_contract_parser = multi_contract_parser
+            # In multi-contract mode, set ethdebug_info to the main contract
+            if contract_address:
+                main_contract = multi_contract_parser.get_contract_at_address(contract_address)
+                if main_contract:
+                    self.tracer.ethdebug_info = main_contract.ethdebug_info
+                    self.tracer.ethdebug_parser = main_contract.parser
+                    # Load source_map from the main contract
+                    self.source_map = main_contract.parser.get_source_mapping() if main_contract.parser else {}
+                    
+                    # Load ABI for the main contract using ETHDebugDirParser
+                    abi_path = ETHDebugDirParser.find_abi_file(
+                        ETHDebugSpec(path=str(main_contract.debug_dir)), 
+                        main_contract.name
+                    )
+                    if abi_path:
+                        self.tracer.load_abi(abi_path)
+                else:
+                    # No debug info for this contract
+                    self.source_map = {}
         self.current_trace = None
         self.current_step = 0
         self.breakpoints = set()
@@ -74,21 +95,34 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         self.abi_path = abi_path
         self.from_addr = from_addr
         self.block = block
+        self.contract_name = contract_name
 
         if self.contract_address and not self.tracer.is_contract_deployed(self.contract_address):
             print(error(f"Error: No contract found at address {self.contract_address}"))
             sys.exit(1)
 
         # Load ETHDebug info if available
-        if ethdebug_dir:
-            if ethdebug_dir.startswith("0x"):
-                ethdebug_dir = ethdebug_dir.split(":")[2]
-            self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir)
+        if ethdebug_dir and not multi_contract_parser:
+            # Use provided contract_name or extract from ethdebug_dir if in address:name:path format
+            if not self.contract_name and ":" in ethdebug_dir and ethdebug_dir.startswith("0x"):
+                try:
+                    spec = ETHDebugDirParser.parse_single_contract(ethdebug_dir)
+                    self.contract_name = spec.name
+                    ethdebug_dir = spec.path
+                except ValueError:
+                    # Fallback to old parsing for backward compatibility
+                    parts = ethdebug_dir.split(":")
+                    if len(parts) >= 3:
+                        self.contract_name = parts[1]  # Extract name part
+                        ethdebug_dir = parts[2]  # Extract path part
+                    elif len(parts) == 2:
+                        ethdebug_dir = parts[1]  # Extract path part
+            self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir, self.contract_name)
             # Load ABI from ethdebug directory
-            if self.tracer.ethdebug_info:
-                abi_path = os.path.join(ethdebug_dir, f"{self.tracer.ethdebug_info.contract_name}.abi")
-                if os.path.exists(abi_path):
-                    self.tracer.load_abi(abi_path)
+            contract_name = self.tracer.ethdebug_info.contract_name if self.tracer.ethdebug_info else None
+            abi_path = ETHDebugDirParser.find_abi_file(ETHDebugSpec(path=ethdebug_dir), contract_name)
+            if abi_path:
+                self.tracer.load_abi(abi_path)
             
         elif debug_file:
             self.source_map = self.tracer.load_debug_info(debug_file)
@@ -119,12 +153,24 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
     def _load_source_files(self):
         """Load all source files referenced in debug info."""
         if self.tracer.ethdebug_info:
-            # Load from ETHDebug sources
+            # Load from ETHDebug sources - only load the main contract source
+            main_contract_source = None
             for source_id, source_path in self.tracer.ethdebug_info.sources.items():
-                lines = self.tracer.ethdebug_parser.load_source_file(source_path)
+                # Find the main contract source (usually the one that matches contract name)
+                if self.tracer.ethdebug_info.contract_name.lower() in source_path.lower():
+                    main_contract_source = source_path
+                    break
+            
+            if main_contract_source:
+                lines = self.tracer.ethdebug_parser.load_source_file(main_contract_source)
                 if lines:
-                    self.source_lines[source_path] = lines
-                    print(f"Loaded source: {info(os.path.basename(source_path))}")
+                    self.source_lines[main_contract_source] = lines
+            else:
+                # Fallback: load all sources
+                for source_id, source_path in self.tracer.ethdebug_info.sources.items():
+                    lines = self.tracer.ethdebug_parser.load_source_file(source_path)
+                    if lines:
+                        self.source_lines[source_path] = lines
         elif self.debug_file:
             # Extract source file from debug file name
             source_file = self.debug_file.split('_')[0]

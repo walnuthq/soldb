@@ -11,6 +11,8 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from soldb.colors import warning
+
 from .ethdebug_parser import ETHDebugParser, ETHDebugInfo, SourceLocation, Instruction, VariableLocation
 from eth_utils import to_checksum_address
 
@@ -76,6 +78,7 @@ class MultiContractETHDebugParser:
         # Create a parser for this contract
         parser = ETHDebugParser()
         parser.source_cache = self.source_cache  # Share source cache
+        parser.debug_dir = str(debug_dir)  # Set debug_dir for source loading
         
         # Load ETHDebug info
         ethdebug_info = parser.load_ethdebug_files(debug_dir, contract_name)
@@ -135,9 +138,9 @@ class MultiContractETHDebugParser:
                     contract_debug_info = self.load_contract(address, debug_dir, contract_name)
                     loaded_contracts[address] = contract_debug_info
                 except Exception as e:
-                    print(f"Warning: Failed to load debug info for {contract_name}: {e}")
+                    print(warning(f"Warning: Failed to load debug info for {contract_name}: {e}"))
             else:
-                print(f"Warning: ETHDebug not enabled for {contract_name}")
+                print(warning(f"Warning: ETHDebug not enabled for {contract_name}"))
         
         # Also handle multi-contract format if present
         elif 'contracts' in deployment_data:
@@ -167,7 +170,7 @@ class MultiContractETHDebugParser:
                             contract_debug_info = self.load_contract(address, debug_dir, contract_name)
                             loaded_contracts[address] = contract_debug_info
                         except Exception as e:
-                            print(f"Warning: Failed to load debug info for {contract_name}: {e}")
+                            print(warning("Warning: Failed to load debug info for {contract_name}: {e}"))
                     else:
                         print(f"Warning: No debug directory found for {contract_name}")
         
@@ -210,7 +213,7 @@ class MultiContractETHDebugParser:
                 contract_debug_info = self.load_contract(address, debug_dir, name)
                 loaded_contracts[address] = contract_debug_info
             except Exception as e:
-                print(f"Warning: Failed to load contract {name} at {address}: {e}")
+                print(warning("Warning: Failed to load contract {name} at {address}: {e}"))
         
         return loaded_contracts
     

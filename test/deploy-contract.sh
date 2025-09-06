@@ -336,4 +336,4 @@ EOF
 echo -e "\n${GREEN}Deployment complete!${NC}"
 echo -e "\n${BLUE}ETHDebug files location:${NC} $DEBUG_DIR"
 echo -e "\n${BLUE}To trace with ETHDebug:${NC}"
-echo -e "  soldb trace $TX_HASH --ethdebug-dir $DEBUG_DIR --rpc $RPC_URL"
+echo -e "  soldb trace $TX_HASH --ethdebug-dir $CONTRACT_ADDR:$CONTRACT_NAME:$DEBUG_DIR --rpc $RPC_URL"

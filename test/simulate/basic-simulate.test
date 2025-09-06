@@ -1,7 +1,7 @@
 # Test basic soldb simulate functionality
 # REQUIRES: soldb
 # First deploy the contract, then simulate a function call
-# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir %{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck %s
+# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck %s
 
 # Check that we get the basic simulation output structure
 # CHECK: Contract: TestContract

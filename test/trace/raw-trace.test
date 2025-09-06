@@ -1,6 +1,6 @@
 # Test raw instruction trace functionality
 # REQUIRES: soldb
-# RUN: %soldb trace %{test_tx} --ethdebug-dir %{ethdebug_dir} --rpc %{rpc_url} --raw 2>&1 | FileCheck %s
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw 2>&1 | FileCheck %s
 
 # When using --raw flag, we should see individual EVM instructions
 # CHECK: Loading transaction

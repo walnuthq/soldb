@@ -15,8 +15,9 @@ from .evm_repl import EVMDebugger
 from .abi_utils import match_abi_types, match_single_type, parse_signature, parse_tuple_arg
 from .multi_contract_ethdebug_parser import MultiContractETHDebugParser
 from .json_serializer import TraceSerializer
-from .colors import error, info
+from .colors import error, info, warning
 from .auto_deploy import AutoDeployDebugger
+from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
 
 
@@ -129,33 +130,27 @@ def trace_command(args):
         
         # Load from ethdebug directories
         if args.ethdebug_dir:
-            for ethdebug_spec in args.ethdebug_dir:
-                # Parse address:path format
-                address = None
-                name = None
-                path = ethdebug_spec
-                parts = ethdebug_spec.split(':', 2)
-                if len(parts) == 3:
-                    address, name, path = parts
-                elif len(parts) == 2:
-                    address, path = parts
-                try:
-                    if address and name:
-                        multi_parser.load_contract(address, path, name)
-                    elif address:
-                        multi_parser.load_contract(address, path)
+            try:
+                # Parse all ethdebug directories at once
+                specs = ETHDebugDirParser.parse_ethdebug_dirs(args.ethdebug_dir)
+                
+                for spec in specs:
+                    if spec.address and spec.name:
+                        # Single contract format: address:name:path
+                        multi_parser.load_contract(spec.address, spec.path, spec.name)
+                    elif spec.address:
+                        # Multi-contract format: address:path
+                        multi_parser.load_contract(spec.address, spec.path)
                     else:
-                        # Try to load from deployment.json in the directory
-                        # NOTE: This does not make sense because the contract that we want to debug is probably already deployed
-                        # and we do not have deployment.json for it.
-                        deployment_file = Path(ethdebug_spec) / "deployment.json"
+                        # Just path - try to load from deployment.json
+                        deployment_file = Path(spec.path) / "deployment.json"
                         if deployment_file.exists():
                             multi_parser.load_from_deployment(deployment_file)
                         else:
-                            print(f"Warning: No deployment.json found in {ethdebug_spec}, skipping...\n")
-                except Exception as e:
-                    print(f"Error loading contract {address or ''} from {path}: {e}\n")
-                    sys.exit(1)
+                            print(f"Warning: No deployment.json found in {spec.path}, skipping...\n")
+            except ValueError as e:
+                print(f"Error parsing ethdebug directories: {e}")
+                return 1
         # Set the multi-contract parser on the tracer
         tracer.multi_contract_parser = multi_parser
         
@@ -179,26 +174,73 @@ def trace_command(args):
                         tracer.load_abi(str(abi_path))
     
     elif args.ethdebug_dir and len(args.ethdebug_dir) == 1:
-        # Single contract mode (backward compatibility)
-        ethdebug_dir = args.ethdebug_dir[0]
+        # Single contract mode - parse address:name:path format (required)
+        try:
+            specs = ETHDebugDirParser.parse_ethdebug_dirs(args.ethdebug_dir)
+            if not specs:
+                print(error("No valid ethdebug directory specified"))
+                return 1
+            spec = specs[0]
+            address, name, ethdebug_dir = spec.address, spec.name, spec.path
+        except ValueError as e:
+            print(error(f"Error: {e}"))
+            return 1
+        
+        # Load ETHDebug info for the specified contract
         if args.interactive:
             # Suppress output for interactive mode
             import io
             import contextlib
             with contextlib.redirect_stdout(io.StringIO()):
-                source_map = tracer.load_ethdebug_info(ethdebug_dir)
+                source_map = tracer.load_ethdebug_info(ethdebug_dir, name)
         else:
-            source_map = tracer.load_ethdebug_info(ethdebug_dir)
+            source_map = tracer.load_ethdebug_info(ethdebug_dir, name)
+        
         # Try to load ABI from ethdebug directory
-        if tracer.ethdebug_info:
-            abi_path = os.path.join(ethdebug_dir, f"{tracer.ethdebug_info.contract_name}.abi")
-            if os.path.exists(abi_path):
-                tracer.load_abi(abi_path)
+        contract_name = tracer.ethdebug_info.contract_name if tracer.ethdebug_info else None
+        abi_path = ETHDebugDirParser.find_abi_file(spec, contract_name)
+        if abi_path:
+            tracer.load_abi(abi_path)
+        
+        # After loading the trace, check if we need to load additional contract debug info
+        # This allows single contract mode to work with multi-contract scenarios
+        if not args.interactive:
+            # Analyze the trace to find additional contracts that need debug info
+            function_calls = tracer.analyze_function_calls(trace)
+            
+            # Create a multi-contract parser to handle additional contracts
+            multi_parser = MultiContractETHDebugParser()
+            
+            # Add the already loaded contract
+            if tracer.ethdebug_info:
+                multi_parser.load_contract(address, ethdebug_dir, name)
+            
+            # Load ABIs for ALL contracts that might be called during trace
+            for addr, contract_info in multi_parser.contracts.items():
+                abi_path = contract_info.debug_dir / f"{contract_info.name}.abi"
+                if abi_path.exists():
+                    tracer.load_abi(str(abi_path))
+            
+            # Set the multi-contract parser
+            tracer.multi_contract_parser = multi_parser
         else:
-            # Try to find any ABI file in the directory
-            for abi_file in Path(ethdebug_dir).glob("*.abi"):
-                tracer.load_abi(str(abi_file))
-                break
+            # For interactive mode, also create multi-contract parser and load ABIs
+            # This ensures ABI is available for parameter decoding
+            multi_parser = MultiContractETHDebugParser()
+            
+            # Add the already loaded contract
+            if tracer.ethdebug_info:
+                multi_parser.load_contract(address, ethdebug_dir, name)
+            
+            # Load ABIs for ALL contracts that might be called during trace
+            for addr, contract_info in multi_parser.contracts.items():
+                abi_path = contract_info.debug_dir / f"{contract_info.name}.abi"
+                if abi_path.exists():
+                    tracer.load_abi(str(abi_path))
+            
+            # Set the multi-contract parser
+            tracer.multi_contract_parser = multi_parser
+            print(f"Multi-contract parser set: {tracer.multi_contract_parser}")
     elif debug_file:
         # Load debug info from zasm format
         source_map = tracer.load_debug_info(debug_file)
@@ -238,13 +280,65 @@ def trace_command(args):
     # Start interactive debugger if requested
     if args.interactive:
         print("\nStarting interactive debugger...")
+        # Determine the correct ethdebug_dir for the entrypoint contract
+        entrypoint_ethdebug_dir = None
+        if tracer.multi_contract_parser and trace.to_addr:
+            # In multi-contract mode, find the ethdebug_dir for the entrypoint contract
+            entrypoint_contract = tracer.multi_contract_parser.get_contract_at_address(trace.to_addr)
+            if entrypoint_contract:
+                entrypoint_ethdebug_dir = str(entrypoint_contract.debug_dir)
+        elif args.ethdebug_dir:
+            # In single contract mode, parse the ethdebug_dir format and extract path
+            try:
+                specs = ETHDebugDirParser.parse_ethdebug_dirs(args.ethdebug_dir)
+                if specs:
+                    entrypoint_ethdebug_dir = specs[0].path
+                else:
+                    entrypoint_ethdebug_dir = args.ethdebug_dir[0]
+            except ValueError:
+                # Fallback to old parsing for backward compatibility
+                ethdebug_spec = args.ethdebug_dir[0]
+                if ':' in ethdebug_spec and ethdebug_spec.startswith('0x'):
+                    parts = ethdebug_spec.split(':', 2)
+                    if len(parts) >= 3:
+                        entrypoint_ethdebug_dir = parts[2]  # Extract path part
+                    elif len(parts) == 2:
+                        entrypoint_ethdebug_dir = parts[1]  # Extract path part
+                    else:
+                        entrypoint_ethdebug_dir = ethdebug_spec
+                else:
+                    entrypoint_ethdebug_dir = ethdebug_spec
+        
+        # Extract contract name from the entrypoint contract
+        contract_name = None
+        if tracer.multi_contract_parser and trace.to_addr:
+            # In multi-contract mode, get the name from the entrypoint contract
+            entrypoint_contract = tracer.multi_contract_parser.get_contract_at_address(trace.to_addr)
+            if entrypoint_contract:
+                contract_name = entrypoint_contract.name
+        elif args.ethdebug_dir:
+            # In single contract mode, extract from ethdebug_dir
+            try:
+                specs = ETHDebugDirParser.parse_ethdebug_dirs(args.ethdebug_dir)
+                if specs:
+                    contract_name = specs[0].name
+                else:
+                    contract_name = None
+            except ValueError:
+                # Fallback to old parsing for backward compatibility
+                ethdebug_spec = args.ethdebug_dir[0]
+                if ':' in ethdebug_spec and ethdebug_spec.startswith('0x'):
+                    parts = ethdebug_spec.split(':', 2)
+                    if len(parts) >= 3:
+                        contract_name = parts[1]  # Extract name part
         
         debugger = EVMDebugger(
             contract_address=trace.to_addr,
             debug_file=debug_file,
             rpc_url=args.rpc,
-            ethdebug_dir=args.ethdebug_dir[0] if args.ethdebug_dir else None,
-            multi_contract_parser=getattr(tracer, 'multi_contract_parser', None)
+            ethdebug_dir=entrypoint_ethdebug_dir,
+            multi_contract_parser=getattr(tracer, 'multi_contract_parser', None),
+            contract_name=contract_name
         )
         
         # Pre-load the trace and function analysis
@@ -317,75 +411,138 @@ def simulate_command(args):
                 sys.exit(1)
         # Load from ethdebug directories
         if ethdebug_dirs:
-            for ethdebug_spec in ethdebug_dirs:
-                # New format: address[:name]:path or address:path or just path
-                address = None
-                name = None
-                path = ethdebug_spec
+            try:
+                # Parse all ethdebug directories at once
+                specs = ETHDebugDirParser.parse_ethdebug_dirs(ethdebug_dirs)
                 
-                # Try to parse as address:name:path or address:path
-                parts = ethdebug_spec.split(':', 2)
-                if len(parts) == 3:
-                    address, name, path = parts                    
-                elif len(parts) == 2:
-                    address, path = parts
-                # Call load_contract with address, path, name
-                try:
-                    if address and name:
-                        multi_parser.load_contract(address, path, name)
-                    elif address:
-                        multi_parser.load_contract(address, path)
+                for spec in specs:
+                    if spec.address and spec.name:
+                        # Single contract format: address:name:path
+                        multi_parser.load_contract(spec.address, spec.path, spec.name)
+                    elif spec.address:
+                        # Multi-contract format: address:path
+                        multi_parser.load_contract(spec.address, spec.path)
                     else:
-                        deployment_file = Path(path) / "deployment.json"
+                        # Just path - try to load from deployment.json
+                        deployment_file = Path(spec.path) / "deployment.json"
                         if deployment_file.exists():
                             try:
                                 multi_parser.load_from_deployment(deployment_file)
                             except Exception as e:
-                                sys.stderr.write(f"Error loading deployment.json from {path}: {e}\n")
+                                sys.stderr.write(f"Error loading deployment.json from {spec.path}: {e}\n")
                                 sys.exit(1)
                         else:
-                            sys.stderr.write(f"Warning: No deployment.json found in {path}, skipping...\n")
-                except Exception as e:
-                    sys.stderr.write(f"Error loading contract {address or ''} from {path}: {e}\n")
-                    sys.exit(1)
+                            sys.stderr.write(f"Warning: No deployment.json found in {spec.path}, skipping...\n")
+            except ValueError as e:
+                sys.stderr.write(f"Error parsing ethdebug directories: {e}\n")
+                sys.exit(1)
         tracer.multi_contract_parser = multi_parser
 
-        # Set primary contract context for simulation
+        # Set primary contract context for simulation (entrypoint contract)
         primary_contract = multi_parser.get_contract_at_address(args.contract_address)
-        if not primary_contract:
-            print(f"Error: Contract address {args.contract_address} not found in loaded debug info.")
-            print(f"Loaded contracts: {[addr for addr in multi_parser.contracts.keys()]}")
-            sys.exit(1)
-        tracer.ethdebug_parser = primary_contract.parser
-        tracer.ethdebug_info = primary_contract.ethdebug_info
-        source_map = primary_contract.parser.get_source_mapping()
-        # Load ABI for primary contract
-        abi_path = primary_contract.debug_dir / f"{primary_contract.name}.abi"
-        if abi_path.exists():
-            tracer.load_abi(str(abi_path))
+        if primary_contract:
+            # We have debug info for the entrypoint contract
+            tracer.ethdebug_parser = primary_contract.parser
+            tracer.ethdebug_parser.debug_dir = str(primary_contract.debug_dir)  # Set debug_dir for source loading
+            tracer.ethdebug_info = primary_contract.ethdebug_info
+            source_map = primary_contract.parser.get_source_mapping()
+            # Load ABI for primary contract
+            abi_path = primary_contract.debug_dir / f"{primary_contract.name}.abi"
+            if abi_path.exists():
+                tracer.load_abi(str(abi_path))
+            else:
+                # Try to find any ABI file in the directory
+                for abi_file in Path(primary_contract.debug_dir).glob("*.abi"):
+                    tracer.load_abi(str(abi_file))
+                    break
         else:
-            # Try to find any ABI file in the directory
-            for abi_file in Path(primary_contract.debug_dir).glob("*.abi"):
-                tracer.load_abi(str(abi_file))
-                break
+            # No debug info for entrypoint contract - simulate without source mapping
+            # This is similar to how trace command works
+            source_map = {}
+            if not getattr(args, 'raw', False) and not getattr(args, 'json', False):
+                print(warning(f"Warning: No ETHDebug information for entrypoint contract {args.contract_address}"))
+                print(f"Simulation will work but function calls may not be properly decoded.")
+                print(f"For better debugging experience, provide ETHDebug information using:")
+                print(f"  --ethdebug-dir {args.contract_address}:ContractName:path/to/debug/dir")
+                print()
+            
+            # Try to load ABI for entrypoint contract from common locations
+            if args.contract_address:
+                # Try to find ABI in current directory
+                for abi_file in Path(".").glob("*.abi"):
+                    tracer.load_abi(str(abi_file))
+                    break
         # Load ABIs for ALL contracts that might be called during simulation
         for addr, contract_info in multi_parser.contracts.items():
             abi_path = contract_info.debug_dir / f"{contract_info.name}.abi"
             if abi_path.exists():
                 tracer.load_abi(str(abi_path))
                 
-    elif ethdebug_dirs:
-        # Single contract mode (backward compatibility)
-        ethdebug_dir = ethdebug_dirs[0]
-        source_map = tracer.load_ethdebug_info(ethdebug_dir)
-        if tracer.ethdebug_info:
-            abi_path = os.path.join(ethdebug_dir, f"{tracer.ethdebug_info.contract_name}.abi")
-            if os.path.exists(abi_path):
-                tracer.load_abi(abi_path)
+    elif ethdebug_dirs and not multi_contract_mode:
+        # Single contract mode - parse address:name:path format (required)
+        try:
+            specs = ETHDebugDirParser.parse_ethdebug_dirs(ethdebug_dirs)
+            if not specs:
+                print(error("No valid ethdebug directory specified"))
+                sys.exit(1)
+            spec = specs[0]
+            address, name, ethdebug_dir = spec.address, spec.name, spec.path
+        except ValueError as e:
+            print(error(f"Error: {e}"))
+            sys.exit(1)
+        
+        # Check if the contract address matches the ETHDebug address
+        if args.contract_address and args.contract_address.lower() != address.lower():
+            # Address doesn't match - simulate without source mapping for entrypoint
+            # This is similar to how trace command works
+            source_map = {}
+            if not getattr(args, 'raw', False) and not getattr(args, 'json', False):
+                print(warning(f"Warning: Contract address {args.contract_address} does not match ETHDebug address {address}"))
+                print(f"Simulation will work but function calls may not be properly decoded.")
+                print(f"For better debugging experience, use the correct address:")
+                print(f"  --ethdebug-dir {args.contract_address}:ContractName:path/to/debug/dir")
+                print()
+            
+            # Load ETHDebug info for the specified contract (even though it's not entrypoint)
+            tracer.load_ethdebug_info(ethdebug_dir, name)
+            if tracer.ethdebug_info:
+                abi_path = os.path.join(ethdebug_dir, f"{tracer.ethdebug_info.contract_name}.abi")
+                if os.path.exists(abi_path):
+                    tracer.load_abi(abi_path)
+            else:
+                for abi_file in Path(ethdebug_dir).glob("*.abi"):
+                    tracer.load_abi(str(abi_file))
+                    break
+            
+            # Try to load ABI for entrypoint contract from common locations
+            if args.contract_address:
+                # Try to find ABI in current directory
+                for abi_file in Path(".").glob("*.abi"):
+                    tracer.load_abi(str(abi_file))
+                    break
         else:
-            for abi_file in Path(ethdebug_dir).glob("*.abi"):
-                tracer.load_abi(str(abi_file))
-                break
+            # Address matches - load debug info
+            source_map = tracer.load_ethdebug_info(ethdebug_dir, name)
+            contract_name = tracer.ethdebug_info.contract_name if tracer.ethdebug_info else None
+            abi_path = ETHDebugDirParser.find_abi_file(spec, contract_name)
+            if abi_path:
+                tracer.load_abi(abi_path)
+        
+        # Create a multi-contract parser to handle additional contracts (same as trace command)
+        multi_parser = MultiContractETHDebugParser()
+        
+        # Add the already loaded contract
+        if tracer.ethdebug_info:
+            multi_parser.load_contract(address, ethdebug_dir, name)
+        
+        # Load ABIs for ALL contracts that might be called during simulation
+        for addr, contract_info in multi_parser.contracts.items():
+            abi_path = contract_info.debug_dir / f"{contract_info.name}.abi"
+            if abi_path.exists():
+                tracer.load_abi(str(abi_path))
+        
+        # Set the multi-contract parser
+        tracer.multi_contract_parser = multi_parser
     else:
         # No debug info provided - simulate without source code
         # Try to load ABI from common locations if available
@@ -476,7 +633,8 @@ def simulate_command(args):
             print(f'Available functions: {available_functions}')
         else:
             print('No functions found in any loaded ABI files.')
-        sys.exit(1)
+        print('Proceeding with function signature parsing...')
+        # Don't exit - continue with function signature parsing
     
     # If no ABI available, we can still proceed with function signature parsing
     if not has_abi:
@@ -568,6 +726,8 @@ def simulate_command(args):
     trace = tracer.simulate_call_trace(
         args.contract_address, args.from_addr, calldata, block, args.tx_index, args.value
     )
+    
+    # Analyze function calls with the loaded debug info
     function_calls = tracer.analyze_function_calls(trace)
     if getattr(args, 'json', False):
         serializer = TraceSerializer()
@@ -666,7 +826,63 @@ def interactive_mode(args,tracer):
         if args.constructor_args:
             print(error("Warning: --constructor-args ignored when using --contract-address (contract is already deployed)."))
         contract_address = args.contract_address
-        ethdebug_dir = args.ethdebug_dir[0] if isinstance(args.ethdebug_dir, list) else args.ethdebug_dir
+        # Determine the correct ethdebug_dir for the entrypoint contract
+        contract_name = None
+        if getattr(tracer, 'multi_contract_parser', None):
+            # In multi-contract mode, find the ethdebug_dir for the entrypoint contract
+            entrypoint_contract = tracer.multi_contract_parser.get_contract_at_address(args.contract_address)
+            if entrypoint_contract:
+                ethdebug_dir = str(entrypoint_contract.debug_dir)
+                contract_name = entrypoint_contract.name
+                print(f"Interactive mode {entrypoint_contract.name}")
+            else:
+                # Fallback to first ethdebug_dir if entrypoint not found - parse format
+                ethdebug_spec = args.ethdebug_dir[0] if isinstance(args.ethdebug_dir, list) else args.ethdebug_dir
+                try:
+                    specs = ETHDebugDirParser.parse_ethdebug_dirs([ethdebug_spec])
+                    if specs:
+                        ethdebug_dir = specs[0].path
+                        contract_name = specs[0].name
+                    else:
+                        ethdebug_dir = ethdebug_spec
+                        contract_name = None
+                except ValueError:
+                    # Fallback to old parsing for backward compatibility
+                    if ':' in ethdebug_spec and ethdebug_spec.startswith('0x'):
+                        parts = ethdebug_spec.split(':', 2)
+                        if len(parts) >= 3:
+                            ethdebug_dir = parts[2]  # Extract path part
+                            contract_name = parts[1]  # Extract name part
+                        elif len(parts) == 2:
+                            ethdebug_dir = parts[1]  # Extract path part
+                        else:
+                            ethdebug_dir = ethdebug_spec
+                    else:
+                        ethdebug_dir = ethdebug_spec
+        else:
+            # Single contract mode - parse format
+            ethdebug_spec = args.ethdebug_dir[0] if isinstance(args.ethdebug_dir, list) else args.ethdebug_dir
+            try:
+                specs = ETHDebugDirParser.parse_ethdebug_dirs([ethdebug_spec])
+                if specs:
+                    ethdebug_dir = specs[0].path
+                    contract_name = specs[0].name
+                else:
+                    ethdebug_dir = ethdebug_spec
+                    contract_name = None
+            except ValueError:
+                # Fallback to old parsing for backward compatibility
+                if ':' in ethdebug_spec and ethdebug_spec.startswith('0x'):
+                    parts = ethdebug_spec.split(':', 2)
+                    if len(parts) >= 3:
+                        ethdebug_dir = parts[2]  # Extract path part
+                        contract_name = parts[1]  # Extract name part
+                    elif len(parts) == 2:
+                        ethdebug_dir = parts[1]  # Extract path part
+                    else:
+                        ethdebug_dir = ethdebug_spec
+                else:
+                    ethdebug_dir = ethdebug_spec
     else:
         print(error("Either --contract-file or --contract-address required"))
         return 1
@@ -681,7 +897,8 @@ def interactive_mode(args,tracer):
         abi_path=abi_path,
         from_addr=args.from_addr,
         block=args.block,
-        tracer=tracer
+        tracer=tracer,
+        contract_name=contract_name
     )
 
     # Baseline snapshot (unless disabled)
@@ -716,7 +933,7 @@ def main():
     trace_parser = subparsers.add_parser('trace', help='Trace and debug an Ethereum transaction')
     trace_parser.add_argument('tx_hash', help='Transaction hash to trace')
     # trace_parser.add_argument('--debug-info-from-zasm-file', '-d', help='Load debug info from .zasm file (solx/evm-dwarf format)')
-    trace_parser.add_argument('--ethdebug-dir', '-e', action='append', help='ETHDebug directory containing ethdebug.json and contract debug files. Can be specified multiple times for multi-contract debugging. Format: [address:]path or just path')
+    trace_parser.add_argument('--ethdebug-dir', '-e', action='append', help='ETHDebug directory containing ethdebug.json and contract debug files. Can be specified multiple times for multi-contract debugging. Format: address:name:path')
     trace_parser.add_argument('--contracts', '-c', help='JSON file mapping contract addresses to debug directories')
     trace_parser.add_argument('--multi-contract', action='store_true', help='Enable multi-contract debugging mode')
     trace_parser.add_argument('--rpc', '-r', default='http://localhost:8545', help='RPC URL')
@@ -737,7 +954,7 @@ def main():
     simulate_parser.add_argument('--block', type=int, default=None, help='Block number or tag (default: latest)')
     simulate_parser.add_argument('--tx-index', type=int, default=None, help='Transaction index in block (optional)')
     simulate_parser.add_argument('--value', type=int, default=0, help='ETH value to send (in wei)')
-    simulate_parser.add_argument('--ethdebug-dir', '-e', action='append', help='ETHDebug directory containing ethdebug.json and contract debug files. Can be specified multiple times for multi-contract debugging. Format: [address:]path or just path')
+    simulate_parser.add_argument('--ethdebug-dir', '-e', action='append', help='ETHDebug directory containing ethdebug.json and contract debug files. Can be specified multiple times for multi-contract debugging. Format: address:name:path')
     simulate_parser.add_argument('--contracts', '-c', help='JSON file mapping contract addresses to debug directories')
     simulate_parser.add_argument('--multi-contract', action='store_true', help='Enable multi-contract debugging mode')
     simulate_parser.add_argument('--rpc-url', default='http://localhost:8545', help='RPC URL')
