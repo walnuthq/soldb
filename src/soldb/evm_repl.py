@@ -79,6 +79,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         self.call_stack = []  # Stack to track cross-contract calls for line-by-line stepping
         self.current_source_line = None  # Current source line we're stepping through
         self.pending_call = None  # Pending call info for step into
+        self.on_call_opcode = False  # Flag to track if we're currently on a CALL opcode
+        self.call_return_line = None  # Line number to return to after CALL skip
         
         # Variable display filters
         self.variable_filters = {
@@ -463,40 +465,61 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         current_step = self.current_trace.steps[self.current_step]
         
         if current_step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
-            # For 'next' command, skip the entire call execution
-            # Show the call info
-            self._show_call_opcode_info(current_step, show_options=False)
-            
-            # Extract target address
-            if len(current_step.stack) >= 6:
-                to_addr = self.tracer.extract_address_from_stack(current_step.stack[-2])
-                
-                # Find the next step in the original contract after this call
-                original_contract = self.contract_address
-                
-                # Look for the next step that belongs to the original contract
-                for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
-                    next_contract = self._get_contract_address_for_step(next_step_idx)
-                    if next_contract == original_contract:
-                        self.current_step = next_step_idx
-                        break
-                else:
-                    # Fallback: find the next step with depth < original_depth
-                    original_depth = current_step.depth
-                    while self.current_step < len(self.current_trace.steps) - 1:
-                        self.current_step += 1
-                        next_step = self.current_trace.steps[self.current_step]
-                        if next_step.depth < original_depth:
-                            break
-                
-                # Update and show current state
-                self._update_current_function()
-                self._track_variable_changes()
-                self._show_current_state()
+            if not self.on_call_opcode:
+                # First time hitting CALL opcode, stop and show options
+                self.on_call_opcode = True
+                self._show_call_opcode_info(current_step, show_options=True)
                 return
+            else:
+                # Already on CALL opcode, skip the call execution
+                self.on_call_opcode = False
+                # Remember the line we're returning to after CALL skip
+                self.call_return_line = current_line + 1
+                self._show_call_opcode_info(current_step, show_options=False)
+                
+                # Extract target address
+                if len(current_step.stack) >= 6:
+                    to_addr = self.tracer.extract_address_from_stack(current_step.stack[-2])
+                    
+                    # Find the next step in the original contract after this call
+                    original_contract = self.contract_address
+                    
+                    # Look for the next step that belongs to the original contract
+                    # and has the specific return line we're looking for
+                    found_next_line = False
+                    target_return_line = self.call_return_line if self.call_return_line else current_line + 1
+                    
+                    # Look for the next available line (not necessarily exact target line)
+                    for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
+                        next_contract = self._get_contract_address_for_step(next_step_idx)
+                        if next_contract == original_contract:
+                            # Check if this step has source info
+                            next_source_info = self._get_source_info_for_step(next_step_idx)
+                            if next_source_info:
+                                next_file, next_line = next_source_info
+                                if next_file == current_file and next_line > current_line:
+                                    # Found the next available line
+                                    self.current_step = next_step_idx
+                                    found_next_line = True
+                                    break
+                    
+                    # If no line found, just move to next step
+                    if not found_next_line:
+                        self.current_step += 1
+                    
+                    # Update and show current state
+                    self._update_current_function()
+                    self._track_variable_changes()
+                    self._show_current_state()
+                    return
         
-        # Step until we reach a different source line in the same file or a different file
+        # Reset call opcode flag since we're moving to next line
+        self.on_call_opcode = False
+        self.call_return_line = None  # Reset return line
+        
+        # Step until we reach the next source line in sequence
         initial_step = self.current_step
+        target_line = current_line + 1  # Look for the next line number
         
         while self.current_step < len(self.current_trace.steps) - 1:
             self.current_step += 1
@@ -507,37 +530,72 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             
             # Check if we encounter a CALL opcode
             if step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
-                # For 'next' command, skip the entire call execution
-                # Show the call info
-                self._show_call_opcode_info(step, show_options=False)
-                
-                # Extract target address
-                if len(step.stack) >= 6:
-                    to_addr = self.tracer.extract_address_from_stack(step.stack[-2])
-                    
-                    # Find the next step in the original contract after this call
-                    original_contract = self.contract_address
-                    
-                    # Look for the next step that belongs to the original contract
-                    for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
-                        next_contract = self._get_contract_address_for_step(next_step_idx)
-                        if next_contract == original_contract:
-                            self.current_step = next_step_idx
-                            break
-                    else:
-                        # Fallback: find the next step with depth < original_depth
-                        original_depth = step.depth
-                        while self.current_step < len(self.current_trace.steps) - 1:
-                            self.current_step += 1
-                            next_step = self.current_trace.steps[self.current_step]
-                            if next_step.depth < original_depth:
-                                break
-                    
-                    # Update and show current state
-                    self._update_current_function()
-                    self._track_variable_changes()
-                    self._show_current_state()
+                if not self.on_call_opcode:
+                    # First time hitting CALL opcode, stop and show options
+                    self.on_call_opcode = True
+                    self._show_call_opcode_info(step, show_options=True)
                     return
+                else:
+                    # Already on CALL opcode, skip the call execution
+                    self.on_call_opcode = False
+                    # Remember the line we're returning to after CALL skip
+                    self.call_return_line = current_line + 1
+                    self._show_call_opcode_info(step, show_options=False)
+                    
+                    # Extract target address
+                    if len(step.stack) >= 6:
+                        to_addr = self.tracer.extract_address_from_stack(step.stack[-2])
+                        
+                        # Find the next step in the original contract after this call
+                        original_contract = self.contract_address
+                        
+                        # Look for the next step that belongs to the original contract
+                        # and has the specific return line we're looking for
+                        found_next_line = False
+                        target_return_line = self.call_return_line if self.call_return_line else current_line + 1
+                        # First, try to find the exact target line
+                        for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
+                            next_contract = self._get_contract_address_for_step(next_step_idx)
+                            if next_contract == original_contract:
+                                # Check if this step has the exact target return line
+                                next_source_info = self._get_source_info_for_step(next_step_idx)
+                                if next_source_info:
+                                    next_file, next_line = next_source_info
+                                    if next_file == current_file and next_line == target_return_line:
+                                        # Found the exact target return line
+                                        self.current_step = next_step_idx
+                                        found_next_line = True
+                                        break
+                        
+                        # If exact line not found, look for the next available line
+                        if not found_next_line:
+                            for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
+                                next_contract = self._get_contract_address_for_step(next_step_idx)
+                                if next_contract == original_contract:
+                                    # Check if this step has a different source line
+                                    next_source_info = self._get_source_info_for_step(next_step_idx)
+                                    if next_source_info:
+                                        next_file, next_line = next_source_info
+                                        if next_file == current_file and next_line > current_line:
+                                            # Found the next available line
+                                            self.current_step = next_step_idx
+                                            found_next_line = True
+                                            break
+                        
+                        if not found_next_line:
+                            # Fallback: find the next step with depth < original_depth
+                            original_depth = step.depth
+                            while self.current_step < len(self.current_trace.steps) - 1:
+                                self.current_step += 1
+                                next_step = self.current_trace.steps[self.current_step]
+                                if next_step.depth < original_depth:
+                                    break
+                        
+                        # Update and show current state
+                        self._update_current_function()
+                        self._track_variable_changes()
+                        self._show_current_state()
+                        return
             
             # Check if we encounter a RETURN opcode (end of cross-contract call)
             if step.op in ["RETURN", "REVERT", "STOP"]:
@@ -563,10 +621,15 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             if new_source_info is not None:
                 new_file, new_line = new_source_info
                 
-                # Check if we've moved to a different line in the same file
-                # or to a different file
-                if (new_file != current_file) or (new_file == current_file and new_line != current_line):
-                    # Reached a new source line
+                # Check if we've moved to the next line in sequence in the same file
+                if new_file == current_file and new_line >= target_line:
+                    # Found the next line in sequence
+                    self._update_current_function()
+                    self._track_variable_changes()
+                    self._show_current_state()
+                    return
+                elif new_file != current_file:
+                    # Different file, stop here
                     self._update_current_function()
                     self._track_variable_changes()
                     self._show_current_state()
@@ -1795,8 +1858,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         step = self.current_trace.steps[step_index]
         
         if self.tracer.ethdebug_info:
-            # Use ETHDebug info
-            context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=0)
+            # Use ETHDebug info with context_lines=2 for consistency with _show_current_state
+            context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=2)
             if context:
                 return (context['file'], context['line'])
         elif self.source_map:
@@ -2158,14 +2221,14 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                     
                     # Show current source context
                     if self.tracer.ethdebug_info:
-                        context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=1)
+                        context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=2)
                         if context:
                             print(f"\nSource Context:")
                             print(f"  File: {info(os.path.basename(context['file']))}:{info(context['line'])}")
                             print(f"    => {source_line(context['content'])}")
                     
                     print(f"\n{info('Options:')}")
-                    print(f"  {success('step')} or {success('si')} - Step into the called contract")
+                    print(f"  {success('step')} or {success('s')} - Step into the called contract")
                     print(f"  {success('next')} or {success('n')} - Continue in current contract (skip call)")
             
             print(f"\n{dim('[')} {dim('Step')} {highlight(f'{self.current_step}')} | "
@@ -2521,7 +2584,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             
             # Show source context if available
             if self.tracer.ethdebug_info:
-                context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=1)
+                context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=2)
                 if context:
                     print(f"         Source: {os.path.basename(context['file'])}:{context['line']}")
                     if context.get('content'):
@@ -2605,7 +2668,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             
             # Show source context if available
             if self.tracer.ethdebug_info:
-                context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=1)
+                context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=2)
                 if context:
                     print(f"         Source: {os.path.basename(context['file'])}:{context['line']}")
                     if context.get('content'):
