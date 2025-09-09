@@ -1871,51 +1871,73 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         return None
     
     def _update_current_function(self):
-        """Update current function based on current step."""
+        """Update current function based on current step using call hierarchy."""
         if not self.function_trace:
             return
         
         # Store previous contract address for comparison
         previous_contract_address = self.contract_address
         
-        # Find which function we're in
-        matching_contract_func = None
+        # Find functions that contain the current step
+        matching_funcs = []
         for func in self.function_trace:
-            if (func.entry_step <= self.current_step <= (func.exit_step or len(self.current_trace.steps)) and
-                func.contract_address == self.contract_address):
-                matching_contract_func = func
+            if (func.entry_step <= self.current_step <= (func.exit_step or len(self.current_trace.steps))):
+                matching_funcs.append(func)
+        
+        if not matching_funcs:
+            self.current_function = None
+            return
+        
+        # Use call hierarchy to find the most specific function
+        # Start with the function that has the highest call_id (most recent)
+        current_func = None
+        
+        # Try to find the function with the highest call_id that contains current step
+        max_call_id = max(func.call_id for func in matching_funcs)
+        for func in matching_funcs:
+            if func.call_id == max_call_id:
+                current_func = func
                 break
         
-        if matching_contract_func:
-            self.current_function = matching_contract_func
-        else:
-            # No function found for current contract, don't set current_function
-            self.current_function = None
+        # If we found a function, check if we're in one of its children
+        if current_func:
+            # Look for child functions that are currently active
+            active_children = []
+            for func in matching_funcs:
+                if (func.parent_call_id == current_func.call_id and 
+                    func.entry_step <= self.current_step <= (func.exit_step or len(self.current_trace.steps))):
+                    active_children.append(func)
+            
+            # If we have active children, use the most recent one
+            if active_children:
+                # Sort by call_id (higher = more recent)
+                active_children.sort(key=lambda f: f.call_id, reverse=True)
+                current_func = active_children[0]
+        
+        self.current_function = current_func
         
         # Update contract address based on current function
-        if self.current_function and self.current_function.contract_address:
-            if self.contract_address != self.current_function.contract_address:
-                self.contract_address = self.current_function.contract_address
+        if self.current_function and self.current_function.contract_address and self.contract_address != self.current_function.contract_address:
+            self.contract_address = self.current_function.contract_address
+            
+            # Check if we need to switch contract context for cross-contract calls
+            # But only if we haven't manually switched (e.g., via step command)
+            if (self.tracer.multi_contract_parser and 
+                self.current_function.contract_address and 
+                not self.manual_contract_switch):
                 
-                # Check if we need to switch contract context for cross-contract calls
-                # But only if we haven't manually switched (e.g., via step command)
-                if (self.tracer.multi_contract_parser and 
-                    self.current_function.contract_address and 
-                    self.current_function.contract_address != self.contract_address and
-                    not self.manual_contract_switch):
+                # Switch to the target contract's debug info
+                target_contract = self.tracer.multi_contract_parser.get_contract_at_address(self.current_function.contract_address)
+                if target_contract:
+                    self.tracer.ethdebug_info = target_contract.ethdebug_info
+                    self.tracer.ethdebug_parser = target_contract.parser
+                    self.source_map = target_contract.parser.get_source_mapping() if target_contract.parser else {}
                     
-                    # Switch to the target contract's debug info
-                    target_contract = self.tracer.multi_contract_parser.get_contract_at_address(self.current_function.contract_address)
-                    if target_contract:
-                        self.tracer.ethdebug_info = target_contract.ethdebug_info
-                        self.tracer.ethdebug_parser = target_contract.parser
-                        self.source_map = target_contract.parser.get_source_mapping() if target_contract.parser else {}
-                        
-                        # Load source files for the new contract
-                        self._load_source_files_for_contract(target_contract)
-                        
-                        # Update contract address
-                        self.contract_address = self.current_function.contract_address
+                    # Load source files for the new contract
+                    self._load_source_files_for_contract(target_contract)
+                    
+                    # Update contract address
+                    self.contract_address = self.current_function.contract_address
                         
         # Check for contract return transitions
         self._check_contract_return_transition(previous_contract_address)
@@ -2138,12 +2160,14 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             if source_content:
                 print(f"{dim('=>')} {source_line(source_content)}")
             
-            # Show parameters if at function entry
-            if self.current_function and self.current_step == self.current_function.entry_step:
-                if self.current_function.args:
-                    print(f"{dim('Parameters:')}")
-                    for param_name, param_value in self.current_function.args:
-                        print(f"  {info(param_name)}: {cyan(str(param_value))}")
+            # Show parameters if we have function args
+            # Only show parameters at function entry or when stepping through function body
+            if (self.current_function and self.current_function.args and 
+                (self.tracer.ethdebug_info or self.tracer.multi_contract_parser) and
+                self.current_step == self.current_function.entry_step):
+                print(f"{dim('Parameters:')}")
+                for param_name, param_value in self.current_function.args:
+                    print(f"  {info(param_name)}: {cyan(str(param_value))}")
             
             # Show local variables if ETHDebug is available
             self._show_local_variables(step)
@@ -2174,6 +2198,14 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             if source_file and source_content:
                 print(f"{dim('Source:')} {info(f'{source_file}:{source_line_num}')}")
                 print(f"  {dim('=>')} {source_line(source_content)}")
+            
+            # Show parameters 
+            if (self.current_function and self.current_function.args and 
+                (self.tracer.ethdebug_info or self.tracer.multi_contract_parser) and
+                self.current_step == self.current_function.entry_step):
+                print(f"{dim('Parameters:')}")
+                for param_name, param_value in self.current_function.args:
+                    print(f"  {info(param_name)}: {cyan(str(param_value))}")
             
             # Show local variables in assembly mode too
             self._show_local_variables(step)
@@ -2213,11 +2245,29 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                         selector = calldata[:10]
                         print(f"Function Selector: {info(selector)}")
                         
-                        # Try to find function name
+                        # Try to find function name and decode parameters
                         if hasattr(self.tracer, 'function_signatures'):
                             func_info = self.tracer.function_signatures.get(selector)
                             if func_info:
                                 print(f"Function: {info(func_info['name'])}")
+                                
+                                # Try to decode function parameters
+                                try:
+                                    decoded_params = self.tracer.decode_function_parameters(selector, calldata)
+                                    if decoded_params:
+                                        print(f"Parameters:")
+                                        for param_name, param_value in decoded_params:
+                                            if isinstance(param_value, int):
+                                                value_str = f"{param_value} (0x{param_value:x})"
+                                            else:
+                                                value_str = str(param_value)
+                                            print(f"  {info(param_name)}: {cyan(value_str)}")
+                                except Exception as e:
+                                    # If decoding fails, show raw calldata
+                                    if calldata and len(calldata) > 10:
+                                        param_data_hex = calldata[10:]  # Skip selector
+                                        if param_data_hex:
+                                            print(f"\nRaw Parameters: {info(f'0x{param_data_hex}')}")
                     
                     # Show current source context
                     if self.tracer.ethdebug_info:
@@ -2225,7 +2275,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                         if context:
                             print(f"\nSource Context:")
                             print(f"  File: {info(os.path.basename(context['file']))}:{info(context['line'])}")
-                            print(f"    => {source_line(context['content'])}")
+                            print(f"    => {(context['content'])}")
                     
                     print(f"\n{info('Options:')}")
                     print(f"  {success('step')} or {success('s')} - Step into the called contract")
