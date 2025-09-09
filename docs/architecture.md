@@ -211,7 +211,7 @@ def analyze_function_calls(trace, ethdebug):
 
 When you run:
 ```bash
-soldb trace 0x35ffb6c4... --ethdebug-dir ./debug --rpc http://localhost:8547
+soldb trace 0x35ffb6c4... --ethdebug-dir 0x3aa5ebb10dc797cac828524e59a333d0a371443c:TestContract:./debug --rpc http://localhost:8547
 ```
 
 The flow is:

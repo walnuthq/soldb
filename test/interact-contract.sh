@@ -26,7 +26,14 @@ get_debug_command() {
     
     # Check if ethdebug format is available
     if [ -f "$abs_debug_dir/ethdebug.json" ]; then
-        echo "soldb trace $tx_hash --ethdebug-dir $abs_debug_dir --rpc $RPC_URL"
+        # Get contract address and name from deployment.json
+        if [ -f "$abs_debug_dir/deployment.json" ]; then
+            CONTRACT_ADDR=$(jq -r '.address' "$abs_debug_dir/deployment.json")
+            CONTRACT_NAME=$(jq -r '.contract' "$abs_debug_dir/deployment.json")
+            echo "soldb trace $tx_hash --ethdebug-dir $CONTRACT_ADDR:$CONTRACT_NAME:$abs_debug_dir --rpc $RPC_URL"
+        else
+            echo "soldb trace $tx_hash --rpc $RPC_URL"
+        fi
     else
         # Default to simple trace without debug info
         echo "soldb trace $tx_hash --rpc $RPC_URL"

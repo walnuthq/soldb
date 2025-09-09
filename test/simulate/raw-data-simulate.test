@@ -1,7 +1,7 @@
 # Test raw data simulation functionality
 # REQUIRES: soldb
 # First deploy the contract, then simulate with raw calldata
-# RUN: %soldb simulate %{contract_address} --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir %{ethdebug_dir} --rpc %{rpc_url} --raw-data 0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004 2>&1 | FileCheck %s
+# RUN: %soldb simulate %{contract_address} --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw-data 0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004 2>&1 | FileCheck %s
 
 # Check that we get the basic simulation output structure with raw data
 # CHECK: Contract: TestContract
