@@ -2767,7 +2767,7 @@ class TransactionTracer:
         print(f"\n{dim('Use --raw flag to see detailed instruction trace')}")
 
     def print_function_calls(self,trace: TransactionTrace):
-        print(f"\n{bold('CALL Opcodes in Trace:')}")
+        print(f"\n{bold('Contracts detected in transaction:')}")
         print(dim("-" * 80))
 
         call_count = 0
@@ -2798,16 +2798,13 @@ class TransactionTracer:
                                 if func_info:
                                     func_name = func_info['name']
                         
-                        print(f"Step {highlight(f'{i:4d}')}: {opcode(step.op)} → {address(to_addr)} ({info(target_name)})")
-                        print(f"         Function: {info(func_name)}")
-                        print(f"         Selector: {info(calldata[:10] if calldata else 'N/A')}")
-                        print(f"         Gas: {gas_value(step.gas)}")
+                        print(f"{address(to_addr)} ({info(target_name)})")
+                        print(f"Entry Function: {info(func_name)}")
+                        print(f"Gas: {gas_value(step.gas)}")
                         print()
         
         if call_count == 0:
             print("No CALL opcodes found in trace.")
-        else:
-            print(f"Total CALL opcodes: {call_count}")
 
 
 class SourceMapper:
