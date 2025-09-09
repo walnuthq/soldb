@@ -337,8 +337,9 @@ def trace_command(args):
             debug_file=debug_file,
             rpc_url=args.rpc,
             ethdebug_dir=entrypoint_ethdebug_dir,
-            multi_contract_parser=getattr(tracer, 'multi_contract_parser', None),
-            contract_name=contract_name
+            tracer=tracer,
+            contract_name=contract_name,
+            abi_path=abi_path
         )
         
         # Pre-load the trace and function analysis

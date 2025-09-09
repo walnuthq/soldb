@@ -21,13 +21,23 @@ class EVMDebugger(cmd.Cmd):
     intro = f"""
 {bold('SolDB EVM Debugger')} - Solidity Debugger
 Type {info('help')} for commands.
-Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('where')} to see call stack.
+Use {info('next')} to step to next source line, {info('step')} to step into contract calls, {info('continue')} to run, {info('where')} to see call stack.
 """
-    prompt = f'{cyan("(soldb)")} '
+    def _get_prompt(self):
+        """Get the current prompt with contract context."""
+        if self.tracer.multi_contract_parser and self.contract_address:
+            contract_info = self.tracer.multi_contract_parser.get_contract_at_address(self.contract_address)
+            if contract_info:
+                return f'{cyan("(soldb")} {dim("|")} {info(contract_info.name)} {dim("|")} {address(self.contract_address[:10])}...{cyan(")")} '
+        return f'{cyan("(soldb)")} '
+    
+    @property
+    def prompt(self):
+        return self._get_prompt()
     
     def __init__(self, contract_address: str = None, debug_file: str = None, 
                  rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
-                 multi_contract_parser = None,function_name: str = None, function_args: List[str] = [],
+                 function_name: str = None, function_args: List[str] = [],
                  abi_path: str = None, from_addr: str = None, block: int = None,
                  tracer: TransactionTracer = None, contract_name: str = None):
         super().__init__()
@@ -37,35 +47,38 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         
         self.tracer = tracer
 
-        # Set multi-contract parser if provided
-        if multi_contract_parser:
-            self.tracer.multi_contract_parser = multi_contract_parser
-            # In multi-contract mode, set ethdebug_info to the main contract
+        # Check if multi-contract mode is enabled
+        if hasattr(tracer, 'multi_contract_parser') and tracer.multi_contract_parser:
             if contract_address:
-                main_contract = multi_contract_parser.get_contract_at_address(contract_address)
+                main_contract = tracer.multi_contract_parser.get_contract_at_address(contract_address)
                 if main_contract:
                     self.tracer.ethdebug_info = main_contract.ethdebug_info
                     self.tracer.ethdebug_parser = main_contract.parser
                     # Load source_map from the main contract
                     self.source_map = main_contract.parser.get_source_mapping() if main_contract.parser else {}
                     
-                    # Load ABI for the main contract using ETHDebugDirParser
-                    abi_path = ETHDebugDirParser.find_abi_file(
-                        ETHDebugSpec(path=str(main_contract.debug_dir)), 
-                        main_contract.name
-                    )
-                    if abi_path:
-                        self.tracer.load_abi(abi_path)
                 else:
                     # No debug info for this contract
                     self.source_map = {}
+        
+        # Load ABI if provided
+        if abi_path:
+            self.tracer.load_abi(abi_path)
+        
         self.current_trace = None
         self.current_step = 0
         self.breakpoints = set()
         self.watch_expressions = []
         self.display_mode = "source"  # "source" or "asm"
         self.function_trace = []  # Function call trace
+        self.manual_contract_switch = False  # Flag to prevent auto-switching back
         self.variable_history = {}  # variable_name -> list of (step, value, type, location)
+        self.previous_depth = 0  # Track previous depth for depth change detection
+        self.enable_depth_detection = True  # Flag to enable/disable depth change detection
+        self.depth_verbose = False  # Flag for verbose depth change messages
+        self.call_stack = []  # Stack to track cross-contract calls for line-by-line stepping
+        self.current_source_line = None  # Current source line we're stepping through
+        self.pending_call = None  # Pending call info for step into
         
         # Variable display filters
         self.variable_filters = {
@@ -102,7 +115,7 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
             sys.exit(1)
 
         # Load ETHDebug info if available
-        if ethdebug_dir and not multi_contract_parser:
+        if ethdebug_dir:
             # Use provided contract_name or extract from ethdebug_dir if in address:name:path format
             if not self.contract_name and ":" in ethdebug_dir and ethdebug_dir.startswith("0x"):
                 try:
@@ -179,6 +192,21 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
                     self.source_lines[source_file] = f.readlines()
                 print(f"Loaded source: {info(source_file)}")
     
+    def _load_source_files_for_contract(self, contract_info):
+        """Load source files for a specific contract."""
+
+        print(f"Loading source files for specific contract: {contract_info.name}")
+        if not contract_info or not contract_info.ethdebug_info:
+            return
+            
+        # Load all source files for this contract
+        for source_id, source_path in contract_info.ethdebug_info.sources.items():
+            if source_path not in self.source_lines:  # Avoid reloading already loaded files
+                lines = contract_info.parser.load_source_file(source_path)
+                if lines:
+                    self.source_lines[source_path] = lines
+    
+    
     def do_run(self, tx_hash: str):
         """Run/load a transaction for debugging. Usage: run <tx_hash>"""
 
@@ -242,6 +270,7 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
 
             # Analyze function calls
             self.function_trace = self.tracer.analyze_function_calls(self.current_trace)
+            
             print(f"{success('Simulation complete.')} {highlight(str(len(self.current_trace.steps)))} steps.")
 
             # Start at the first function call after dispatcher
@@ -388,6 +417,7 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
             return
             
         self.current_step += 1
+        self._check_depth_change()
         self._update_current_function()
         self._track_variable_changes()
         self._show_current_state()
@@ -405,7 +435,7 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         self.do_nexti(arg)
     
     def do_next(self, arg):
-        """Step to next source line (source-level). Aliases: n, step, s"""
+        """Step to next source line (source-level) with cross-contract call handling. Aliases: n"""
         if not self.current_trace:
             print("No transaction loaded. Use 'run <tx_hash>' first.")
             return
@@ -413,31 +443,134 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         if self.current_step >= len(self.current_trace.steps) - 1:
             print(info("Already at end of execution."))
             return
-        
-        if not self.source_map:
+
+        if not self.source_map and not self.tracer.ethdebug_info:
             print("No source mapping available. Use 'nexti' for instruction stepping.")
             self.do_nexti(arg)
             return
         
-        # Get current source line
-        current_line = self._get_source_line_for_step(self.current_step)
-        if current_line is None:
+        # Get current source line and file
+        current_source_info = self._get_source_info_for_step(self.current_step)
+        if current_source_info is None:
             # No source mapping, fall back to instruction stepping
             self.do_nexti(arg)
             return
         
-        # Step until we reach a different source line
-        initial_step = self.current_step
-        while self.current_step < len(self.current_trace.steps) - 1:
-            self.current_step += 1
-            new_line = self._get_source_line_for_step(self.current_step)
+        current_file, current_line = current_source_info
+        self.current_source_line = current_line
+        
+        # Check if current step is a CALL opcode first
+        current_step = self.current_trace.steps[self.current_step]
+        
+        if current_step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
+            # For 'next' command, skip the entire call execution
+            # Show the call info
+            self._show_call_opcode_info(current_step, show_options=False)
             
-            if new_line is not None and new_line != current_line:
-                # Reached a new source line
+            # Extract target address
+            if len(current_step.stack) >= 6:
+                to_addr = self.tracer.extract_address_from_stack(current_step.stack[-2])
+                
+                # Find the next step in the original contract after this call
+                original_contract = self.contract_address
+                
+                # Look for the next step that belongs to the original contract
+                for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
+                    next_contract = self._get_contract_address_for_step(next_step_idx)
+                    if next_contract == original_contract:
+                        self.current_step = next_step_idx
+                        break
+                else:
+                    # Fallback: find the next step with depth < original_depth
+                    original_depth = current_step.depth
+                    while self.current_step < len(self.current_trace.steps) - 1:
+                        self.current_step += 1
+                        next_step = self.current_trace.steps[self.current_step]
+                        if next_step.depth < original_depth:
+                            break
+                
+                # Update and show current state
                 self._update_current_function()
                 self._track_variable_changes()
                 self._show_current_state()
                 return
+        
+        # Step until we reach a different source line in the same file or a different file
+        initial_step = self.current_step
+        
+        while self.current_step < len(self.current_trace.steps) - 1:
+            self.current_step += 1
+            step = self.current_trace.steps[self.current_step]
+            
+            # Check for depth changes
+            self._check_depth_change()
+            
+            # Check if we encounter a CALL opcode
+            if step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
+                # For 'next' command, skip the entire call execution
+                # Show the call info
+                self._show_call_opcode_info(step, show_options=False)
+                
+                # Extract target address
+                if len(step.stack) >= 6:
+                    to_addr = self.tracer.extract_address_from_stack(step.stack[-2])
+                    
+                    # Find the next step in the original contract after this call
+                    original_contract = self.contract_address
+                    
+                    # Look for the next step that belongs to the original contract
+                    for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
+                        next_contract = self._get_contract_address_for_step(next_step_idx)
+                        if next_contract == original_contract:
+                            self.current_step = next_step_idx
+                            break
+                    else:
+                        # Fallback: find the next step with depth < original_depth
+                        original_depth = step.depth
+                        while self.current_step < len(self.current_trace.steps) - 1:
+                            self.current_step += 1
+                            next_step = self.current_trace.steps[self.current_step]
+                            if next_step.depth < original_depth:
+                                break
+                    
+                    # Update and show current state
+                    self._update_current_function()
+                    self._track_variable_changes()
+                    self._show_current_state()
+                    return
+            
+            # Check if we encounter a RETURN opcode (end of cross-contract call)
+            if step.op in ["RETURN", "REVERT", "STOP"]:
+                # Only handle as cross-contract return if we have a call stack
+                if self.call_stack:
+                    self._handle_return_opcode(step)
+                    return
+                else:
+                    # Just a normal return, show it and continue to next step
+                    self._show_return_opcode_info(step)
+                    # Continue to next step instead of returning
+                    self.current_step += 1
+                    if self.current_step < len(self.current_trace.steps):
+                        # Check for contract return transition after RETURN opcode
+                        self._check_contract_return_transition(self.contract_address)
+                        self._update_current_function()
+                        self._track_variable_changes()
+                        self._show_current_state()
+                    return
+            
+            new_source_info = self._get_source_info_for_step(self.current_step)
+            
+            if new_source_info is not None:
+                new_file, new_line = new_source_info
+                
+                # Check if we've moved to a different line in the same file
+                # or to a different file
+                if (new_file != current_file) or (new_file == current_file and new_line != current_line):
+                    # Reached a new source line
+                    self._update_current_function()
+                    self._track_variable_changes()
+                    self._show_current_state()
+                    return
         
         # Reached end without finding new source line
         print(info("Already at end of execution."))
@@ -445,23 +578,346 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         self.current_step = len(self.current_trace.steps) - 1
         self._update_current_function()
     
+    def _execute_pending_call(self):
+        """Execute the pending call - step into the called contract."""
+        if not self.pending_call:
+            return
+        
+        call_info = self.pending_call
+        self.pending_call = None
+        
+        if not call_info['target_contract']:
+            print(f"\n{error('No debug info for contract')}")
+            print(f"{dim('=' * 50)}")
+            print(f"  Target address: {call_info['target_address']}")
+            print(f"  {info('Available contracts with debug info:')}")
+            if self.tracer.multi_contract_parser:
+                for contract_addr, contract in self.tracer.multi_contract_parser.contracts.items():
+                    print(f"    {contract_addr}: {contract.name}")
+            else:
+                print(f"    No multi-contract parser available")
+            print(f"\n  {info('You can continue with:')}")
+            print(f"    {success('next')} or {success('n')} - Continue in current contract (skip call)")
+            print(f"    {success('continue')} or {success('c')} - Continue execution")
+            return
+        
+        print(f"\n{success('Stepping into called contract...')}")
+        print(f"{dim('=' * 40)}")
+        
+        # Push current context to call stack
+        self.call_stack.append({
+            'step': self.current_step,
+            'contract': self.contract_address,
+            'source_line': self.current_source_line,
+            'return_pc': call_info['step'].pc + 1
+        })
+        
+        # Switch to target contract
+        self.contract_address = call_info['target_address']
+        self.tracer.ethdebug_info = call_info['target_contract'].ethdebug_info
+        self.tracer.ethdebug_parser = call_info['target_contract'].parser
+        self.source_map = call_info['target_contract'].parser.get_source_mapping() if call_info['target_contract'].parser else {}
+        self._load_source_files_for_contract(call_info['target_contract'])
+        
+        print(f"  {success('Switched to contract:')} {call_info['target_contract'].name}")
+        print(f"  {info('Continuing line by line in called contract...')}")
+        
+        # Move to the next step where the called contract actually starts executing
+        self.current_step += 1
+        self._update_current_function()
+        self._track_variable_changes()
+        self._show_current_state()
+    
+    def _handle_return_opcode(self, step):
+        """Handle RETURN opcode - return to calling contract and continue line by line."""
+        if not self.call_stack:
+            # No call stack, just show return
+            self._show_return_opcode_info(step)
+            return
+        
+        # Pop the call context
+        call_context = self.call_stack.pop()
+        
+        # Get current contract name
+        current_contract_name = self.contract_address
+        if self.tracer.multi_contract_parser:
+            current_contract = self.tracer.multi_contract_parser.get_contract_at_address(self.contract_address)
+            if current_contract:
+                current_contract_name = current_contract.name
+        
+        # Get calling contract name
+        calling_contract_name = call_context['contract']
+        if self.tracer.multi_contract_parser:
+            calling_contract = self.tracer.multi_contract_parser.get_contract_at_address(call_context['contract'])
+            if calling_contract:
+                calling_contract_name = calling_contract.name
+        
+        print(f"\n{warning('RETURN DETECTED - Returning from contract')}")
+        print(f"{dim('=' * 60)}")
+        print(f"  {info('From:')} {current_contract_name} @ {self.contract_address[:10]}...")
+        print(f"  {info('To:')} {calling_contract_name} @ {call_context['contract'][:10]}...")
+        
+        # Restore calling contract context
+        if self.tracer.multi_contract_parser:
+            calling_contract = self.tracer.multi_contract_parser.get_contract_at_address(call_context['contract'])
+            if calling_contract:
+                self.contract_address = call_context['contract']
+                self.tracer.ethdebug_info = calling_contract.ethdebug_info
+                self.tracer.ethdebug_parser = calling_contract.parser
+                self.source_map = calling_contract.parser.get_source_mapping() if calling_contract.parser else {}
+                self._load_source_files_for_contract(calling_contract)
+                
+                print(f"\n  {success('Returned to contract:')} {calling_contract.name}")
+                
+                # Continue to next step to return to calling contract
+                self.current_step += 1
+                self._update_current_function()
+                self._track_variable_changes()
+                self._show_current_state()
+                return
+        
+        # Fallback: just show the return
+        self._show_return_opcode_info(step)
+    
+    def do_callstack(self, arg):
+        """Show the current call stack for line-by-line stepping. Usage: callstack"""
+        if not self.call_stack:
+            print(f"{info('Call stack is empty.')}")
+            return
+        
+        print(f"\n{info('Call Stack for Line-by-Line Stepping')}")
+        print(f"{dim('=' * 60)}")
+        
+        for i, call in enumerate(self.call_stack):
+            # Get contract name
+            contract_name = "Unknown"
+            if self.tracer.multi_contract_parser:
+                contract = self.tracer.multi_contract_parser.get_contract_at_address(call['contract'])
+                if contract:
+                    contract_name = contract.name
+            
+            print(f"  {i}: {contract_name} @ {call['contract'][:10]}...")
+            print(f"      Step: {call['step']} | Line: {call['source_line']} | PC: {call['return_pc']}")
+        
+        print(f"{dim('=' * 60)}")
+        print(f"Current contract: {self.contract_address[:10]}... | Current line: {self.current_source_line}")
+
+    def do_reset_callstack(self, arg):
+        """Reset the call stack and return to main contract. Usage: reset_callstack"""
+        if not self.call_stack:
+            print(f"{info('Call stack is already empty.')}")
+            return
+        
+        print(f"{warning('Resetting call stack and returning to main contract...')}")
+        
+        # Clear call stack
+        self.call_stack = []
+        
+        # Return to main contract
+        if self.tracer.multi_contract_parser:
+            main_contract = self.tracer.multi_contract_parser.get_main_contract()
+            if main_contract:
+                self.contract_address = main_contract.address
+                self.tracer.ethdebug_info = main_contract.ethdebug_info
+                self.tracer.ethdebug_parser = main_contract.parser
+                self.source_map = main_contract.parser.get_source_mapping() if main_contract.parser else {}
+                self._load_source_files_for_contract(main_contract)
+                
+                print(f"{success('Returned to main contract:')} {main_contract.name}")
+                self._update_current_function()
+                self._track_variable_changes()
+                self._show_current_state()
+                return
+        
+        print(f"{error('Could not return to main contract')}")
+
     def do_n(self, arg):
         """Alias for next"""
         self.do_next(arg)
     
-    def do_step(self, arg):
-        """Alias for next"""
-        self.do_next(arg)
-    
     def do_s(self, arg):
-        """Alias for next"""
-        self.do_next(arg)
+        """Alias for step (step into)"""
+        self.do_step(arg)
+    
+    def do_step(self, arg):
+        """Step into contract calls (step into). Aliases: s"""
+        if not self.current_trace:
+            print("No transaction loaded.")
+            return
+        
+        if self.current_step >= len(self.current_trace.steps) - 1:
+            print(info("Already at end of execution."))
+            return
+        
+        # Check if we have a pending call to step into
+        if self.pending_call:
+            self._execute_pending_call()
+            return
+        
+        # Check if we're currently on a CALL opcode
+        current_step = self.current_trace.steps[self.current_step]
+        if current_step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
+            # Find the corresponding function call in the function trace
+            target_addr = self.tracer.extract_address_from_stack(current_step.stack[-2])
+            
+            # Look for a function call that matches this CALL opcode
+            # Find the closest function call to the target address after current step
+            best_match = None
+            for func in self.function_trace:
+                if (func.contract_address == target_addr and 
+                    func.entry_step > self.current_step):
+                    # Found a matching function
+                    if best_match is None or func.entry_step < best_match.entry_step:
+                        best_match = func
+            
+            if best_match:
+                # Found the target function, jump to its entry
+                self.current_step = best_match.entry_step
+                
+                # Check for depth changes
+                self._check_depth_change()
+                
+                # Explicitly switch to the target contract
+                if (self.tracer.multi_contract_parser and 
+                    best_match.contract_address and 
+                    best_match.contract_address != self.contract_address):
+                    
+                    target_contract = self.tracer.multi_contract_parser.get_contract_at_address(best_match.contract_address)
+                    if target_contract:
+                        # Add to call stack before switching
+                        self.call_stack.append({
+                            'step': self.current_step,
+                            'contract': self.contract_address,
+                            'target_contract': best_match.contract_address,
+                            'call_type': current_step.op
+                        })
+                        
+                        self.tracer.ethdebug_info = target_contract.ethdebug_info
+                        self.tracer.ethdebug_parser = target_contract.parser
+                        self.source_map = target_contract.parser.get_source_mapping() if target_contract.parser else {}
+                        self._load_source_files_for_contract(target_contract)
+                        self.contract_address = best_match.contract_address
+                        self.manual_contract_switch = True  # Prevent auto-switching back
+                        print(f"{info('Switched to contract:')} {address(best_match.contract_address)} ({target_contract.name})")
+                    else:
+                        # No debug info for target contract
+                        print(f"\n{warning('Cannot step into contract - no debug info available')}")
+                        print(f"Target Address: {address(best_match.contract_address)}")
+                        print(f"Use 'next' or 'n' to continue in current contract")
+                        return
+                
+                self._update_current_function()
+                self._track_variable_changes()
+                self._show_current_state()
+                return
+            
+            # If no matching function found, check if we can step into the target contract
+            if self.tracer.multi_contract_parser:
+                target_contract = self.tracer.multi_contract_parser.get_contract_at_address(target_addr)
+                if not target_contract:
+                    # No debug info for target contract
+                    print(f"\n{warning('Cannot step into contract - no debug info available')}")
+                    print(f"Target Address: {address(target_addr)}")
+                    print(f"Use 'next' or 'n' to continue in current contract")
+                    return
+            
+            # Just step to next instruction
+            self.current_step += 1
+            self._update_current_function()
+            self._track_variable_changes()
+            self._show_current_state()
+            return
+        
+        # If not on a CALL opcode, behave like next but look for CALL opcodes
+        if not self.source_map and not self.tracer.ethdebug_info:
+            print("No source mapping available. Use 'nexti' for instruction stepping.")
+            self.do_nexti(arg)
+            return
+        
+        # Get current source line and file
+        current_source_info = self._get_source_info_for_step(self.current_step)
+        if current_source_info is None:
+            # No source mapping, fall back to instruction stepping
+            self.do_nexti(arg)
+            return
+        
+        current_file, current_line = current_source_info
+        
+        # Step until we reach a different source line or a CALL opcode
+        initial_step = self.current_step
+        while self.current_step < len(self.current_trace.steps) - 1:
+            self.current_step += 1
+            step = self.current_trace.steps[self.current_step]
+            
+            # If we encounter a CALL opcode, stop here and show it
+            if step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
+                # Track the call in call stack for potential return
+                if len(step.stack) >= 6:
+                    to_addr = self.tracer.extract_address_from_stack(step.stack[-2])
+                    # Add to call stack if we have debug info for the target contract
+                    if self.tracer.multi_contract_parser:
+                        target_contract = self.tracer.multi_contract_parser.get_contract_at_address(to_addr)
+                        if target_contract:
+                            self.call_stack.append({
+                                'step': self.current_step,
+                                'contract': self.contract_address,
+                                'target_contract': to_addr,
+                                'call_type': step.op
+                            })
+                
+                self._update_current_function()
+                self._track_variable_changes()
+                self._show_current_state()
+                return
+            
+            # If we encounter a RETURN opcode, handle it appropriately
+            if step.op in ["RETURN", "REVERT", "STOP"]:
+                # Only handle as cross-contract return if we have a call stack
+                if self.call_stack:
+                    self._handle_return_opcode(step)
+                    return
+                else:
+                    # Just a normal return, show it and continue to next step
+                    self._show_return_opcode_info(step)
+                    # Continue to next step instead of returning
+                    self.current_step += 1
+                    if self.current_step < len(self.current_trace.steps):
+                        # Check for contract return transition after RETURN opcode
+                        self._check_contract_return_transition(self.contract_address)
+                        self._update_current_function()
+                        self._track_variable_changes()
+                        self._show_current_state()
+                    return
+            
+            new_source_info = self._get_source_info_for_step(self.current_step)
+            
+            if new_source_info is not None:
+                new_file, new_line = new_source_info
+                
+                # Check if we've moved to a different line in the same file
+                # or to a different file
+                if (new_file != current_file) or (new_file == current_file and new_line != current_line):
+                    # Reached a new source line
+                    self._update_current_function()
+                    self._track_variable_changes()
+                    self._show_current_state()
+                    return
+        
+        # Reached end without finding new source line
+        print(info("Already at end of execution."))
+        # Reset to where we were since we didn't find a new line
+        self.current_step = len(self.current_trace.steps) - 1
+        self._update_current_function()
+    
     
     def do_continue(self, arg):
         """Continue execution until breakpoint or end. Alias: c"""
         if not self.current_trace:
             print("No transaction loaded. Use 'run <tx_hash>' first.")
             return
+        
+        # Reset manual contract switch flag for continue
+        self.manual_contract_switch = False
         
         if self.current_step >= len(self.current_trace.steps) - 1:
             print(info("Already at end of execution."))
@@ -568,7 +1024,15 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         source_info = self.source_map.get(step.pc)
         
         if source_info:
-            _, line_num = source_info
+            if isinstance(source_info, tuple) and len(source_info) >= 2:
+                try:
+                    _, line_num = source_info
+                except ValueError:
+                    print(f"Error: source_info has unexpected format: {source_info}")
+                    return
+            else:
+                print(f"Error: source_info is not a tuple with at least 2 elements: {source_info}")
+                return
             
             # Find the source file that contains this line number
             source_lines = None
@@ -1021,6 +1485,210 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
             print(f"Unknown filter command: {command}")
             print("Use 'filter' without arguments to see usage help")
     
+    def do_contract(self, arg):
+        """Show current contract context. Usage: contract"""
+        if not self.tracer.multi_contract_parser:
+            return
+        
+        if not self.contract_address:
+            return
+        
+        contract_info = self.tracer.multi_contract_parser.get_contract_at_address(self.contract_address)
+        if not contract_info:
+            print(f"No debug info available for contract {self.contract_address}")
+            return
+        
+        print(f"\n{bold('Current Contract Context:')}")
+        print(dim("-" * 50))
+        print(f"Address: {address(self.contract_address)}")
+        print(f"Name: {info(contract_info.name)}")
+        print(f"Debug Directory: {info(str(contract_info.debug_dir))}")
+        
+        # Show all loaded contracts
+        all_contracts = self.tracer.multi_contract_parser.get_all_loaded_contracts()
+        if len(all_contracts) > 1:
+            print(f"\n{bold('All Loaded Contracts:')}")
+            for addr, name in all_contracts:
+                marker = "=>" if addr == self.contract_address else "  "
+                print(f"{marker} {info(name)} @ {address(addr)}")
+        
+        print(dim("-" * 50))
+    
+    def do_calls(self, arg):
+        """Show all CALL opcodes in the trace. Usage: calls"""
+        if not self.current_trace:
+            print("No transaction loaded.")
+            return
+        
+        print(f"\n{bold('CALL Opcodes in Trace:')}")
+        print(dim("-" * 80))
+        
+        call_count = 0
+        for i, step in enumerate(self.current_trace.steps):
+            if step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
+                call_count += 1
+                
+                # Extract call information
+                if len(step.stack) >= 6:
+                    required_stack_size = 7 if step.op == "CALL" else 6
+                    if len(step.stack) >= required_stack_size:
+                        to_addr = self.tracer.extract_address_from_stack(step.stack[-2])
+                        calldata = self.tracer.extract_calldata_from_step(step)
+                        
+                        # Try to identify source contract (who is making the call)
+                        source_name = "Unknown"
+                        if self.tracer.multi_contract_parser:
+                            # Get the contract that's making the call at this step
+                            source_contract = self.tracer.multi_contract_parser.get_contract_at_address(self.contract_address)
+                            if source_contract:
+                                source_name = source_contract.name
+                        
+                        # Try to identify target contract
+                        target_name = "Unknown"
+                        if self.tracer.multi_contract_parser:
+                            target_contract = self.tracer.multi_contract_parser.get_contract_at_address(to_addr)
+                            if target_contract:
+                                target_name = target_contract.name
+                        
+                        # Try to decode function
+                        func_name = "Unknown"
+                        if calldata and len(calldata) >= 10:
+                            selector = calldata[:10]
+                            if hasattr(self.tracer, 'function_signatures'):
+                                func_info = self.tracer.function_signatures.get(selector)
+                                if func_info:
+                                    func_name = func_info['name']
+                        
+                        print(f"Step {highlight(f'{i:4d}')}: {opcode(step.op)} | PC: {step.pc:4d} | Depth: {step.depth:2d} | Gas: {gas_value(step.gas)}")
+                        print(f"         Gas: {step.gas} | Value: {step.value:6d} | Args: {len(step.stack)} | Ret: {len(step.stack)}")
+                        print(f"         Target: {address(to_addr)} ({info(target_name)})")
+                        print(f"         Source: {info(source_name)}")
+                        print(f"        => {info(func_name)}")
+                        print()
+        
+        if call_count == 0:
+            print("No CALL opcodes found in trace.")
+        else:
+            print(f"Total CALL opcodes: {call_count}")
+        
+        print(dim("-" * 80))
+    
+    def do_steps(self, arg):
+        """Show all steps grouped by contract. Usage: steps [contract_name_or_address]"""
+        if not self.current_trace:
+            print("No transaction loaded.")
+            return
+        
+        if not self.tracer.multi_contract_parser:
+            print("Multi-contract mode not enabled.")
+            return
+        
+        # Parse argument to find specific contract
+        target_contract = None
+        if arg:
+            arg = arg.strip()
+            # Try to find contract by name or address
+            for contract_info in self.tracer.multi_contract_parser.contracts.values():
+                if (contract_info.name.lower() == arg.lower() or 
+                    contract_info.address.lower() == arg.lower()):
+                    target_contract = contract_info
+                    break
+            
+            if not target_contract:
+                print(f"Contract '{arg}' not found.")
+                print("Available contracts:")
+                for contract_info in self.tracer.multi_contract_parser.contracts.values():
+                    print(f"  {contract_info.name} @ {contract_info.address}")
+                return
+        
+        print(f"\n{bold('Steps by Contract:')}")
+        print(dim("-" * 80))
+        
+        # Group steps by contract using function_trace
+        contract_steps = {}
+        
+        for i, step in enumerate(self.current_trace.steps):
+            # Find which contract is executing at this step
+            current_contract_addr = self._get_contract_address_for_step(i)
+            
+            # Assign step to current contract
+            if current_contract_addr not in contract_steps:
+                contract_steps[current_contract_addr] = []
+            contract_steps[current_contract_addr].append((i, step))
+        
+        # Display steps by contract
+        for contract_addr, steps in contract_steps.items():
+            contract_info = self.tracer.multi_contract_parser.get_contract_at_address(contract_addr)
+            contract_name = contract_info.name if contract_info else "Unknown"
+            
+            # If target contract specified, only show that one
+            if target_contract and contract_addr != target_contract.address:
+                continue
+            
+            print(f"\n{info(contract_name)} @ {address(contract_addr)}")
+            print(f"Steps: {len(steps)} (range: {steps[0][0]}-{steps[-1][0]})")
+            
+            # Show all steps without truncation
+            for step_num, step in steps:
+                marker = "=>" if step_num == self.current_step else "  "
+                print(f"{marker} Step {step_num:4d}: PC {step.pc:4d} | {step.op}")
+        
+        print(dim("-" * 80))
+    
+    def do_goto_call(self, arg):
+        """Jump to a specific CALL opcode. Usage: goto_call <step_number>"""
+        if not self.current_trace:
+            print("No transaction loaded.")
+            return
+        
+        if not arg:
+            print("Usage: goto_call <step_number>")
+            print("Use 'calls' command to see available CALL opcodes.")
+            return
+        
+        try:
+            step_num = int(arg)
+            if step_num < 0 or step_num >= len(self.current_trace.steps):
+                print(f"Invalid step number. Range: 0-{len(self.current_trace.steps)-1}")
+                return
+            
+            step = self.current_trace.steps[step_num]
+            if step.op not in ["CALL", "DELEGATECALL", "STATICCALL"]:
+                print(f"Step {step_num} is not a CALL opcode (it's {step.op})")
+                return
+            
+            self.current_step = step_num
+            self._update_current_function()
+            self._track_variable_changes()
+            self._show_current_state()
+            
+        except ValueError:
+            print("Invalid step number. Must be an integer.")
+    
+    def do_goto(self, arg):
+        """Jump to a specific step. Usage: goto <step_number>"""
+        if not self.current_trace:
+            print("No transaction loaded.")
+            return
+        
+        if not arg:
+            print("Usage: goto <step_number>")
+            return
+        
+        try:
+            step_num = int(arg)
+            if step_num < 0 or step_num >= len(self.current_trace.steps):
+                print(f"Invalid step number. Range: 0-{len(self.current_trace.steps)-1}")
+                return
+            
+            self.current_step = step_num
+            self._update_current_function()
+            self._track_variable_changes()
+            self._show_current_state()
+            
+        except ValueError:
+            print("Invalid step number. Must be an integer.")
+    
     def do_debug_ethdebug(self, arg):
         """Debug ETHDebug data. Usage: debug_ethdebug [pc]"""
         if not self.tracer.ethdebug_info:
@@ -1116,6 +1784,11 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
     
     def _get_source_line_for_step(self, step_index: int) -> Optional[int]:
         """Get source line number for a given step."""
+        source_info = self._get_source_info_for_step(step_index)
+        return source_info[1] if source_info else None
+    
+    def _get_source_info_for_step(self, step_index: int) -> Optional[Tuple[str, int]]:
+        """Get source file and line number for a given step."""
         if step_index >= len(self.current_trace.steps):
             return None
             
@@ -1125,12 +1798,12 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
             # Use ETHDebug info
             context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=0)
             if context:
-                return context['line']
+                return (context['file'], context['line'])
         elif self.source_map:
             # Use basic source map
             source_info = self.source_map.get(step.pc)
             if source_info:
-                return source_info[1]
+                return (source_info[0], source_info[1])
         
         return None
     
@@ -1138,12 +1811,172 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         """Update current function based on current step."""
         if not self.function_trace:
             return
-            
+        
+        # Store previous contract address for comparison
+        previous_contract_address = self.contract_address
+        
         # Find which function we're in
+        matching_contract_func = None
         for func in self.function_trace:
-            if func.entry_step <= self.current_step <= (func.exit_step or len(self.current_trace.steps)):
-                self.current_function = func
+            if (func.entry_step <= self.current_step <= (func.exit_step or len(self.current_trace.steps)) and
+                func.contract_address == self.contract_address):
+                matching_contract_func = func
                 break
+        
+        if matching_contract_func:
+            self.current_function = matching_contract_func
+        else:
+            # No function found for current contract, don't set current_function
+            self.current_function = None
+        
+        # Update contract address based on current function
+        if self.current_function and self.current_function.contract_address:
+            if self.contract_address != self.current_function.contract_address:
+                self.contract_address = self.current_function.contract_address
+                
+                # Check if we need to switch contract context for cross-contract calls
+                # But only if we haven't manually switched (e.g., via step command)
+                if (self.tracer.multi_contract_parser and 
+                    self.current_function.contract_address and 
+                    self.current_function.contract_address != self.contract_address and
+                    not self.manual_contract_switch):
+                    
+                    # Switch to the target contract's debug info
+                    target_contract = self.tracer.multi_contract_parser.get_contract_at_address(self.current_function.contract_address)
+                    if target_contract:
+                        self.tracer.ethdebug_info = target_contract.ethdebug_info
+                        self.tracer.ethdebug_parser = target_contract.parser
+                        self.source_map = target_contract.parser.get_source_mapping() if target_contract.parser else {}
+                        
+                        # Load source files for the new contract
+                        self._load_source_files_for_contract(target_contract)
+                        
+                        # Update contract address
+                        self.contract_address = self.current_function.contract_address
+                        
+        # Check for contract return transitions
+        self._check_contract_return_transition(previous_contract_address)
+        
+        # Also check if we're at a CALL opcode step that should be highlighted
+        if (self.current_step < len(self.current_trace.steps) and 
+            self.current_trace.steps[self.current_step].op in ["CALL", "DELEGATECALL", "STATICCALL"]):
+            # CALL opcode - this will be handled by _show_current_state
+            pass
+    
+    def _check_contract_return_transition(self, previous_contract_address):
+        """Check if we're returning from a second contract to the first one."""
+        if not self.current_trace or self.current_step >= len(self.current_trace.steps):
+            return
+        
+        # Check if depth detection is enabled
+        if not self.enable_depth_detection:
+            return
+            
+        current_step = self.current_trace.steps[self.current_step]
+        
+        # Check if we're at a return opcode
+        if current_step.op in ["RETURN", "REVERT", "STOP"]:
+            # Check if we're returning to a different contract (depth decrease)
+            if (previous_contract_address and 
+                # self.contract_address != previous_contract_address and
+                self.tracer.multi_contract_parser):
+                
+                # Get contract names for better display
+                from_contract = self.tracer.multi_contract_parser.get_contract_at_address(previous_contract_address)
+                to_contract = self.tracer.multi_contract_parser.get_contract_at_address(self.contract_address)
+                
+                from_name = from_contract.name if from_contract else "Unknown"
+                to_name = to_contract.name if to_contract else "Unknown"
+                
+                # Show return transition indication
+                print(f"\n{success('↩️  RETURNING FROM CONTRACT')}")
+                print(f"{dim('=' * 50)}")
+                print(f"{info('From:')} {address(previous_contract_address)} ({from_name})")
+                print(f"{info('To:')} {address(self.contract_address)} ({to_name})")
+                
+                # Show return value if available
+                if current_step.op == "RETURN" and len(current_step.stack) >= 2:
+                    try:
+                        offset = int(current_step.stack[0], 16)
+                        length = int(current_step.stack[1], 16)
+                        if length > 0 and current_step.memory:
+                            # Extract return data from memory
+                            memory_hex = current_step.memory.replace('0x', '')
+                            start_idx = offset * 2
+                            end_idx = start_idx + (length * 2)
+                            if start_idx < len(memory_hex) and end_idx <= len(memory_hex):
+                                return_data = memory_hex[start_idx:end_idx]
+                                print(f"{info('Return Data:')} 0x{return_data}")
+                    except (ValueError, IndexError):
+                        pass
+                
+                print(f"{dim('=' * 50)}\n")
+        
+        # Check if we need to return to previous contract based on call stack and depth
+        if self.tracer.multi_contract_parser and self.call_stack:
+            # Check if we're returning from a deeper call (depth decreased)
+            current_step = self.current_trace.steps[self.current_step]
+            if (hasattr(self, 'previous_depth') and 
+                current_step.depth < self.previous_depth and 
+                self.current_function and self.current_function.exit_step and
+                self.current_step >= self.current_function.exit_step):
+                
+                # We're returning from a deeper call, check call stack
+                calling_contract_addr = self.call_stack[-1]['contract'] if self.call_stack else None
+                if calling_contract_addr and calling_contract_addr != self.contract_address:
+                    # Look for next function call in the calling contract
+                    next_calling_contract_func = None
+                    for func in self.function_trace:
+                        if (func.contract_address == calling_contract_addr and 
+                            func.entry_step > self.current_step):
+                            next_calling_contract_func = func
+                            break
+                    
+                    if next_calling_contract_func:
+                        # Get contract info for better display
+                        current_contract = self.tracer.multi_contract_parser.get_contract_at_address(self.contract_address)
+                        calling_contract = self.tracer.multi_contract_parser.get_contract_at_address(calling_contract_addr)
+                        
+                        current_name = current_contract.name if current_contract else "Unknown"
+                        calling_name = calling_contract.name if calling_contract else "Unknown"
+                        
+                        # Switch back to calling contract
+                        print(f"\n{success('↩️  RETURNING TO CALLING CONTRACT')}")
+                        print(f"{dim('=' * 50)}")
+                        print(f"{info('From:')} {self.contract_address[:10]}... ({current_name})")
+                        print(f"{info('To:')} {calling_contract_addr[:10]}... ({calling_name})")
+                        print(f"{info('Depth:')} {self.previous_depth} → {current_step.depth}")
+                        print(f"{dim('=' * 50)}\n")
+                        
+                        # Switch to calling contract context
+                        self.contract_address = calling_contract_addr
+                        if calling_contract:
+                            self.tracer.ethdebug_info = calling_contract.ethdebug_info
+                            self.tracer.ethdebug_parser = calling_contract.parser
+                            self.source_map = calling_contract.parser.get_source_mapping() if calling_contract.parser else {}
+                            self._load_source_files_for_contract(calling_contract)
+                        self.manual_contract_switch = False  # Reset manual switch flag
+                        
+                        # Pop from call stack since we're returning
+                        self.call_stack.pop()
+    
+    def _check_depth_change(self):
+        """Check for depth changes and provide indication."""
+        if not self.current_trace or self.current_step >= len(self.current_trace.steps):
+            return
+        
+        # Check if depth detection is enabled
+        if not self.enable_depth_detection:
+            # Still update previous_depth for consistency
+            current_step = self.current_trace.steps[self.current_step]
+            self.previous_depth = current_step.depth
+            return
+            
+        current_step = self.current_trace.steps[self.current_step]
+        current_depth = current_step.depth
+        
+        # Update previous depth
+        self.previous_depth = current_depth
     
     def _track_variable_changes(self):
         """Track changes in variable values for history."""
@@ -1191,6 +2024,22 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
             return
         
         step = self.current_trace.steps[self.current_step]
+        
+        # Check if this is a CALL opcode that should trigger contract switching
+        if step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
+            self._show_call_opcode_info(step, show_options=True)
+            return
+        
+        # Check if this is a return opcode that should be highlighted
+        if step.op in ["RETURN", "REVERT", "STOP", "SELFDESTRUCT"]:
+            # Only handle as cross-contract return if we have a call stack
+            if self.call_stack:
+                self._handle_return_opcode(step)
+                return
+            else:
+                # Just a normal return, show it normally
+                self._show_return_opcode_info(step)
+                # Continue with normal display
         
         # Get source information
         source_file = None
@@ -1269,6 +2118,107 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         # Watch expressions
         if self.watch_expressions:
             self._evaluate_watch_expressions(step)
+    
+    def _show_call_opcode_info(self, step, show_options=True):
+        """Display information about CALL/DELEGATECALL/STATICCALL opcodes."""
+        if show_options:
+            print(f"\n{warning('CALL DETECTED - Entering contract')}")
+            print(f"{dim('=' * 50)}")
+            
+            # Extract call information from stack
+            if len(step.stack) >= 6:  # Minimum for DELEGATECALL/STATICCALL
+                required_stack_size = 7 if step.op == "CALL" else 6
+                
+                if len(step.stack) >= required_stack_size:
+                    # Extract target address
+                    to_addr = self.tracer.extract_address_from_stack(step.stack[-2])
+                    
+                    # Try to identify the target contract
+                    contract_name = ""
+                    if self.tracer.multi_contract_parser:
+                        target_contract = self.tracer.multi_contract_parser.get_contract_at_address(to_addr)
+                        if target_contract:
+                            contract_name = f" ({target_contract.name})"
+                    
+                    print(f"Target: {address(to_addr)}{info(contract_name)}")
+                    
+                    # Extract calldata
+                    calldata = self.tracer.extract_calldata_from_step(step)
+                    
+                    # Try to decode function signature
+                    if calldata and len(calldata) >= 10:
+                        selector = calldata[:10]
+                        print(f"Function Selector: {info(selector)}")
+                        
+                        # Try to find function name
+                        if hasattr(self.tracer, 'function_signatures'):
+                            func_info = self.tracer.function_signatures.get(selector)
+                            if func_info:
+                                print(f"Function: {info(func_info['name'])}")
+                    
+                    # Show current source context
+                    if self.tracer.ethdebug_info:
+                        context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=1)
+                        if context:
+                            print(f"\nSource Context:")
+                            print(f"  File: {info(os.path.basename(context['file']))}:{info(context['line'])}")
+                            print(f"    => {source_line(context['content'])}")
+                    
+                    print(f"\n{info('Options:')}")
+                    print(f"  {success('step')} or {success('si')} - Step into the called contract")
+                    print(f"  {success('next')} or {success('n')} - Continue in current contract (skip call)")
+            
+            print(f"\n{dim('[')} {dim('Step')} {highlight(f'{self.current_step}')} | "
+                  f"{dim('Gas:')} {gas_value(step.gas)} | "
+                  f"{dim('PC:')} {pc_value(step.pc)} | "
+                  f"{opcode(step.op)} {dim(']')}")
+            
+            print(f"{dim('=' * 50)}")
+        else:
+            # For next command, show only brief info
+            if len(step.stack) >= 6:
+                required_stack_size = 7 if step.op == "CALL" else 6
+                
+                if len(step.stack) >= required_stack_size:
+                    # Extract target address
+                    to_addr = self.tracer.extract_address_from_stack(step.stack[-2])
+                    
+                    # Try to identify the target contract
+                    contract_name = ""
+                    if self.tracer.multi_contract_parser:
+                        target_contract = self.tracer.multi_contract_parser.get_contract_at_address(to_addr)
+                        if target_contract:
+                            contract_name = f" ({target_contract.name})"
+                    
+                    print(f"\n{warning('Skipping call')} {address(to_addr)}{info(contract_name)}")
+    
+    def _show_return_opcode_info(self, step):
+        """Display information about RETURN/REVERT/STOP/SELFDESTRUCT opcodes."""
+        
+        # Determine the type of return
+        if step.op == "RETURN":
+            opcode_type = "RETURN"
+            opcode_desc = "Successful execution return"
+            color_func = success
+        elif step.op == "REVERT":
+            opcode_type = "REVERT"
+            opcode_desc = "Execution reverted"
+            color_func = error
+        elif step.op == "STOP":
+            opcode_type = "STOP"
+            opcode_desc = "Execution stopped"
+            color_func = warning
+        elif step.op == "SELFDESTRUCT":
+            opcode_type = "SELFDESTRUCT"
+            opcode_desc = "Contract self-destructed"
+            color_func = error
+        else:
+            opcode_type = step.op
+            opcode_desc = "State-returning opcode"
+            color_func = warning
+        
+        print(f"  {info('Type:')} {color_func(opcode_type)} - {opcode_desc}")
+        print(f"{dim('=' * 60)}")
     
     def _show_local_variables(self, step):
         """Display local variables at the current step."""
@@ -1505,6 +2455,182 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
         ok = self.tracer.revert_state(target)
         print("Reverted." if ok else "Revert failed.")
     
+    def do_returns(self, arg):
+        """Show all return opcodes (RETURN, REVERT, STOP, SELFDESTRUCT) in the trace. Usage: returns"""
+        if not self.current_trace:
+            print("No transaction loaded.")
+            return
+        
+        print(f"\n{info('Return Opcodes in Trace')}")
+        print(f"{dim('=' * 80)}")
+        
+        return_opcodes = ["RETURN", "REVERT", "STOP", "SELFDESTRUCT"]
+        found_returns = []
+        
+        for i, step in enumerate(self.current_trace.steps):
+            if step.op in return_opcodes:
+                found_returns.append((i, step))
+        
+        if not found_returns:
+            print(f"{warning('No return opcodes found in trace.')}")
+            return
+        
+        for step_num, step in found_returns:
+            # Determine color and description
+            if step.op == "RETURN":
+                color_func = success
+                desc = "Successful return"
+            elif step.op == "REVERT":
+                color_func = error
+                desc = "Reverted"
+            elif step.op == "STOP":
+                color_func = warning
+                desc = "Stopped"
+            elif step.op == "SELFDESTRUCT":
+                color_func = error
+                desc = "Self-destructed"
+            else:
+                color_func = warning
+                desc = "State return"
+            
+            # Get contract info if available
+            contract_info = ""
+            if self.tracer.multi_contract_parser:
+                # Find which contract is executing at this step by looking at function calls
+                step_contract_address = self._get_contract_address_for_step(i)
+                contract = self.tracer.multi_contract_parser.get_contract_at_address(step_contract_address)
+                if contract:
+                    contract_info = f" ({contract.name})"
+            
+            print(f"Step {step_num:4d}: {color_func(step.op):12s} | PC: {step.pc:4d} | Depth: {step.depth:2d} | Gas: {step.gas:8d}{contract_info}")
+            
+            # Show return data for RETURN/REVERT
+            if step.op in ["RETURN", "REVERT"] and len(step.stack) >= 2:
+                try:
+                    offset = int(step.stack[0], 16)
+                    length = int(step.stack[1], 16)
+                    if length > 0 and step.memory:
+                        memory_hex = step.memory.replace('0x', '')
+                        start_idx = offset * 2
+                        end_idx = start_idx + (length * 2)
+                        if start_idx < len(memory_hex) and end_idx <= len(memory_hex):
+                            data = memory_hex[start_idx:end_idx]
+                            print(f"         Data: 0x{data[:64]}{'...' if len(data) > 64 else ''}")
+                except (ValueError, IndexError):
+                    pass
+            
+            # Show source context if available
+            if self.tracer.ethdebug_info:
+                context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=1)
+                if context:
+                    print(f"         Source: {os.path.basename(context['file'])}:{context['line']}")
+                    if context.get('content'):
+                        print(f"         => {context['content'].strip()}")
+                    elif context.get('context_lines'):
+                        print(f"         => {context['context_lines'][0].strip()}")
+        
+        print(f"{dim('=' * 80)}")
+        print(f"Found {len(found_returns)} return opcodes in trace.")
+
+    def do_calls(self, arg):
+        """Show all CALL opcodes (CALL, DELEGATECALL, STATICCALL) in the trace. Usage: calls"""
+        if not self.current_trace:
+            print("No transaction loaded.")
+            return
+        
+        print(f"\n{info('Call Opcodes in Trace')}")
+        print(f"{dim('=' * 80)}")
+        
+        call_opcodes = ["CALL", "DELEGATECALL", "STATICCALL"]
+        found_calls = []
+        
+        for i, step in enumerate(self.current_trace.steps):
+            if step.op in call_opcodes:
+                found_calls.append((i, step))
+        
+        if not found_calls:
+            print(f"{warning('No call opcodes found in trace.')}")
+            return
+        
+        for step_num, step in found_calls:
+            # Determine color and description
+            if step.op == "CALL":
+                color_func = info
+                desc = "External call"
+            elif step.op == "DELEGATECALL":
+                color_func = warning
+                desc = "Delegate call"
+            elif step.op == "STATICCALL":
+                color_func = success
+                desc = "Static call"
+            else:
+                color_func = warning
+                desc = "Call"
+            
+            # Get contract info if available
+            contract_info = ""
+            if self.tracer.multi_contract_parser:
+                # Find which contract is executing at this step by looking at function calls
+                step_contract_address = self._get_contract_address_for_step(i)
+                contract = self.tracer.multi_contract_parser.get_contract_at_address(step_contract_address)
+                if contract:
+                    contract_info = f" ({contract.name})"
+            
+            print(f"Step {step_num:4d}: {color_func(step.op):12s} | PC: {step.pc:4d} | Depth: {step.depth:2d} | Gas: {step.gas:8d}{contract_info}")
+            
+            # Extract call information from stack
+            if len(step.stack) >= 7:  # CALL has 7 stack items
+                try:
+                    gas = int(step.stack[-1], 16)
+                    addr = step.stack[-2]
+                    value = int(step.stack[-3], 16) if step.op == "CALL" else 0
+                    args_offset = int(step.stack[-4], 16)
+                    args_length = int(step.stack[-5], 16)
+                    ret_offset = int(step.stack[-6], 16)
+                    ret_length = int(step.stack[-7], 16)
+                    
+                    print(f"         Gas: {gas:8d} | Value: {value:8d} | Args: {args_offset}+{args_length} | Ret: {ret_offset}+{ret_length}")
+                    print(f"         Target: {addr}")
+                    
+                    # Try to decode function selector
+                    if args_length >= 4 and step.memory:
+                        memory_hex = step.memory.replace('0x', '')
+                        start_idx = args_offset * 2
+                        end_idx = start_idx + 8  # First 4 bytes
+                        if start_idx < len(memory_hex) and end_idx <= len(memory_hex):
+                            selector = memory_hex[start_idx:end_idx]
+                            print(f"         Selector: 0x{selector}")
+                except (ValueError, IndexError):
+                    pass
+            
+            # Show source context if available
+            if self.tracer.ethdebug_info:
+                context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=1)
+                if context:
+                    print(f"         Source: {os.path.basename(context['file'])}:{context['line']}")
+                    if context.get('content'):
+                        print(f"        => {context['content'].strip()}")
+                    elif context.get('context_lines'):
+                        print(f"        => {context['context_lines'][0].strip()}")
+        
+        print(f"{dim('=' * 80)}")
+        print(f"Found {len(found_calls)} call opcodes in trace.")
+
+    
+    def _get_contract_address_for_step(self, step_index: int) -> str:
+        """Get the contract address that is executing at a given step."""
+        if not self.function_trace:
+            return self.contract_address
+        
+        # Find the function call that covers this step
+        for func in reversed(self.function_trace):  # Check most recent first
+            if (func.entry_step <= step_index <= (func.exit_step or len(self.current_trace.steps)) and
+                func.contract_address):
+                return func.contract_address
+        
+        # Fallback to current contract address
+        return self.contract_address
+
     def do_help(self, arg):
         """Show help information."""
         if arg:
@@ -1518,9 +2644,11 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
             # Execution Control
             print(f"\n{cyan('Execution Control:')}")
             print(f"  {info('run')} <tx_hash>     - Load and debug a transaction")
-            print(f"  {info('next')} (n/step/s)   - Step to next source line")
+            print(f"  {info('next')} (n)          - Step to next source line")
+            print(f"  {info('step')} (s)          - Step into function calls (step into)")
             print(f"  {info('nexti')} (ni/stepi)  - Step to next instruction")  
             print(f"  {info('continue')} (c)      - Continue execution")
+            print(f"  {info('goto')} <step>       - Jump to specific step")
             
             # Breakpoints
             print(f"\n{cyan('Breakpoints:')}")
@@ -1550,6 +2678,10 @@ Use {info('next')}/{info('nexti')} to step, {info('continue')} to run, {info('wh
             # Debug Commands
             print(f"\n{cyan('Debug Commands:')}")
             print(f"  {info('debug_ethdebug')}    - Debug ETHDebug data at current PC")
+            print(f"  {info('contract')}          - Show current contract context")
+            print(f"  {info('calls')}             - Show all CALL opcodes in trace")
+            print(f"  {info('steps')}             - Show all steps grouped by contract")
+            print(f"  {info('goto_call')} <step>  - Jump to specific CALL opcode")
             
             # Other
             print(f"\n{cyan('Other Commands:')}")
