@@ -311,6 +311,8 @@ def trace_command(args):
         
         # Extract contract name from the entrypoint contract
         contract_name = None
+        abi_path = None
+        
         if tracer.multi_contract_parser and trace.to_addr:
             # In multi-contract mode, get the name from the entrypoint contract
             entrypoint_contract = tracer.multi_contract_parser.get_contract_at_address(trace.to_addr)
