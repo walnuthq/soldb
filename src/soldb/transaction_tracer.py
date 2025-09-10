@@ -2766,47 +2766,6 @@ class TransactionTracer:
         print(dim("-" * 60))
         print(f"\n{dim('Use --raw flag to see detailed instruction trace')}")
 
-    def print_function_calls(self,trace: TransactionTrace):
-        print(f"\n{bold('Contracts detected in transaction:')}")
-        print(dim("-" * 80))
-
-        call_count = 0
-        for i, step in enumerate(trace.steps):
-            if step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
-                call_count += 1
-                
-                # Extract call information
-                if len(step.stack) >= 6:
-                    required_stack_size = 7 if step.op == "CALL" else 6
-                    if len(step.stack) >= required_stack_size:
-                        to_addr = self.extract_address_from_stack(step.stack[-2])
-                        calldata = self.extract_calldata_from_step(step)
-                        
-                        # Try to identify target contract
-                        target_name = "Unknown"
-                        if self.multi_contract_parser:
-                            target_contract = self.multi_contract_parser.get_contract_at_address(to_addr)
-                            if target_contract:
-                                target_name = target_contract.name
-                        
-                        # Try to decode function
-                        func_name = "Unknown"
-                        if calldata and len(calldata) >= 10:
-                            selector = calldata[:10]
-                            if hasattr(self, 'function_signatures'):
-                                func_info = self.function_signatures.get(selector)
-                                if func_info:
-                                    func_name = func_info['name']
-                        
-                        print(f"{address(to_addr)} ({info(target_name)})")
-                        print(f"Entry Function: {info(func_name)}")
-                        print(f"Gas: {gas_value(step.gas)}")
-                        print()
-        
-        if call_count == 0:
-            print("No CALL opcodes found in trace.")
-
-
 class SourceMapper:
     """Maps EVM bytecode positions to Solidity source locations."""
     

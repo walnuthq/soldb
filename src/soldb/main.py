@@ -19,6 +19,7 @@ from .colors import error, info, warning
 from .auto_deploy import AutoDeployDebugger
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
+from .utils import print_contracts_in_transaction
 
 
 def find_debug_file(contract_addr: str) -> str:
@@ -360,55 +361,77 @@ def trace_command(args):
     
     return 0
 
-def _display_contract_info(args):
-    tracer = TransactionTracer(args.rpc_url)
-    
-    if args.multi_contract or args.ethdebug_dir or args.contracts:
-        # Multi-contract mode
+def list_contracts_command(args):
+    """Execute the list-events command."""
+
+    # Create tracer
+    try:
+        tracer = TransactionTracer(args.rpc_url)
+    except ConnectionError as e:
+        print(f"{error(e)}")
+        return 1
+
+    # Multi-contract mode detection (same as trace_command)
+    multi_contract_mode = False
+    ethdebug_dirs = []
+    if hasattr(args, 'ethdebug_dir') and args.ethdebug_dir:
+        if isinstance(args.ethdebug_dir, list):
+            ethdebug_dirs = args.ethdebug_dir
+        else:
+            ethdebug_dirs = [args.ethdebug_dir]
+    if getattr(args, 'multi_contract', False) or (ethdebug_dirs and len(ethdebug_dirs) > 1) or getattr(args, 'contracts', None):
+        multi_contract_mode = True
+
+    if multi_contract_mode:
         multi_parser = MultiContractETHDebugParser()
-        
         # Load from contracts mapping file if provided
-        if args.contracts:
-            multi_parser.load_from_mapping_file(args.contracts)
-        
+        if getattr(args, 'contracts', None):
+            try:
+                multi_parser.load_from_mapping_file(args.contracts)
+            except Exception as e:
+                print(f"Error loading contracts mapping file: {e}")
+                sys.exit(1)
         # Load from ethdebug directories
-        if args.ethdebug_dir:
-            for ethdebug_spec in args.ethdebug_dir:
-                # Parse address:path format
-                address = None
-                name = None
-                path = ethdebug_spec
-                parts = ethdebug_spec.split(':', 2)
-                if len(parts) == 3:
-                    address, name, path = parts
-                elif len(parts) == 2:
-                    address, path = parts
-                try:
-                    if address and name:
-                        multi_parser.load_contract(address, path, name)
-                    elif address:
-                        multi_parser.load_contract(address, path)
+        if ethdebug_dirs:
+            try:
+                # Parse all ethdebug directories at once
+                specs = ETHDebugDirParser.parse_ethdebug_dirs(ethdebug_dirs)
+
+                for spec in specs:
+                    if spec.address and spec.name:
+                        # Single contract format: address:name:path
+                        multi_parser.load_contract(spec.address, spec.path, spec.name)
+                    elif spec.address:
+                        # Multi-contract format: address:path
+                        multi_parser.load_contract(spec.address, spec.path)
                     else:
-                        # Try to load from deployment.json in the directory
-                        # NOTE: This does not make sense because the contract that we want to debug is probably already deployed
-                        # and we do not have deployment.json for it.
-                        deployment_file = Path(ethdebug_spec) / "deployment.json"
+                        # Just path - try to load from deployment.json
+                        deployment_file = Path(spec.path) / "deployment.json"
                         if deployment_file.exists():
-                            multi_parser.load_from_deployment(deployment_file)
+                            try:
+                                multi_parser.load_from_deployment(deployment_file)
+                            except Exception as e:
+                                sys.stderr.write(f"Error loading deployment.json from {spec.path}: {e}\n")
+                                sys.exit(1)
                         else:
-                            print(f"Warning: No deployment.json found in {ethdebug_spec}, skipping...\n")
-                except Exception as e:
-                    print(f"Error loading contract {address or ''} from {path}: {e}\n")
-                    sys.exit(1)
+                            sys.stderr.write(f"Warning: No deployment.json found in {spec.path}, skipping...\n")
+            except ValueError as e:
+                sys.stderr.write(f"Error parsing ethdebug directories: {e}\n")
+                sys.exit(1)
 
         for addr, contract_info in multi_parser.contracts.items():
             abi_path = contract_info.debug_dir / f"{contract_info.name}.abi"
             if abi_path.exists():
                 tracer.load_abi(str(abi_path))
+            elif (contract_info.debug_dir / f"{contract_info.name}.json").exists():
+                tracer.load_abi(str(contract_info.debug_dir / f"{contract_info.name}.json"))
 
         tracer.multi_contract_parser = multi_parser
+
+    # Get transaction trace
     trace = tracer.trace_transaction(args.tx_hash)
-    tracer.print_function_calls(trace)
+    # Print contracts involved in the transaction
+    print_contracts_in_transaction(tracer,trace)
     return 0
           
 def simulate_command(args):
@@ -1046,7 +1069,7 @@ def main():
         return simulate_command(args)
 
     if args.command == 'list-contracts':
-        return _display_contract_info(args)
+        return list_contracts_command(args)
 
     return 0
 
