@@ -11,7 +11,7 @@ import sys
 from eth_utils import decode_hex
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
-from web3 import Web3
+from web3 import HTTPProvider, Web3
 from eth_utils import to_hex, to_checksum_address,keccak
 from eth_abi.abi import encode as abi_encode
 from .colors import *
@@ -149,6 +149,8 @@ class TransactionTracer:
         self.function_abis = {}  # selector -> full ABI item
         self.function_params = {}  # function name -> parameter info
         self.function_abis_by_name = {}  # function name -> full ABI item
+        self.event_abis = {}  # event signature hash -> full ABI item
+        self.event_signatures = {}  # event signature hash -> event signature string
         self._initial_snapshot_id: Optional[str] = None
         self._last_snapshot_id: Optional[str] = None
         self.missing_mappings_warned = False  # Track if we've already warned about missing mappings
@@ -798,7 +800,18 @@ class TransactionTracer:
         """Load ABI and extract function signatures."""
         try:
             with open(abi_path, 'r') as f:
-                abi = json.load(f)
+                data = json.load(f)
+            
+            # Handle both direct ABI arrays and Forge artifact format
+            if isinstance(data, list):
+                # Direct ABI array
+                abi = data
+            elif isinstance(data, dict) and 'abi' in data:
+                # Forge artifact format
+                abi = data['abi']
+            else:
+                print(f"Warning: Unknown ABI format in {abi_path}")
+                return
             
             for item in abi:
                 if item.get('type') == 'function':
@@ -820,6 +833,21 @@ class TransactionTracer:
                     self.function_params[name] = inputs
                     # Also store ABI by function name for internal calls
                     self.function_abis_by_name[name] = item
+                
+                if item.get('type') == 'event':
+                    # Handle event's ABI
+                    name = item['name']
+                    inputs = item.get('inputs', [])
+                    
+                    input_types = ','.join([self.format_abi_type(inp) for inp in inputs])
+                    signature = f"{name}({input_types})"
+
+                    topic_bytes = self.w3.keccak(text=signature)
+                    topic_hash = '0x' + topic_bytes.hex()
+
+                    # Store event information
+                    self.event_signatures[topic_hash] = signature
+                    self.event_abis[topic_hash] = item
                     
         except Exception as e:
             print(f"Warning: Could not load ABI: {e}")
@@ -2765,6 +2793,173 @@ class TransactionTracer:
         
         print(dim("-" * 60))
         print(f"\n{dim('Use --raw flag to see detailed instruction trace')}")
+
+    def decode_event_log(self, log_entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Decode an event log using ABI information."""
+        decoded_log = {
+            'address': log_entry.get('address'),
+            'topics': log_entry.get('topics', []),
+            'data': log_entry.get('data', '0x'),
+            'decoded': None
+        }
+        
+        topics = log_entry.get('topics', [])
+        if not topics:
+            return decoded_log
+        
+        # First topic is the event signature hash
+        # Handle both bytes and string formats
+        first_topic = topics[0]
+        if isinstance(first_topic, bytes):
+            event_hash = '0x' + first_topic.hex()
+        elif isinstance(first_topic, str):
+            event_hash = first_topic
+            if not event_hash.startswith('0x'):
+                event_hash = '0x' + event_hash
+        else:
+            # Fallback - convert to string
+            event_hash = str(first_topic)
+            if not event_hash.startswith('0x'):
+                event_hash = '0x' + event_hash
+        
+        # Look up event ABI
+        if event_hash in self.event_abis:
+            try:
+                event_abi = self.event_abis[event_hash]
+                event_signature = self.event_signatures[event_hash]
+                
+                # Prepare for decoding
+                from eth_abi.abi import decode
+                
+                # Separate indexed and non-indexed parameters
+                indexed_inputs = [inp for inp in event_abi['inputs'] if inp.get('indexed', False)]
+                non_indexed_inputs = [inp for inp in event_abi['inputs'] if not inp.get('indexed', False)]
+                
+                decoded_values = {}
+                
+                # Decode indexed parameters from topics (skip first topic which is event signature)
+                indexed_topics = topics[1:]
+                for i, (topic, inp) in enumerate(zip(indexed_topics, indexed_inputs)):
+                    if i < len(indexed_topics):
+                        param_name = inp['name']
+                        param_type = inp['type']
+                        
+                        # Convert topic to bytes for decoding
+                        if isinstance(topic, bytes):
+                            topic_bytes = topic
+                        elif isinstance(topic, str):
+                            topic_bytes = bytes.fromhex(topic[2:] if topic.startswith('0x') else topic)
+                        else:
+                            # Handle HexBytes or other types
+                            topic_bytes = bytes(topic)
+                        
+                        # Decode based on type
+                        if param_type in ['address']:
+                            # Address is in the last 20 bytes
+                            decoded_values[param_name] = '0x' + topic_bytes[-20:].hex()
+                        elif param_type.startswith('uint') or param_type.startswith('int'):
+                            # Integer types
+                            decoded_values[param_name] = int.from_bytes(topic_bytes, 'big')
+                        elif param_type == 'bool':
+                            decoded_values[param_name] = topic_bytes[-1] != 0
+                        elif param_type.startswith('bytes'):
+                            if param_type == 'bytes':
+                                # Dynamic bytes
+                                decoded_values[param_name] = topic
+                            else:
+                                # Fixed bytes
+                                decoded_values[param_name] = topic
+                        else:
+                            # For other types, just show the raw topic
+                            decoded_values[param_name] = topic
+                
+                # Decode non-indexed parameters from data
+                if non_indexed_inputs and log_entry.get('data', '0x') != '0x':
+                    data_hex = log_entry['data']
+                    
+                    # Handle different data formats
+                    if isinstance(data_hex, bytes):
+                        data_hex = data_hex.hex()
+                    elif isinstance(data_hex, str):
+                        if data_hex.startswith('0x'):
+                            data_hex = data_hex[2:]
+                    else:
+                        # Handle HexBytes or other types
+                        data_hex = bytes(data_hex).hex()
+                    
+                    if data_hex:
+                        data_bytes = bytes.fromhex(data_hex)
+                        param_types = [inp['type'] for inp in non_indexed_inputs]
+                        
+                        try:
+                            decoded_data = decode(param_types, data_bytes)
+                            for inp, value in zip(non_indexed_inputs, decoded_data):
+                                decoded_values[inp['name']] = value
+                        except Exception as e:
+                            # If decoding fails, add raw data
+                            for inp in non_indexed_inputs:
+                                decoded_values[inp['name']] = f"decode_error: {str(e)}"
+                
+                decoded_log['decoded'] = {
+                    'event': event_abi['name'],
+                    'signature': event_signature,
+                    'args': decoded_values
+                }
+                
+            except Exception as e:
+                decoded_log['decoded'] = {
+                    'error': f"Failed to decode event: {str(e)}"
+                }
+        else:
+            # Unknown event
+            decoded_log['decoded'] = {
+                'event': 'Unknown',
+                'signature': event_hash,
+                'raw_topics': topics[0].hex(),
+                'raw_data': log_entry.get('data', '0x').hex()
+            }
+        
+        return decoded_log
+
+    def print_contracts_events(self, receipt):
+        print("")
+        print(f"Contract events in transaction:")
+        print(dim("-" * 80))
+        
+        # Get logs from transaction receipt
+        receipt_logs = receipt['logs'] if receipt and 'logs' in receipt else []
+        
+        decoded_logs = []
+    
+        # Process all receipt logs
+        for i, log in enumerate(receipt_logs):
+            decoded_log = self.decode_event_log(log)
+            decoded_logs.append(decoded_log)
+
+        if not decoded_logs:
+            print(dim("No events emitted"))
+        else:
+            for i, log in enumerate(decoded_logs):
+                if log['decoded']:
+                    
+                    if 'error' in log['decoded']:
+                        print(f"  {error(log['decoded']['error'])}")
+                    elif log['decoded']['event'] == 'Unknown':
+                        print(f"{warning(f'Event #{i+1}:')} {f'Contract:{(log['address'])}::Topic:{f'{log['decoded']['signature']}'}'}")
+                        print(f"    data: {cyan(log['decoded']['raw_data'])}")
+                    else:
+                        print(f"{success(f'Event #{i+1}: ')}", end="")
+                        if self.multi_contract_parser:
+                            contract_name = self.multi_contract_parser.get_contract_at_address(log['address']).name
+                            print(f"{info(contract_name)}::", end="")
+                        print(f"{function_name(log['decoded']['signature'])}")
+                        for arg_name, arg_value in log['decoded']['args'].items():    
+                            value_str = yellow(str(arg_value))
+                            print(f"    {arg_name}: {value_str}")
+                else:
+                    print("  No decoded information available")
+                print(dim("-" * 80))
+
 
 class SourceMapper:
     """Maps EVM bytecode positions to Solidity source locations."""
