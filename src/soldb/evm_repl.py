@@ -81,6 +81,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         self.pending_call = None  # Pending call info for step into
         self.on_call_opcode = False  # Flag to track if we're currently on a CALL opcode
         self.call_return_line = None  # Line number to return to after CALL skip
+        self._in_step_mode = False  # Flag to control automatic contract switching
         
         # Variable display filters
         self.variable_filters = {
@@ -445,6 +446,9 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         if self.current_step >= len(self.current_trace.steps) - 1:
             print(info("Already at end of execution."))
             return
+        
+        # Set next mode flag to prevent automatic contract switching
+        self._in_step_mode = False
 
         if not self.source_map and not self.tracer.ethdebug_info:
             print("No source mapping available. Use 'nexti' for instruction stepping.")
@@ -491,7 +495,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                     
                     # Look for the next available line (not necessarily exact target line)
                     for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
-                        next_contract = self._get_contract_address_for_step(next_step_idx)
+                        # Use current contract address instead of trying to guess from step
+                        next_contract = self.contract_address
                         if next_contract == original_contract:
                             # Check if this step has source info
                             next_source_info = self._get_source_info_for_step(next_step_idx)
@@ -555,7 +560,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                         target_return_line = self.call_return_line if self.call_return_line else current_line + 1
                         # First, try to find the exact target line
                         for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
-                            next_contract = self._get_contract_address_for_step(next_step_idx)
+                            # Use current contract address instead of trying to guess from step
+                            next_contract = self.contract_address
                             if next_contract == original_contract:
                                 # Check if this step has the exact target return line
                                 next_source_info = self._get_source_info_for_step(next_step_idx)
@@ -570,7 +576,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                         # If exact line not found, look for the next available line
                         if not found_next_line:
                             for next_step_idx in range(self.current_step + 1, len(self.current_trace.steps)):
-                                next_contract = self._get_contract_address_for_step(next_step_idx)
+                                # Use current contract address instead of trying to guess from step
+                                next_contract = self.contract_address
                                 if next_contract == original_contract:
                                     # Check if this step has a different source line
                                     next_source_info = self._get_source_info_for_step(next_step_idx)
@@ -811,6 +818,9 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         if self.current_step >= len(self.current_trace.steps) - 1:
             print(info("Already at end of execution."))
             return
+        
+        # Set step mode flag to allow automatic contract switching
+        self._in_step_mode = True
         
         # Check if we have a pending call to step into
         if self.pending_call:
@@ -1671,8 +1681,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         contract_steps = {}
         
         for i, step in enumerate(self.current_trace.steps):
-            # Find which contract is executing at this step
-            current_contract_addr = self._get_contract_address_for_step(i)
+            # Use current contract address instead of trying to guess from step
+            current_contract_addr = self.contract_address
             
             # Assign step to current contract
             if current_contract_addr not in contract_steps:
@@ -1918,13 +1928,17 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         
         # Update contract address based on current function
         if self.current_function and self.current_function.contract_address and self.contract_address != self.current_function.contract_address:
+            # Only update contract address, don't switch context automatically
+            # Context switching should only happen in do_step command
             self.contract_address = self.current_function.contract_address
             
             # Check if we need to switch contract context for cross-contract calls
             # But only if we haven't manually switched (e.g., via step command)
+            # AND only if we're in step mode (not next mode)
             if (self.tracer.multi_contract_parser and 
                 self.current_function.contract_address and 
-                not self.manual_contract_switch):
+                not self.manual_contract_switch and
+                hasattr(self, '_in_step_mode') and self._in_step_mode):
                 
                 # Switch to the target contract's debug info
                 target_contract = self.tracer.multi_contract_parser.get_contract_at_address(self.current_function.contract_address)
@@ -2609,8 +2623,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             # Get contract info if available
             contract_info = ""
             if self.tracer.multi_contract_parser:
-                # Find which contract is executing at this step by looking at function calls
-                step_contract_address = self._get_contract_address_for_step(i)
+                # Use current contract address instead of trying to guess from step
+                step_contract_address = self.contract_address
                 contract = self.tracer.multi_contract_parser.get_contract_at_address(step_contract_address)
                 if contract:
                     contract_info = f" ({contract.name})"
@@ -2683,8 +2697,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             # Get contract info if available
             contract_info = ""
             if self.tracer.multi_contract_parser:
-                # Find which contract is executing at this step by looking at function calls
-                step_contract_address = self._get_contract_address_for_step(i)
+                # Use current contract address instead of trying to guess from step
+                step_contract_address = self.contract_address
                 contract = self.tracer.multi_contract_parser.get_contract_at_address(step_contract_address)
                 if contract:
                     contract_info = f" ({contract.name})"
@@ -2730,19 +2744,6 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         print(f"Found {len(found_calls)} call opcodes in trace.")
 
     
-    def _get_contract_address_for_step(self, step_index: int) -> str:
-        """Get the contract address that is executing at a given step."""
-        if not self.function_trace:
-            return self.contract_address
-        
-        # Find the function call that covers this step
-        for func in reversed(self.function_trace):  # Check most recent first
-            if (func.entry_step <= step_index <= (func.exit_step or len(self.current_trace.steps)) and
-                func.contract_address):
-                return func.contract_address
-        
-        # Fallback to current contract address
-        return self.contract_address
 
     def do_help(self, arg):
         """Show help information."""
