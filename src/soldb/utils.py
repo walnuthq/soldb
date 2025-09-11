@@ -1,12 +1,12 @@
     
 
 from .transaction_tracer import TransactionTrace, TransactionTracer
-from .colors import bold, dim, address, info, gas_value
+from .colors import bold, dim, address, info, gas_value,warning
 
 
 def print_contracts_in_transaction(tracer: TransactionTracer,trace: TransactionTrace):
         """Prints the contracts involved in a transaction trace."""
-
+        print(f"Looking for contracts in transaction: {info(trace.tx_hash)} on {info(tracer.rpc_url)}..")
         print(f"\n{bold('Contracts detected in transaction:')}")
         print(dim("-" * 80))
 
@@ -37,11 +37,17 @@ def print_contracts_in_transaction(tracer: TransactionTracer,trace: TransactionT
                                 func_info = tracer.function_signatures.get(selector)
                                 if func_info:
                                     func_name = func_info['name']
-                        
-                        print(f"{address(to_addr)} ({info(target_name)})")
-                        print(f"Entry Function: {info(func_name)}")
-                        print(f"Gas: {gas_value(step.gas)}")
+
+                        print(f"{address(to_addr)}",end="")
+                        if target_name != "Unknown":
+                            print(f" ({info(target_name)})")
+                        if func_name != "Unknown":
+                            print(f"Entry Function: {info(func_name)}",end="")
+                        print(f"\nGas: {gas_value(step.gas)}")
                         print(dim("-" * 80))
         
         if call_count == 0:
-            print("No CALL opcodes found in trace.")
+            print(f"{warning('No contract calls detected in this transaction.')}")
+            print(f"Please verify:")
+            print(f"  {dim('-')} {'The transaction hash is correct'}")
+            print(f"  {dim('-')} {'The RPC URL is correct'}")

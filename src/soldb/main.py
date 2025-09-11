@@ -429,7 +429,11 @@ def list_contracts_command(args):
         tracer.multi_contract_parser = multi_parser
 
     # Get transaction trace
-    trace = tracer.trace_transaction(args.tx_hash)
+    try:
+        trace = tracer.trace_transaction(args.tx_hash)
+    except ValueError as e:
+        print(f"{error(e)}")
+        return 1
     # Print contracts involved in the transaction
     print_contracts_in_transaction(tracer,trace)
     return 0
