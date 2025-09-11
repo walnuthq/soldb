@@ -699,6 +699,31 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         print(f"  {info('From:')} {current_contract_name} @ {self.contract_address[:10]}...")
         print(f"  {info('To:')} {calling_contract_name} @ {call_context['contract'][:10]}...")
         
+        # Show source context for REVERT
+        if step.op == "REVERT":
+            # Find the step index for this step
+            step_index = None
+            for i, s in enumerate(self.current_trace.steps):
+                if s == step:
+                    step_index = i
+                    break
+            
+            if step_index is not None:
+                source_info = self._get_source_info_for_step(step_index)
+            else:
+                source_info = None
+                
+            if source_info:
+                file_name, line_num = source_info
+                print(f"  {info('Source:')} {os.path.basename(file_name)}:{line_num}")
+                
+                # TODO: Get line content
+                if self.source_lines and file_name in self.source_lines:
+                    lines = self.source_lines[file_name]
+                    if 1 <= line_num <= len(lines):
+                        line_content = lines[line_num - 1].strip()
+                        # print(f"  {info('Line:')} {line_content}")
+                    
         # Restore calling contract context
         if self.tracer.multi_contract_parser:
             calling_contract = self.tracer.multi_contract_parser.get_contract_at_address(call_context['contract'])
@@ -1635,31 +1660,17 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             self.current_function = None
             return
         
-        # Use call hierarchy to find the most specific function
-        # Start with the function that has the highest call_id (most recent)
-        current_func = None
+        # First, try to find a function from the current contract
+        current_contract_funcs = [func for func in matching_funcs if func.contract_address == self.contract_address]
         
-        # Try to find the function with the highest call_id that contains current step
-        max_call_id = max(func.call_id for func in matching_funcs)
-        for func in matching_funcs:
-            if func.call_id == max_call_id:
-                current_func = func
-                break
-        
-        # If we found a function, check if we're in one of its children
-        if current_func:
-            # Look for child functions that are currently active
-            active_children = []
-            for func in matching_funcs:
-                if (func.parent_call_id == current_func.call_id and 
-                    func.entry_step <= self.current_step <= (func.exit_step or len(self.current_trace.steps))):
-                    active_children.append(func)
-            
-            # If we have active children, use the most recent one
-            if active_children:
-                # Sort by call_id (higher = more recent)
-                active_children.sort(key=lambda f: f.call_id, reverse=True)
-                current_func = active_children[0]
+        if current_contract_funcs:
+            # Use the most recent function from current contract
+            current_contract_funcs.sort(key=lambda f: f.call_id, reverse=True)
+            current_func = current_contract_funcs[0]
+        else:
+            # Fallback to the most recent function from any contract
+            matching_funcs.sort(key=lambda f: f.call_id, reverse=True)
+            current_func = matching_funcs[0]
         
         self.current_function = current_func
         
@@ -2082,6 +2093,32 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             color_func = warning
         
         print(f"  {info('Type:')} {color_func(opcode_type)} - {opcode_desc}")
+        
+        # Show source context for REVERT
+        if step.op == "REVERT":
+            # Find the step index for this step
+            step_index = None
+            for i, s in enumerate(self.current_trace.steps):
+                if s == step:
+                    step_index = i
+                    break
+            
+            if step_index is not None:
+                source_info = self._get_source_info_for_step(step_index)
+            else:
+                source_info = None
+                
+            if source_info:
+                file_name, line_num = source_info
+                print(f"  {info('Source:')} {os.path.basename(file_name)}:{line_num}")
+                
+                #  TODO: Get line content 
+                if self.source_lines and file_name in self.source_lines:
+                    lines = self.source_lines[file_name]
+                    if 1 <= line_num <= len(lines):
+                        line_content = lines[line_num - 1].strip()
+                        #print(f"  {info('Line:')} {line_content}")
+        
         print(f"{dim('=' * 60)}")
     
     def _show_local_variables(self, step):
