@@ -504,7 +504,7 @@ class TransactionTracer:
                     f"{'Connected to RPC:'} {self.rpc_url}\n"
                     f"{'Please verify:'}\n"
                     f"{bullet_point('The transaction hash is correct')}\n"
-                    f"{bullet_point('You\'re connected to the right network')}"
+                    f"{bullet_point('You are connected to the right network')}"
                 )
             else:
                 raise ValueError(
