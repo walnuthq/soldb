@@ -78,7 +78,6 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         self.depth_verbose = False  # Flag for verbose depth change messages
         self.call_stack = []  # Stack to track cross-contract calls for line-by-line stepping
         self.current_source_line = None  # Current source line we're stepping through
-        self.pending_call = None  # Pending call info for step into
         self.on_call_opcode = False  # Flag to track if we're currently on a CALL opcode
         self.call_return_line = None  # Line number to return to after CALL skip
         self._in_step_mode = False  # Flag to control automatic contract switching
@@ -656,55 +655,6 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         self.current_step = len(self.current_trace.steps) - 1
         self._update_current_function()
     
-    def _execute_pending_call(self):
-        """Execute the pending call - step into the called contract."""
-        if not self.pending_call:
-            return
-        
-        call_info = self.pending_call
-        self.pending_call = None
-        
-        if not call_info['target_contract']:
-            print(f"\n{error('No debug info for contract')}")
-            print(f"{dim('=' * 50)}")
-            print(f"  Target address: {call_info['target_address']}")
-            print(f"  {info('Available contracts with debug info:')}")
-            if self.tracer.multi_contract_parser:
-                for contract_addr, contract in self.tracer.multi_contract_parser.contracts.items():
-                    print(f"    {contract_addr}: {contract.name}")
-            else:
-                print(f"    No multi-contract parser available")
-            print(f"\n  {info('You can continue with:')}")
-            print(f"    {success('next')} or {success('n')} - Continue in current contract (skip call)")
-            print(f"    {success('continue')} or {success('c')} - Continue execution")
-            return
-        
-        print(f"\n{success('Stepping into called contract...')}")
-        print(f"{dim('=' * 40)}")
-        
-        # Push current context to call stack
-        self.call_stack.append({
-            'step': self.current_step,
-            'contract': self.contract_address,
-            'source_line': self.current_source_line,
-            'return_pc': call_info['step'].pc + 1
-        })
-        
-        # Switch to target contract
-        self.contract_address = call_info['target_address']
-        self.tracer.ethdebug_info = call_info['target_contract'].ethdebug_info
-        self.tracer.ethdebug_parser = call_info['target_contract'].parser
-        self.source_map = call_info['target_contract'].parser.get_source_mapping() if call_info['target_contract'].parser else {}
-        self._load_source_files_for_contract(call_info['target_contract'])
-        
-        print(f"  {success('Switched to contract:')} {call_info['target_contract'].name}")
-        print(f"  {info('Continuing line by line in called contract...')}")
-        
-        # Move to the next step where the called contract actually starts executing
-        self.current_step += 1
-        self._update_current_function()
-        self._track_variable_changes()
-        self._show_current_state()
     
     def _handle_return_opcode(self, step):
         """Handle RETURN opcode - return to calling contract and continue line by line."""
@@ -771,58 +721,6 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         # Fallback: just show the return
         self._show_return_opcode_info(step)
     
-    def do_callstack(self, arg):
-        """Show the current call stack for line-by-line stepping. Usage: callstack"""
-        if not self.call_stack:
-            print(f"{info('Call stack is empty.')}")
-            return
-        
-        print(f"\n{info('Call Stack for Line-by-Line Stepping')}")
-        print(f"{dim('=' * 60)}")
-        
-        for i, call in enumerate(self.call_stack):
-            # Get contract name
-            contract_name = "Unknown"
-            if self.tracer.multi_contract_parser:
-                contract = self.tracer.multi_contract_parser.get_contract_at_address(call['contract'])
-                if contract:
-                    contract_name = contract.name
-            
-            print(f"  {i}: {contract_name} @ {call['contract'][:10]}...")
-            print(f"      Step: {call['step']} | Line: {call['source_line']} | PC: {call['return_pc']}")
-        
-        print(f"{dim('=' * 60)}")
-        print(f"Current contract: {self.contract_address[:10]}... | Current line: {self.current_source_line}")
-
-    def do_reset_callstack(self, arg):
-        """Reset the call stack and return to main contract. Usage: reset_callstack"""
-        if not self.call_stack:
-            print(f"{info('Call stack is already empty.')}")
-            return
-        
-        print(f"{warning('Resetting call stack and returning to main contract...')}")
-        
-        # Clear call stack
-        self.call_stack = []
-        
-        # Return to main contract
-        if self.tracer.multi_contract_parser:
-            main_contract = self.tracer.multi_contract_parser.get_main_contract()
-            if main_contract:
-                self.contract_address = main_contract.address
-                self.tracer.ethdebug_info = main_contract.ethdebug_info
-                self.tracer.ethdebug_parser = main_contract.parser
-                self.source_map = main_contract.parser.get_source_mapping() if main_contract.parser else {}
-                self._load_source_files_for_contract(main_contract)
-                
-                print(f"{success('Returned to main contract:')} {main_contract.name}")
-                self._update_current_function()
-                self._track_variable_changes()
-                self._show_current_state()
-                return
-        
-        print(f"{error('Could not return to main contract')}")
-
     def do_n(self, arg):
         """Alias for next"""
         self.do_next(arg)
@@ -844,10 +742,6 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         # Set step mode flag to allow automatic contract switching
         self._in_step_mode = True
         
-        # Check if we have a pending call to step into
-        if self.pending_call:
-            self._execute_pending_call()
-            return
         
         # Check if we're currently on a CALL opcode
         current_step = self.current_trace.steps[self.current_step]
