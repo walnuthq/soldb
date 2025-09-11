@@ -311,6 +311,8 @@ def trace_command(args):
         
         # Extract contract name from the entrypoint contract
         contract_name = None
+        abi_path = None
+        
         if tracer.multi_contract_parser and trace.to_addr:
             # In multi-contract mode, get the name from the entrypoint contract
             entrypoint_contract = tracer.multi_contract_parser.get_contract_at_address(trace.to_addr)
@@ -337,8 +339,9 @@ def trace_command(args):
             debug_file=debug_file,
             rpc_url=args.rpc,
             ethdebug_dir=entrypoint_ethdebug_dir,
-            multi_contract_parser=getattr(tracer, 'multi_contract_parser', None),
-            contract_name=contract_name
+            tracer=tracer,
+            contract_name=contract_name,
+            abi_path=abi_path
         )
         
         # Pre-load the trace and function analysis
