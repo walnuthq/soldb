@@ -1581,7 +1581,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
     
     def do_exit(self, arg):
         """Exit the debugger"""
-        print(f"\n{info('Got feedback? We\'d love to hear it!')}")
+        print(f"\n{info('Got feedback? We would love to hear it!')}")
         print(f"{success('https://t.me/+4duQJBB7OzpkMTQ0')}")
         print(f"{dim('See ya!')}\n")
         return True
