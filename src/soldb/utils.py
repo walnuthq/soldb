@@ -38,14 +38,15 @@ def print_contracts_in_transaction(tracer: TransactionTracer,trace: TransactionT
                                 if func_info:
                                     func_name = func_info['name']
 
-                        print(f"{address(to_addr)}",end="")
+                        print(f"Contract Address: {address(to_addr)}",end="")
                         if target_name != "Unknown":
                             print(f" ({info(target_name)})")
                         if func_name != "Unknown":
-                            print(f"Entry Function: {info(func_name)}",end="")
-                        print(f"\nGas: {gas_value(step.gas)}")
-                        print(dim("-" * 80))
-        
+                            print(f"Entry Function: {info(func_name)}")
+                            print(f"Gas: {gas_value(step.gas)}",end="")
+
+                        print(f"\n{dim('-' * 80)}")
+
         if call_count == 0:
             print(f"{warning('No contract calls detected in this transaction.')}")
             print(f"Please verify:")
