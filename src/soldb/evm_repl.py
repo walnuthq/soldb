@@ -275,6 +275,14 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             self.function_trace = self.tracer.analyze_function_calls(self.current_trace)
             
             print(f"{success('Simulation complete.')} {highlight(str(len(self.current_trace.steps)))} steps.")
+            
+            # Show simulation status
+            if self.current_trace.success:
+                print(f"{dim('Status:')} {success('SUCCESS')}")
+            else:
+                print(f"{dim('Status:')} {error('REVERTED')}")
+                if self.current_trace.error:
+                    print(f"{error('Error:')} {self.current_trace.error}")
 
             # Start at the first function call after dispatcher
             if len(self.function_trace) > 1:
@@ -722,7 +730,21 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             if calling_contract:
                 calling_contract_name = calling_contract.name
         
-        print(f"\n{warning('RETURN DETECTED - Returning from contract')}")
+        # Determine the type of return and appropriate color
+        if step.op == "REVERT":
+            opcode_type = "REVERT DETECTED"
+            opcode_desc = "Execution reverted"
+            color_func = error
+        elif step.op == "RETURN":
+            opcode_type = "RETURN DETECTED"
+            opcode_desc = "Returning from contract"
+            color_func = warning
+        else:
+            opcode_type = f"{step.op} DETECTED"
+            opcode_desc = "Returning from contract"
+            color_func = warning
+        
+        print(f"\n{color_func(opcode_type)} - {opcode_desc}")
         print(f"{dim('=' * 60)}")
         print(f"  {info('From:')} {current_contract_name} @ {self.contract_address[:10]}...")
         print(f"  {info('To:')} {calling_contract_name} @ {call_context['contract'][:10]}...")
@@ -1879,6 +1901,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                 return (source_info[0], source_info[1])
         
         return None
+    
     
     def _update_current_function(self):
         """Update current function based on current step using call hierarchy."""
