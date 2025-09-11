@@ -172,5 +172,8 @@ cd test
 
 SolDB is licensed under the GNU General Public License v3.0 (GPL-3.0), the same license used by Solidity and other Ethereum Foundation projects.
 
-📄 [Full license](./LICENSE.md)  
-📬 Contact: hi@walnut.dev
+📄 [Full license](./LICENSE.md)
+
+## Community & Support
+💬 Join our Telegram: [@walnut_soldb](https://t.me/walnut_soldb)
+📬 Email: hi@walnut.dev
