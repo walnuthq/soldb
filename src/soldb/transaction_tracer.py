@@ -2766,7 +2766,6 @@ class TransactionTracer:
         print(dim("-" * 60))
         print(f"\n{dim('Use --raw flag to see detailed instruction trace')}")
 
-
 class SourceMapper:
     """Maps EVM bytecode positions to Solidity source locations."""
     

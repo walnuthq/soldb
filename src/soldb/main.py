@@ -19,6 +19,7 @@ from .colors import error, info, warning
 from .auto_deploy import AutoDeployDebugger
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
+from .utils import print_contracts_in_transaction
 
 
 def find_debug_file(contract_addr: str) -> str:
@@ -363,6 +364,83 @@ def trace_command(args):
     
     return 0
 
+def list_contracts_command(args):
+    """Execute the list-events command."""
+
+    # Create tracer
+    try:
+        tracer = TransactionTracer(args.rpc_url)
+    except ConnectionError as e:
+        print(f"{error(e)}")
+        return 1
+
+    # Multi-contract mode detection (same as trace_command)
+    multi_contract_mode = False
+    ethdebug_dirs = []
+    if hasattr(args, 'ethdebug_dir') and args.ethdebug_dir:
+        if isinstance(args.ethdebug_dir, list):
+            ethdebug_dirs = args.ethdebug_dir
+        else:
+            ethdebug_dirs = [args.ethdebug_dir]
+    if getattr(args, 'multi_contract', False) or (ethdebug_dirs and len(ethdebug_dirs) > 1) or getattr(args, 'contracts', None):
+        multi_contract_mode = True
+
+    if multi_contract_mode:
+        multi_parser = MultiContractETHDebugParser()
+        # Load from contracts mapping file if provided
+        if getattr(args, 'contracts', None):
+            try:
+                multi_parser.load_from_mapping_file(args.contracts)
+            except Exception as e:
+                print(f"Error loading contracts mapping file: {e}")
+                sys.exit(1)
+        # Load from ethdebug directories
+        if ethdebug_dirs:
+            try:
+                # Parse all ethdebug directories at once
+                specs = ETHDebugDirParser.parse_ethdebug_dirs(ethdebug_dirs)
+
+                for spec in specs:
+                    if spec.address and spec.name:
+                        # Single contract format: address:name:path
+                        multi_parser.load_contract(spec.address, spec.path, spec.name)
+                    elif spec.address:
+                        # Multi-contract format: address:path
+                        multi_parser.load_contract(spec.address, spec.path)
+                    else:
+                        # Just path - try to load from deployment.json
+                        deployment_file = Path(spec.path) / "deployment.json"
+                        if deployment_file.exists():
+                            try:
+                                multi_parser.load_from_deployment(deployment_file)
+                            except Exception as e:
+                                sys.stderr.write(f"Error loading deployment.json from {spec.path}: {e}\n")
+                                sys.exit(1)
+                        else:
+                            sys.stderr.write(f"Warning: No deployment.json found in {spec.path}, skipping...\n")
+            except ValueError as e:
+                sys.stderr.write(f"Error parsing ethdebug directories: {e}\n")
+                sys.exit(1)
+
+        for addr, contract_info in multi_parser.contracts.items():
+            abi_path = contract_info.debug_dir / f"{contract_info.name}.abi"
+            if abi_path.exists():
+                tracer.load_abi(str(abi_path))
+            elif (contract_info.debug_dir / f"{contract_info.name}.json").exists():
+                tracer.load_abi(str(contract_info.debug_dir / f"{contract_info.name}.json"))
+
+        tracer.multi_contract_parser = multi_parser
+
+    # Get transaction trace
+    try:
+        trace = tracer.trace_transaction(args.tx_hash)
+    except ValueError as e:
+        print(f"{error(e)}")
+        return 1
+    # Print contracts involved in the transaction
+    print_contracts_in_transaction(tracer,trace)
+    return 0
+          
 def simulate_command(args):
     """Execute the simulate command."""
 
@@ -931,7 +1009,14 @@ def main():
     # Create subparsers for different commands
     subparsers = parser.add_subparsers(dest='command', help='Commands')
     subparsers.required = True
-    
+
+    list_parser = subparsers.add_parser('list-contracts', help='List all contracts in the project')
+    list_parser.add_argument('tx_hash', help='Transaction hash to list contracts for')
+    list_parser.add_argument('--rpc-url', '-r', default='http://localhost:8545', help='RPC URL')
+    list_parser.add_argument('--ethdebug-dir', '-e', action='append', help='ETHDebug directory containing ethdebug.json and contract debug files. Can be specified multiple times for multi-contract debugging. Format: [address:]path or just path')
+    list_parser.add_argument('--contracts', '-c', help='JSON file mapping contract addresses to debug directories')
+    list_parser.add_argument('--multi-contract', action='store_true', help='Enable multi-contract debugging mode')
+
     # Create the 'trace' subcommand
     trace_parser = subparsers.add_parser('trace', help='Trace and debug an Ethereum transaction')
     trace_parser.add_argument('tx_hash', help='Transaction hash to trace')
@@ -989,7 +1074,10 @@ def main():
         return trace_command(args)
     if args.command == 'simulate':
         return simulate_command(args)
-        
+
+    if args.command == 'list-contracts':
+        return list_contracts_command(args)
+
     return 0
 
 
