@@ -764,12 +764,19 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             print(info("Already at end of execution."))
             return
         
+        # Check if current OP code is CALL, DELEGATECALL, or STATICCALL
+        current_step = self.current_trace.steps[self.current_step]
+        if current_step.op not in ["CALL", "DELEGATECALL", "STATICCALL"]:
+            print(f"{warning('Current OP code is')} {error(current_step.op)}.")
+            print(f"{success('step/s')} {info('is only allowed for CALL, DELEGATECALL, or STATICCALL operations.')}")
+            print(f"{success('next/n')} {info('is allowed for line-level debugging.')}")
+            return
+        
         # Set step mode flag to allow automatic contract switching
         self._in_step_mode = True
         
         
         # Check if we're currently on a CALL opcode
-        current_step = self.current_trace.steps[self.current_step]
         if current_step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
             # Find the corresponding function call in the function trace
             target_addr = self.tracer.extract_address_from_stack(current_step.stack[-2])
