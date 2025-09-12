@@ -21,7 +21,7 @@ from .colors import error, info, warning
 from .auto_deploy import AutoDeployDebugger
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
-from .utils import print_contracts_in_transaction
+from .utils import print_contracts_in_transaction,print_contracts_events
 
 
 def find_debug_file(contract_addr: str) -> str:
@@ -1073,10 +1073,15 @@ def list_events_command(args):
         tracer.multi_contract_parser = multi_parser
 
     # Get transaction receipt
-    receipt = tracer.w3.eth.get_transaction_receipt(args.tx_hash)
-
+    try:
+        receipt = tracer.w3.eth.get_transaction_receipt(args.tx_hash)
+    except Exception as e:
+        print(f"{error(e)}")
+        return 1
+    
     # Decode and print events
-    tracer.print_contracts_events(receipt)
+    print_contracts_events(tracer,receipt)
+    return 0
 
 def main():
     parser = argparse.ArgumentParser(description='SolDB - Ethereum transaction analysis tool')
