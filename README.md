@@ -6,7 +6,8 @@
 
 SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
 
-https://github.com/user-attachments/assets/9936fa8f-02d8-4058-8302-a6a76ed04a0a
+![soldb demo 11 sept 2025](https://github.com/user-attachments/assets/7376da04-96b0-4aae-8c9b-154680ffe6b4)
+
 
 ---
 
