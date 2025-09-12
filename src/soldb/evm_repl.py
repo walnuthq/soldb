@@ -115,31 +115,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         if self.contract_address and not self.tracer.is_contract_deployed(self.contract_address):
             print(error(f"Error: No contract found at address {self.contract_address}"))
             sys.exit(1)
-
-        # Load ETHDebug info if available
-        if ethdebug_dir:
-            # Use provided contract_name or extract from ethdebug_dir if in address:name:path format
-            if not self.contract_name and ":" in ethdebug_dir and ethdebug_dir.startswith("0x"):
-                try:
-                    spec = ETHDebugDirParser.parse_single_contract(ethdebug_dir)
-                    self.contract_name = spec.name
-                    ethdebug_dir = spec.path
-                except ValueError:
-                    # Fallback to old parsing for backward compatibility
-                    parts = ethdebug_dir.split(":")
-                    if len(parts) >= 3:
-                        self.contract_name = parts[1]  # Extract name part
-                        ethdebug_dir = parts[2]  # Extract path part
-                    elif len(parts) == 2:
-                        ethdebug_dir = parts[1]  # Extract path part
-            self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir, self.contract_name)
-            # Load ABI from ethdebug directory
-            contract_name = self.tracer.ethdebug_info.contract_name if self.tracer.ethdebug_info else None
-            abi_path = ETHDebugDirParser.find_abi_file(ETHDebugSpec(path=ethdebug_dir), contract_name)
-            if abi_path:
-                self.tracer.load_abi(abi_path)
-            
-        elif debug_file:
+        
+        if debug_file:
             self.source_map = self.tracer.load_debug_info(debug_file)
             
             # Try to load DWARF debug ELF
