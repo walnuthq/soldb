@@ -11,7 +11,7 @@ import sys
 from eth_utils import decode_hex
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
-from web3 import Web3
+from web3 import HTTPProvider, Web3
 from eth_utils import to_hex, to_checksum_address,keccak
 from eth_abi.abi import encode as abi_encode
 from .colors import *
@@ -149,6 +149,8 @@ class TransactionTracer:
         self.function_abis = {}  # selector -> full ABI item
         self.function_params = {}  # function name -> parameter info
         self.function_abis_by_name = {}  # function name -> full ABI item
+        self.event_abis = {}  # event signature hash -> full ABI item
+        self.event_signatures = {}  # event signature hash -> event signature string
         self._initial_snapshot_id: Optional[str] = None
         self._last_snapshot_id: Optional[str] = None
         self.missing_mappings_warned = False  # Track if we've already warned about missing mappings
@@ -798,7 +800,18 @@ class TransactionTracer:
         """Load ABI and extract function signatures."""
         try:
             with open(abi_path, 'r') as f:
-                abi = json.load(f)
+                data = json.load(f)
+            
+            # Handle both direct ABI arrays and Forge artifact format
+            if isinstance(data, list):
+                # Direct ABI array
+                abi = data
+            elif isinstance(data, dict) and 'abi' in data:
+                # Forge artifact format
+                abi = data['abi']
+            else:
+                print(f"Warning: Unknown ABI format in {abi_path}")
+                return
             
             for item in abi:
                 if item.get('type') == 'function':
@@ -820,6 +833,21 @@ class TransactionTracer:
                     self.function_params[name] = inputs
                     # Also store ABI by function name for internal calls
                     self.function_abis_by_name[name] = item
+                
+                if item.get('type') == 'event':
+                    # Handle event's ABI
+                    name = item['name']
+                    inputs = item.get('inputs', [])
+                    
+                    input_types = ','.join([self.format_abi_type(inp) for inp in inputs])
+                    signature = f"{name}({input_types})"
+
+                    topic_bytes = self.w3.keccak(text=signature)
+                    topic_hash = '0x' + topic_bytes.hex()
+
+                    # Store event information
+                    self.event_signatures[topic_hash] = signature
+                    self.event_abis[topic_hash] = item
                     
         except Exception as e:
             print(f"Warning: Could not load ABI: {e}")
