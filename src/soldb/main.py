@@ -189,21 +189,17 @@ def trace_command(args):
             print(error(f"Error: {e}"))
             return 1
         
-        # Load ETHDebug info for the specified contract
-        if args.interactive:
-            # Suppress output for interactive mode
-            import io
-            import contextlib
-            with contextlib.redirect_stdout(io.StringIO()):
-                source_map = tracer.load_ethdebug_info(ethdebug_dir, name)
-        else:
+        # Load ETHDebug info for non-interactive mode only
+        if not args.interactive:
             source_map = tracer.load_ethdebug_info(ethdebug_dir, name)
-        
-        # Try to load ABI from ethdebug directory
-        contract_name = tracer.ethdebug_info.contract_name if tracer.ethdebug_info else None
-        abi_path = ETHDebugDirParser.find_abi_file(spec, contract_name)
-        if abi_path:
-            tracer.load_abi(abi_path)
+            # Try to load ABI from ethdebug directory
+            contract_name = tracer.ethdebug_info.contract_name if tracer.ethdebug_info else None
+            abi_path = ETHDebugDirParser.find_abi_file(spec, contract_name)
+            if abi_path:
+                tracer.load_abi(abi_path)
+        else:
+            # For interactive mode, ETHDebug info will be loaded by EVMDebugger
+            source_map = {}
         
         # After loading the trace, check if we need to load additional contract debug info
         # This allows single contract mode to work with multi-contract scenarios
@@ -587,15 +583,16 @@ def simulate_command(args):
                 print()
             
             # Load ETHDebug info for the specified contract (even though it's not entrypoint)
-            tracer.load_ethdebug_info(ethdebug_dir, name)
-            if tracer.ethdebug_info:
-                abi_path = os.path.join(ethdebug_dir, f"{tracer.ethdebug_info.contract_name}.abi")
-                if os.path.exists(abi_path):
-                    tracer.load_abi(abi_path)
-            else:
-                for abi_file in Path(ethdebug_dir).glob("*.abi"):
-                    tracer.load_abi(str(abi_file))
-                    break
+            if not args.interactive:
+                tracer.load_ethdebug_info(ethdebug_dir, name)
+                if tracer.ethdebug_info:
+                    abi_path = os.path.join(ethdebug_dir, f"{tracer.ethdebug_info.contract_name}.abi")
+                    if os.path.exists(abi_path):
+                        tracer.load_abi(abi_path)
+                else:
+                    for abi_file in Path(ethdebug_dir).glob("*.abi"):
+                        tracer.load_abi(str(abi_file))
+                        break
             
             # Try to load ABI for entrypoint contract from common locations
             if args.contract_address:
@@ -604,12 +601,15 @@ def simulate_command(args):
                     tracer.load_abi(str(abi_file))
                     break
         else:
-            # Address matches - load debug info
-            source_map = tracer.load_ethdebug_info(ethdebug_dir, name)
-            contract_name = tracer.ethdebug_info.contract_name if tracer.ethdebug_info else None
-            abi_path = ETHDebugDirParser.find_abi_file(spec, contract_name)
-            if abi_path:
-                tracer.load_abi(abi_path)
+            # Address matches - load debug info for non-interactive mode only
+            if not args.interactive:
+                source_map = tracer.load_ethdebug_info(ethdebug_dir, name)
+                contract_name = tracer.ethdebug_info.contract_name if tracer.ethdebug_info else None
+                abi_path = ETHDebugDirParser.find_abi_file(spec, contract_name)
+                if abi_path:
+                    tracer.load_abi(abi_path)
+            else:
+                source_map = {}
         
         # Create a multi-contract parser to handle additional contracts (same as trace command)
         multi_parser = MultiContractETHDebugParser()

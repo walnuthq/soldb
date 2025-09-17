@@ -115,8 +115,42 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         if self.contract_address and not self.tracer.is_contract_deployed(self.contract_address):
             print(error(f"Error: No contract found at address {self.contract_address}"))
             sys.exit(1)
-        
-        if debug_file:
+
+        # Load ETHDebug info if available
+        if ethdebug_dir:
+            # Use provided contract_name or extract from ethdebug_dir if in address:name:path format
+            if not self.contract_name and ":" in ethdebug_dir and ethdebug_dir.startswith("0x"):
+                try:
+                    spec = ETHDebugDirParser.parse_single_contract(ethdebug_dir)
+                    self.contract_name = spec.name
+                    ethdebug_dir = spec.path
+                except ValueError:
+                    # Fallback to old parsing for backward compatibility
+                    parts = ethdebug_dir.split(":")
+                    if len(parts) >= 3:
+                        self.contract_name = parts[1]  # Extract name part
+                        ethdebug_dir = parts[2]  # Extract path part
+                    elif len(parts) == 2:
+                        ethdebug_dir = parts[1]  # Extract path part
+            
+            # Always load ethdebug_info to ensure pc_to_source is available
+            # But suppress duplicate prints if already loaded
+            if not self.tracer.ethdebug_info:
+                self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir, self.contract_name)
+            else:
+                # Re-load to get pc_to_source mapping, but suppress prints
+                import io
+                import contextlib
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir, self.contract_name)
+            
+            # Load ABI from ethdebug directory
+            contract_name = self.tracer.ethdebug_info.contract_name if self.tracer.ethdebug_info else None
+            abi_path = ETHDebugDirParser.find_abi_file(ETHDebugSpec(path=ethdebug_dir), contract_name)
+            if abi_path:
+                self.tracer.load_abi(abi_path)
+            
+        elif debug_file:
             self.source_map = self.tracer.load_debug_info(debug_file)
             
             # Try to load DWARF debug ELF
@@ -1011,13 +1045,26 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             print("No source available.")
             return
         
+        # Check if current_step is within valid range
+        if self.current_step > len(self.current_trace.steps):
+            print(f"Error: Current step {self.current_step} is out of range. Total steps: {len(self.current_trace.steps)}")
+            return
+        
         step = self.current_trace.steps[self.current_step]
         source_info = self.source_map.get(step.pc)
         
         if source_info:
             if isinstance(source_info, tuple) and len(source_info) >= 2:
                 try:
-                    _, line_num = source_info
+                    if len(source_info) == 2:
+                        file_id, line_num = source_info
+                        source_file_name = None
+                    elif len(source_info) == 3:
+                        file_id, line_num, _ = source_info  # file_id, line_num, column
+                        source_file_name = None
+                    else:
+                        print(f"Error: source_info has unexpected number of elements: {source_info}")
+                        return
                 except ValueError:
                     print(f"Error: source_info has unexpected format: {source_info}")
                     return
@@ -1026,13 +1073,26 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                 return
             
             # Find the source file that contains this line number
+            # First try to find by specific file name if available
             source_lines = None
             source_file = None
-            for file_path, lines in self.source_lines.items():
-                if 0 < line_num <= len(lines):
-                    source_lines = lines
-                    source_file = file_path
-                    break
+            
+            # If we have a specific file name from source_info, try to find it first
+            if len(source_info) >= 3 and isinstance(source_info[0], str) and source_info[0].endswith('.sol'):
+                source_file_name = source_info[0]
+                for file_path, lines in self.source_lines.items():
+                    if file_path.endswith(source_file_name) and 0 < line_num <= len(lines):
+                        source_lines = lines
+                        source_file = file_path
+                        break
+            
+            # If not found by specific name, fall back to any file that contains the line
+            if not source_lines:
+                for file_path, lines in self.source_lines.items():
+                    if 0 < line_num <= len(lines):
+                        source_lines = lines
+                        source_file = file_path
+                        break
             
             if source_lines:
                 # Show 5 lines before and after
@@ -1042,6 +1102,14 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                 # Show filename if multiple files
                 if len(self.source_lines) > 1:
                     print(f"File: {os.path.basename(source_file)}")
+                
+                # Show available lines info if we can't show full range
+                lines_before = line_num - 1
+                lines_after = len(source_lines) - line_num
+                if lines_before < 5:
+                    print(f"Note: Only {lines_before} lines available before current line")
+                if lines_after < 5:
+                    print(f"Note: Only {lines_after} lines available after current line")
                 
                 for i in range(start, end):
                     marker = "=>" if i + 1 == line_num else "  "
