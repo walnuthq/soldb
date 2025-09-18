@@ -1046,7 +1046,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             return
         
         # Check if current_step is within valid range
-        if self.current_step > len(self.current_trace.steps):
+        if self.current_step >= len(self.current_trace.steps):
             print(f"Error: Current step {self.current_step} is out of range. Total steps: {len(self.current_trace.steps)}")
             return
         
