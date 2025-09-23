@@ -5,12 +5,13 @@ import os
 import io
 from typing import Dict, Any, List, Optional
 from zipfile import Path
+from pathlib import Path
 
-from .evm_repl import EVMDebugger
-from .transaction_tracer import TransactionTracer
-from .ethdebug_dir_parser import ETHDebugDirParser
-from .ethdebug_parser import ETHDebugInfo
-from .multi_contract_ethdebug_parser import MultiContractETHDebugParser
+from soldb.evm_repl import EVMDebugger
+from soldb.transaction_tracer import TransactionTracer
+from soldb.ethdebug_dir_parser import ETHDebugDirParser
+from soldb.ethdebug_parser import ETHDebugInfo
+from soldb.multi_contract_ethdebug_parser import MultiContractETHDebugParser
 from eth_utils.address import is_address
 
 CRLF = b"\r\n"
@@ -57,6 +58,30 @@ class WalnutDAPServer:
             "output": text,
             "category": "stdout"
         })
+
+    def setup_soldb_environment(self, soldb_path: str = None):
+        """Setup environment to use soldb from external location"""
+        
+        if not soldb_path:
+            raise FileNotFoundError("Error: Cannot find soldb installation.")
+
+        soldb_path = Path(soldb_path).resolve()
+        src_dir = soldb_path / 'src'
+        
+        if not src_dir.exists():
+            raise FileNotFoundError(f"Error: soldb src directory not found at {src_dir}")
+        
+        if not (src_dir / 'soldb').exists():
+            raise FileNotFoundError(f"Error: soldb module directory not found at {src_dir / 'soldb'}")
+        
+        # Add soldb src to Python path
+        if str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+        
+        # Change to soldb project root for file resolution
+        os.chdir(soldb_path)
+        
+        return soldb_path, src_dir
 
     # ---- DAP transport helpers ----
     def _send(self, msg: Dict[str, Any]):
@@ -129,6 +154,7 @@ class WalnutDAPServer:
             source = args.get("source")
             function_signature = args.get("function", None)
             function_args = args.get("functionArgs", [])
+            soldb_path = args.get("soldbPath", os.getenv("SOLDB_PATH", None))
             
             # Store paths for later use in source requests
             self.source_file = source
@@ -136,7 +162,8 @@ class WalnutDAPServer:
             contract_name = None
             abi_path = None
 
-
+            self.setup_soldb_environment(soldb_path)
+            
             if contracts:
                 with open(contracts, "r") as f:
                     contracts_data = json.load(f)
@@ -362,7 +389,7 @@ class WalnutDAPServer:
                 tracer=tracer,
                 contract_name=contract_name
             )
-                                
+
             try:
                 # Check prerequisites before simulation
                 if not self.debugger.contract_address:
@@ -659,7 +686,6 @@ class WalnutDAPServer:
                         if os.path.exists(alt):
                             abs_source_path = alt
                             break
-                
                 source = {
                     "name": os.path.basename(abs_source_path),
                     "path": abs_source_path,
@@ -732,11 +758,11 @@ class WalnutDAPServer:
             args = request.get("arguments", {})
             source_ref = args.get("source", {})
             path = source_ref.get("path", "") if isinstance(source_ref, dict) else source_ref
-            
             # Use the source file path from launch if available, otherwise use the requested path
             if hasattr(self, 'source_file') and self.source_file:
                 source_path = self.source_file
             elif path:
+                
                 # Try to read the source file from the requested path
                 if os.path.isabs(path):
                     # Absolute path
