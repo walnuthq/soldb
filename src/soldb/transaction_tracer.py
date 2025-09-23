@@ -1176,7 +1176,7 @@ class TransactionTracer:
                 # For complex types, return hex representation
                 return '0x' + raw_value
         except Exception as e:
-            print(f"Warning: Failed to decode {param_type} value: {e}")
+            # print(f"Warning: Failed to decode {param_type} value: {e}")
             return '0x' + raw_value
     
     def extract_from_memory(self, memory: str, offset: int, param_type: str) -> Optional[Any]:
@@ -1764,18 +1764,29 @@ class TransactionTracer:
                                 else:
                                     # Fallback to dispatcher
                                     call_stack[-1].children_call_ids.append(call.call_id)
-                        else:
-                                # Only add as child if the depth is greater than parent
+                                    call.parent_call_id = call_stack[-1].call_id
+                            else:
+                                # Internal calls can have the same depth as their parent
                                 parent_call = call_stack[-1]
-                                if call.depth > parent_call.depth:
+                                if call.call_type == "internal":
+                                    # Internal calls are children of the current function
                                     parent_call.children_call_ids.append(call.call_id)
+                                    call.parent_call_id = parent_call.call_id
+                                elif call.depth > parent_call.depth:
+                                    # External calls need to have greater depth
+                                    parent_call.children_call_ids.append(call.call_id)
+                                    call.parent_call_id = parent_call.call_id
                                 else:
                                     # Find the correct parent based on depth
                                     for j in range(len(call_stack) - 1, -1, -1):
                                         potential_parent = call_stack[j]
                                         if call.depth > potential_parent.depth:
                                             potential_parent.children_call_ids.append(call.call_id)
+                                            call.parent_call_id = potential_parent.call_id
                                             break
+                        else:
+                           # No function calls yet, this is the first one
+                            call.parent_call_id = None
                         next_call_id += 1
                         insert_call_sorted(call)
                         call_stack.append(call)
