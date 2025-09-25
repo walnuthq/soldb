@@ -39,6 +39,7 @@ class FunctionCall:
     call_id: int = 0
     caused_revert: bool = False  # True if this frame initiated the revert
     parent_call_id: Optional[int] = None
+    contract_call_id: Optional[int] = None  # ID of the contract call that contains this function call
     children_call_ids: List[int] = field(default_factory=list)
 
 @dataclass
@@ -1508,6 +1509,7 @@ class TransactionTracer:
                 call_type="external",  # Main entry from transaction
                 call_id=next_call_id,  # This will be 1
                 parent_call_id=dispatcher_call.call_id,
+                contract_call_id=dispatcher_call.call_id,  # Main call belongs to dispatcher contract call
                 children_call_ids=[]
             )
             next_call_id += 1
@@ -1550,7 +1552,7 @@ class TransactionTracer:
                 call = self._process_external_call(step, i, current_contract, current_depth)
                 if call:
                     call.call_id = next_call_id
-                    
+                    call.contract_call_id = next_call_id
                     # Find the appropriate parent for this call
                     if call_stack:
                         # Find parent based on depth - parent should have depth < current call depth
@@ -1601,6 +1603,7 @@ class TransactionTracer:
                 call = self._process_create_call(step, i, current_contract, current_depth, trace)
                 if call:
                     call.call_id = next_call_id
+                    call.contract_call_id = call.call_id
                     call.parent_call_id = call_stack[-1].call_id if call_stack else None
                     if call_stack:
                         parent_call = call_stack[-1]
@@ -1618,7 +1621,7 @@ class TransactionTracer:
                     current_depth += 1
             # Internal functions
             elif step.op == "JUMPDEST":
-                result = self._detect_internal_call(step, i, current_contract, call_stack, self.missing_mappings_warned)
+                result = self._detect_internal_call(step, i, current_contract, call_stack, function_calls, self.missing_mappings_warned)
                 if result:
                     # Check if we detected missing mappings
                     if isinstance(result, tuple):
@@ -1763,15 +1766,15 @@ class TransactionTracer:
                                     call.parent_call_id = main_func.call_id
                                 else:
                                     # Fallback to dispatcher
-                                    call_stack[-1].children_call_ids.append(call.call_id)
-                                    call.parent_call_id = call_stack[-1].call_id
+                                        call_stack[-1].children_call_ids.append(call.call_id)
+                                        call.parent_call_id = call_stack[-1].call_id
                             else:
                                 # Internal calls can have the same depth as their parent
                                 parent_call = call_stack[-1]
                                 if call.call_type == "internal":
                                     # Internal calls are children of the current function
-                                    parent_call.children_call_ids.append(call.call_id)
-                                    call.parent_call_id = parent_call.call_id
+                                        parent_call.children_call_ids.append(call.call_id)
+                                        call.parent_call_id = parent_call.call_id
                                 elif call.depth > parent_call.depth:
                                     # External calls need to have greater depth
                                     parent_call.children_call_ids.append(call.call_id)
@@ -1933,7 +1936,7 @@ class TransactionTracer:
         return function_calls
 
    
-    def _detect_internal_call(self, step, step_idx, current_contract, call_stack, missing_mappings_warned=False):
+    def _detect_internal_call(self, step, step_idx, current_contract, call_stack, function_calls, missing_mappings_warned=False):
         """Detect internal function calls using proper execution context."""
         # Get source context
         context = self.get_source_context_for_step(step, current_contract)
@@ -1970,6 +1973,42 @@ class TransactionTracer:
             return (None, self.missing_mappings_warned) if self.missing_mappings_warned else None
         current_func = call_stack[-1].name if call_stack else None
 
+        # Find the contract call ID for the current contract
+        contract_call_id = None
+        if call_stack:
+            # Start with the immediate parent and traverse up the parent chain
+            current_parent_id = call_stack[-1].call_id if call_stack else None
+            all_calls_dict = {call.call_id: call for call in function_calls}
+            
+            while current_parent_id is not None:
+                parent_call = all_calls_dict.get(current_parent_id)
+                if not parent_call:
+                    break
+                
+                # Check if this parent is a CALL type
+                if parent_call.call_type in ["external", "CALL", "DELEGATECALL", "STATICCALL", "CREATE", "CREATE2"]:
+                    # For external calls, check if the 'to' address matches current contract
+                    # For internal calls, check contract_address
+                    if (hasattr(parent_call, 'to') and parent_call.to and parent_call.to == current_contract) or \
+                       (hasattr(parent_call, 'contract_address') and parent_call.contract_address and parent_call.contract_address == current_contract):
+                        contract_call_id = parent_call.call_id
+                        break
+                
+                # Move to the next parent
+                current_parent_id = parent_call.parent_call_id
+            
+            # Fallback: if no matching contract found, use the most recent external call
+            if contract_call_id is None:
+                for stack_call in reversed(call_stack):
+                    if stack_call.call_type in ["external", "create", "create2"]:
+                        contract_call_id = stack_call.call_id
+                        break
+        
+        # Calculate appropriate depth for internal functions
+        # Internal functions should have depth = parent_depth + 1
+        parent_depth = len(call_stack) - 1 if call_stack else 0
+        
+        
         call = FunctionCall(
             name=func_name,
             selector="",
@@ -1980,7 +2019,8 @@ class TransactionTracer:
             args=[],
             call_type="internal",
             contract_address=current_contract,
-            source_line=context.get('line')
+            source_line=context.get('line'),
+            contract_call_id=contract_call_id
         )
         
         # Return with warning flag if it was set
@@ -2030,7 +2070,8 @@ class TransactionTracer:
             args=[],
             call_type="entry",
             contract_address=contract_address,
-            source_line=source_line
+            source_line=source_line,
+            contract_call_id=0  # Entry point is the root contract call
         )
 
     def _extract_function_name(self, source_line: str) -> Optional[str]:
@@ -2129,7 +2170,7 @@ class TransactionTracer:
             depth=current_depth + 1,
             args=decoded_params,
             call_type=step.op,
-            contract_address=to_addr
+            contract_address=to_addr,
         )
 
     def _process_create_call(self, step: TraceStep, step_idx: int, 
