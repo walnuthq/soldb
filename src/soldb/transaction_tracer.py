@@ -422,7 +422,7 @@ class TransactionTracer:
                 return '0x' + addr_hex
                 
         except Exception as e:
-            print(f"Warning: Failed to extract address from memory at offset {offset}: {e}")
+            print(f"Warning: Failed to extract address from memory at offset {offset}: {e}", file=sys.stderr)
             return None
     
     
@@ -810,7 +810,7 @@ class TransactionTracer:
                 # Forge artifact format
                 abi = data['abi']
             else:
-                print(f"Warning: Unknown ABI format in {abi_path}")
+                print(f"Warning: Unknown ABI format in {abi_path}", file=sys.stderr)
                 return
             
             for item in abi:
@@ -850,7 +850,7 @@ class TransactionTracer:
                     self.event_abis[topic_hash] = item
                     
         except Exception as e:
-            print(f"Warning: Could not load ABI: {e}")
+            print(f"Warning: Could not load ABI: {e}", file=sys.stderr)
     
     def lookup_function_signature(self, selector: str, contract_address: str = None) -> Optional[str]:
         """Look up function signature from multiple sources."""
@@ -975,7 +975,7 @@ class TransactionTracer:
                         params.append((param_name, value))
             
         except Exception as e:
-            print(f"Warning: Could not decode parameters with eth_abi, falling back to raw decoding: {e}")
+            print(f"Warning: Could not decode parameters with eth_abi, falling back to raw decoding: {e}", file=sys.stderr)
             # Fallback to simple raw decoding
             try:
                 offset = 0
@@ -997,7 +997,7 @@ class TransactionTracer:
                     else:
                         break
             except Exception as e2:
-                print(f"Warning: Fallback decoding also failed: {e2}")
+                print(f"Warning: Fallback decoding also failed: {e2}", file=sys.stderr)
         
         return params
     
@@ -1082,7 +1082,7 @@ class TransactionTracer:
             return None
             
         if function_step >= len(trace.steps):
-            print(f"Warning: Function step {function_step} out of range (trace has {len(trace.steps)} steps)")
+            print(f"Warning: Function step {function_step} out of range (trace has {len(trace.steps)} steps)", file=sys.stderr)
             return None
             
         step = trace.steps[function_step]
@@ -1116,7 +1116,7 @@ class TransactionTracer:
                                 print(f"[ETHDebug] Found {param_name} on stack[{var_loc.offset}] = {value}")
                             return value
                         else:
-                            print(f"Warning: Stack offset {var_loc.offset} out of range (stack size: {len(step.stack)})")
+                            print(f"Warning: Stack offset {var_loc.offset} out of range (stack size: {len(step.stack)})", file=sys.stderr)
                     elif var_loc.location_type == "memory":
                         # Extract from memory
                         value = self.extract_from_memory(step.memory, var_loc.offset, param_type)
@@ -1130,7 +1130,7 @@ class TransactionTracer:
                             print(f"[ETHDebug] Found {param_name} in storage[{var_loc.offset}] = {value}")
                         return value
                     else:
-                        print(f"Warning: Unknown location type '{var_loc.location_type}' for {param_name}")
+                        print(f"Warning: Unknown location type '{var_loc.location_type}' for {param_name}", file=sys.stderr)
                 except Exception as e:
                     print(f"Error extracting {param_name} from {var_loc.location_type}: {e}")
                     continue
@@ -1211,7 +1211,7 @@ class TransactionTracer:
                 if data_hex:
                     return self.decode_value(data_hex, param_type)
         except Exception as e:
-            print(f"Warning: Failed to extract from memory: {e}")
+            print(f"Warning: Failed to extract from memory: {e}", file=sys.stderr)
         
         return None
     
@@ -1228,7 +1228,7 @@ class TransactionTracer:
             if slot_str in storage:
                 return self.decode_value(storage[slot_str], param_type)
         except Exception as e:
-            print(f"Warning: Failed to extract from storage: {e}")
+            print(f"Warning: Failed to extract from storage: {e}", file=sys.stderr)
         
         return None
     
@@ -1412,7 +1412,7 @@ class TransactionTracer:
                     # No return data - this is a void function
                     return None
             except Exception as e:
-                print(f"Warning: Failed to extract return value: {e}")
+                print(f"Warning: Failed to extract return value: {e}", file=sys.stderr)
         
         # For STOP or REVERT, there's typically no return value
         return None
