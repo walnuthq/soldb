@@ -292,6 +292,7 @@ class TraceSerializer:
             "input": input_data,
             "callId": call.call_id,
             "parentCallId": call.parent_call_id,
+            "contractCallId": call.contract_call_id,
             "childrenCallIds": call.children_call_ids[:],
         }
         
@@ -544,62 +545,20 @@ class TraceSerializer:
     def build_steps_array(
         self, 
         trace: TransactionTrace, 
-        function_calls: List[FunctionCall]
+        function_calls: List[FunctionCall],
+        multi_parser: Optional[MultiContractETHDebugParser] = None,
+        ethdebug_info: Optional[ETHDebugInfo] = None
     ) -> List[Dict[str, Any]]:
         """Build the steps array mapping PC to trace call index."""
         steps = []
         
-        # Build a hierarchical representation of calls to assign indices
-        # The trace call tree is flattened in depth-first order
-        # Use id() to create hashable keys for FunctionCall objects
-        call_indices = {}
+        # Build mapping from call object to its callId
+        # traceCallIndex should directly correspond to callId
+        call_id_map = {}
+        for call in function_calls:
+            call_id_map[id(call)] = call.call_id
         
-        def assign_indices_to_calls():
-            """Assign a unique index to each call in depth-first order."""
-            index = 0
-            
-            # Group calls by depth for hierarchical processing
-            calls_by_depth = {}
-            for call in function_calls:
-                if call.depth not in calls_by_depth:
-                    calls_by_depth[call.depth] = []
-                calls_by_depth[call.depth].append(call)
-            
-            # Sort calls within each depth by entry step
-            for depth_calls in calls_by_depth.values():
-                depth_calls.sort(key=lambda c: c.entry_step if c.entry_step is not None else -1)
-            
-            # Process in depth-first order
-            def process_call(call, idx):
-                call_indices[id(call)] = idx
-                idx += 1
-                
-                # Find children of this call
-                child_depth = call.depth + 1
-                if child_depth in calls_by_depth:
-                    for child in calls_by_depth[child_depth]:
-                        # Check if child is within parent's range
-                        if (call.entry_step is not None and child.entry_step is not None and 
-                            call.entry_step <= child.entry_step and 
-                            (call.exit_step is None or child.entry_step <= call.exit_step)):
-                            idx = process_call(child, idx)
-                
-                return idx
-            
-            # Start with root calls (external calls at depth 1, or depth 0 if no external)
-            root_depth = 1 if any(c.depth == 1 and c.call_type == "external" for c in function_calls) else 0
-            if root_depth in calls_by_depth:
-                for root_call in calls_by_depth[root_depth]:
-                    if root_call.call_type == "external" or root_depth == 0:
-                        index = process_call(root_call, index)
-                        break  # Only process the first root call
-            
-            return call_indices
-        
-        # Assign indices to all calls
-        call_index_map = assign_indices_to_calls()
-        
-        # Map each step to its corresponding call index
+        # Map each step to its corresponding call ID
         for i, step in enumerate(trace.steps):
             # Find the deepest call that contains this step
             containing_call = None
@@ -612,16 +571,69 @@ class TraceSerializer:
                     containing_call = call
                     deepest_depth = call.depth
             
-            # Get the index for this call, default to 0 (root call)
-            call_index = call_index_map.get(id(containing_call), 0) if containing_call else 0
+            # Get the callId for this call, default to 0 (root call)
+            call_id = call_id_map.get(id(containing_call), 0) if containing_call else 0
             
-            steps.append({
-                "pc": step.pc,
-                "traceCallIndex": call_index
-            })
+            # Detect unverified contract calls
+            if step.op in ["CALL", "DELEGATECALL", "STATICCALL"]:
+                # Extract target contract address from stack
+                target_contract = None
+                if len(step.stack) >= 2:
+                    # For CALL: stack[-2] is the target address
+                    # For DELEGATECALL/STATICCALL: stack[-2] is also the target address
+                    raw_address = step.stack[-2]
+                    if raw_address.startswith('0x'):
+                        raw_address = raw_address[2:]
+                    target_contract = "0x" + raw_address.zfill(40)
+                
+                # Find the callId for the target contract in the trace
+                target_call_id = None
+                has_debug_info = False
+                if target_contract:
+                    # Check if we have debug info for this target contract
+                    if multi_parser:
+                        target_contract_obj = multi_parser.get_contract_at_address(target_contract)
+                        has_debug_info = target_contract_obj is not None and target_contract_obj.ethdebug_info is not None
+                    elif ethdebug_info:
+                        # For single contract mode, check if this is the main contract
+                        has_debug_info = True  
+                    else:
+                        has_debug_info = False
+                
+                # Mark as unverified contract call only if we don't have debug info
+                step_info = {
+                    "pc": step.pc,
+                    "traceCallIndex": call_id, 
+                    "stepIndex": i,
+                    "targetContract": target_contract
+                }
+                
+                # Only add debug_info: False if we don't have debug info
+                if not has_debug_info:
+                    step_info["debugInfo"] = False
+            else:
+                # For regular steps, check if we have debug info for the target contract
+                step_info = {
+                    "pc": step.pc,
+                    "traceCallIndex": call_id,
+                    "stepIndex": i  
+                }
+            
+            steps.append(step_info)
+        
+        # Sort steps by the entry_step of their containing call
+        # This ensures steps are ordered by execution sequence
+        steps.sort(key=lambda step: function_calls[step["traceCallIndex"]].entry_step 
+                  if step["traceCallIndex"] < len(function_calls) and 
+                     function_calls[step["traceCallIndex"]].entry_step is not None 
+                  else float('inf'))
+        
+        # Remove the temporary stepIndex field
+        for step in steps:
+            step.pop("stepIndex", None)
         
         return steps
-    
+
     def build_contracts_mapping(
         self,
         trace: TransactionTrace,
@@ -733,7 +745,6 @@ class TraceSerializer:
         
         # Check for any remaining unprocessed calls
         # This should not happen if parent-child relationships are correct
-        # Log a warning if there are unprocessed calls but don't add them as top-level
         unprocessed_calls = []
         for call in function_calls:
             if call.call_id not in processed_ids:
@@ -763,21 +774,32 @@ class TraceSerializer:
         # Build ABIs mapping
         abis = self.extract_internal_function_abi(function_calls, tracer_instance)
 
-        # Build the response - check if we have step-by-step debugging info
-        if trace.steps and (ethdebug_info or multi_parser):
-            # Build step-by-step debugging response
-            steps = self.build_steps_array(trace, function_calls)
-            contracts = self.build_contracts_mapping(
-                trace, ethdebug_info, multi_parser, abis, tracer_instance
-            )
-            response = {
-                "status": "success" if trace.success else "reverted",
-                "traceCall": root_trace_call,
-                "steps": steps,
-                "contracts": contracts
-            }
+        # Build the response - always build steps if we have trace steps
+        if trace.steps:
+            # Build step-by-step response (with or without debug info)
+            steps = self.build_steps_array(trace, function_calls, multi_parser, ethdebug_info)
+            
+            if ethdebug_info or multi_parser:
+                # Full debugging response with contracts mapping
+                contracts = self.build_contracts_mapping(
+                    trace, ethdebug_info, multi_parser, abis, tracer_instance
+                )
+                response = {
+                    "status": "success" if trace.success else "reverted",
+                    "traceCall": root_trace_call,
+                    "steps": steps,
+                    "contracts": contracts
+                }
+            else:
+                # Basic response with steps but no contracts mapping
+                response = {
+                    "status": "success" if trace.success else "reverted",
+                    "traceCall": root_trace_call,
+                    "steps": steps,
+                    "abis": abis
+                }
         else:
-            # Basic response without step-by-step debugging
+            # Basic response without steps
             response = {
                 "status": "success" if trace.success else "reverted",
                 "traceCall": root_trace_call,
