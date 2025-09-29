@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import json
 import sys
 import os
@@ -158,7 +159,7 @@ class WalnutDAPServer:
             
             # Store paths for later use in source requests
             self.source_file = source
-            
+            self._send_output(f"Using soldb path: {soldb_path}\n")
             contract_name = None
             abi_path = None
 
