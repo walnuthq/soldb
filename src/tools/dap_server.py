@@ -60,30 +60,6 @@ class WalnutDAPServer:
             "category": "stdout"
         })
 
-    def setup_soldb_environment(self, soldb_path: str = None):
-        """Setup environment to use soldb from external location"""
-        
-        if not soldb_path:
-            raise FileNotFoundError("Error: Cannot find soldb installation.")
-
-        soldb_path = Path(soldb_path).resolve()
-        src_dir = soldb_path / 'src'
-        
-        if not src_dir.exists():
-            raise FileNotFoundError(f"Error: soldb src directory not found at {src_dir}")
-        
-        if not (src_dir / 'soldb').exists():
-            raise FileNotFoundError(f"Error: soldb module directory not found at {src_dir / 'soldb'}")
-        
-        # Add soldb src to Python path
-        if str(src_dir) not in sys.path:
-            sys.path.insert(0, str(src_dir))
-        
-        # Change to soldb project root for file resolution
-        os.chdir(soldb_path)
-        
-        return soldb_path, src_dir
-
     # ---- DAP transport helpers ----
     def _send(self, msg: Dict[str, Any]):
         body = json.dumps(msg).encode("utf-8")
@@ -146,24 +122,54 @@ class WalnutDAPServer:
     def launch(self, request):
         try:
             args = request.get("arguments", {}) or {}
-            contract_address = args.get("contractAddress")
-            contracts = args.get("contracts")  # path to contracts mapping file
-            ethdebug_dir = args.get("ethdebugDir")
+            
+            # Get source file and workspace root
+            source = args.get("source")
+            workspace_root = args.get("workspaceRoot")
+            
+            # workspace detection
+            if not workspace_root:
+                if source:
+                    workspace_root = os.path.dirname(source)
+                else:
+                    workspace_root = os.getcwd()
+            
+            # Change to workspace root
+            os.chdir(workspace_root)
+            
+            # Enhanced path resolution with fallbacks
+            def resolve_path(path_arg):
+                if not path_arg:
+                    return path_arg
+                if os.path.isabs(path_arg):
+                    return path_arg
+                
+                # Try workspace-relative first
+                workspace_path = os.path.join(workspace_root, path_arg)
+                if os.path.exists(workspace_path):
+                    return workspace_path
+                
+                # Try current directory
+                if os.path.exists(path_arg):
+                    return os.path.abspath(path_arg)
+                
+                # Fallback to workspace-relative
+                return workspace_path
+            
+            # Resolve all paths
+            contracts = resolve_path(args.get("contracts"))
+            ethdebug_dir = resolve_path(args.get("ethdebugDir"))
             rpc_url = args.get("rpc", "http://localhost:8545")
             block = args.get("block", None)
             from_addr = args.get("from_addr", "")
-            source = args.get("source")
             function_signature = args.get("function", None)
             function_args = args.get("functionArgs", [])
-            soldb_path = args.get("soldbPath", os.getenv("SOLDB_PATH", None))
             
             # Store paths for later use in source requests
             self.source_file = source
-            self._send_output(f"Using soldb path: {soldb_path}\n")
+            self.workspace_root = workspace_root
             contract_name = None
             abi_path = None
-
-            self.setup_soldb_environment(soldb_path)
             
             if contracts:
                 with open(contracts, "r") as f:
