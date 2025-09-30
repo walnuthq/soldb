@@ -504,6 +504,12 @@ class WalnutDAPServer:
             self._send_output(f"Error during continue command: {e}")
             self._response(request, False, message=str(e))
             return
+        
+        # If continue reaches end of execution
+        if self.debugger.current_step >= len(self.debugger.current_trace.steps) - 1:
+            self._response(request, True, {"allThreadsContinued": False})
+            self._event("exited", {"exitCode": 0})
+            return
 
         self._response(request, True, {"allThreadsContinued": False})
         self._event("stopped", {"reason": "breakpoint", "threadId": self.thread_id})
@@ -513,6 +519,10 @@ class WalnutDAPServer:
         try:
             if self.debugger:
                 self.debugger.do_next("")
+                if self.debugger.current_step >= len(self.debugger.current_trace.steps):
+                    self._response(request, True, {})
+                    self._event("exited", {"exitCode": 0})
+                    return
                 new_step = self.debugger.current_trace.steps[self.debugger.current_step]
                 # If we stepped into a CALL/DELEGATECALL/STATICCALL, step over it
                 if new_step.op in ['CALL', 'DELEGATECALL', 'STATICCALL']:
@@ -722,6 +732,7 @@ class WalnutDAPServer:
         scopes = [
             {"name": "Stack", "variablesReference": 1000, "expensive": False},
             {"name": "Parameters", "variablesReference": 1001, "expensive": False},
+            {"name": "Step", "variablesReference": 1002, "expensive": False},
         ]
         self._response(request, True, {"scopes": scopes})
 
@@ -731,6 +742,9 @@ class WalnutDAPServer:
         if not self.debugger or not self.debugger.current_trace:
             return self._response(request, True, {"variables": vars_list})
 
+        if self.debugger.current_step >= len(self.debugger.current_trace.steps):
+            return self._response(request, True, {"variables": vars_list})
+        
         step = self.debugger.current_trace.steps[self.debugger.current_step]
                     
         if ref == 1000:
@@ -745,6 +759,14 @@ class WalnutDAPServer:
 
                 for param_name, param_value in self.debugger.current_function.args:
                     vars_list.append({"name": f"{param_name}", "value": str(param_value), "variablesReference": 0})
+        elif ref == 1002:
+            # Current step info
+            vars_list.append({"name": "pc", "value": str(step.pc), "variablesReference": 0})
+            vars_list.append({"name": "op", "value": step.op, "variablesReference": 0})
+            vars_list.append({"name": "depth", "value": str(step.depth), "variablesReference": 0})
+            vars_list.append({"name": "gas", "value": str(step.gas), "variablesReference": 0})
+            vars_list.append({"name": "gasCost", "value": str(step.gas_cost), "variablesReference": 0})
+            vars_list.append({"name": "step", "value": str(self.debugger.current_step), "variablesReference": 0})
         self._response(request, True, {"variables": vars_list})
 
     def evaluate(self, request):
@@ -753,6 +775,8 @@ class WalnutDAPServer:
         try:
             if expr.startswith("stack[") and expr.endswith("]") and self.debugger and self.debugger.current_trace:
                 idx = int(expr[6:-1])
+                if self.debugger.current_step >= len(self.debugger.current_trace.steps):
+                    raise IndexError("Current step out of range")
                 val = self.debugger.current_trace.steps[self.debugger.current_step].stack[idx]
                 result = hex(val) if isinstance(val, int) else str(val)
             self._response(request, True, {"result": result, "variablesReference": 0})
