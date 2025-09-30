@@ -840,7 +840,10 @@ class WalnutDAPServer:
             else:
                 self._response(msg, False, message=f"Unsupported command: {cmd}")
 
-if __name__ == "__main__":
+def main():
     server = WalnutDAPServer()
     server.run()
+
+if __name__ == "__main__":
+    main()
 
