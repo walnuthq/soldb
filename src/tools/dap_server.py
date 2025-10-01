@@ -495,24 +495,28 @@ class WalnutDAPServer:
         # Run until end or breakpoint
         if not self.debugger or not self.debugger.current_trace:
             self._response(request, True, {})
-            self._event("stopped", {"reason": "breakpoint", "threadId": self.thread_id})
+            self._event("stopped", {"reason": "pause", "threadId": self.thread_id})
             return
         
         try:
             self.debugger.do_continue("")
+            
+            # Check what happened after continue
+            if self.debugger.current_step >= len(self.debugger.current_trace.steps) - 1:
+                # Reached end of execution
+                self._response(request, True, {"allThreadsContinued": False})
+                self._event("exited", {"exitCode": 0})
+                return
+            else:
+                # Breakpoint hit
+                self._response(request, True, {"allThreadsContinued": False})
+                self._event("stopped", {"reason": "breakpoint", "threadId": self.thread_id})
+                return
+            
         except Exception as e:
             self._send_output(f"Error during continue command: {e}")
             self._response(request, False, message=str(e))
             return
-        
-        # If continue reaches end of execution
-        if self.debugger.current_step >= len(self.debugger.current_trace.steps) - 1:
-            self._response(request, True, {"allThreadsContinued": False})
-            self._event("exited", {"exitCode": 0})
-            return
-
-        self._response(request, True, {"allThreadsContinued": False})
-        self._event("stopped", {"reason": "breakpoint", "threadId": self.thread_id})
 
     def next(self, request):
         # Source-level step
