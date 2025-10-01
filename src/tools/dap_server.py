@@ -547,7 +547,9 @@ class WalnutDAPServer:
                     # Step in until we hit a CALL/DELEGATECALL/STATICCALL
                     if current_op in ["CALL", "DELEGATECALL", "STATICCALL"]:
                         break
+                
                 self.debugger.do_step("")
+                
             self._response(request, True, {})
             self._event("stopped", {"reason": "step", "threadId": self.thread_id})
         except Exception as e:
@@ -734,9 +736,23 @@ class WalnutDAPServer:
 
     def scopes(self, request):
         scopes = [
-            {"name": "Stack", "variablesReference": 1000, "expensive": False},
-            {"name": "Parameters", "variablesReference": 1001, "expensive": False},
-            {"name": "Step", "variablesReference": 1002, "expensive": False},
+            {
+                "name": "Parameters",
+                "variablesReference": 1000,
+                "expensive": False,
+                "presentationHint": "Function Parameters",
+                "expanded": True
+            },
+            {
+                "name": "Stack",
+                "variablesReference": 1001,
+                "expensive": False
+            },
+            {
+                "name": "Gas",
+                "variablesReference": 1002,
+                "expensive": False
+            },
         ]
         self._response(request, True, {"scopes": scopes})
 
@@ -751,12 +767,12 @@ class WalnutDAPServer:
         
         step = self.debugger.current_trace.steps[self.debugger.current_step]
                     
-        if ref == 1000:
+        if ref == 1001:
             # Stack
             for i, v in enumerate(step.stack):
                 vars_list.append({"name": f"stack[{i}]", "value": hex(v) if isinstance(v, int) else str(v), "variablesReference": 0})
-        
-        elif ref == 1001:
+
+        elif ref == 1000:
             # Parameters
             if (self.debugger.current_function and self.debugger.current_function.args and
                 (self.debugger.tracer.ethdebug_info or self.debugger.tracer.multi_contract_parser)):
@@ -765,12 +781,8 @@ class WalnutDAPServer:
                     vars_list.append({"name": f"{param_name}", "value": str(param_value), "variablesReference": 0})
         elif ref == 1002:
             # Current step info
-            vars_list.append({"name": "pc", "value": str(step.pc), "variablesReference": 0})
-            vars_list.append({"name": "op", "value": step.op, "variablesReference": 0})
-            vars_list.append({"name": "depth", "value": str(step.depth), "variablesReference": 0})
             vars_list.append({"name": "gas", "value": str(step.gas), "variablesReference": 0})
             vars_list.append({"name": "gasCost", "value": str(step.gas_cost), "variablesReference": 0})
-            vars_list.append({"name": "step", "value": str(self.debugger.current_step), "variablesReference": 0})
         self._response(request, True, {"variables": vars_list})
 
     def evaluate(self, request):
