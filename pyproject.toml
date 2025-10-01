@@ -51,9 +51,10 @@ Issues = "https://github.com/yourusername/soldb/issues"
 
 [project.scripts]
 soldb = "soldb.main:main"
+soldb-dap-server = "tools.dap_server:main"
 
 [tool.setuptools]
-packages = ["soldb"]
+packages = ["soldb","tools"]
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
