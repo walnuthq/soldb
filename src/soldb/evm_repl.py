@@ -39,7 +39,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                  rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
                  function_name: str = None, function_args: List[str] = [],
                  abi_path: str = None, from_addr: str = None, block: int = None,
-                 tracer: TransactionTracer = None, contract_name: str = None):
+                 tracer: TransactionTracer = None, contract_name: str = None, value: int = 0):
         super().__init__()
 
         if not tracer:
@@ -111,6 +111,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         self.from_addr = from_addr
         self.block = block
         self.contract_name = contract_name
+        self.value = value
 
         if self.contract_address and not self.tracer.is_contract_deployed(self.contract_address):
             print(error(f"Error: No contract found at address {self.contract_address}"))
@@ -272,7 +273,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                 to=contract_addr,
                 from_=self.from_addr,
                 calldata=calldata,
-                block=self.block
+                block=self.block,
+                value=self.value
             )
 
             if not self.current_trace:
