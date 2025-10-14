@@ -41,6 +41,7 @@ class FunctionCall:
     parent_call_id: Optional[int] = None
     contract_call_id: Optional[int] = None  # ID of the contract call that contains this function call
     children_call_ids: List[int] = field(default_factory=list)
+    value: Optional[int] = None  # ETH value sent with the call
 
 @dataclass
 class StackVariable:
@@ -1510,7 +1511,8 @@ class TransactionTracer:
                 call_id=next_call_id,  # This will be 1
                 parent_call_id=dispatcher_call.call_id,
                 contract_call_id=dispatcher_call.call_id,  # Main call belongs to dispatcher contract call
-                children_call_ids=[]
+                children_call_ids=[],
+                value=trace.value,
             )
             next_call_id += 1
             # Add to function_calls and call_stack
@@ -2116,7 +2118,11 @@ class TransactionTracer:
         # Extract call parameters
         to_addr = self.extract_address_from_stack(step.stack[-2])
         calldata = self.extract_calldata_from_step(step)
-
+        # Extract value for step's stack
+        if step.op == "CALL":
+            value = int(step.stack[-3], 16)
+        else:
+            value = None
         # Get contract name and check if we have debug info for target contract
         contract_name = self.format_address_display(to_addr)
         target_contract_info = None
@@ -2171,6 +2177,7 @@ class TransactionTracer:
             args=decoded_params,
             call_type=step.op,
             contract_address=to_addr,
+            value=value
         )
 
     def _process_create_call(self, step: TraceStep, step_idx: int, 
@@ -2730,6 +2737,9 @@ class TransactionTracer:
                     func_display = f"{cyan(call.name)} {dim(f'[{call.selector}]')}"
                 else:
                     func_display = cyan(call.name)
+                
+                if call.value:
+                    func_display = f"{func_display} {f'{dim(f'[value: {call.value}]')}' if call.value else ''}"
                 
                 # Add call type indicator with enhanced info for external calls
                 if call.call_type in ["CALL", "DELEGATECALL", "STATICCALL"]:

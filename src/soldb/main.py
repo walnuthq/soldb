@@ -982,7 +982,8 @@ def interactive_mode(args,tracer):
         from_addr=args.from_addr,
         block=args.block,
         tracer=tracer,
-        contract_name=contract_name
+        contract_name=contract_name,
+        value=args.value
     )
 
     # Baseline snapshot (unless disabled)
