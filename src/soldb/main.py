@@ -17,7 +17,7 @@ from .evm_repl import EVMDebugger
 from .abi_utils import match_abi_types, match_single_type, parse_signature, parse_tuple_arg
 from .multi_contract_ethdebug_parser import MultiContractETHDebugParser
 from .json_serializer import TraceSerializer
-from .colors import error, info, warning
+from .colors import error, info, warning, number
 from .auto_deploy import AutoDeployDebugger
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
@@ -451,13 +451,22 @@ def simulate_command(args):
     # Show RPC URL being used
     if not getattr(args, 'json', False):
         print(f"Connecting to RPC: {info(args.rpc_url)}")
-
+        
     # Create tracer
     try:
         tracer = TransactionTracer(args.rpc_url)
     except ConnectionError as e:
         print(f"{error(e)}")
         return 1
+
+    if args.value and args.value > 0:
+        balance = tracer.w3.eth.get_balance(args.from_addr,args.block)
+        if balance < args.value:
+            print(f"{error(f'Error: User {args.from_addr} has not enough funds.')}")
+            print(f"    - Available balance: {number(str(balance))} wei")
+            print(f"    - Requested value: {number(args.value)} wei")
+            return 1
+    
     source_map = {}
 
     if args.contract_address and not args.interactive:
