@@ -459,8 +459,6 @@ def serialize_events_to_json(tracer, receipt) -> Dict[str, Any]:
                 event_data["signature"] = decoded_log['decoded']['signature']
                 if 'event_name' in decoded_log['decoded'] and decoded_log['decoded']['event_name'] != "Unknown":
                     event_data["event_name"] = decoded_log['decoded']['event_name']
-                if 'param_count' in decoded_log['decoded']:
-                    event_data["param_count"] = decoded_log['decoded']['param_count']
                 
                 # Add contract name if available
                 if tracer.multi_contract_parser:
