@@ -1,0 +1,21 @@
+# Test soldb list-events with multiple events (increment function emits 3 events)
+# REQUIRES: soldb
+# This test checks the output when a transaction emits multiple events
+# The increment function calls increment2 and increment3, each emitting CounterIncremented event
+# RUN: %soldb list-events %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck %s
+
+# Check that we get the basic events output structure
+# CHECK: Events emitted in Transaction:
+
+# Check for event headers with numbers (should have 3 events)
+# CHECK: Event #1: Contract Address: [[CONTRACT_ADDRESS:.*]]
+# CHECK:     topic: 0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c
+# CHECK:     data: 0x{{[0-9a-f]+}}
+
+# CHECK: Event #2: Contract Address: [[CONTRACT_ADDRESS:.*]]
+# CHECK:     topic: 0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c
+# CHECK:     data: 0x{{[0-9a-f]+}}
+
+# CHECK: Event #3: Contract Address: [[CONTRACT_ADDRESS:.*]]
+# CHECK:     topic: 0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c
+# CHECK:     data: 0x{{[0-9a-f]+}}

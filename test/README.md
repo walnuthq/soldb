@@ -8,6 +8,7 @@ This directory contains the test infrastructure for SolDB.
 test/
 ├── trace/           # Trace command tests
 ├── simulate/        # Simulate command tests
+├── events/          # Events command tests
 ├── run-tests.sh     # Main test runner script
 ├── lit.cfg.py       # Test framework configuration
 ├── lit.site.cfg.py - Generated site-specific configuration (gitignored)
@@ -44,6 +45,9 @@ cd test
 
 # Run only simulate tests
 ./run-tests.sh --simulate-only
+
+# Run only events tests
+./run-tests.sh --events-only
 ```
 
 ### Run with Verbose Output

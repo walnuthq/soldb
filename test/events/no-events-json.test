@@ -1,0 +1,20 @@
+# Test soldb list-events with --json-events when no events are emitted
+# REQUIRES: soldb
+# This test checks the JSON output when a transaction doesn't emit any events
+# Uses complexCalculation function which is pure and doesn't emit events
+# RUN: %soldb list-events %{test_tx_no_events} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --json-events 2>&1 | FileCheck %s
+
+# When using --json-events flag with no events, we should get valid JSON output
+# CHECK: {
+
+# Check for the main JSON structure fields
+# CHECK: "events":
+
+# Verify the events array is empty
+# CHECK: []
+
+# Check for total_events field with value 0
+# CHECK: "total_events": 0
+
+# Verify JSON object closing
+# CHECK: }
