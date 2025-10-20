@@ -1,10 +1,11 @@
     
 
 from .transaction_tracer import TransactionTrace, TransactionTracer
-from typing import Dict, Any
+from typing import Dict, Any, List
 from eth_abi.abi import decode
 from .colors import *
 import requests
+import json
 
 
 def print_contracts_in_transaction(tracer: TransactionTracer,trace: TransactionTrace):
@@ -115,22 +116,21 @@ def decode_event_log(tracer,log_entry: Dict[str, Any]) -> Dict[str, Any]:
                         # Decode based on type
                         if param_type in ['address']:
                             # Address is in the last 20 bytes
-                            decoded_values[param_name] = '0x' + topic_bytes[-20:].hex()
+                            decoded_value = '0x' + topic_bytes[-20:].hex()
                         elif param_type.startswith('uint') or param_type.startswith('int'):
                             # Integer types
-                            decoded_values[param_name] = int.from_bytes(topic_bytes, 'big')
+                            decoded_value = int.from_bytes(topic_bytes, 'big')
                         elif param_type == 'bool':
-                            decoded_values[param_name] = topic_bytes[-1] != 0
-                        elif param_type.startswith('bytes'):
-                            if param_type == 'bytes':
-                                # Dynamic bytes
-                                decoded_values[param_name] = topic
-                            else:
-                                # Fixed bytes
-                                decoded_values[param_name] = topic
+                            decoded_value = topic_bytes[-1] != 0
                         else:
                             # For other types, just show the raw topic
-                            decoded_values[param_name] = topic
+                            decoded_value = topic
+                        
+                        # Store with type information
+                        decoded_values[param_name] = {
+                            'type': param_type,
+                            'value': decoded_value
+                        }
                 
                 # Decode non-indexed parameters from data
                 if non_indexed_inputs and log_entry.get('data', '0x') != '0x':
@@ -153,11 +153,17 @@ def decode_event_log(tracer,log_entry: Dict[str, Any]) -> Dict[str, Any]:
                         try:
                             decoded_data = decode(param_types, data_bytes)
                             for inp, value in zip(non_indexed_inputs, decoded_data):
-                                decoded_values[inp['name']] = value
+                                decoded_values[inp['name']] = {
+                                    'type': inp['type'],
+                                    'value': value
+                                }
                         except Exception as e:
-                            # If decoding fails, add raw data
+                            # If decoding fails, add raw data with error
                             for inp in non_indexed_inputs:
-                                decoded_values[inp['name']] = f"decode_error: {str(e)}"
+                                decoded_values[inp['name']] = {
+                                    'type': inp['type'],
+                                    'value': f"decode_error: {str(e)}"
+                                }
                 
                 decoded_log['decoded'] = {
                     'event': event_abi['name'],
@@ -259,7 +265,11 @@ def decode_event_log(tracer,log_entry: Dict[str, Any]) -> Dict[str, Any]:
         
         return decoded_log
 
-def print_contracts_events(tracer, receipt):
+def print_contracts_events(tracer, receipt, json_output=False):
+    if json_output:
+        # Return JSON data instead of printing
+        return serialize_events_to_json(tracer, receipt)
+    
     print("")
     print(f"Events emitted in Transaction:")
     print(dim("-" * 80))
@@ -283,7 +293,15 @@ def print_contracts_events(tracer, receipt):
                 if 'error' in log['decoded']:
                     print(f"  {error(log['decoded']['error'])}")
                 elif log['decoded']['event'] == 'Unknown':
+                    contract_name = ""
+                    if tracer.multi_contract_parser:
+                        contract_info = tracer.multi_contract_parser.get_contract_at_address(log['address'])
+                        if contract_info:
+                            contract_name = contract_info.name
+                    
                     print(f"{warning(f'Event #{i+1}:')} Contract Address: {(log['address'])}")
+                    if contract_name:
+                        print(f"    Contract: {info(contract_name)}")
                     if log['decoded']['event_name'] != "Unknown":
                         print(f"    topic: {f'{address(log['decoded']['event_name'])}'}")
                     else:
@@ -291,13 +309,178 @@ def print_contracts_events(tracer, receipt):
                     print(f"    data: {cyan(log['decoded']['data'])}")
                 else:
                     print(f"{success(f'Event #{i+1}: ')}", end="")
+                    contract_name = ""
                     if tracer.multi_contract_parser:
-                        contract_name = tracer.multi_contract_parser.get_contract_at_address(log['address']).name
-                        print(f"{info(contract_name)}::", end="")
+                        contract_info = tracer.multi_contract_parser.get_contract_at_address(log['address'])
+                        if contract_info:
+                            contract_name = contract_info.name
+                            print(f"{info(contract_name)}::", end="")
                     print(f"{function_name(log['decoded']['signature'])}")
-                    for arg_name, arg_value in log['decoded']['args'].items():    
+                    for arg_name, arg_info in log['decoded']['args'].items():
+                        # Handle both old format (direct value) and new format (dict with type/value)
+                        if isinstance(arg_info, dict) and 'type' in arg_info and 'value' in arg_info:
+                            # New format
+                            arg_type = arg_info['type']
+                            arg_value = arg_info['value']
+                        
                         value_str = yellow(str(arg_value))
-                        print(f"    {arg_name}: {value_str}")
+                        type_str = dim(f"({arg_type})")
+                        print(f"    {arg_name}: {value_str} {type_str}")
             else:
                 print("  No decoded information available")
             print(dim("-" * 80))
+
+def _convert_hexbytes_to_string(obj):
+    """Convert HexBytes and other non-serializable objects to strings."""
+    if isinstance(obj, str):
+        return obj  
+    
+    # Handle HexBytes and bytes efficiently
+    if hasattr(obj, 'hex'):
+        hex_str = obj.hex()
+        return hex_str if hex_str.startswith('0x') else '0x' + hex_str
+    elif isinstance(obj, bytes):
+        return '0x' + obj.hex()
+    
+    # Handle collections
+    if isinstance(obj, list):
+        return [_convert_hexbytes_to_string(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: _convert_hexbytes_to_string(value) for key, value in obj.items()}
+    elif isinstance(obj, tuple):
+        return tuple(_convert_hexbytes_to_string(item) for item in obj)
+    
+    # Handle custom objects with __dict__
+    if hasattr(obj, '__dict__'):
+        return _convert_hexbytes_to_string(obj.__dict__)
+    elif hasattr(obj, '_asdict'):
+        # NamedTuple
+        return _convert_hexbytes_to_string(obj._asdict())
+    elif hasattr(obj, '_fields'):
+        # NamedTuple alternative
+        return {field: _convert_hexbytes_to_string(getattr(obj, field)) 
+                for field in obj._fields}
+    
+    # Handle iterables (but not strings/bytes)
+    if hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):
+        try:
+            return [_convert_hexbytes_to_string(item) for item in obj]
+        except (TypeError, AttributeError):
+            pass
+    
+    # Return as-is for other types
+    return obj
+
+def serialize_events_to_json(tracer, receipt) -> Dict[str, Any]:
+    """Serialize events to JSON format."""
+    # Get logs from transaction receipt
+    receipt_logs = receipt['logs'] if receipt and 'logs' in receipt else []
+    
+    events = []
+    
+    # Process all receipt logs
+    for i, log in enumerate(receipt_logs):
+        decoded_log = decode_event_log(tracer, log)
+        
+        event_data = {
+            "index": i,
+            "address": decoded_log['address'],
+            "topics": decoded_log['topics'],
+            "data": decoded_log['data']
+        }
+        
+        # Add datas field - either decoded or raw hex
+        if decoded_log['decoded'] and 'args' in decoded_log['decoded']:
+            event_data["datas"] = []
+            
+            for arg_name, arg_info in decoded_log['decoded']['args'].items():
+                # Handle both old format (direct value) and new format (dict with type/value)
+                if isinstance(arg_info, dict) and 'type' in arg_info and 'value' in arg_info:
+                    # New format
+                    arg_type = arg_info['type']
+                    arg_value = arg_info['value']
+                else:
+                    # Old format fallback
+                    arg_type = "unknown"
+                    arg_value = arg_info
+                
+                # Convert value to appropriate format
+                if isinstance(arg_value, bytes) and arg_type == 'string':
+                    # For string bytes, decode to string and remove null bytes
+                    value = arg_value.decode('utf-8').rstrip('\x00')
+                elif isinstance(arg_value, (str, int, bool)):
+                    # For strings, integers, and booleans, keep as is
+                    value = arg_value
+                else:
+                    # For everything else, convert to hex
+                    value = f"0x{str(arg_value)}"
+                
+                event_data["datas"].append({
+                    "name": arg_name,
+                    "type": arg_type,
+                    "value": value
+                })
+        else:
+            # No decoded data, use raw hex data
+            raw_data = decoded_log['data']
+            if isinstance(raw_data, bytes):
+                raw_data = raw_data.hex()
+            elif isinstance(raw_data, str) and not raw_data.startswith('0x'):
+                raw_data = '0x' + raw_data
+            
+            # Split into 32-byte chunks for datas array
+            if raw_data and raw_data != '0x':
+                data_hex = raw_data[2:] if raw_data.startswith('0x') else raw_data
+                if len(data_hex) >= 64:  # At least one 32-byte chunk
+                    datas = []
+                    for i in range(0, len(data_hex), 64):
+                        chunk = data_hex[i:i+64]
+                        if len(chunk) == 64:  # Only add complete 32-byte chunks
+                            datas.append({
+                                "name": None,
+                                "type": "hex",
+                                "value": f"0x{chunk}"
+                            })
+                    event_data["datas"] = datas
+                else:
+                    event_data["datas"] = [{
+                        "name": None,
+                        "type": "hex", 
+                        "value": raw_data
+                    }]
+            else:
+                event_data["datas"] = []
+        
+        if decoded_log['decoded']:
+            if 'error' in decoded_log['decoded']:
+                event_data["error"] = decoded_log['decoded']['error']
+            elif decoded_log['decoded']['event'] == 'Unknown':
+                event_data["event"] = ""
+                event_data["signature"] = decoded_log['decoded']['signature']
+                if 'event_name' in decoded_log['decoded'] and decoded_log['decoded']['event_name'] != "Unknown":
+                    event_data["event_name"] = decoded_log['decoded']['event_name']
+                
+                # Add contract name if available
+                if tracer.multi_contract_parser:
+                    contract_info = tracer.multi_contract_parser.get_contract_at_address(log['address'])
+                    if contract_info:
+                        event_data["contract_name"] = contract_info.name
+            else:
+                event_data["event"] = decoded_log['decoded']['event']
+                event_data["signature"] = decoded_log['decoded']['signature']
+                # Add contract name if available
+                if tracer.multi_contract_parser:
+                    contract_info = tracer.multi_contract_parser.get_contract_at_address(log['address'])
+                    if contract_info:
+                        event_data["contract_name"] = contract_info.name
+        
+        events.append(event_data)
+    
+    result = {
+        "transaction_hash": receipt.get('transactionHash'),
+        "events": events,
+        "total_events": len(events)
+    }
+    
+    # Convert all HexBytes and non-serializable objects to strings
+    return _convert_hexbytes_to_string(result)

@@ -1,0 +1,202 @@
+# Test soldb list-events with --json-events flag for Sepolia transaction
+# REQUIRES: soldb, sepolia-rpc
+# This test checks that the --json-events flag produces valid JSON output for a Sepolia transaction
+# RUN: %soldb list-events 0x1362ee26050935178c2f491dbe2a5f0d277903cb5d77fa9e6e30d8b2db31a541 --ethdebug-dir 0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd:TaxCalculator:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd/debug --ethdebug-dir 0xbE734aD6434E16f6bE04706005faED6fD38eb2B2:ShippingManager:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xbE734aD6434E16f6bE04706005faED6fD38eb2B2/debug --ethdebug-dir 0xf776FF56e2400e31f3070c1ac70Ab80433B01823:PaymentProcessor:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xf776FF56e2400e31f3070c1ac70Ab80433B01823/debug --rpc %{sepolia_rpc_url} --json-events 2>&1 | FileCheck %s
+
+# When using --json-events flag
+# CHECK: {
+# CHECK: "transaction_hash": "0x1362ee26050935178c2f491dbe2a5f0d277903cb5d77fa9e6e30d8b2db31a541",
+
+# CHECK: "events": [
+
+# Event 0: Unknown contract event
+# CHECK: {
+# CHECK: "index": 0,
+# CHECK: "address": "0xdcDd1dd0ff17043f8bCD1AC9E5Be20BBEd4FAc0A",
+# CHECK: "topics": [
+# CHECK: "0xdf2f43000ad262ff927c671ed83129f9054af075e5d3add03a2ba7116e719a51"
+# CHECK: ],
+# CHECK: "data": "0x00000000000000000000000059a714559b46c823d87986b5c5b7c630e2f5668d000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000195374617274696e67206f726465722070726f63657373696e6700000000000000",
+# CHECK: "datas": [
+# CHECK: {
+# CHECK: "name": null,
+# CHECK: "type": "hex",
+# CHECK: "value": "0x00000000000000000000000059a714559b46c823d87986b5c5b7c630e2f5668d"
+# CHECK: },
+# CHECK: {
+# CHECK: "name": null,
+# CHECK: "type": "hex",
+# CHECK: "value": "0x0000000000000000000000000000000000000000000000000000000000000040"
+# CHECK: },
+# CHECK: {
+# CHECK: "name": null,
+# CHECK: "type": "hex",
+# CHECK: "value": "0x0000000000000000000000000000000000000000000000000000000000000019"
+# CHECK: },
+# CHECK: {
+# CHECK: "name": null,
+# CHECK: "type": "hex",
+# CHECK: "value": "0x5374617274696e67206f726465722070726f63657373696e6700000000000000"
+# CHECK: }
+# CHECK: ],
+# CHECK: "event": "",
+# CHECK: "signature": "0xdf2f43000ad262ff927c671ed83129f9054af075e5d3add03a2ba7116e719a51"
+
+# Event 1: TaxComputed decoded event
+# CHECK: {
+# CHECK: "index": 1,
+# CHECK: "address": "0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd",
+# CHECK: "topics": [
+# CHECK: "0x02d5554e2af6025118aa4eaf18a3923aacfae979280c8be954792212a17ba58a"
+# CHECK: ],
+# CHECK: "data": "0x00000000000000000000000059a714559b46c823d87986b5c5b7c630e2f5668d00000000000000000000000000000000000000000000000000000000000003e80000000000000000000000000000000000000000000000000000000000000050",
+# CHECK: "datas": [
+# CHECK: {
+# CHECK: "name": "caller",
+# CHECK: "type": "address",
+# CHECK: "value": "0x59a714559b46c823d87986b5c5b7c630e2f5668d"
+# CHECK: },
+# CHECK: {
+# CHECK: "name": "orderValue",
+# CHECK: "type": "uint256",
+# CHECK: "value": 1000
+# CHECK: },
+# CHECK: {
+# CHECK: "name": "taxAmount",
+# CHECK: "type": "uint256",
+# CHECK: "value": 80
+# CHECK: }
+# CHECK: ],
+# CHECK: "event": "TaxComputed",
+# CHECK: "signature": "TaxComputed(address,uint256,uint256)",
+# CHECK: "contract_name": "TaxCalculator"
+
+# Event 2: Unknown contract event
+# CHECK: {
+# CHECK: "index": 2,
+# CHECK: "address": "0xdcDd1dd0ff17043f8bCD1AC9E5Be20BBEd4FAc0A",
+# CHECK: "topics": [
+# CHECK: "0x29c44a39e8532b4217116f0df1e627d35a994882005f6a710764fcefcd4feef4"
+# CHECK: ],
+# CHECK: "data": "0x00000000000000000000000059a714559b46c823d87986b5c5b7c630e2f5668d0000000000000000000000000000000000000000000000000000000000000050",
+# CHECK: "datas": [
+# CHECK: {
+# CHECK: "name": null,
+# CHECK: "type": "hex",
+# CHECK: "value": "0x00000000000000000000000059a714559b46c823d87986b5c5b7c630e2f5668d"
+# CHECK: },
+# CHECK: {
+# CHECK: "name": null,
+# CHECK: "type": "hex",
+# CHECK: "value": "0x0000000000000000000000000000000000000000000000000000000000000050"
+# CHECK: }
+# CHECK: ],
+# CHECK: "event": "",
+# CHECK: "signature": "0x29c44a39e8532b4217116f0df1e627d35a994882005f6a710764fcefcd4feef4"
+
+# Event 3: ShippingStarted decoded event
+# CHECK: {
+# CHECK: "index": 3,
+# CHECK: "address": "0xbE734aD6434E16f6bE04706005faED6fD38eb2B2",
+# CHECK: "topics": [
+# CHECK: "0x78302c0b02740c4c38cc7b7088fba887830825c761f3ef6754e8ea1b3179f885"
+# CHECK: ],
+# CHECK: "data": "0x000000000000000000000000286af310ea3303c80ebe9a66f6998b21bd8c1c29000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000076578707265737300000000000000000000000000000000000000000000000000",
+# CHECK: "datas": [
+# CHECK: {
+# CHECK: "name": "to",
+# CHECK: "type": "address",
+# CHECK: "value": "0x286af310ea3303c80ebe9a66f6998b21bd8c1c29"
+# CHECK: },
+# CHECK: {
+# CHECK: "name": "method",
+# CHECK: "type": "string",
+# CHECK: "value": "express"
+# CHECK: }
+# CHECK: ],
+# CHECK: "event": "ShippingStarted",
+# CHECK: "signature": "ShippingStarted(address,string)",
+# CHECK: "contract_name": "ShippingManager"
+
+# Event 4: ShippingEstimate decoded event
+# CHECK: {
+# CHECK: "index": 4,
+# CHECK: "address": "0xbE734aD6434E16f6bE04706005faED6fD38eb2B2",
+# CHECK: "topics": [
+# CHECK: "0xd3b74a10a734fb26e308ebf8f33cf773856aca1f8aef8b3e5d90d535a5f7b1cf"
+# CHECK: ],
+# CHECK: "data": "0x0000000000000000000000000000000000000000000000000000000000000032",
+# CHECK: "datas": [
+# CHECK: {
+# CHECK: "name": "cost",
+# CHECK: "type": "uint256",
+# CHECK: "value": 50
+# CHECK: }
+# CHECK: ],
+# CHECK: "event": "ShippingEstimate",
+# CHECK: "signature": "ShippingEstimate(uint256)",
+# CHECK: "contract_name": "ShippingManager"
+
+# Event 5: Unknown contract event
+# CHECK: {
+# CHECK: "index": 5,
+# CHECK: "address": "0xdcDd1dd0ff17043f8bCD1AC9E5Be20BBEd4FAc0A",
+# CHECK: "topics": [
+# CHECK: "0x29c44a39e8532b4217116f0df1e627d35a994882005f6a710764fcefcd4feef4"
+# CHECK: ],
+# CHECK: "data": "0x00000000000000000000000059a714559b46c823d87986b5c5b7c630e2f5668d0000000000000000000000000000000000000000000000000000000000000032",
+
+# Event 6: PaymentReceived decoded event
+# CHECK: {
+# CHECK: "index": 6,
+# CHECK: "address": "0xf776FF56e2400e31f3070c1ac70Ab80433B01823",
+# CHECK: "topics": [
+# CHECK: "0x6ef95f06320e7a25a04a175ca677b7052bdd97131872c2192525a629f51be770"
+# CHECK: ],
+# CHECK: "data": "0x000000000000000000000000286af310ea3303c80ebe9a66f6998b21bd8c1c290000000000000000000000000000000000000000000000000000000000000438",
+# CHECK: "datas": [
+# CHECK: {
+# CHECK: "name": "from",
+# CHECK: "type": "address",
+# CHECK: "value": "0x286af310ea3303c80ebe9a66f6998b21bd8c1c29"
+# CHECK: },
+# CHECK: {
+# CHECK: "name": "amount",
+# CHECK: "type": "uint256",
+# CHECK: "value": 1080
+# CHECK: }
+# CHECK: ],
+# CHECK: "event": "PaymentReceived",
+# CHECK: "signature": "PaymentReceived(address,uint256)",
+# CHECK: "contract_name": "PaymentProcessor"
+
+# Event 7: Unknown contract event
+# CHECK: {
+# CHECK: "index": 7,
+# CHECK: "address": "0xdcDd1dd0ff17043f8bCD1AC9E5Be20BBEd4FAc0A",
+# CHECK: "topics": [
+# CHECK: "0xdf2f43000ad262ff927c671ed83129f9054af075e5d3add03a2ba7116e719a51"
+# CHECK: ],
+# CHECK: "data": "0x00000000000000000000000059a714559b46c823d87986b5c5b7c630e2f5668d0000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000e4f7264657220636f6d706c657465000000000000000000000000000000000000",
+
+# Event 8: Unknown contract event
+# CHECK: {
+# CHECK: "index": 8,
+# CHECK: "address": "0xdcDd1dd0ff17043f8bCD1AC9E5Be20BBEd4FAc0A",
+# CHECK: "topics": [
+# CHECK: "0x29c44a39e8532b4217116f0df1e627d35a994882005f6a710764fcefcd4feef4"
+# CHECK: ],
+# CHECK: "data": "0x00000000000000000000000059a714559b46c823d87986b5c5b7c630e2f5668d0000000000000000000000000000000000000000000000000000000000000438",
+
+# Event 9: Final unknown contract event
+# CHECK: {
+# CHECK: "index": 9,
+# CHECK: "address": "0x59A714559B46c823d87986b5c5B7C630e2f5668d",
+# CHECK: "topics": [
+# CHECK: "0x092776ba01c21f36e09e32d1c65c1916cc815300aaeaf89e9df6f3870067a70a"
+# CHECK: ],
+# CHECK: "data": "0x000000000000000000000000286af310ea3303c80ebe9a66f6998b21bd8c1c2900000000000000000000000000000000000000000000000000000000000003e8000000000000000000000000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000000000000320000000000000000000000000000000000000000000000000000000000000438",
+
+# Check total_events at the end and JSON closing
+# CHECK: "total_events": 10
+# CHECK: }

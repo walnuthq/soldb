@@ -9,6 +9,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Parse command line arguments
 RUN_TRACE_TESTS=true
 RUN_SIMULATE_TESTS=true
+RUN_EVENTS_TESTS=true
 VERBOSE=false
 SEPOLIA_KEY=""
 
@@ -24,10 +25,17 @@ for arg in "$@"; do
             ;;
         --trace-only)
             RUN_SIMULATE_TESTS=false
+            RUN_EVENTS_TESTS=false
             shift
             ;;
         --simulate-only)
             RUN_TRACE_TESTS=false
+            RUN_EVENTS_TESTS=false
+            shift
+            ;;
+        --events-only)
+            RUN_TRACE_TESTS=false
+            RUN_SIMULATE_TESTS=false
             shift
             ;;
         -v|--verbose)
@@ -40,6 +48,7 @@ for arg in "$@"; do
             echo "Options:"
             echo "  --trace-only       Run only trace tests (from test/trace/)"
             echo "  --simulate-only    Run only simulate tests (from test/simulate/)"
+            echo "  --events-only      Run only events tests (from test/events/)"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
             echo "  -v, --verbose      Run tests with verbose output"
             echo "  -h, --help         Show this help message"
@@ -47,6 +56,7 @@ for arg in "$@"; do
             echo "Test Structure:"
             echo "  test/trace/        Contains trace command tests"
             echo "  test/simulate/     Contains simulate command tests"
+            echo "  test/events/       Contains list-events command tests"
             echo ""
             echo "Environment variables:"
             echo "  RPC_URL            RPC endpoint (default: http://localhost:8545)"
@@ -58,6 +68,7 @@ for arg in "$@"; do
             echo "  $0                           # Run all tests"
             echo "  $0 --trace-only              # Run only trace tests"
             echo "  $0 --simulate-only           # Run only simulate tests"
+            echo "  $0 --events-only             # Run only events tests"
             echo "  $0 -v                        # Run all tests with verbose output"
             exit 0
             ;;
@@ -100,6 +111,7 @@ echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
 echo -e "${GREEN}Organized test structure:${NC}"
 echo -e "${GREEN}  - test/trace/     : Trace command tests${NC}"
 echo -e "${GREEN}  - test/simulate/  : Simulate command tests${NC}"
+echo -e "${GREEN}  - test/events/    : List-events command tests${NC}"
 
 # Test-specific debug directory (relative to examples)
 TEST_DEBUG_REL="out"
@@ -179,8 +191,27 @@ else
     TEST_TX="${TEST_TX:-0x8a387193d19ae8ff6d15b32b7abec4144601d98da8c2af1eebd9cf4061c033a7}"
 fi
 
+# Create additional test transactions for events testing
+if [ -n "$CONTRACT_ADDRESS" ]; then
+    # Create a transaction that doesn't emit events (complexCalculation is pure function)
+    if [ -z "$TEST_TX_NO_EVENTS" ]; then
+        echo -e "${YELLOW}Creating no-events test transaction (complexCalculation)...${NC}"
+        NO_EVENTS_TX_OUTPUT=$(cd "${PROJECT_DIR}/examples" && DEBUG_DIR="${TEST_DEBUG_REL}" RPC_URL="${RPC_URL}" PRIVATE_KEY="${PRIVATE_KEY}" "${SCRIPT_DIR}/interact-contract.sh" send "complexCalculation(uint256,uint256)" 10 20 2>&1)
+        TEST_TX_NO_EVENTS=$(echo "$NO_EVENTS_TX_OUTPUT" | grep -o '0x[a-fA-F0-9]\{64\}' | head -1)
+        if [ -n "$TEST_TX_NO_EVENTS" ]; then
+            echo -e "${GREEN}Created no-events test transaction: ${TEST_TX_NO_EVENTS}${NC}"
+        else
+            echo -e "${YELLOW}Failed to create no-events test transaction, using fallback${NC}"
+            TEST_TX_NO_EVENTS="${TEST_TX}"
+        fi
+    fi
+fi
+
 echo "Using contract: ${CONTRACT_ADDRESS}"
 echo "Using transaction: ${TEST_TX}"
+if [ -n "$TEST_TX_NO_EVENTS" ]; then
+    echo "Using no-events transaction: ${TEST_TX_NO_EVENTS}"
+fi
 echo ""
 
 # Find soldb - prefer system-wide installation
@@ -229,6 +260,7 @@ config.test_contracts = {
     "contract_address": "${CONTRACT_ADDRESS}",
     "deploy_tx": "${DEPLOY_TX}",
     "test_tx": "${TEST_TX}",
+    "test_tx_no_events": "${TEST_TX_NO_EVENTS}",
     "ethdebug_dir": os.path.join(project_dir, "examples", "${TEST_DEBUG_REL}")
 }
 # Determine solc path dynamically
@@ -294,6 +326,16 @@ if [ "$RUN_SIMULATE_TESTS" = true ]; then
         "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/simulate"
     else
         echo -e "${YELLOW}Warning: simulate directory not found${NC}"
+    fi
+fi
+
+# Run events tests
+if [ "$RUN_EVENTS_TESTS" = true ]; then
+    echo -e "${YELLOW}Running events tests...${NC}"
+    if [ -d "${SCRIPT_DIR}/events" ]; then
+        "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/events"
+    else
+        echo -e "${YELLOW}Warning: events directory not found${NC}"
     fi
 fi
 

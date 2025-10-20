@@ -1080,7 +1080,13 @@ def list_events_command(args):
         return 1
     
     # Decode and print events
-    print_contracts_events(tracer,receipt)
+    if getattr(args, 'json_events', False):
+        # Output JSON format
+        events_data = print_contracts_events(tracer, receipt, json_output=True)
+        print(json.dumps(events_data, indent=2))
+    else:
+        # Output human-readable format
+        print_contracts_events(tracer, receipt)
     return 0
 
 def main():
@@ -1104,6 +1110,7 @@ def main():
     event_parser.add_argument('--contracts', '-c', help='JSON file mapping contract addresses to debug directories')
     event_parser.add_argument('--rpc-url', '-r', default='http://localhost:8545', help='RPC URL')
     event_parser.add_argument('--multi-contract', action='store_true', help='Enable multi-contract decoding mode')
+    event_parser.add_argument('--json-events', action='store_true', help='Output events in JSON format')
 
     # Create the 'trace' subcommand
     trace_parser = subparsers.add_parser('trace', help='Trace and debug an Ethereum transaction')

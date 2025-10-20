@@ -551,7 +551,7 @@ class TransactionTracer:
         if not error_msg and receipt['status'] == 0:
             # Try to decode revert reason from return value
             return_value = trace_result.get('returnValue', '')
-            if return_value and return_value.startswith('08c379a0'):
+            if return_value and (return_value.startswith('08c379a0') or return_value.startswith('0x08c379a0')):
                 # This is Error(string) - decode the revert reason
                 try:
                     data = return_value[8:]  # Skip selector
@@ -563,7 +563,7 @@ class TransactionTracer:
                     error_msg = "Execution reverted"
             elif return_value:
                 # Other revert types (custom errors, etc.)
-                error_msg = f"Reverted with data: 0x{return_value}"
+                    error_msg = f"Reverted with data: {return_value}"
             else:
                 error_msg = "Execution reverted"
         
@@ -633,7 +633,7 @@ class TransactionTracer:
         if not error_msg and is_failed:
             # Try to decode revert reason from return value
             return_value = trace_result.get('returnValue', '')
-            if return_value and return_value.startswith('08c379a0'):
+            if return_value and return_value.startswith('08c379a0') or return_value.startswith('0x08c379a0'):
                 # This is Error(string) - decode the revert reason
                 try:
                     data = return_value[8:]  # Skip selector
@@ -645,7 +645,7 @@ class TransactionTracer:
                     error_msg = "Execution reverted"
             elif return_value:
                 # Other revert types (custom errors, etc.)
-                error_msg = f"Reverted with data: 0x{return_value}"
+                    error_msg = f"Reverted with data: 0x{return_value}"
             else:
                 error_msg = "Execution reverted"
         

@@ -1,0 +1,19 @@
+{
+  "contracts": [
+    {
+      "address": "0xdcDd1dd0ff17043f8bCD1AC9E5Be20BBEd4FAc0A",
+      "name": "Logger",
+      "debug_dir": "./out/ethdebug_logger"
+    },
+    {
+      "address": "0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd",
+      "name": "TaxCalculator",
+      "debug_dir": "./out/ethdebug_tax_calculator"
+    },
+    {
+      "address": "0xf776FF56e2400e31f3070c1ac70Ab80433B01823",
+      "name": "PaymentProcessor",
+      "debug_dir": "./out/ethdebug_payment_processor"
+    }
+  ]
+}

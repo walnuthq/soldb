@@ -1,0 +1,11 @@
+# Test soldb list-events when no events are emitted
+# REQUIRES: soldb
+# This test checks the output when a transaction doesn't emit any events
+# Uses complexCalculation function which is pure and doesn't emit events
+# RUN: %soldb list-events %{test_tx_no_events} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck %s
+
+# Check that we get the basic events output structure
+# CHECK: Events emitted in Transaction:
+
+# Check for the "no events" message
+# CHECK: No events emitted

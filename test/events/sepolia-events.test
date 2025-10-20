@@ -1,0 +1,48 @@
+# Test soldb list-events functionality with Sepolia and Walnut test data
+# REQUIRES: soldb, sepolia-rpc
+# This test checks event decoding for a real Sepolia transaction with multiple contracts
+# RUN: %soldb list-events 0x1362ee26050935178c2f491dbe2a5f0d277903cb5d77fa9e6e30d8b2db31a541 --ethdebug-dir 0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd:TaxCalculator:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd/debug --ethdebug-dir 0xbE734aD6434E16f6bE04706005faED6fD38eb2B2:ShippingManager:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xbE734aD6434E16f6bE04706005faED6fD38eb2B2/debug --ethdebug-dir 0xf776FF56e2400e31f3070c1ac70Ab80433B01823:PaymentProcessor:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xf776FF56e2400e31f3070c1ac70Ab80433B01823/debug --rpc %{sepolia_rpc_url} 2>&1 | FileCheck %s
+
+# Check header
+# CHECK: Events emitted in Transaction:
+
+# Check mixed events - both decoded and unknown
+# CHECK: Event #1: Contract Address: 0x{{[0-9a-fA-F]+}}
+# CHECK:     topic: 0xdf2f43000ad262ff927c671ed83129f9054af075e5d3add03a2ba7116e719a51
+# CHECK:     data: [{{'0x59a714559b46c823d87986b5c5b7c630e2f5668d', '0x40', '0x19', '0x5374617274696e67206f726465722070726f63657373696e6700000000000000'}}]
+
+# CHECK: Event #2: TaxCalculator::TaxComputed(address,uint256,uint256)
+# CHECK:     caller: 0x{{[0-9a-fA-F]+}} (address)
+# CHECK:     orderValue: 1000 (uint256)
+# CHECK:     taxAmount: 80 (uint256)
+
+# CHECK: Event #3: Contract Address: 0x{{[0-9a-fA-F]+}}
+# CHECK:     topic: 0x29c44a39e8532b4217116f0df1e627d35a994882005f6a710764fcefcd4feef4
+# CHECK:     data: [{{'0x59a714559b46c823d87986b5c5b7c630e2f5668d', '0x50'}}]
+
+# CHECK: Event #4: ShippingManager::ShippingStarted(address,string)
+# CHECK:     to: 0x{{[0-9a-fA-F]+}} (address)
+# CHECK:     method: express (string)
+
+# CHECK: Event #5: ShippingManager::ShippingEstimate(uint256)
+# CHECK:     cost: 50 (uint256)
+
+# CHECK: Event #6: Contract Address: 0x{{[0-9a-fA-F]+}}
+# CHECK:     topic: 0x29c44a39e8532b4217116f0df1e627d35a994882005f6a710764fcefcd4feef4
+# CHECK:     data: [{{'0x59a714559b46c823d87986b5c5b7c630e2f5668d', '0x32'}}]
+
+# CHECK: Event #7: PaymentProcessor::PaymentReceived(address,uint256)
+# CHECK:     from: 0x{{[0-9a-fA-F]+}} (address)
+# CHECK:     amount: 1080 (uint256)
+
+# CHECK: Event #8: Contract Address: 0x{{[0-9a-fA-F]+}}
+# CHECK:     topic: 0xdf2f43000ad262ff927c671ed83129f9054af075e5d3add03a2ba7116e719a51
+# CHECK:     data: [{{'0x59a714559b46c823d87986b5c5b7c630e2f5668d', '0x40', '0xe', '0x4f7264657220636f6d706c657465000000000000000000000000000000000000'}}]
+
+# CHECK: Event #9: Contract Address: 0x{{[0-9a-fA-F]+}}
+# CHECK:     topic: 0x29c44a39e8532b4217116f0df1e627d35a994882005f6a710764fcefcd4feef4
+# CHECK:     data: [{{'0x59a714559b46c823d87986b5c5b7c630e2f5668d', '0x438'}}]
+
+# CHECK: Event #10: Contract Address: 0x{{[0-9a-fA-F]+}}
+# CHECK:     topic: 0x092776ba01c21f36e09e32d1c65c1916cc815300aaeaf89e9df6f3870067a70a
+# CHECK:     data: [{{'0x286af310ea3303c80ebe9a66f6998b21bd8c1c29', '0x3e8', '0x50', '0x32', '0x438'}}]
