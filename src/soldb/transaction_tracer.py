@@ -591,7 +591,7 @@ class TransactionTracer:
             'to': to,
             'from': from_,
             'data': "0x" + calldata if not calldata.startswith("0x") else calldata,
-            'value': hex(value) if isinstance(value, int) else value
+            'value': value
         }
        
         # Call debug_traceCall
@@ -655,7 +655,7 @@ class TransactionTracer:
             tx_hash=None,
             from_addr=from_,
             to_addr=to,
-            value=0,
+            value=value,
             input_data=calldata,
             gas_used=trace_result.get('gas', 0),
             output=trace_result.get('returnValue', '0x'),
