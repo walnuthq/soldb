@@ -474,7 +474,7 @@ def simulate_command(args):
 
             token_value = tracer.w3.to_wei(value, token_type)
         except:
-            print(f"{error(f'Invalid value for --value: {token_value}')}")
+            print(f"{error(f'Invalid value for --value: {args.value}')}")
             sys.exit(1)
 
         balance = tracer.w3.eth.get_balance(args.from_addr,args.block)
