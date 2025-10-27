@@ -17,7 +17,7 @@ from .evm_repl import EVMDebugger
 from .abi_utils import match_abi_types, match_single_type, parse_signature, parse_tuple_arg
 from .multi_contract_ethdebug_parser import MultiContractETHDebugParser
 from .json_serializer import TraceSerializer
-from .colors import error, info, warning
+from .colors import error, info, warning, number
 from .auto_deploy import AutoDeployDebugger
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
@@ -451,13 +451,39 @@ def simulate_command(args):
     # Show RPC URL being used
     if not getattr(args, 'json', False):
         print(f"Connecting to RPC: {info(args.rpc_url)}")
-
+        
     # Create tracer
     try:
         tracer = TransactionTracer(args.rpc_url)
     except ConnectionError as e:
         print(f"{error(e)}")
         return 1
+
+    if args.value and args.value is not None:
+        token = {}
+        token_type = "wei"
+        token_value = 0
+
+        try:
+            if isinstance(args.value, str) and args.value.endswith('ether'):
+                value = args.value.split('ether')[0]
+                token_type = "ether"
+            else:
+                value = int(args.value)
+                token_type = "wei"
+
+            token_value = tracer.w3.to_wei(value, token_type)
+        except:
+            print(f"{error(f'Invalid value for --value: {args.value}')}")
+            sys.exit(1)
+
+        balance = tracer.w3.eth.get_balance(args.from_addr,args.block)
+        if balance < token_value:
+            print(f"{error(f'User {args.from_addr} has not enough funds.')}")
+            print(f"    - Available balance: {number(str(balance))} wei")
+            print(f"    - Requested value: {number(token_value)} wei")
+            return 1
+        
     source_map = {}
 
     if args.contract_address and not args.interactive:
@@ -636,7 +662,7 @@ def simulate_command(args):
                 break
     if args.interactive:
         # Start interactive debugger
-        interactive_mode(args,tracer)
+        interactive_mode(args,tracer,token_value if args.value else 0)
         return 0
     # If raw_data is provided, use it directly as calldata
     if getattr(args, 'raw_data', None):
@@ -647,12 +673,12 @@ def simulate_command(args):
             'to': args.contract_address,
             'from': args.from_addr,
             'data': calldata,
-            'value': args.value
+            'value': token_value if args.value else 0
         }
         block = args.block
         try:
             trace = tracer.simulate_call_trace(
-                args.contract_address, args.from_addr, calldata, block, args.tx_index, args.value
+                args.contract_address, args.from_addr, calldata, block, args.tx_index, token_value if args.value else 0
             )
         except Exception as e:
             print(f"Error during simulation: {e}")
@@ -799,7 +825,7 @@ def simulate_command(args):
         'to': args.contract_address,
         'from': args.from_addr,
         'data': calldata,
-        'value': args.value
+        'value': token_value if args.value else 0
     }
     trace_config = {"disableStorage": False, "disableMemory": False}
     if args.tx_index is not None:
@@ -807,7 +833,7 @@ def simulate_command(args):
     block = args.block
     # Simulate call
     trace = tracer.simulate_call_trace(
-        args.contract_address, args.from_addr, calldata, block, args.tx_index, args.value
+        args.contract_address, args.from_addr, calldata, block, args.tx_index, token_value if args.value else 0
     )
     
     # Analyze function calls with the loaded debug info
@@ -829,7 +855,7 @@ def simulate_command(args):
         tracer.print_function_trace(trace, function_calls)
     return 0
 
-def interactive_mode(args,tracer):
+def interactive_mode(args,tracer,value=0):
     """Execute the debug command."""
     contract_address = None
     ethdebug_dir = None
@@ -982,7 +1008,8 @@ def interactive_mode(args,tracer):
         from_addr=args.from_addr,
         block=args.block,
         tracer=tracer,
-        contract_name=contract_name
+        contract_name=contract_name,
+        value=value
     )
 
     # Baseline snapshot (unless disabled)
@@ -1136,7 +1163,7 @@ def main():
     simulate_parser.add_argument('function_args', nargs='*', help='Arguments for the function')
     simulate_parser.add_argument('--block', type=int, default=None, help='Block number or tag (default: latest)')
     simulate_parser.add_argument('--tx-index', type=int, default=None, help='Transaction index in block (optional)')
-    simulate_parser.add_argument('--value', type=int, default=0, help='ETH value to send (in wei)')
+    simulate_parser.add_argument('--value', default=0, help='ETH value to send (in wei)')
     simulate_parser.add_argument('--ethdebug-dir', '-e', action='append', help='ETHDebug directory containing ethdebug.json and contract debug files. Can be specified multiple times for multi-contract debugging. Format: address:name:path')
     simulate_parser.add_argument('--contracts', '-c', help='JSON file mapping contract addresses to debug directories')
     simulate_parser.add_argument('--multi-contract', action='store_true', help='Enable multi-contract debugging mode')

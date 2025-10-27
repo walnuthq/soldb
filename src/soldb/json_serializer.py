@@ -294,7 +294,11 @@ class TraceSerializer:
             "parentCallId": call.parent_call_id,
             "contractCallId": call.contract_call_id,
             "childrenCallIds": call.children_call_ids[:],
+            "value": call.value if call.value else None,
         }
+
+        # Remove "value" key if it's None
+        trace_call = {key: value for key, value in trace_call.items() if value is not None}
         
         # Add decoded function information
         trace_call["functionName"] = call.name
