@@ -587,11 +587,25 @@ class TransactionTracer:
         """Simulate a transaction execution."""
 
         # Prepare call object
+        # Convert value to hex string 
+        if isinstance(value, (int, float)):
+            value_hex = to_hex(value)
+        elif isinstance(value, str):
+            if value.startswith('0x'):
+                value_hex = value
+            else:
+                try:
+                    value_hex = to_hex(int(value))
+                except (ValueError, TypeError):
+                    value_hex = value
+        else:
+            value_hex = to_hex(0)
+        
         call_obj = {
             'to': to,
             'from': from_,
             'data': "0x" + calldata if not calldata.startswith("0x") else calldata,
-            'value': value
+            'value': value_hex
         }
        
         # Call debug_traceCall
