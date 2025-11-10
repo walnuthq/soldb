@@ -285,9 +285,9 @@ def print_contracts_events(tracer, receipt):
                 elif log['decoded']['event'] == 'Unknown':
                     print(f"{warning(f'Event #{i+1}:')} Contract Address: {(log['address'])}")
                     if log['decoded']['event_name'] != "Unknown":
-                        print(f"    topic: {f'{address(log['decoded']['event_name'])}'}")
+                        print(f"    topic: {address(log['decoded']['event_name'])}")
                     else:
-                        print(f"    topic: {f'{log['decoded']['signature']}'}")
+                        print(f"    topic: {log['decoded']['signature']}")
                     print(f"    data: {cyan(log['decoded']['data'])}")
                 else:
                     print(f"{success(f'Event #{i+1}: ')}", end="")
