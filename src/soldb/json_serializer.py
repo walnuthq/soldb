@@ -253,7 +253,9 @@ class TraceSerializer:
         elif trace_type == "INTERNAL":
             trace_type = "INTERNALCALL"
         elif trace_type == "STATICCALL":
-            trace_type = "CALL"
+            trace_type = "STATICCALL"  # Keep STATICCALL information
+        elif trace_type == "DELEGATECALL":
+            trace_type = "DELEGATECALL"  # Keep DELEGATECALL information
         elif trace_type in ["CREATE", "CREATE2"]:
             # Keep CREATE/CREATE2 as is
             pass
