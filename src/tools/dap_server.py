@@ -224,6 +224,18 @@ class WalnutDAPServer:
                 # Load trace into debugger temporarily
                 self.debugger.current_trace = trace
                 
+                # Reload source_map for the contract after loading trace
+                # This is important because source_map might not be loaded yet
+                if (hasattr(self.debugger, 'tracer') and self.debugger.tracer and
+                    hasattr(self.debugger.tracer, 'multi_contract_parser') and self.debugger.tracer.multi_contract_parser):
+                    contract_info = self.debugger.tracer.multi_contract_parser.get_contract_at_address(contract_address)
+                    if contract_info and hasattr(contract_info, 'parser') and contract_info.parser:
+                        self.debugger.source_map = contract_info.parser.get_source_mapping()
+                    else:
+                        self.debugger.source_map = {}
+                else:
+                    self.debugger.source_map = {}
+                
                 # Analyze function calls
                 self.debugger.function_trace = self._tracer.analyze_function_calls(trace)
                 
@@ -284,6 +296,10 @@ class WalnutDAPServer:
                     # Update contract_address from transaction if not set
                     if contract_address and (not self.debugger.contract_address or self.debugger.contract_address == "None"):
                         self.debugger.contract_address = contract_address
+                    
+                    # Re-register breakpoints after loading new transaction
+                    # This is important because source_map might have changed
+                    self._register_existing_breakpoints()
                     
                     self._send_output(f"Breakpoint hit at {os.path.basename(breakpoint_source)}:{breakpoint_line} in transaction {tx_hash[:16]}...\n")
                     # Send stopped event with breakpoint reason
@@ -1007,12 +1023,14 @@ class WalnutDAPServer:
     def _register_existing_breakpoints(self):
         """Register all existing breakpoints in the debugger after initialization."""
         if not self.debugger:
+            self._send_output("DEBUG: _register_existing_breakpoints called but no debugger\n")
             return
         
         self._send_output("Registering existing breakpoints...\n")
         self._send_output(f"Stored breakpoints: {self.breakpoints}\n")
         self._send_output(f"Debugger source_map available: {bool(self.debugger.source_map)}\n")
         self._send_output(f"Source_map size: {len(self.debugger.source_map) if self.debugger.source_map else 0}\n")
+        self._send_output(f"Debugger breakpoints before registration: {self.debugger.breakpoints}\n")
         
         # Register all stored breakpoints
         registered_count = 0
@@ -1020,35 +1038,35 @@ class WalnutDAPServer:
             if not lines:
                 continue
             for line in lines:
-                try:
-                    # In soldb interactive mode, do_break accepts "file:line" format
-                    # but only uses line number for lookup (filename is ignored)
-                    # So we can use any filename, or just use the source_name we have
-                    self.debugger.do_break(f"{source_name}:{line}")
-                    registered_count += 1
-                    self._send_output(f"Registered breakpoint at {source_name}:{line}\n")
-                except Exception as e:
-                    # Breakpoint will be registered when source map is available
-                    # This is expected if source map hasn't been loaded yet
-                    self._send_output(f"Could not register {source_name}:{line} yet: {e}\n")
-                    # Try to register with just line number if file:line format fails
+                # Directly register breakpoints using source_map instead of do_break
+                # This is more reliable and we can control to register only first PC per line
+                if self.debugger.source_map:
+                    # Find only the FIRST PC for this line (to avoid stopping multiple times on same line)
+                    pc_found = None
+                    for pc, source_info in self.debugger.source_map.items():
+                        if isinstance(source_info, tuple) and len(source_info) >= 2:
+                            src_line = source_info[1]
+                            if src_line == line:
+                                pc_found = pc
+                                break  # Take only the first PC for this line
+                    
+                    if pc_found is not None:
+                        self.debugger.breakpoints.add(pc_found)
+                        registered_count += 1
+                        self._send_output(f"✓ Registered breakpoint at {source_name}:{line} (PC {pc_found})\n")
+                    else:
+                        self._send_output(f"⚠ No PC found for line {line} in source_map\n")
+                else:
+                    # Fallback to do_break if source_map not available
                     try:
-                        # Try direct PC lookup if source_map is available
-                        if self.debugger.source_map:
-                            pc_found = False
-                            for pc, (_, src_line) in self.debugger.source_map.items():
-                                if src_line == line:
-                                    self.debugger.breakpoints.add(pc)
-                                    registered_count += 1
-                                    self._send_output(f"✓ Registered breakpoint at line {line} (PC {pc})\n")
-                                    pc_found = True
-                                    break
-                            if not pc_found:
-                                self._send_output(f"⚠ No PC found for line {line} in source_map\n")
-                    except Exception as e2:
-                        self._send_output(f"⚠ Alternative registration also failed: {e2}\n")
+                        self.debugger.do_break(f"{source_name}:{line}")
+                        registered_count += 1
+                        self._send_output(f"Registered breakpoint at {source_name}:{line} (via do_break)\n")
+                    except Exception as e:
+                        self._send_output(f"Could not register {source_name}:{line}: {e}\n")
         
         self._send_output(f"Registered {registered_count} breakpoint(s)\n")
+        self._send_output(f"Debugger breakpoints after registration: {self.debugger.breakpoints}\n")
 
     def threads(self, request):
         self._response(request, True, {"threads": [{"id": self.thread_id, "name": "main"}]})
@@ -1061,6 +1079,16 @@ class WalnutDAPServer:
             return
         
         try:
+            # Ensure breakpoints are registered before continue
+            # This is important because breakpoints might have been lost or source_map might have changed
+            if self.debugger.source_map and self.breakpoints:
+                self._register_existing_breakpoints()
+            
+            # Store step before continue
+            step_before = self.debugger.current_step
+            total_steps = len(self.debugger.current_trace.steps)
+            
+            # Run continue - do_continue will stop at breakpoint or end
             self.debugger.do_continue("")
             
             # Check what happened after continue
@@ -1069,14 +1097,74 @@ class WalnutDAPServer:
                 self._response(request, True, {"allThreadsContinued": False})
                 self._event("exited", {"exitCode": 0})
                 return
-            else:
-                # Breakpoint hit
+            
+            # Check if we stopped at a breakpoint
+            current_step = self.debugger.current_trace.steps[self.debugger.current_step]
+            current_pc = current_step.pc
+            is_breakpoint_hit = current_pc in self.debugger.breakpoints
+            
+            if is_breakpoint_hit:
+                # Breakpoint hit - get source location
+                source_info = None
+                source_path = None
+                line_num = 1
+                
+                # Try to get source info from tracer
+                if (hasattr(self.debugger, 'tracer') and self.debugger.tracer and
+                    hasattr(self.debugger.tracer, 'multi_contract_parser') and self.debugger.tracer.multi_contract_parser):
+                    contract_info = self.debugger.tracer.multi_contract_parser.get_contract_at_address(self.debugger.contract_address)
+                    if contract_info and hasattr(contract_info, 'ethdebug_info') and contract_info.ethdebug_info:
+                        source_info = contract_info.ethdebug_info.get_source_info(current_step.pc)
+                        if source_info:
+                            source_path, offset, length = source_info
+                            parser = getattr(contract_info, 'parser', None)
+                            if parser:
+                                line_num, col = parser.offset_to_line_col(source_path, offset)
+                
+                # Fallback to main parser
+                if not source_info and (hasattr(self.debugger, 'tracer') and self.debugger.tracer and
+                    hasattr(self.debugger.tracer, 'ethdebug_info') and self.debugger.tracer.ethdebug_info):
+                    source_info = self.debugger.tracer.ethdebug_info.get_source_info(current_step.pc)
+                    if source_info:
+                        source_path, offset, length = source_info
+                        if hasattr(self.debugger.tracer, 'ethdebug_parser') and self.debugger.tracer.ethdebug_parser:
+                            line_num, col = self.debugger.tracer.ethdebug_parser.offset_to_line_col(source_path, offset)
+                
+                # Fallback to source_map if available
+                if not source_info and hasattr(self.debugger, 'source_map') and self.debugger.source_map:
+                    source_map_entry = self.debugger.source_map.get(current_step.pc)
+                    if source_map_entry:
+                        if isinstance(source_map_entry, tuple) and len(source_map_entry) >= 2:
+                            line_num = source_map_entry[1]
+                            # Try to find source file
+                            if hasattr(self, 'source_file') and self.source_file:
+                                source_path = self.source_file
+                
+                # Build stopped event with source location
+                stopped_event = {
+                    "reason": "breakpoint",
+                    "threadId": self.thread_id,
+                    "description": f"Breakpoint hit at PC {current_step.pc}"
+                }
+                
+                if source_path:
+                    stopped_event["source"] = {
+                        "name": os.path.basename(source_path),
+                        "path": source_path
+                    }
+                    stopped_event["line"] = line_num
+                
                 self._response(request, True, {"allThreadsContinued": False})
-                self._event("stopped", {"reason": "breakpoint", "threadId": self.thread_id})
+                self._event("stopped", stopped_event)
+                return
+            else:
+                # Stopped for some other reason (error, etc.) - still send stopped event
+                self._response(request, True, {"allThreadsContinued": False})
+                self._event("stopped", {"reason": "pause", "threadId": self.thread_id})
                 return
             
         except Exception as e:
-            self._send_output(f"Error during continue command: {e}")
+            self._send_output(f"Error during continue command: {e}\n")
             self._response(request, False, message=str(e))
             return
 
@@ -1518,6 +1606,21 @@ class WalnutDAPServer:
                 self.debugger.contract_address = contract_address
                 self._send_output(f"Contract address set to: {contract_address}\n")
             
+            # Reload source_map for the contract after loading trace
+            # This is important because source_map might not be loaded yet
+            if (hasattr(self.debugger, 'tracer') and self.debugger.tracer and
+                hasattr(self.debugger.tracer, 'multi_contract_parser') and self.debugger.tracer.multi_contract_parser):
+                contract_info = self.debugger.tracer.multi_contract_parser.get_contract_at_address(contract_address)
+                if contract_info and hasattr(contract_info, 'parser') and contract_info.parser:
+                    self.debugger.source_map = contract_info.parser.get_source_mapping()
+                    self._send_output(f"Loaded source_map with {len(self.debugger.source_map)} entries\n")
+                else:
+                    self._send_output(f"Warning: Could not load source_map for contract {contract_address}\n")
+                    self.debugger.source_map = {}
+            else:
+                self._send_output(f"Warning: No multi_contract_parser available for source_map loading\n")
+                self.debugger.source_map = {}
+            
             # Analyze function calls
             self.debugger.function_trace = self._tracer.analyze_function_calls(trace)
             
@@ -1532,6 +1635,11 @@ class WalnutDAPServer:
                 self.debugger.current_function = self.debugger.function_trace[0]
             
             self.debugger.current_step = entry_step
+            
+            # Re-register breakpoints after loading new transaction
+            # This is important because source_map might have changed or breakpoints might have been lost
+            self._send_output(f"Re-registering breakpoints after loading transaction...\n")
+            self._register_existing_breakpoints()
             
             self._send_output(f"✓ Transaction loaded into debugger. Ready to debug.\n")
             
