@@ -68,6 +68,7 @@ class WalnutDAPServer:
         self._tracer: Optional[TransactionTracer] = None
         self._workspace_root: Optional[str] = None
         self._out_dir: Optional[str] = None
+        self._rpc_url: Optional[str] = None
 
     def _capture_output(self):
         """Context manager to capture stdout and send as DAP output events."""
@@ -165,6 +166,16 @@ class WalnutDAPServer:
                     # Use selector as entrypoint if function name not found
                     entrypoint = selector
             
+            # Get transaction receipt to check status
+            status = None
+            try:
+                receipt = w3.eth.get_transaction_receipt(tx_hash)
+                # Status: 1 = success, 0 = failed/reverted
+                status = receipt.status if hasattr(receipt, 'status') else (receipt.get('status') if isinstance(receipt, dict) else None)
+            except Exception as e:
+                # If receipt not available yet, status remains None
+                self._send_output(f"Warning: Could not get receipt for {tx_hash}: {e}\n")
+            
             # Store transaction info
             tx_info = {
                 "tx_hash": tx_hash,
@@ -173,7 +184,8 @@ class WalnutDAPServer:
                 "entrypoint": entrypoint or "unknown",
                 "block_number": tx.blockNumber if hasattr(tx, 'blockNumber') else None,
                 "from": tx['from'] if 'from' in tx else None,
-                "value": str(tx.value) if hasattr(tx, 'value') else "0"
+                "value": str(tx.value) if hasattr(tx, 'value') else "0",
+                "status": status
             }
             
             self._monitored_transactions.append(tx_info)
@@ -185,7 +197,8 @@ class WalnutDAPServer:
                 "entrypoint": tx_info["entrypoint"],
                 "blockNumber": tx_info.get("block_number"),
                 "from": tx_info.get("from"),
-                "value": tx_info.get("value", "0")
+                "value": tx_info.get("value", "0"),
+                "status": tx_info.get("status")
             })
             
             # Check if we have breakpoints set
@@ -909,6 +922,9 @@ class WalnutDAPServer:
             function_signature = args.get("function", None)
             function_args = args.get("functionArgs", [])
             contract_address = args.get("contractAddress", "")
+            
+            # Store RPC URL for later use
+            self._rpc_url = rpc_url
             
             # Store paths for later use in source requests
             self.source_file = source
@@ -1842,9 +1858,13 @@ class WalnutDAPServer:
                     "entrypoint": tx.get("entrypoint"),
                     "blockNumber": tx.get("block_number"),
                     "from": tx.get("from"),
-                    "value": tx.get("value")
+                    "value": tx.get("value"),
+                    "status": tx.get("status")
                 })
-            self._response(request, True, {"transactions": transactions})
+            self._response(request, True, {
+                "transactions": transactions,
+                "rpcUrl": self._rpc_url or "unknown"
+            })
         except Exception as e:
             self._response(request, False, message=str(e))
 
