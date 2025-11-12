@@ -211,13 +211,28 @@ class WalnutDAPServer:
                 if not hasattr(self._tracer, 'multi_contract_parser') or not self._tracer.multi_contract_parser:
                     self._load_ethdebug_for_contract(contract_address)
                 
+                # Get contract-specific ethdebug_dir
+                ethdebug_dir = self._out_dir  # Default fallback
+                if hasattr(self, '_contract_ethdebug_dirs') and contract_address:
+                    contract_ethdebug_dir = self._contract_ethdebug_dirs.get(contract_address.lower())
+                    if contract_ethdebug_dir:
+                        ethdebug_dir = contract_ethdebug_dir
+                    else:
+                        # Try to find it
+                        found_dir, _ = self._find_contract_ethdebug_dir(contract_address)
+                        if found_dir:
+                            ethdebug_dir = found_dir
+                            if not hasattr(self, '_contract_ethdebug_dirs'):
+                                self._contract_ethdebug_dirs = {}
+                            self._contract_ethdebug_dirs[contract_address.lower()] = found_dir
+                
                 # Check if debugger is initialized
                 if not self.debugger:
                     # Initialize debugger if not already done
                     self.debugger = EVMDebugger(
                         contract_address=str(contract_address),
                         rpc_url=self._tracer.rpc_url,
-                        ethdebug_dir=self._out_dir,
+                        ethdebug_dir=ethdebug_dir,
                         tracer=self._tracer,
                     )
                 
@@ -233,6 +248,7 @@ class WalnutDAPServer:
                         self.debugger.source_map = contract_info.parser.get_source_mapping()
                     else:
                         self.debugger.source_map = {}
+                        
                 else:
                     self.debugger.source_map = {}
                 
@@ -301,20 +317,41 @@ class WalnutDAPServer:
                     # This is important because source_map might have changed
                     self._register_existing_breakpoints()
                     
-                    self._send_output(f"Breakpoint hit at {os.path.basename(breakpoint_source)}:{breakpoint_line} in transaction {tx_hash[:16]}...\n")
+                    # Normalize breakpoint_source path
+                    normalized_breakpoint_source = breakpoint_source
+                    if normalized_breakpoint_source.startswith('out/'):
+                        normalized_breakpoint_source = normalized_breakpoint_source[4:]
+                    elif normalized_breakpoint_source.startswith('./out/'):
+                        normalized_breakpoint_source = normalized_breakpoint_source[6:]
+                    
+                    # Resolve absolute path using workspace_root
+                    workspace_root = getattr(self, '_workspace_root', None) or getattr(self, 'workspace_root', None)
+                    if not workspace_root and hasattr(self, '_out_dir') and self._out_dir:
+                        workspace_root = os.path.dirname(self._out_dir)
+                    
+                    if os.path.isabs(normalized_breakpoint_source):
+                        abs_breakpoint_source = normalized_breakpoint_source
+                    elif workspace_root:
+                        abs_breakpoint_source = os.path.normpath(os.path.join(workspace_root, normalized_breakpoint_source))
+                        if not os.path.exists(abs_breakpoint_source):
+                            abs_breakpoint_source = os.path.normpath(os.path.join(workspace_root, breakpoint_source))
+                    else:
+                        abs_breakpoint_source = os.path.abspath(normalized_breakpoint_source)
+                    
+                    self._send_output(f"Breakpoint hit at {os.path.basename(abs_breakpoint_source)}:{breakpoint_line} in transaction {tx_hash[:16]}...\n")
                     # Send stopped event with breakpoint reason
                     self._event("stopped", {
                         "reason": "breakpoint",
                         "threadId": self.thread_id,
                         "description": f"Breakpoint hit in transaction {tx_hash[:16]}...",
                         "source": {
-                            "name": os.path.basename(breakpoint_source),
-                            "path": breakpoint_source
+                            "name": os.path.basename(abs_breakpoint_source),
+                            "path": abs_breakpoint_source
                         },
                         "line": breakpoint_line
                     })
                     
-                    self._send_output(f"Breakpoint hit at {os.path.basename(breakpoint_source)}:{breakpoint_line} in transaction {tx_hash[:16]}...\n")
+                    self._send_output(f"Breakpoint hit at {os.path.basename(abs_breakpoint_source)}:{breakpoint_line} in transaction {tx_hash[:16]}...\n")
                 else:
                     # No breakpoint hit - just print transaction hash
                     self._send_output(f"Transaction monitored: {tx_hash}\n")
@@ -327,50 +364,193 @@ class WalnutDAPServer:
         except Exception as e:
             self._send_output(f"Error handling transaction {tx_hash}: {e}\n")
 
-    def _load_ethdebug_for_contract(self, contract_address: str):
-        """Load ethdebug files for a contract address from out/ directory."""
+    def _find_contract_ethdebug_dir(self, contract_address: str, contract_name: str = None) -> tuple:
+        """Find ethdebug directory for a contract by comparing deployed bytecode with compiled bytecode.
+        Returns (ethdebug_dir, contract_name) tuple or (None, None) if not found.
+        """
+        if not self._out_dir or not os.path.exists(self._out_dir):
+            return (None, None)
+        
+        ethdebug_dir = None
+        found_name = contract_name
+        
+        # Get deployed bytecode from blockchain for comparison
+        deployed_bytecode = None
+        if contract_address and self._tracer and hasattr(self._tracer, 'w3'):
+            try:
+                deployed_bytecode = self._tracer.w3.eth.get_code(contract_address)
+                if deployed_bytecode:
+                    # Normalize to hex string
+                    if isinstance(deployed_bytecode, bytes):
+                        deployed_bytecode = deployed_bytecode.hex()
+                    if not deployed_bytecode.startswith('0x'):
+                        deployed_bytecode = '0x' + deployed_bytecode
+                    # Remove 0x prefix for comparison (runtime bytecode)
+                    deployed_bytecode = deployed_bytecode[2:] if deployed_bytecode.startswith('0x') else deployed_bytecode
+                    self._send_output(f"Got deployed bytecode (length: {len(deployed_bytecode)} chars)\n")
+            except Exception as e:
+                self._send_output(f"Warning: Could not get deployed bytecode: {e}\n")
+        
+        # First, try to find contract by name in subfolder (preferred method)
+        if contract_name:
+            self._send_output(f"Trying to find contract {contract_name} in {self._out_dir}\n")
+            contract_dir = os.path.join(self._out_dir, contract_name)
+            # Check if contract subfolder exists and has ethdebug files
+            if os.path.exists(contract_dir) and os.path.isdir(contract_dir):
+                # Verify bytecode match if available
+                if deployed_bytecode and self._verify_bytecode_match(contract_dir, contract_name, deployed_bytecode):
+                    ethdebug_dir = contract_dir
+                    found_name = contract_name
+                else:
+                    # Check for ethdebug files even if bytecode doesn't match
+                    try:
+                        ethdebug_files = [
+                            f for f in os.listdir(contract_dir)
+                            if f.endswith('_ethdebug.json') or f.endswith('_ethdebug-runtime.json') or f == 'ethdebug.json'
+                        ]
+                        if ethdebug_files and not deployed_bytecode:
+                            # If we can't verify bytecode, use it anyway
+                            ethdebug_dir = contract_dir
+                            found_name = contract_name
+                    except (OSError, PermissionError):
+                        pass
+        
+        # If not found by name, try to find contract info from contracts.json
+        if not ethdebug_dir:
+            contracts_json_path = os.path.join(self._out_dir, "contracts.json")
+            if os.path.exists(contracts_json_path):
+                try:
+                    with open(contracts_json_path, "r") as f:
+                        contracts_data = json.load(f)
+                        for contract in contracts_data.get('contracts', []):
+                            if contract.get('address', '').lower() == contract_address.lower():
+                                found_name = contract.get('name', '')
+                                if found_name:
+                                    contract_dir = os.path.join(self._out_dir, found_name)
+                                    if os.path.exists(contract_dir) and os.path.isdir(contract_dir):
+                                        # Verify bytecode match
+                                        if deployed_bytecode and self._verify_bytecode_match(contract_dir, found_name, deployed_bytecode):
+                                            ethdebug_dir = contract_dir
+                                            break
+                                        else:
+                                            # Check for ethdebug files
+                                            try:
+                                                ethdebug_files = [
+                                                    f for f in os.listdir(contract_dir)
+                                                    if f.endswith('_ethdebug.json') or f.endswith('_ethdebug-runtime.json') or f == 'ethdebug.json'
+                                                ]
+                                                if ethdebug_files:
+                                                    ethdebug_dir = contract_dir
+                                                    break
+                                            except (OSError, PermissionError):
+                                                pass
+                except (json.JSONDecodeError, IOError):
+                    pass
+        
+        # If still not found, try to find by comparing bytecode with all contract folders
+        if not ethdebug_dir and deployed_bytecode:
+            self._send_output(f"Scanning contract folders to match bytecode...\n")
+            try:
+                for item in os.listdir(self._out_dir):
+                    item_path = os.path.join(self._out_dir, item)
+                    if os.path.isdir(item_path):
+                        # Try to match bytecode
+                        if self._verify_bytecode_match(item_path, item, deployed_bytecode):
+                            ethdebug_dir = item_path
+                            found_name = item
+                            self._send_output(f"✓ Matched bytecode with contract folder: {item}\n")
+                            break
+            except (OSError, PermissionError):
+                pass
+        
+        # If still not found, try to find by scanning out/ directory for contract subfolders (fallback)
+        if not ethdebug_dir:
+            try:
+                for item in os.listdir(self._out_dir):
+                    item_path = os.path.join(self._out_dir, item)
+                    if os.path.isdir(item_path):
+                        # Check for ethdebug files in this folder
+                        try:
+                            ethdebug_files = [
+                                f for f in os.listdir(item_path)
+                                if f.endswith('_ethdebug.json') or f.endswith('_ethdebug-runtime.json') or f == 'ethdebug.json'
+                            ]
+                            if ethdebug_files:
+                                ethdebug_dir = item_path
+                                if not found_name:
+                                    found_name = item
+                                    # Don't break - continue to find better match
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError):
+                pass
+            
+            # If still not found, check if out/ itself has ethdebug.json (fallback)
+            if not ethdebug_dir and os.path.exists(os.path.join(self._out_dir, "ethdebug.json")):
+                ethdebug_dir = self._out_dir
+        
+        self._send_output(f"Found ethdebug directory: {ethdebug_dir}\n")
+        self._send_output(f"Found contract name: {found_name}\n")
+        return (ethdebug_dir, found_name)
+    
+    def _verify_bytecode_match(self, contract_dir: str, contract_name: str, deployed_bytecode: str) -> bool:
+        """Verify if deployed bytecode matches compiled bytecode from contract folder.
+        Returns True if bytecode matches, False otherwise.
+        """
+        try:
+            # Look for .bin file in contract directory
+            bin_file = os.path.join(contract_dir, f"{contract_name}.bin")
+            if not os.path.exists(bin_file):
+                return False
+            
+            # Read compiled bytecode
+            with open(bin_file, 'r') as f:
+                compiled_bytecode = f.read().strip()
+            
+            # Normalize bytecode (remove 0x prefix, whitespace)
+            compiled_bytecode = compiled_bytecode.replace('0x', '').replace(' ', '').replace('\n', '')
+            deployed_bytecode = deployed_bytecode.replace('0x', '').replace(' ', '').replace('\n', '')
+            
+            # Compare runtime bytecode (deployed bytecode is runtime, compiled .bin might be creation bytecode)
+            # For runtime comparison, we need to extract runtime part from .bin if it contains creation bytecode
+            # For now, simple comparison - if deployed matches end of compiled, it's likely a match
+            if deployed_bytecode and compiled_bytecode:
+                # Check if deployed bytecode is contained in compiled bytecode (runtime bytecode)
+                if deployed_bytecode in compiled_bytecode:
+                    return True
+                # Or check if they match exactly (if .bin contains only runtime bytecode)
+                if deployed_bytecode == compiled_bytecode:
+                    return True
+                # Or check if compiled bytecode ends with deployed bytecode (creation bytecode + runtime)
+                if compiled_bytecode.endswith(deployed_bytecode):
+                    return True
+            
+            return False
+        except Exception as e:
+            self._send_output(f"Warning: Error verifying bytecode match: {e}\n")
+            return False
+    
+    def _load_ethdebug_for_contract(self, contract_address: str, contract_name: str = None):
+        """Load ethdebug files for a contract address from out/ directory.
+        Looks for contract files in out/ContractName/ subfolder first.
+        """
         if not self._out_dir or not os.path.exists(self._out_dir):
             self._send_output(f"Warning: out/ directory not found. Skipping ethdebug loading.\n")
             return
         
+        ethdebug_dir = None
+        found_name = None
+        
         try:
-            # Try to find contract info from contracts.json
-            contracts_json_path = os.path.join(self._out_dir, "contracts.json")
-            contract_name = None
-            ethdebug_dir = None
-            
-            if os.path.exists(contracts_json_path):
-                with open(contracts_json_path, "r") as f:
-                    contracts_data = json.load(f)
-                    for contract in contracts_data.get('contracts', []):
-                        if contract.get('address', '').lower() == contract_address.lower():
-                            contract_name = contract.get('name', '')
-                            # Try to find ethdebug directory
-                            # Check if there's a subdirectory with the contract name
-                            contract_dir = os.path.join(self._out_dir, contract_name)
-                            if os.path.exists(contract_dir) and os.path.exists(os.path.join(contract_dir, "ethdebug.json")):
-                                ethdebug_dir = contract_dir
-                            elif os.path.exists(os.path.join(self._out_dir, "ethdebug.json")):
-                                ethdebug_dir = self._out_dir
-                            break
-            
-            # If not found in contracts.json, try to find by scanning out/ directory
-            if not ethdebug_dir:
-                for item in os.listdir(self._out_dir):
-                    item_path = os.path.join(self._out_dir, item)
-                    if os.path.isdir(item_path):
-                        if os.path.exists(os.path.join(item_path, "ethdebug.json")):
-                            ethdebug_dir = item_path
-                            if not contract_name:
-                                contract_name = item
-                            break
-                
-                # If still not found, check if out/ itself has ethdebug.json
-                if not ethdebug_dir and os.path.exists(os.path.join(self._out_dir, "ethdebug.json")):
-                    ethdebug_dir = self._out_dir
+            # Find contract ethdebug directory
+            ethdebug_dir, found_name = self._find_contract_ethdebug_dir(contract_address, contract_name)
             
             if not ethdebug_dir:
-                self._send_output(f"⚠ Warning: Could not find ethdebug directory for contract {contract_address}\n")
+                self._send_output(f"⚠ Warning: Could not find ethdebug directory for contract {contract_address}")
+                if found_name:
+                    self._send_output(f" (expected: {os.path.join(self._out_dir, found_name)})\n")
+                else:
+                    self._send_output(f"\n")
                 return
             
             # Now load the ethdebug files
@@ -384,8 +564,8 @@ class WalnutDAPServer:
                 multi_parser = self._tracer.multi_contract_parser
             
             # Load contract into parser
-            if contract_name:
-                multi_parser.load_contract(contract_address, ethdebug_dir, contract_name)
+            if found_name:
+                multi_parser.load_contract(contract_address, ethdebug_dir, found_name)
             else:
                 multi_parser.load_contract(contract_address, ethdebug_dir)
             
@@ -401,12 +581,20 @@ class WalnutDAPServer:
                 if abi_path.exists():
                     self._tracer.load_abi(str(abi_path))
                 
-                self._send_output(f"✓ Loaded ethdebug files for contract {contract_name} at {contract_address}\n")
+                self._send_output(f"✓ Loaded ethdebug files for contract {found_name or 'unknown'} at {contract_address}\n")
             else:
                 self._send_output(f"⚠ Warning: Failed to load contract info from ethdebug directory\n")
+            
+            # Store ethdebug_dir for this contract (only if we successfully found it)
+            if ethdebug_dir:
+                if not hasattr(self, '_contract_ethdebug_dirs'):
+                    self._contract_ethdebug_dirs = {}
+                self._contract_ethdebug_dirs[contract_address.lower()] = ethdebug_dir
                 
         except Exception as e:
             self._send_output(f"Error loading ethdebug files: {e}\n")
+            import traceback
+            self._send_output(f"Traceback: {traceback.format_exc()}\n")
 
     def _start_monitoring(self):
         """Start the transaction monitoring thread."""
@@ -439,7 +627,9 @@ class WalnutDAPServer:
             self._monitor_thread = None
 
     def _compile_contracts(self, workspace_root: str, output_dir: str):
-        """Compile all Solidity files in the workspace to the output directory."""
+        """Compile all Solidity files in the workspace to the output directory.
+        Each contract gets its own subfolder in output_dir/ContractName/
+        """
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
         
@@ -485,12 +675,113 @@ class WalnutDAPServer:
             if result.stderr:
                 self._send_output(f"Compilation warnings:\n{result.stderr}")
             
+            # Organize compiled files into contract-specific subfolders
+            self._organize_compiled_files(output_dir)
+            
             self._send_output(f"Successfully compiled {len(sol_files)} Solidity file(s) to {output_dir}\n")
             
         except FileNotFoundError:
             raise RuntimeError("solc not found. Please install solc and ensure it's in your PATH.")
         except subprocess.SubprocessError as e:
             raise RuntimeError(f"Compilation failed: {e}")
+    
+    def _organize_compiled_files(self, output_dir: str):
+        """Organize compiled files into contract-specific subfolders.
+        Moves ContractName_*.json, ContractName.bin, ContractName.abi into out/ContractName/
+        """
+        if not os.path.exists(output_dir):
+            return
+        
+        # Find all contract files in output directory
+        # Use a dict to map all possible contract names to their files
+        contract_files = {}
+        
+        for filename in os.listdir(output_dir):
+            file_path = os.path.join(output_dir, filename)
+            
+            # Skip directories
+            if os.path.isdir(file_path):
+                continue
+            
+            # Skip main ethdebug.json (we'll copy it later)
+            if filename == "ethdebug.json":
+                continue
+            
+            # Parse contract name from filename
+            # Format: ContractName_ethdebug.json, ContractName_ethdebug-runtime.json, ContractName.bin, ContractName.abi
+            contract_name = None
+            
+            # Check in order from most specific to least specific
+            if filename.endswith('_ethdebug-runtime.json'):
+                contract_name = filename[:-23]  # Remove '_ethdebug-runtime.json'
+            elif filename.endswith('_ethdebug.json'):
+                contract_name = filename[:-14]  # Remove '_ethdebug.json'
+            elif filename.endswith('.bin'):
+                contract_name = filename[:-4]  # Remove '.bin'
+            elif filename.endswith('.abi'):
+                contract_name = filename[:-4]  # Remove '.abi'
+            
+            if contract_name:
+                if contract_name not in contract_files:
+                    contract_files[contract_name] = []
+                contract_files[contract_name].append(file_path)
+        
+        # Normalize contract names - merge similar names (handle cases like BuggyVaul vs BuggyVault)
+        # Strategy: if one name is a prefix of another, merge them and use the longer name
+        normalized_contracts = {}
+        processed_names = set()
+        
+        for contract_name, files in contract_files.items():
+            if contract_name in processed_names:
+                continue
+            
+            # Find all similar names (one is prefix of another)
+            similar_names = [contract_name]
+            for other_name in contract_files.keys():
+                if other_name != contract_name and other_name not in processed_names:
+                    # Check if one is prefix of another
+                    if contract_name.startswith(other_name) or other_name.startswith(contract_name):
+                        similar_names.append(other_name)
+            
+            # Use the longest name as the normalized name
+            normalized_name = max(similar_names, key=len)
+            
+            # Collect all files from similar names
+            all_files = []
+            for name in similar_names:
+                all_files.extend(contract_files[name])
+                processed_names.add(name)
+            
+            normalized_contracts[normalized_name] = all_files
+        
+        # Move files to contract-specific subfolders
+        for contract_name, files in normalized_contracts.items():
+            contract_dir = os.path.join(output_dir, contract_name)
+            os.makedirs(contract_dir, exist_ok=True)
+            
+            for file_path in files:
+                filename = os.path.basename(file_path)
+                dest_path = os.path.join(contract_dir, filename)
+                
+                # Move file to contract subfolder
+                try:
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)  # Remove existing file if any
+                    os.rename(file_path, dest_path)
+                except Exception as e:
+                    self._send_output(f"Warning: Could not move {filename} to {contract_dir}: {e}\n")
+        
+        # Also copy ethdebug.json to each contract folder if it exists
+        main_ethdebug = os.path.join(output_dir, "ethdebug.json")
+        if os.path.exists(main_ethdebug):
+            for contract_name in normalized_contracts.keys():
+                contract_dir = os.path.join(output_dir, contract_name)
+                dest_ethdebug = os.path.join(contract_dir, "ethdebug.json")
+                try:
+                    import shutil
+                    shutil.copy2(main_ethdebug, dest_ethdebug)
+                except Exception as e:
+                    self._send_output(f"Warning: Could not copy ethdebug.json to {contract_dir}: {e}\n")
 
     # ---- DAP transport helpers ----
     def _send(self, msg: Dict[str, Any]):
@@ -1148,9 +1439,31 @@ class WalnutDAPServer:
                 }
                 
                 if source_path:
+                    # Normalize source_path - remove 'out/' prefix if present
+                    normalized_source_path = source_path
+                    if normalized_source_path.startswith('out/'):
+                        normalized_source_path = normalized_source_path[4:]  # Remove 'out/' prefix
+                    elif normalized_source_path.startswith('./out/'):
+                        normalized_source_path = normalized_source_path[6:]  # Remove './out/' prefix
+                    
+                    # Resolve absolute path using workspace_root
+                    workspace_root = getattr(self, '_workspace_root', None) or getattr(self, 'workspace_root', None)
+                    if not workspace_root and hasattr(self, '_out_dir') and self._out_dir:
+                        workspace_root = os.path.dirname(self._out_dir)
+                    
+                    if os.path.isabs(normalized_source_path):
+                        abs_source_path = normalized_source_path
+                    elif workspace_root:
+                        abs_source_path = os.path.normpath(os.path.join(workspace_root, normalized_source_path))
+                        # If file doesn't exist, try original path
+                        if not os.path.exists(abs_source_path):
+                            abs_source_path = os.path.normpath(os.path.join(workspace_root, source_path))
+                    else:
+                        abs_source_path = os.path.abspath(normalized_source_path)
+                    
                     stopped_event["source"] = {
-                        "name": os.path.basename(source_path),
-                        "path": source_path
+                        "name": os.path.basename(abs_source_path),
+                        "path": abs_source_path
                     }
                     stopped_event["line"] = line_num
                 
@@ -1335,26 +1648,50 @@ class WalnutDAPServer:
                 source_path, offset, _ = si
                 l, c = parser.offset_to_line_col(source_path, offset)
                 
-                # Resolve absolute path
-                if os.path.isabs(source_path):
-                    abs_source_path = source_path
+                # Normalize source_path - remove 'out/' prefix if present
+                normalized_source_path = source_path
+                if normalized_source_path.startswith('out/'):
+                    normalized_source_path = normalized_source_path[4:]  # Remove 'out/' prefix
+                elif normalized_source_path.startswith('./out/'):
+                    normalized_source_path = normalized_source_path[6:]  # Remove './out/' prefix
+                
+                # Resolve absolute path using workspace_root
+                workspace_root = getattr(self, '_workspace_root', None) or getattr(self, 'workspace_root', None)
+                if not workspace_root and hasattr(self, '_out_dir') and self._out_dir:
+                    workspace_root = os.path.dirname(self._out_dir)
+                
+                if os.path.isabs(normalized_source_path):
+                    abs_source_path = normalized_source_path
+                elif workspace_root:
+                    # Use workspace root to resolve path
+                    abs_source_path = os.path.normpath(os.path.join(workspace_root, normalized_source_path))
+                    # If file doesn't exist, try with original source_path
+                    if not os.path.exists(abs_source_path):
+                        abs_source_path = os.path.normpath(os.path.join(workspace_root, source_path))
                 else:
-                    # Use contract's debug directory as base if available
+                    # Fallback to contract's debug directory or source_file
                     if contract_info and hasattr(contract_info, 'debug_dir'):
                         base_dir = os.path.dirname(str(contract_info.debug_dir))
-                        abs_source_path = os.path.normpath(os.path.join(base_dir, source_path))
+                        abs_source_path = os.path.normpath(os.path.join(base_dir, normalized_source_path))
                     elif hasattr(self, 'source_file') and self.source_file:
                         base_dir = os.path.dirname(self.source_file)
-                        abs_source_path = os.path.normpath(os.path.join(base_dir, source_path))
+                        abs_source_path = os.path.normpath(os.path.join(base_dir, normalized_source_path))
                     else:
-                        abs_source_path = os.path.abspath(source_path)
+                        abs_source_path = os.path.abspath(normalized_source_path)
                 
                 # Check if file exists and try alternatives
-                if not os.path.exists(abs_source_path) and hasattr(self, 'source_file') and self.source_file:
-                    alternatives = [
-                        os.path.join(os.path.dirname(self.source_file), source_path),
-                        os.path.join(os.path.dirname(self.source_file), os.path.basename(source_path))
-                    ]
+                if not os.path.exists(abs_source_path):
+                    alternatives = []
+                    if workspace_root:
+                        alternatives.extend([
+                            os.path.join(workspace_root, normalized_source_path),
+                            os.path.join(workspace_root, source_path)  # Try original path too
+                        ])
+                    if hasattr(self, 'source_file') and self.source_file:
+                        alternatives.extend([
+                            os.path.join(os.path.dirname(self.source_file), normalized_source_path),
+                            os.path.join(os.path.dirname(self.source_file), os.path.basename(normalized_source_path))
+                        ])
                     for alt in alternatives:
                         if os.path.exists(alt):
                             abs_source_path = alt
