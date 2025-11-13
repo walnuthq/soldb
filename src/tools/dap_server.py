@@ -111,7 +111,7 @@ class WalnutDAPServer:
             current_block = w3.eth.block_number
             if self._last_block_number is None:
                 self._last_block_number = current_block
-                self._send_output(f"Monitoring all transactions starting from block {current_block}\n")
+                self._send_output(f"Monitoring transactions starting from block {current_block}\n")
                 return
             
             # Check new blocks for transactions
@@ -225,7 +225,7 @@ class WalnutDAPServer:
             
             # We have breakpoints - trace the transaction and check for breakpoint hits
             try:
-                self._send_output(f"Checking breakpoints for transaction {tx_hash}...\n")
+                self._send_output(f"Getting breakpoints for transaction {tx_hash}...\n")
                 
                 # Trace the transaction
                 trace = self._tracer.trace_transaction(tx_hash)
@@ -288,7 +288,6 @@ class WalnutDAPServer:
                 breakpoint_source = None
                 breakpoint_line = None
                 
-                self._send_output(f"Checking breakpoints for transaction {tx_hash}...\n")
                 for step_idx, step in enumerate(trace.steps):
                     # Get source location for this step
                     source_info = None
@@ -320,9 +319,6 @@ class WalnutDAPServer:
                         # Get source file name (basename)
                         source_file_name = os.path.basename(source_path).replace('.sol', '')
                         
-                        # Check if this line has a breakpoint
-                        self._send_output(f"Breakpoints: {self.breakpoints}\n")
-                        self._send_output(f"Checking breakpoints for {source_file_name} at line {line_num}\n")
                         if source_file_name in self.breakpoints:
                             if line_num in self.breakpoints[source_file_name]:
                                 # Breakpoint hit!
@@ -365,12 +361,12 @@ class WalnutDAPServer:
                     else:
                         abs_breakpoint_source = os.path.abspath(normalized_breakpoint_source)
                     
-                    self._send_output(f"Breakpoint hit at {os.path.basename(abs_breakpoint_source)}:{breakpoint_line} in transaction {tx_hash[:16]}...\n")
+                    self._send_output(f"Breakpoint hit at {os.path.basename(abs_breakpoint_source)}:{breakpoint_line} in transaction {tx_hash}\n")
                     # Send stopped event with breakpoint reason
                     self._event("stopped", {
                         "reason": "breakpoint",
                         "threadId": self.thread_id,
-                        "description": f"Breakpoint hit in transaction {tx_hash[:16]}...",
+                        "description": f"Breakpoint hit in transaction {tx_hash}",
                         "source": {
                             "name": os.path.basename(abs_breakpoint_source),
                             "path": abs_breakpoint_source
@@ -378,7 +374,7 @@ class WalnutDAPServer:
                         "line": breakpoint_line
                     })
                     
-                    self._send_output(f"Breakpoint hit at {os.path.basename(abs_breakpoint_source)}:{breakpoint_line} in transaction {tx_hash[:16]}...\n")
+                    self._send_output(f"Breakpoint hit at {os.path.basename(abs_breakpoint_source)}:{breakpoint_line} in transaction {tx_hash}\n")
                 else:
                     # No breakpoint hit - just print transaction hash
                     self._send_output(f"Transaction monitored: {tx_hash}\n")
@@ -414,7 +410,6 @@ class WalnutDAPServer:
                         deployed_bytecode = '0x' + deployed_bytecode
                     # Remove 0x prefix for comparison (runtime bytecode)
                     deployed_bytecode = deployed_bytecode[2:] if deployed_bytecode.startswith('0x') else deployed_bytecode
-                    self._send_output(f"Got deployed bytecode (length: {len(deployed_bytecode)} chars)\n")
             except Exception as e:
                 self._send_output(f"Warning: Could not get deployed bytecode: {e}\n")
         
@@ -476,7 +471,6 @@ class WalnutDAPServer:
         
         # If still not found, try to find by comparing bytecode with all contract folders
         if not ethdebug_dir and deployed_bytecode:
-            self._send_output(f"Scanning contract folders to match bytecode...\n")
             try:
                 for item in os.listdir(self._out_dir):
                     item_path = os.path.join(self._out_dir, item)
@@ -485,7 +479,6 @@ class WalnutDAPServer:
                         if self._verify_bytecode_match(item_path, item, deployed_bytecode):
                             ethdebug_dir = item_path
                             found_name = item
-                            self._send_output(f"✓ Matched bytecode with contract folder: {item}\n")
                             break
             except (OSError, PermissionError):
                 pass
@@ -516,8 +509,6 @@ class WalnutDAPServer:
             if not ethdebug_dir and os.path.exists(os.path.join(self._out_dir, "ethdebug.json")):
                 ethdebug_dir = self._out_dir
         
-        self._send_output(f"Found ethdebug directory: {ethdebug_dir}\n")
-        self._send_output(f"Found contract name: {found_name}\n")
         return (ethdebug_dir, found_name)
     
     def _verify_bytecode_match(self, contract_dir: str, contract_name: str, deployed_bytecode: str) -> bool:
@@ -634,7 +625,6 @@ class WalnutDAPServer:
         try:
             with open(contracts_json_path, "w") as f:
                 json.dump(contracts_data, f, indent=2)
-            self._send_output(f"✓ Updated contracts.json with contract {contract_name} at {contract_address}\n")
         except IOError as e:
             self._send_output(f"Warning: Could not write contracts.json: {e}\n")
     
@@ -654,15 +644,12 @@ class WalnutDAPServer:
             ethdebug_dir, found_name = self._find_contract_ethdebug_dir(contract_address, contract_name)
             
             if not ethdebug_dir:
-                self._send_output(f"⚠ Warning: Could not find ethdebug directory for contract {contract_address}")
+                self._send_output(f"Warning: Could not find ethdebug directory for contract {contract_address}")
                 if found_name:
                     self._send_output(f" (expected: {os.path.join(self._out_dir, found_name)})\n")
                 else:
                     self._send_output(f"\n")
                 return
-            
-            # Now load the ethdebug files
-            self._send_output(f"Loading ethdebug files from {ethdebug_dir}...\n")
             
             # Create multi-contract parser if it doesn't exist
             if not hasattr(self._tracer, 'multi_contract_parser') or not self._tracer.multi_contract_parser:
@@ -688,10 +675,8 @@ class WalnutDAPServer:
                 abi_path = primary_contract.debug_dir / f"{primary_contract.name}.abi"
                 if abi_path.exists():
                     self._tracer.load_abi(str(abi_path))
-                
-                self._send_output(f"✓ Loaded ethdebug files for contract {found_name or 'unknown'} at {contract_address}\n")
             else:
-                self._send_output(f"⚠ Warning: Failed to load contract info from ethdebug directory\n")
+                self._send_output(f"Warning: Failed to load contract info from ethdebug directory\n")
             
             # Update contracts.json with the found contract information
             if ethdebug_dir and found_name:
@@ -716,7 +701,6 @@ class WalnutDAPServer:
         self._monitor_stop_event.clear()
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
-        self._send_output("✓ Transaction monitoring started\n")
 
     def _monitor_loop(self):
         """Main loop for monitoring transactions."""
@@ -1411,7 +1395,6 @@ class WalnutDAPServer:
             else:
                 # No function specified - enter monitoring mode
                 # Contract address is optional - we monitor all transactions
-                self._send_output(f"✓ Debugger initialized. Monitoring all transactions\n")
                 self._send_output(f"Waiting for transactions on RPC: {rpc_url}\n")
                 
                 # Start monitoring thread
@@ -1426,9 +1409,6 @@ class WalnutDAPServer:
             # If we have a trace, stop at entry point, otherwise wait for transactions
             if self.debugger.current_trace:
                 self._event("stopped", {"reason": "entry", "threadId": self.thread_id})
-            else:
-                # In monitoring mode, we're ready but waiting
-                self._send_output("Debugger ready. Waiting for transactions...\n")
         except Exception as e:
             self._send_output(f"Launch failed with error: {e}")
             self._response(request, False, message=str(e))
@@ -1459,8 +1439,6 @@ class WalnutDAPServer:
         
         lines = []
         functions = []
-
-        self._send_output(f"Source name: {source_name}\n")
         # Separate line and function breakpoints
         for bp in breakpoints:
             if "line" in bp:
@@ -1485,7 +1463,6 @@ class WalnutDAPServer:
             for line in lines:
                 try:
                     self.debugger.do_break(f"{source_name}:{line}")
-                    self._send_output(f"Registered breakpoint at {source_name}:{line}\n")
                 except Exception as e:
                     # Breakpoint will be registered when source map is available
                     self._send_output(f"Could not register breakpoint at {source_name}:{line} yet: {e}\n")
@@ -1494,7 +1471,6 @@ class WalnutDAPServer:
             for func_name in functions:
                 try:
                     self.debugger.do_break(func_name)
-                    self._send_output(f"Registered function breakpoint: {func_name}\n")
                 except Exception as e:
                     # Breakpoint will be registered when function trace is available
                     self._send_output(f"Could not register function breakpoint {func_name} yet: {e}\n")
@@ -1504,14 +1480,7 @@ class WalnutDAPServer:
     def _register_existing_breakpoints(self):
         """Register all existing breakpoints in the debugger after initialization."""
         if not self.debugger:
-            self._send_output("DEBUG: _register_existing_breakpoints called but no debugger\n")
             return
-        
-        self._send_output("Registering existing breakpoints...\n")
-        self._send_output(f"Stored breakpoints: {self.breakpoints}\n")
-        self._send_output(f"Debugger source_map available: {bool(self.debugger.source_map)}\n")
-        self._send_output(f"Source_map size: {len(self.debugger.source_map) if self.debugger.source_map else 0}\n")
-        self._send_output(f"Debugger breakpoints before registration: {self.debugger.breakpoints}\n")
         
         # Register all stored breakpoints
         registered_count = 0
@@ -1534,21 +1503,16 @@ class WalnutDAPServer:
                     if pc_found is not None:
                         self.debugger.breakpoints.add(pc_found)
                         registered_count += 1
-                        self._send_output(f"✓ Registered breakpoint at {source_name}:{line} (PC {pc_found})\n")
                     else:
-                        self._send_output(f"⚠ No PC found for line {line} in source_map\n")
+                        self._send_output(f"No PC found for line {line} in source_map\n")
                 else:
                     # Fallback to do_break if source_map not available
                     try:
                         self.debugger.do_break(f"{source_name}:{line}")
                         registered_count += 1
-                        self._send_output(f"Registered breakpoint at {source_name}:{line} (via do_break)\n")
                     except Exception as e:
                         self._send_output(f"Could not register {source_name}:{line}: {e}\n")
         
-        self._send_output(f"Registered {registered_count} breakpoint(s)\n")
-        self._send_output(f"Debugger breakpoints after registration: {self.debugger.breakpoints}\n")
-
     def threads(self, request):
         self._response(request, True, {"threads": [{"id": self.thread_id, "name": "main"}]})
 
@@ -2054,7 +2018,6 @@ class WalnutDAPServer:
             if not tx_hash and self._monitored_transactions:
                 tx_info = self._monitored_transactions[-1]
                 tx_hash = ensure_0x_prefix(tx_info["tx_hash"])
-                self._send_output(f"No transaction hash provided, using last monitored transaction: {tx_hash}\n")
             elif not tx_hash:
                 self._response(request, False, message="No transaction hash provided and no monitored transactions available")
                 return
@@ -2135,7 +2098,6 @@ class WalnutDAPServer:
             # Update contract_address from transaction if not set
             if contract_address and (not self.debugger.contract_address or self.debugger.contract_address == "None"):
                 self.debugger.contract_address = contract_address
-                self._send_output(f"Contract address set to: {contract_address}\n")
             
             # Reload source_map for the contract after loading trace
             # This is important because source_map might not be loaded yet
@@ -2169,10 +2131,7 @@ class WalnutDAPServer:
             
             # Re-register breakpoints after loading new transaction
             # This is important because source_map might have changed or breakpoints might have been lost
-            self._send_output(f"Re-registering breakpoints after loading transaction...\n")
             self._register_existing_breakpoints()
-            
-            self._send_output(f"✓ Transaction loaded into debugger. Ready to debug.\n")
             
             # Send event to VS Code with transaction details
             self._event("transactionData", {
@@ -2189,7 +2148,7 @@ class WalnutDAPServer:
             self._event("stopped", {
                 "reason": "breakpoint",
                 "threadId": self.thread_id,
-                "description": f"Transaction {tx_hash[:16]}... ready for debugging"
+                "description": f"Transaction {tx_hash} ready for debugging"
             })
             
             self._response(request, True, {
