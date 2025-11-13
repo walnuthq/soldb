@@ -84,6 +84,20 @@ class WalnutDAPServer:
     def _find_sol_files(self, root_dir: str) -> List[str]:
         """Find all .sol files in the workspace."""
         return find_sol_files(root_dir)
+    
+    def _find_project_root(self, start_path: str) -> Optional[str]:
+        """Find the project root directory by looking for foundry.toml.
+        """
+        current_path = Path(start_path).resolve()
+        
+        # Walk up the directory tree
+        while current_path != current_path.parent:
+            foundry_toml = current_path / "foundry.toml"
+            if foundry_toml.exists() and foundry_toml.is_file():
+                return str(current_path)
+            current_path = current_path.parent
+        
+        return None
 
     def _monitor_transactions(self):
         """Monitor for all new transactions on the blockchain."""
@@ -543,6 +557,87 @@ class WalnutDAPServer:
             self._send_output(f"Warning: Error verifying bytecode match: {e}\n")
             return False
     
+    def _update_contracts_json(self, contract_address: str, contract_name: str, debug_dir: str):
+        """Create or update contracts.json file with contract information.
+        
+        Args:
+            contract_address: The contract address (checksum format)
+            contract_name: The contract name
+            debug_dir: Absolute path to the debug directory
+        """
+        if not self._out_dir or not os.path.exists(self._out_dir):
+            return
+        
+        contracts_json_path = os.path.join(self._out_dir, "contracts.json")
+        
+        # Normalize address to checksum format
+        try:
+            contract_address = to_checksum_address(contract_address)
+        except Exception:
+            pass  # Keep original if conversion fails
+        
+        # Calculate relative path from contracts.json location to debug_dir
+        try:
+            # If debug_dir is already relative, check if it's relative to out_dir
+            if not os.path.isabs(debug_dir):
+                # Already relative, use as-is but ensure ./ prefix
+                relative_debug_dir = debug_dir if debug_dir.startswith('./') or debug_dir.startswith('../') else './' + debug_dir
+            else:
+                # Absolute path - convert to relative
+                debug_dir_path = Path(debug_dir).resolve()
+                out_dir_path = Path(self._out_dir).resolve()
+                
+                # Try to make path relative
+                try:
+                    relative_debug_dir = os.path.relpath(debug_dir_path, out_dir_path)
+                    # Ensure it starts with ./ for consistency (unless it's ../)
+                    if not relative_debug_dir.startswith('./') and not relative_debug_dir.startswith('../'):
+                        relative_debug_dir = './' + relative_debug_dir
+                except ValueError:
+                    # If paths are on different drives (Windows), use absolute path
+                    relative_debug_dir = str(debug_dir_path)
+        except Exception:
+            # Fallback to absolute path if relative path calculation fails
+            relative_debug_dir = debug_dir
+        
+        # Load existing contracts.json if it exists
+        contracts_data = {"contracts": []}
+        if os.path.exists(contracts_json_path):
+            try:
+                with open(contracts_json_path, "r") as f:
+                    contracts_data = json.load(f)
+                    if not isinstance(contracts_data, dict) or "contracts" not in contracts_data:
+                        contracts_data = {"contracts": []}
+            except (json.JSONDecodeError, IOError) as e:
+                self._send_output(f"Warning: Could not read existing contracts.json: {e}\n")
+                contracts_data = {"contracts": []}
+        
+        # Check if contract already exists in the list
+        contract_found = False
+        for contract in contracts_data.get("contracts", []):
+            if contract.get("address", "").lower() == contract_address.lower():
+                # Update existing entry
+                contract["name"] = contract_name
+                contract["debug_dir"] = relative_debug_dir
+                contract_found = True
+                break
+        
+        # Add new contract if not found
+        if not contract_found:
+            contracts_data.setdefault("contracts", []).append({
+                "address": contract_address,
+                "name": contract_name,
+                "debug_dir": relative_debug_dir
+            })
+        
+        # Write updated contracts.json
+        try:
+            with open(contracts_json_path, "w") as f:
+                json.dump(contracts_data, f, indent=2)
+            self._send_output(f"✓ Updated contracts.json with contract {contract_name} at {contract_address}\n")
+        except IOError as e:
+            self._send_output(f"Warning: Could not write contracts.json: {e}\n")
+    
     def _load_ethdebug_for_contract(self, contract_address: str, contract_name: str = None):
         """Load ethdebug files for a contract address from out/ directory.
         Looks for contract files in out/ContractName/ subfolder first.
@@ -598,6 +693,10 @@ class WalnutDAPServer:
             else:
                 self._send_output(f"⚠ Warning: Failed to load contract info from ethdebug directory\n")
             
+            # Update contracts.json with the found contract information
+            if ethdebug_dir and found_name:
+                self._update_contracts_json(contract_address, found_name, ethdebug_dir)
+            
             # Store ethdebug_dir for this contract (only if we successfully found it)
             if ethdebug_dir:
                 if not hasattr(self, '_contract_ethdebug_dirs'):
@@ -642,22 +741,59 @@ class WalnutDAPServer:
     def _compile_contracts(self, workspace_root: str, output_dir: str):
         """Compile all Solidity files in the workspace to the output directory.
         Each contract gets its own subfolder in output_dir/ContractName/
+        Only compiles files from src/ directory to avoid dependencies in lib/ and node_modules/
         """
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
         
-        # Find all .sol files
-        sol_files = self._find_sol_files(workspace_root)
+        # Get absolute paths for base-path and include-path
+        workspace_root_abs = os.path.abspath(workspace_root)
+        
+        # Find src/ directory - try common locations first
+        src_dir = None
+        # Try workspace_root/src first
+        candidate = os.path.join(workspace_root_abs, 'src')
+        if os.path.exists(candidate) and os.path.isdir(candidate):
+            src_dir = candidate
+        else:
+            # Try packages/blockchain/src (common in monorepos)
+            candidate = os.path.join(workspace_root_abs, 'packages', 'blockchain', 'src')
+            if os.path.exists(candidate) and os.path.isdir(candidate):
+                src_dir = candidate
+            else:
+                # Try to find src directory in immediate subdirectories
+                try:
+                    for item in os.listdir(workspace_root_abs):
+                        item_path = os.path.join(workspace_root_abs, item)
+                        if os.path.isdir(item_path):
+                            candidate = os.path.join(item_path, 'src')
+                            if os.path.exists(candidate) and os.path.isdir(candidate):
+                                src_dir = candidate
+                                break
+                except (OSError, PermissionError):
+                    pass
+        
+        # Fallback: use workspace_root if src not found
+        if not src_dir:
+            src_dir = workspace_root_abs
+            self._send_output(f"Warning: src/ directory not found, using workspace root: {workspace_root_abs}\n")
+        else:
+            self._send_output(f"Compiling Solidity files from: {src_dir}\n")
+        
+        # Find all .sol files only in src/ directory
+        sol_files = self._find_sol_files(src_dir)
         
         if not sol_files:
-            raise ValueError(f"No .sol files found in workspace: {workspace_root}")
+            raise ValueError(f"No .sol files found in src directory: {src_dir}")
         
-        # Get relative paths for compilation
-        relative_files = [os.path.relpath(f, workspace_root) for f in sol_files]
+        # Get relative paths for compilation (relative to workspace_root)
+        relative_files = [os.path.relpath(f, workspace_root_abs) for f in sol_files]
         
-        # Build compilation command
+        # Build compilation command with proper path handling
         cmd = [
             'solc',
+            '--base-path', workspace_root_abs,
+            '--allow-paths', '.',
             '--via-ir',
             '--debug-info', 'ethdebug',
             '--ethdebug',
@@ -666,7 +802,35 @@ class WalnutDAPServer:
             '--abi',
             '--overwrite',
             '-o', output_dir
-        ] + relative_files
+        ]
+        
+        # Add include paths for common directories (node_modules, lib)
+        # Try to find them relative to src_dir parent (for monorepo structures)
+        include_paths = []
+        src_parent = os.path.dirname(src_dir) if src_dir != workspace_root_abs else workspace_root_abs
+        
+        # Try node_modules in src parent directory first (e.g., packages/blockchain/node_modules)
+        node_modules_path = os.path.join(src_parent, 'node_modules')
+        if not os.path.exists(node_modules_path) or not os.path.isdir(node_modules_path):
+            # Fallback to workspace root
+            node_modules_path = os.path.join(workspace_root_abs, 'node_modules')
+        
+        if os.path.exists(node_modules_path) and os.path.isdir(node_modules_path):
+            include_paths.append('--include-path')
+            include_paths.append(node_modules_path)
+        
+        # Try lib in src parent directory first (e.g., packages/blockchain/lib)
+        lib_path = os.path.join(src_parent, 'lib')
+        if not os.path.exists(lib_path) or not os.path.isdir(lib_path):
+            # Fallback to workspace root
+            lib_path = os.path.join(workspace_root_abs, 'lib')
+        
+        if os.path.exists(lib_path) and os.path.isdir(lib_path):
+            include_paths.append('--include-path')
+            include_paths.append(lib_path)
+        
+        cmd.extend(include_paths)
+        cmd.extend(relative_files)
         
         try:
             # Run compilation
@@ -891,8 +1055,16 @@ class WalnutDAPServer:
                 # Fallback to workspace-relative
                 return workspace_path
             
-            # Auto-detect out/ directory
-            out_dir = os.path.join(workspace_root, "out")
+            # Find project root (where foundry.toml is located) for out/ directory
+            project_root = self._find_project_root(workspace_root)
+            if project_root:
+                self._send_output(f"Found Foundry project root: {project_root}\n")
+                out_dir = os.path.join(project_root, "out")
+            else:
+                # Fallback to workspace_root if foundry.toml not found
+                self._send_output(f"Foundry project root not found, using workspace root: {workspace_root}\n")
+                out_dir = os.path.join(workspace_root, "out")
+            
             self._workspace_root = workspace_root
             self._out_dir = out_dir
             # Always compile - remove existing out/ folder if it exists to ensure fresh compilation
@@ -903,8 +1075,10 @@ class WalnutDAPServer:
                     self._send_output(f"Warning: Could not remove out/ directory: {e}\n")
             
             # Auto-compile contracts
+            # Use project_root for compilation if found, otherwise use workspace_root
+            compile_root = project_root if project_root else workspace_root
             self._send_output("Compiling Solidity contracts...\n")
-            self._compile_contracts(workspace_root, out_dir)
+            self._compile_contracts(compile_root, out_dir)
             
             # Auto-detect contracts.json if it exists
             contracts = resolve_path(args.get("contracts"))
