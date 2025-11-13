@@ -86,18 +86,29 @@ class WalnutDAPServer:
         return find_sol_files(root_dir)
     
     def _find_project_root(self, start_path: str) -> Optional[str]:
-        """Find the project root directory by looking for foundry.toml.
+        """Find the project root directory by looking for foundry.toml in subdirectories.
+        Searches recursively in child directories. If not found, returns the original start_path.
         """
-        current_path = Path(start_path).resolve()
+        start_path_resolved = Path(start_path).resolve()
         
-        # Walk up the directory tree
-        while current_path != current_path.parent:
-            foundry_toml = current_path / "foundry.toml"
-            if foundry_toml.exists() and foundry_toml.is_file():
-                return str(current_path)
-            current_path = current_path.parent
+        # First check if foundry.toml exists in the start directory itself
+        foundry_toml = start_path_resolved / "foundry.toml"
+        if foundry_toml.exists() and foundry_toml.is_file():
+            return str(start_path_resolved)
         
-        return None
+        # Search in subdirectories (children)
+        try:
+            # Use rglob to search recursively in subdirectories
+            for foundry_file in start_path_resolved.rglob("foundry.toml"):
+                if foundry_file.is_file():
+                    # Return the directory containing foundry.toml
+                    return str(foundry_file.parent)
+        except (PermissionError, OSError):
+            # If we can't access some directories, continue
+            pass
+        
+        # If not found, return the original start_path
+        return str(start_path_resolved)
 
     def _monitor_transactions(self):
         """Monitor for all new transactions on the blockchain."""
@@ -721,34 +732,41 @@ class WalnutDAPServer:
             self._monitor_stop_event.set()
             self._monitor_thread.join(timeout=2)
             self._monitor_thread = None
-
-    def _compile_contracts(self, workspace_root: str, output_dir: str):
+    
+    def _compile_contracts(self, project_root: str, output_dir: str):
         """Compile all Solidity files in the workspace to the output directory.
         Each contract gets its own subfolder in output_dir/ContractName/
         Only compiles files from src/ directory to avoid dependencies in lib/ and node_modules/
+        
+        Args:
+            project_root: Foundry project root (where foundry.toml is located)
+            output_dir: Output directory for compiled files
         """
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
         
-        # Get absolute paths for base-path and include-path
-        workspace_root_abs = os.path.abspath(workspace_root)
+        # Get workspace root (original workspace, not foundry project root)
+        workspace_root_abs = os.path.abspath(self._workspace_root) if self._workspace_root else os.path.abspath(project_root)
+        
+        # Get absolute path for project root
+        project_root_abs = os.path.abspath(project_root)
         
         # Find src/ directory - try common locations first
         src_dir = None
-        # Try workspace_root/src first
-        candidate = os.path.join(workspace_root_abs, 'src')
+        # Try project_root/src first
+        candidate = os.path.join(project_root_abs, 'src')
         if os.path.exists(candidate) and os.path.isdir(candidate):
             src_dir = candidate
         else:
             # Try packages/blockchain/src (common in monorepos)
-            candidate = os.path.join(workspace_root_abs, 'packages', 'blockchain', 'src')
+            candidate = os.path.join(project_root_abs, 'packages', 'blockchain', 'src')
             if os.path.exists(candidate) and os.path.isdir(candidate):
                 src_dir = candidate
             else:
                 # Try to find src directory in immediate subdirectories
                 try:
-                    for item in os.listdir(workspace_root_abs):
-                        item_path = os.path.join(workspace_root_abs, item)
+                    for item in os.listdir(project_root_abs):
+                        item_path = os.path.join(project_root_abs, item)
                         if os.path.isdir(item_path):
                             candidate = os.path.join(item_path, 'src')
                             if os.path.exists(candidate) and os.path.isdir(candidate):
@@ -757,12 +775,13 @@ class WalnutDAPServer:
                 except (OSError, PermissionError):
                     pass
         
-        # Fallback: use workspace_root if src not found
+        # Fallback: use project_root if src not found
         if not src_dir:
-            src_dir = workspace_root_abs
-            self._send_output(f"Warning: src/ directory not found, using workspace root: {workspace_root_abs}\n")
-        else:
-            self._send_output(f"Compiling Solidity files from: {src_dir}\n")
+            src_dir = project_root_abs
+            self._send_output(f"Warning: src/ directory not found, using project root: {project_root_abs}\n")
+        
+        # Show project root in message, not src directory
+        self._send_output(f"Compiling Solidity files from: {project_root_abs}\n")
         
         # Find all .sol files only in src/ directory
         sol_files = self._find_sol_files(src_dir)
@@ -770,10 +789,11 @@ class WalnutDAPServer:
         if not sol_files:
             raise ValueError(f"No .sol files found in src directory: {src_dir}")
         
-        # Get relative paths for compilation (relative to workspace_root)
-        relative_files = [os.path.relpath(f, workspace_root_abs) for f in sol_files]
+        # Use absolute paths for compilation
+        absolute_files = [os.path.abspath(f) for f in sol_files]
         
         # Build compilation command with proper path handling
+        # base-path should be workspace_root, not project_root
         cmd = [
             'solc',
             '--base-path', workspace_root_abs,
@@ -791,13 +811,13 @@ class WalnutDAPServer:
         # Add include paths for common directories (node_modules, lib)
         # Try to find them relative to src_dir parent (for monorepo structures)
         include_paths = []
-        src_parent = os.path.dirname(src_dir) if src_dir != workspace_root_abs else workspace_root_abs
+        src_parent = os.path.dirname(src_dir) if src_dir != project_root_abs else project_root_abs
         
         # Try node_modules in src parent directory first (e.g., packages/blockchain/node_modules)
         node_modules_path = os.path.join(src_parent, 'node_modules')
         if not os.path.exists(node_modules_path) or not os.path.isdir(node_modules_path):
-            # Fallback to workspace root
-            node_modules_path = os.path.join(workspace_root_abs, 'node_modules')
+            # Fallback to project root
+            node_modules_path = os.path.join(project_root_abs, 'node_modules')
         
         if os.path.exists(node_modules_path) and os.path.isdir(node_modules_path):
             include_paths.append('--include-path')
@@ -806,21 +826,25 @@ class WalnutDAPServer:
         # Try lib in src parent directory first (e.g., packages/blockchain/lib)
         lib_path = os.path.join(src_parent, 'lib')
         if not os.path.exists(lib_path) or not os.path.isdir(lib_path):
-            # Fallback to workspace root
-            lib_path = os.path.join(workspace_root_abs, 'lib')
+            # Fallback to project root
+            lib_path = os.path.join(project_root_abs, 'lib')
         
         if os.path.exists(lib_path) and os.path.isdir(lib_path):
             include_paths.append('--include-path')
             include_paths.append(lib_path)
         
         cmd.extend(include_paths)
-        cmd.extend(relative_files)
+        cmd.extend(absolute_files)
+        
+        # Log the compilation command
+        cmd_str = ' '.join(cmd)
+        self._send_output(f"Running solc command:\n{cmd_str}\n\n")
         
         try:
-            # Run compilation
+            # Run compilation with cwd as workspace_root
             result = subprocess.run(
                 cmd,
-                cwd=workspace_root,
+                cwd=project_root_abs,
                 capture_output=True,
                 text=True,
                 check=False
@@ -1041,12 +1065,14 @@ class WalnutDAPServer:
             
             # Find project root (where foundry.toml is located) for out/ directory
             project_root = self._find_project_root(workspace_root)
-            if project_root:
+            # Check if foundry.toml was actually found
+            foundry_toml_path = Path(project_root) / "foundry.toml"
+            if foundry_toml_path.exists() and foundry_toml_path.is_file():
                 self._send_output(f"Found Foundry project root: {project_root}\n")
                 out_dir = os.path.join(project_root, "out")
             else:
-                # Fallback to workspace_root if foundry.toml not found
-                self._send_output(f"Foundry project root not found, using workspace root: {workspace_root}\n")
+                # foundry.toml not found in subdirectories, using original workspace root
+                self._send_output(f"Foundry project root not found in subdirectories, using workspace root: {workspace_root}\n")
                 out_dir = os.path.join(workspace_root, "out")
             
             self._workspace_root = workspace_root
