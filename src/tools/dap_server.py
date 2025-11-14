@@ -229,14 +229,12 @@ class WalnutDAPServer:
             # Check if we have breakpoints set
             has_breakpoints = any(len(lines) > 0 for lines in self.breakpoints.values())
             
-            if not has_breakpoints:
-                # No breakpoints - just print transaction hash
-                self._send_output(f"Transaction monitored: {tx_hash}\n")
-                return
-            
-            # We have breakpoints - trace the transaction and check for breakpoint hits
+            # Trace the transaction to entrypoint (even if no breakpoints)
             try:
-                self._send_output(f"Getting breakpoints for transaction {tx_hash}...\n")
+                if has_breakpoints:
+                    self._send_output(f"Getting breakpoints for transaction {tx_hash}...\n")
+                else:
+                    self._send_output(f"Tracing transaction {tx_hash} to decode entrypoint...\n")
                 
                 # Trace the transaction
                 trace = self._tracer.trace_transaction(tx_hash)
@@ -292,6 +290,45 @@ class WalnutDAPServer:
                 
                 # Analyze function calls
                 self.debugger.function_trace = self._tracer.analyze_function_calls(trace)
+                
+                # Update entrypoint with actual function name from function_trace if available
+                if self.debugger.function_trace:
+                    entry_function = None
+                    if len(self.debugger.function_trace) > 1:
+                        # Skip dispatcher, go to first actual function
+                        entry_function = self.debugger.function_trace[1]
+                    elif len(self.debugger.function_trace) > 0:
+                        entry_function = self.debugger.function_trace[0]
+                    
+                    if entry_function and hasattr(entry_function, 'name') and entry_function.name:
+                        # Extract just the function name (remove contract:: prefix if present)
+                        function_name = entry_function.name
+                        if '::' in function_name:
+                            # Extract function name after ::
+                            function_name = function_name.split('::')[-1]
+                        # Only update if we have a meaningful function name (not dispatcher)
+                        if function_name and function_name != "runtime_dispatcher" and function_name != "constructor":
+                            tx_info["entrypoint"] = function_name
+                            # Update in monitored_transactions list
+                            for monitored_tx in self._monitored_transactions:
+                                if monitored_tx["tx_hash"] == tx_hash:
+                                    monitored_tx["entrypoint"] = function_name
+                                    break
+                            # Send updated transaction event to VS Code
+                            self._event("transactionMonitored", {
+                                "txHash": tx_info["tx_hash"],
+                                "contractAddress": tx_info["contract_address"],
+                                "entrypoint": tx_info["entrypoint"],
+                                "blockNumber": tx_info.get("block_number"),
+                                "from": tx_info.get("from"),
+                                "value": tx_info.get("value", "0"),
+                                "status": tx_info.get("status")
+                            })
+                
+                # If no breakpoints, just return after decoding entrypoint
+                if not has_breakpoints:
+                    self._send_output(f"Transaction monitored: {tx_hash}\n")
+                    return
                 
                 # Check each step for breakpoint hits
                 breakpoint_hit = False
@@ -2145,19 +2182,60 @@ class WalnutDAPServer:
             
             # Find entry point (first function call after dispatcher if available)
             entry_step = 0
+            entry_function = None
             if len(self.debugger.function_trace) > 1:
                 # Skip dispatcher, go to first actual function
                 entry_step = self.debugger.function_trace[1].entry_step
-                self.debugger.current_function = self.debugger.function_trace[1]
+                entry_function = self.debugger.function_trace[1]
+                self.debugger.current_function = entry_function
             elif len(self.debugger.function_trace) > 0:
                 entry_step = self.debugger.function_trace[0].entry_step
-                self.debugger.current_function = self.debugger.function_trace[0]
+                entry_function = self.debugger.function_trace[0]
+                self.debugger.current_function = entry_function
             
-            self.debugger.current_step = entry_step
+            # Update entrypoint with actual function name from function_trace if available
+            if entry_function and hasattr(entry_function, 'name') and entry_function.name:
+                # Extract just the function name (remove contract:: prefix if present)
+                function_name = entry_function.name
+                if '::' in function_name:
+                    # Extract function name after ::
+                    function_name = function_name.split('::')[-1]
+                # Only update if we have a meaningful function name (not dispatcher)
+                if function_name and function_name != "runtime_dispatcher" and function_name != "constructor":
+                    tx_info["entrypoint"] = function_name
+                    # Also update in monitored_transactions list if this transaction is there
+                    for monitored_tx in self._monitored_transactions:
+                        if monitored_tx["tx_hash"] == tx_hash:
+                            monitored_tx["entrypoint"] = function_name
+                            break
             
             # Re-register breakpoints after loading new transaction
             # This is important because source_map might have changed or breakpoints might have been lost
             self._register_existing_breakpoints()
+            
+            # Check if any breakpoints match steps in the trace
+            # Start from entry_step and look for the first matching breakpoint
+            breakpoint_step = None
+            if self.debugger.breakpoints:
+                # Search from entry_step onwards for a matching breakpoint
+                for step_idx in range(entry_step, len(trace.steps)):
+                    step = trace.steps[step_idx]
+                    if step.pc in self.debugger.breakpoints:
+                        breakpoint_step = step_idx
+                        break
+            
+            # Set current_step to breakpoint if found, otherwise use entry_step
+            if breakpoint_step is not None:
+                self.debugger.current_step = breakpoint_step
+                # Update current_function to match the breakpoint step
+                if hasattr(self.debugger, '_update_current_function'):
+                    self.debugger._update_current_function()
+                stop_reason = "breakpoint"
+                stop_description = f"Transaction {tx_hash} stopped at breakpoint"
+            else:
+                self.debugger.current_step = entry_step
+                stop_reason = "entry"
+                stop_description = f"Transaction {tx_hash} ready for debugging"
             
             # Send event to VS Code with transaction details
             self._event("transactionData", {
@@ -2170,11 +2248,11 @@ class WalnutDAPServer:
                 "value": tx_info.get("value", "0")
             })
             
-            # Notify VS Code that we've stopped at the transaction
+            # Notify VS Code that we've stopped
             self._event("stopped", {
-                "reason": "breakpoint",
+                "reason": stop_reason,
                 "threadId": self.thread_id,
-                "description": f"Transaction {tx_hash} ready for debugging"
+                "description": stop_description
             })
             
             self._response(request, True, {
