@@ -56,7 +56,11 @@ def trace_command(args):
     try:
         tracer = TransactionTracer(args.rpc, quiet_mode=args.json)
     except ConnectionError as e:
-        print(f"{error(e)}")
+        if args.json:
+            json_output = format_error_json(str(e), "ConnectionError")
+            print(json.dumps(json_output, indent=2))
+        else:
+            print(f"{error(e)}")
         return 1
     
     # Trace transaction
@@ -67,14 +71,37 @@ def trace_command(args):
     try:
         trace = tracer.trace_transaction(args.tx_hash)
     except ValueError as e:
-        print(f"{error(e)}")
+        if args.json:
+            json_output = format_error_json(str(e), "TransactionError")
+            print(json.dumps(json_output, indent=2))
+        else:
+            print(f"{error(e)}")
         return 1
     
     # Check if debug trace is available
     if not trace.debug_trace_available:
         if args.json:
             # Output minimal JSON with error using uniform format
-            error_message = "debug_traceTransaction unavailable"
+            # Build descriptive error message
+            base_message = "debug_traceTransaction unavailable"
+            if trace.error:
+                # Try to extract meaningful error message from trace.error
+                error_detail = trace.error
+                if isinstance(trace.error, str):
+                    try:
+                        # Try to parse as Python dict string (e.g., "{'code': -32000, 'message': 'execution timeout'}")
+                        import ast
+                        if trace.error.strip().startswith('{'):
+                            error_dict = ast.literal_eval(trace.error)
+                            if isinstance(error_dict, dict) and 'message' in error_dict:
+                                error_detail = error_dict['message']
+                    except:
+                        # If parsing fails, use the error as-is
+                        pass
+                error_message = f"{base_message}: {error_detail}"
+            else:
+                error_message = base_message
+            
             json_output = format_error_json(
                 error_message,
                 "DebugTraceUnavailable",
@@ -488,16 +515,21 @@ def simulate_command(args):
                 print(f"{error(error_message)}")
             sys.exit(1)
 
-        balance = tracer.w3.eth.get_balance(args.from_addr,args.block)
+        # Get balance - use 'latest' block if args.block is None to ensure we check current balance
+        balance_block = args.block if args.block is not None else 'latest'
+        balance = tracer.w3.eth.get_balance(args.from_addr, balance_block)
         if balance < token_value:
             if getattr(args, 'json', False):
-                error_message = f"User {args.from_addr} has not enough funds. Available balance: {balance} wei. Requested value: {token_value} wei"
+                # Include block information in error message for debugging
+                block_info = f" at block {args.block}" if args.block is not None else " at latest block"
+                error_message = f"User {args.from_addr} has not enough funds{block_info}. Available balance: {balance} wei. Requested value: {token_value} wei"
                 json_output = format_error_json(
                     error_message,
                     "InsufficientFunds",
                     available_balance=str(balance),
                     requested_value=str(token_value),
-                    from_address=args.from_addr
+                    from_address=args.from_addr,
+                    balance_block=args.block if args.block is not None else "latest"
                 )
                 print(json.dumps(json_output, indent=2))
             else:
@@ -705,8 +737,7 @@ def simulate_command(args):
         except Exception as e:
             if getattr(args, 'json', False):
                 error_message = f"Error during simulation: {str(e)}"
-                json_output = format_error_json(str(e), "SimulationError")
-                json_output["soldbFailed"] = error_message  # Override with more descriptive message
+                json_output = format_error_json(error_message, "SimulationError")
                 print(json.dumps(json_output, indent=2))
             else:
                 print(f"Error during simulation: {e}")
@@ -1131,7 +1162,11 @@ def list_events_command(args):
     try:
         receipt = tracer.w3.eth.get_transaction_receipt(args.tx_hash)
     except Exception as e:
-        print(f"{error(e)}")
+        if getattr(args, 'json_events', False):
+            json_output = format_error_json(str(e), "TransactionReceiptError")
+            print(json.dumps(json_output, indent=2))
+        else:
+            print(f"{error(e)}")
         return 1
     
     # Decode and print events
