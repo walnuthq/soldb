@@ -2748,12 +2748,14 @@ class TransactionTracer:
                 
                 # Format function name with selector if available
                 if call.selector:
-                    func_display = f"{cyan(call.name)} {dim(f'[{call.selector}]')}"
+                    selector_str = f'[{call.selector}]'
+                    func_display = f"{cyan(call.name)} {dim(selector_str)}"
                 else:
                     func_display = cyan(call.name)
                 
                 if call.value:
-                    func_display = f"{func_display} {f'{dim(f'[value: {call.value}]')}' if call.value else ''}"
+                    value_str = f'[value: {call.value}]'
+                    func_display = f"{func_display} {dim(value_str)}"
                 
                 # Add call type indicator with enhanced info for external calls
                 if call.call_type in ["CALL", "DELEGATECALL", "STATICCALL"]:

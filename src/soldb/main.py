@@ -21,7 +21,7 @@ from .colors import error, info, warning, number
 from .auto_deploy import AutoDeployDebugger
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
-from .utils import print_contracts_in_transaction,print_contracts_events
+from .utils import print_contracts_in_transaction, print_contracts_events, format_error_json
 
 
 def find_debug_file(contract_addr: str) -> str:
@@ -73,16 +73,18 @@ def trace_command(args):
     # Check if debug trace is available
     if not trace.debug_trace_available:
         if args.json:
-            # Output minimal JSON with error
-            json_output = {
-                "soldbFailed": "debug_traceTransaction unavailable",
-                "tx_hash": trace.tx_hash,
-                "from": trace.from_addr,
-                "to": trace.to_addr,
-                "gas_used": trace.gas_used,
-                "status": "SUCCESS" if trace.success else "REVERTED",
-                "error": trace.error
-            }
+            # Output minimal JSON with error using uniform format
+            error_message = "debug_traceTransaction unavailable"
+            json_output = format_error_json(
+                error_message,
+                "DebugTraceUnavailable",
+                tx_hash=trace.tx_hash,
+                from_address=trace.from_addr,
+                to_address=trace.to_addr,
+                gas_used=trace.gas_used,
+                status="SUCCESS" if trace.success else "REVERTED",
+                trace_error=trace.error
+            )
             print(json.dumps(json_output, indent=2))
         else:
             print(f"\n{error('Error: debug_traceTransaction not available')}")
@@ -456,7 +458,11 @@ def simulate_command(args):
     try:
         tracer = TransactionTracer(args.rpc_url)
     except ConnectionError as e:
-        print(f"{error(e)}")
+        if getattr(args, 'json', False):
+            json_output = format_error_json(str(e), "ConnectionError")
+            print(json.dumps(json_output, indent=2))
+        else:
+            print(f"{error(e)}")
         return 1
 
     if args.value and args.value is not None:
@@ -473,15 +479,31 @@ def simulate_command(args):
                 token_type = "wei"
 
             token_value = tracer.w3.to_wei(value, token_type)
-        except:
-            print(f"{error(f'Invalid value for --value: {args.value}')}")
+        except Exception as e:
+            error_message = f"Invalid value for --value: {args.value}"
+            if getattr(args, 'json', False):
+                json_output = format_error_json(error_message, "InvalidValue", provided_value=str(args.value))
+                print(json.dumps(json_output, indent=2))
+            else:
+                print(f"{error(error_message)}")
             sys.exit(1)
 
         balance = tracer.w3.eth.get_balance(args.from_addr,args.block)
         if balance < token_value:
-            print(f"{error(f'User {args.from_addr} has not enough funds.')}")
-            print(f"    - Available balance: {number(str(balance))} wei")
-            print(f"    - Requested value: {number(token_value)} wei")
+            if getattr(args, 'json', False):
+                error_message = f"User {args.from_addr} has not enough funds. Available balance: {balance} wei. Requested value: {token_value} wei"
+                json_output = format_error_json(
+                    error_message,
+                    "InsufficientFunds",
+                    available_balance=str(balance),
+                    requested_value=str(token_value),
+                    from_address=args.from_addr
+                )
+                print(json.dumps(json_output, indent=2))
+            else:
+                print(f"{error(f'User {args.from_addr} has not enough funds.')}")
+                print(f"    - Available balance: {number(str(balance))} wei")
+                print(f"    - Requested value: {number(token_value)} wei")
             return 1
         
     source_map = {}
@@ -681,7 +703,13 @@ def simulate_command(args):
                 args.contract_address, args.from_addr, calldata, block, args.tx_index, token_value if args.value else 0
             )
         except Exception as e:
-            print(f"Error during simulation: {e}")
+            if getattr(args, 'json', False):
+                error_message = f"Error during simulation: {str(e)}"
+                json_output = format_error_json(str(e), "SimulationError")
+                json_output["soldbFailed"] = error_message  # Override with more descriptive message
+                print(json.dumps(json_output, indent=2))
+            else:
+                print(f"Error during simulation: {e}")
             sys.exit(1)
         function_calls = tracer.analyze_function_calls(trace)
         if getattr(args, 'json', False):
