@@ -17,11 +17,11 @@ from .evm_repl import EVMDebugger
 from .abi_utils import match_abi_types, match_single_type, parse_signature, parse_tuple_arg
 from .multi_contract_ethdebug_parser import MultiContractETHDebugParser
 from .json_serializer import TraceSerializer
-from .colors import error, info, warning
+from .colors import error, info, warning, number
 from .auto_deploy import AutoDeployDebugger
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
-from .utils import print_contracts_in_transaction,print_contracts_events
+from .utils import print_contracts_in_transaction, print_contracts_events, format_error_json
 
 
 def find_debug_file(contract_addr: str) -> str:
@@ -56,7 +56,11 @@ def trace_command(args):
     try:
         tracer = TransactionTracer(args.rpc, quiet_mode=args.json)
     except ConnectionError as e:
-        print(f"{error(e)}")
+        if args.json:
+            json_output = format_error_json(str(e), "ConnectionError")
+            print(json.dumps(json_output, indent=2))
+        else:
+            print(f"{error(e)}")
         return 1
     
     # Trace transaction
@@ -67,22 +71,47 @@ def trace_command(args):
     try:
         trace = tracer.trace_transaction(args.tx_hash)
     except ValueError as e:
-        print(f"{error(e)}")
+        if args.json:
+            json_output = format_error_json(str(e), "TransactionError")
+            print(json.dumps(json_output, indent=2))
+        else:
+            print(f"{error(e)}")
         return 1
     
     # Check if debug trace is available
     if not trace.debug_trace_available:
         if args.json:
-            # Output minimal JSON with error
-            json_output = {
-                "soldbFailed": "debug_traceTransaction unavailable",
-                "tx_hash": trace.tx_hash,
-                "from": trace.from_addr,
-                "to": trace.to_addr,
-                "gas_used": trace.gas_used,
-                "status": "SUCCESS" if trace.success else "REVERTED",
-                "error": trace.error
-            }
+            # Output minimal JSON with error using uniform format
+            # Build descriptive error message
+            base_message = "debug_traceTransaction unavailable"
+            if trace.error:
+                # Try to extract meaningful error message from trace.error
+                error_detail = trace.error
+                if isinstance(trace.error, str):
+                    try:
+                        # Try to parse as Python dict string (e.g., "{'code': -32000, 'message': 'execution timeout'}")
+                        import ast
+                        if trace.error.strip().startswith('{'):
+                            error_dict = ast.literal_eval(trace.error)
+                            if isinstance(error_dict, dict) and 'message' in error_dict:
+                                error_detail = error_dict['message']
+                    except:
+                        # If parsing fails, use the error as-is
+                        pass
+                error_message = f"{base_message}: {error_detail}"
+            else:
+                error_message = base_message
+            
+            json_output = format_error_json(
+                error_message,
+                "DebugTraceUnavailable",
+                tx_hash=trace.tx_hash,
+                from_address=trace.from_addr,
+                to_address=trace.to_addr,
+                gas_used=trace.gas_used,
+                status="SUCCESS" if trace.success else "REVERTED",
+                trace_error=trace.error
+            )
             print(json.dumps(json_output, indent=2))
         else:
             print(f"\n{error('Error: debug_traceTransaction not available')}")
@@ -451,13 +480,64 @@ def simulate_command(args):
     # Show RPC URL being used
     if not getattr(args, 'json', False):
         print(f"Connecting to RPC: {info(args.rpc_url)}")
-
+        
     # Create tracer
     try:
         tracer = TransactionTracer(args.rpc_url)
     except ConnectionError as e:
-        print(f"{error(e)}")
+        if getattr(args, 'json', False):
+            json_output = format_error_json(str(e), "ConnectionError")
+            print(json.dumps(json_output, indent=2))
+        else:
+            print(f"{error(e)}")
         return 1
+
+    if args.value and args.value is not None:
+        token = {}
+        token_type = "wei"
+        token_value = 0
+
+        try:
+            if isinstance(args.value, str) and args.value.endswith('ether'):
+                value = args.value.split('ether')[0]
+                token_type = "ether"
+            else:
+                value = int(args.value)
+                token_type = "wei"
+
+            token_value = tracer.w3.to_wei(value, token_type)
+        except Exception as e:
+            error_message = f"Invalid value for --value: {args.value}"
+            if getattr(args, 'json', False):
+                json_output = format_error_json(error_message, "InvalidValue", provided_value=str(args.value))
+                print(json.dumps(json_output, indent=2))
+            else:
+                print(f"{error(error_message)}")
+            sys.exit(1)
+
+        # Get balance - use 'latest' block if args.block is None to ensure we check current balance
+        balance_block = args.block if args.block is not None else 'latest'
+        balance = tracer.w3.eth.get_balance(args.from_addr, balance_block)
+        if balance < token_value:
+            if getattr(args, 'json', False):
+                # Include block information in error message for debugging
+                block_info = f" at block {args.block}" if args.block is not None else " at latest block"
+                error_message = f"User {args.from_addr} has not enough funds{block_info}. Available balance: {balance} wei. Requested value: {token_value} wei"
+                json_output = format_error_json(
+                    error_message,
+                    "InsufficientFunds",
+                    available_balance=str(balance),
+                    requested_value=str(token_value),
+                    from_address=args.from_addr,
+                    balance_block=args.block if args.block is not None else "latest"
+                )
+                print(json.dumps(json_output, indent=2))
+            else:
+                print(f"{error(f'User {args.from_addr} has not enough funds.')}")
+                print(f"    - Available balance: {number(str(balance))} wei")
+                print(f"    - Requested value: {number(token_value)} wei")
+            return 1
+        
     source_map = {}
 
     if args.contract_address and not args.interactive:
@@ -636,7 +716,7 @@ def simulate_command(args):
                 break
     if args.interactive:
         # Start interactive debugger
-        interactive_mode(args,tracer)
+        interactive_mode(args,tracer,token_value if args.value else 0)
         return 0
     # If raw_data is provided, use it directly as calldata
     if getattr(args, 'raw_data', None):
@@ -647,15 +727,20 @@ def simulate_command(args):
             'to': args.contract_address,
             'from': args.from_addr,
             'data': calldata,
-            'value': args.value
+            'value': token_value if args.value else 0
         }
         block = args.block
         try:
             trace = tracer.simulate_call_trace(
-                args.contract_address, args.from_addr, calldata, block, args.tx_index, args.value
+                args.contract_address, args.from_addr, calldata, block, args.tx_index, token_value if args.value else 0
             )
         except Exception as e:
-            print(f"Error during simulation: {e}")
+            if getattr(args, 'json', False):
+                error_message = f"Error during simulation: {str(e)}"
+                json_output = format_error_json(error_message, "SimulationError")
+                print(json.dumps(json_output, indent=2))
+            else:
+                print(f"Error during simulation: {e}")
             sys.exit(1)
         function_calls = tracer.analyze_function_calls(trace)
         if getattr(args, 'json', False):
@@ -799,7 +884,7 @@ def simulate_command(args):
         'to': args.contract_address,
         'from': args.from_addr,
         'data': calldata,
-        'value': args.value
+        'value': token_value if args.value else 0
     }
     trace_config = {"disableStorage": False, "disableMemory": False}
     if args.tx_index is not None:
@@ -807,7 +892,7 @@ def simulate_command(args):
     block = args.block
     # Simulate call
     trace = tracer.simulate_call_trace(
-        args.contract_address, args.from_addr, calldata, block, args.tx_index, args.value
+        args.contract_address, args.from_addr, calldata, block, args.tx_index, token_value if args.value else 0
     )
     
     # Analyze function calls with the loaded debug info
@@ -829,7 +914,7 @@ def simulate_command(args):
         tracer.print_function_trace(trace, function_calls)
     return 0
 
-def interactive_mode(args,tracer):
+def interactive_mode(args,tracer,value=0):
     """Execute the debug command."""
     contract_address = None
     ethdebug_dir = None
@@ -982,7 +1067,8 @@ def interactive_mode(args,tracer):
         from_addr=args.from_addr,
         block=args.block,
         tracer=tracer,
-        contract_name=contract_name
+        contract_name=contract_name,
+        value=value
     )
 
     # Baseline snapshot (unless disabled)
@@ -1076,7 +1162,11 @@ def list_events_command(args):
     try:
         receipt = tracer.w3.eth.get_transaction_receipt(args.tx_hash)
     except Exception as e:
-        print(f"{error(e)}")
+        if getattr(args, 'json_events', False):
+            json_output = format_error_json(str(e), "TransactionReceiptError")
+            print(json.dumps(json_output, indent=2))
+        else:
+            print(f"{error(e)}")
         return 1
     
     # Decode and print events
@@ -1136,7 +1226,7 @@ def main():
     simulate_parser.add_argument('function_args', nargs='*', help='Arguments for the function')
     simulate_parser.add_argument('--block', type=int, default=None, help='Block number or tag (default: latest)')
     simulate_parser.add_argument('--tx-index', type=int, default=None, help='Transaction index in block (optional)')
-    simulate_parser.add_argument('--value', type=int, default=0, help='ETH value to send (in wei)')
+    simulate_parser.add_argument('--value', default=0, help='ETH value to send (in wei)')
     simulate_parser.add_argument('--ethdebug-dir', '-e', action='append', help='ETHDebug directory containing ethdebug.json and contract debug files. Can be specified multiple times for multi-contract debugging. Format: address:name:path')
     simulate_parser.add_argument('--contracts', '-c', help='JSON file mapping contract addresses to debug directories')
     simulate_parser.add_argument('--multi-contract', action='store_true', help='Enable multi-contract debugging mode')

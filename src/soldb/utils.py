@@ -1,11 +1,33 @@
-    
-
 from .transaction_tracer import TransactionTrace, TransactionTracer
 from typing import Dict, Any, List
 from eth_abi.abi import decode
 from .colors import *
 import requests
 import json
+
+
+def format_error_json(message: str, error_type: str, **extra_fields) -> dict:
+    """
+    Format a uniform error JSON structure for all soldb errors.
+    
+    Args:
+        message: The main error message
+        error_type: Type of error (e.g., "InsufficientFunds", "ConnectionError")
+        **extra_fields: Additional fields to include in the error object
+    
+    Returns:
+        dict: Uniform error JSON structure with soldbFailed and error fields
+    """
+    error_obj = {
+        "message": message,
+        "type": error_type
+    }
+    error_obj.update(extra_fields)
+    
+    return {
+        "soldbFailed": message,
+        "error": error_obj
+    }
 
 
 def print_contracts_in_transaction(tracer: TransactionTracer,trace: TransactionTrace):
