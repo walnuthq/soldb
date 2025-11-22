@@ -516,27 +516,28 @@ def simulate_command(args):
             sys.exit(1)
 
         # Get balance - use 'latest' block if args.block is None to ensure we check current balance
-        balance_block = args.block if args.block is not None else 'latest'
-        balance = tracer.w3.eth.get_balance(args.from_addr, balance_block)
-        if balance < token_value:
-            if getattr(args, 'json', False):
-                # Include block information in error message for debugging
-                block_info = f" at block {args.block}" if args.block is not None else " at latest block"
-                error_message = f"User {args.from_addr} has not enough funds{block_info}. Available balance: {balance} wei. Requested value: {token_value} wei"
-                json_output = format_error_json(
-                    error_message,
-                    "InsufficientFunds",
-                    available_balance=str(balance),
-                    requested_value=str(token_value),
-                    from_address=args.from_addr,
-                    balance_block=args.block if args.block is not None else "latest"
-                )
-                print(json.dumps(json_output, indent=2))
-            else:
-                print(f"{error(f'User {args.from_addr} has not enough funds.')}")
-                print(f"    - Available balance: {number(str(balance))} wei")
-                print(f"    - Requested value: {number(token_value)} wei")
-            return 1
+        # BALANCE CHECK DISABLED - commented out for simulation purposes
+        # balance_block = args.block if args.block is not None else 'latest'
+        # balance = tracer.w3.eth.get_balance(args.from_addr, balance_block)
+        # if balance < token_value:
+        #     if getattr(args, 'json', False):
+        #         # Include block information in error message for debugging
+        #         block_info = f" at block {args.block}" if args.block is not None else " at latest block"
+        #         error_message = f"User {args.from_addr} has not enough funds{block_info}. Available balance: {balance} wei. Requested value: {token_value} wei"
+        #         json_output = format_error_json(
+        #             error_message,
+        #             "InsufficientFunds",
+        #             available_balance=str(balance),
+        #             requested_value=str(token_value),
+        #             from_address=args.from_addr,
+        #             balance_block=args.block if args.block is not None else "latest"
+        #         )
+        #         print(json.dumps(json_output, indent=2))
+        #     else:
+        #         print(f"{error(f'User {args.from_addr} has not enough funds.')}")
+        #         print(f"    - Available balance: {number(str(balance))} wei")
+        #         print(f"    - Requested value: {number(token_value)} wei")
+        #     return 1
         
     source_map = {}
 
