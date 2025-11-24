@@ -612,7 +612,8 @@ class TransactionTracer:
         try:
             trace_config = {"disableStorage": False, "disableMemory": False, "enableMemory": True}
             if tx_index is not None:
-                trace_config["txIndex"] = tx_index
+                # Convert txIndex to hex string as required by RPC endpoint
+                trace_config["txIndex"] = hex(tx_index)
             # Block param
             if block is None:
                 block_param = 'latest'
