@@ -124,4 +124,6 @@ else:
         config.substitutions.append(('FileCheck', 'FileCheck'))
 
 # Environment variables
-config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
+# Don't set PYTHONPATH to avoid conflicts between different Python versions
+# The venv should handle the Python path correctly
+# config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
