@@ -601,11 +601,84 @@ class TransactionTracer:
         else:
             value_hex = to_hex(0)
         
-        call_obj = {
+        # Determine block number for gas price calculation
+        if block is None:
+            block_param = 'latest'
+            block_number = 'latest'
+        else:
+            block_param = hex(block)
+            block_number = block
+        
+        # Get block info to determine appropriate gas parameters
+        try:
+            block_info = self.w3.eth.get_block(block_number)
+            base_fee = block_info.get('baseFeePerGas', 0)
+        except Exception:
+            base_fee = 0
+        
+        # Simple gas parameter calculation
+        if base_fee > 0:
+            # EIP-1559: maxFeePerGas must be >= baseFeePerGas
+            max_fee_per_gas = base_fee * 2  # 2x base fee for safety
+            # Ensure maxPriorityFeePerGas < maxFeePerGas
+            # Use 10% of max_fee_per_gas or 1 gwei, whichever is smaller
+            max_priority_fee = min(self.w3.to_wei(2, 'gwei'), max_fee_per_gas // 10)
+            # Ensure at least 1 gwei difference
+            if max_priority_fee >= max_fee_per_gas:
+                max_priority_fee = max(1, max_fee_per_gas - self.w3.to_wei(1, 'gwei'))
+        else:
+            # Non-EIP-1559 or no base fee: use gasPrice
+            try:
+                gas_price = self.w3.eth.gas_price
+                max_fee_per_gas = gas_price * 2
+                max_priority_fee = min(self.w3.to_wei(2, 'gwei'), max_fee_per_gas // 10)
+                if max_priority_fee >= max_fee_per_gas:
+                    max_priority_fee = max(1, max_fee_per_gas - self.w3.to_wei(1, 'gwei'))
+            except Exception:
+                # Fallback defaults
+                max_priority_fee = self.w3.to_wei(2, 'gwei')
+                max_fee_per_gas = self.w3.to_wei(100, 'gwei')
+        
+        # Final safety check: ensure values are positive and maxPriorityFeePerGas < maxFeePerGas
+        if max_priority_fee <= 0:
+            max_priority_fee = 1  # Minimum 1 wei
+        if max_fee_per_gas <= max_priority_fee:
+            max_fee_per_gas = max_priority_fee + self.w3.to_wei(1, 'gwei')
+        
+        # Estimate gas limit for the call to avoid "insufficient funds" errors
+        # Prepare a minimal call object for gas estimation (without gas params)
+        estimate_call_obj = {
             'to': to,
             'from': from_,
             'data': "0x" + calldata if not calldata.startswith("0x") else calldata,
             'value': value_hex
+        }
+        
+        try:
+            # Try to estimate gas first
+            estimated_gas = self.w3.eth.estimate_gas(estimate_call_obj, block_number)
+            # Add 20% buffer for safety
+            gas_limit = int(estimated_gas * 1.2)
+            # Cap at reasonable maximum (5M gas) to avoid excessive costs
+            gas_limit = min(gas_limit, 5000000)
+        except Exception as e:
+            # If estimation fails, use a reasonable default based on call type
+            # Simple calls: ~21k, contract calls: ~100k-500k
+            if calldata and calldata != "0x" and len(calldata) > 2:
+                # Contract call - use 500k as safe default
+                gas_limit = 500000
+            else:
+                # Simple transfer - use 21k
+                gas_limit = 21000
+        
+        call_obj = {
+            'to': to,
+            'from': from_,
+            'data': "0x" + calldata if not calldata.startswith("0x") else calldata,
+            'value': value_hex,
+            'gas': to_hex(gas_limit),
+            'maxFeePerGas': to_hex(max_fee_per_gas),
+            'maxPriorityFeePerGas': to_hex(max_priority_fee)
         }
        
         # Call debug_traceCall
@@ -614,11 +687,6 @@ class TransactionTracer:
             if tx_index is not None:
                 # Convert txIndex to hex string as required by RPC endpoint
                 trace_config["txIndex"] = hex(tx_index)
-            # Block param
-            if block is None:
-                block_param = 'latest'
-            else:
-                block_param = hex(block)
 
             trace_result = self.w3.manager.request_blocking(
                 "debug_traceCall",
