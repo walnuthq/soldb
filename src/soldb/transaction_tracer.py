@@ -522,7 +522,14 @@ class TransactionTracer:
         try:
             trace_result = self.w3.manager.request_blocking(
                 "debug_traceTransaction",
-                [tx_hash, {"disableStorage": False, "disableMemory": False, "enableMemory": True}]
+                [tx_hash, {
+                    "tracerConfig": {
+                        "disableStorage": False,
+                        "disableMemory": False,
+                        "enableMemory": True
+                    },
+                    "timeout": "5m"
+                }]
             )
         except Exception as e:
             debug_trace_available = False
@@ -683,7 +690,7 @@ class TransactionTracer:
        
         # Call debug_traceCall
         try:
-            trace_config = {"disableStorage": False, "disableMemory": False, "enableMemory": True}
+            trace_config = {"tracer": "callTracer", "tracerConfig": {"disableStorage": False, "disableMemory": False, "enableMemory": True, "timeout": "5m"}}
             if tx_index is not None:
                 # Convert txIndex to hex string as required by RPC endpoint
                 trace_config["txIndex"] = hex(tx_index)
