@@ -690,7 +690,7 @@ class TransactionTracer:
        
         # Call debug_traceCall
         try:
-            trace_config = {"tracer": "callTracer", "tracerConfig": {"disableStorage": False, "disableMemory": False, "enableMemory": True, "timeout": "5m"}}
+            trace_config = {"tracerConfig": {"disableStorage": False, "disableMemory": False, "enableMemory": True}, "timeout": "5m"}
             if tx_index is not None:
                 # Convert txIndex to hex string as required by RPC endpoint
                 trace_config["txIndex"] = hex(tx_index)
