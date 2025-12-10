@@ -107,27 +107,14 @@ class TransactionTracer:
     Traces and replays Ethereum transactions for debugging.
     """
     
-    def __init__(self, rpc_url: str = "http://localhost:8545", quiet_mode: bool = False):
+    def __init__(self, rpc_url: str = "http://localhost:8545", quiet_mode: bool = False, timeout: int = 30):
         self.rpc_url = rpc_url
-        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+        self.w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": timeout}))
         
         try:
-            if not self.w3.is_connected():
-                if rpc_url == "http://localhost:8545":
-                    raise ConnectionError(
-                        f"{error('Failed to connect to')} {error(rpc_url)}\n"
-                        f"{'This is the default Anvil RPC URL. Make sure Anvil is running:'}\n"
-                        f"{bullet_point('anvil')}"
-                    )
-                else:
-                    raise ConnectionError(
-                        f"{error('Failed to connect to')} {error(rpc_url)}\n"
-                        f"{error('Please check if the RPC endpoint is running and accessible')}"
-                    )
+            # Use a direct RPC call instead of is_connected() for more reliable connection check
+            self.w3.eth.block_number
         except Exception as e:
-            if isinstance(e, ConnectionError):
-                raise
-            # Handle other connection errors 
             if rpc_url == "http://localhost:8545":
                 raise ConnectionError(
                     f"{error('Failed to connect to')} {error(rpc_url)}\n"
@@ -137,7 +124,8 @@ class TransactionTracer:
             else:
                 raise ConnectionError(
                     f"{error('Failed to connect to')} {error(rpc_url)}\n"
-                    f"{'Please check if the RPC endpoint is running and accessible'}"
+                    f"{error('Please check if the RPC endpoint is running and accessible')}\n"
+                    f"{error(f'Error: {e}')}"
                 )
         
         self.quiet_mode = quiet_mode
@@ -496,12 +484,10 @@ class TransactionTracer:
         if isinstance(tx_hash, str) and not tx_hash.startswith('0x'):
             tx_hash = '0x' + tx_hash
         
-        # Get transaction receipt - web3.py accepts hex strings
+        # Get transaction first (more reliable), then receipt
         try:
-            receipt = self.w3.eth.get_transaction_receipt(tx_hash)
             tx = self.w3.eth.get_transaction(tx_hash)
         except Exception as e:
-            # Handle transaction not found errors with clearer messages
             if "not found" in str(e).lower() or "transaction" in str(e).lower():
                 raise ValueError(
                     f"{error('Transaction not found:')} {error(tx_hash)}\n"
@@ -515,6 +501,28 @@ class TransactionTracer:
                     f"{error('Failed to fetch transaction')} {error(tx_hash)}: {error(str(e))}\n"
                     f"{'Connected to RPC:'} {self.rpc_url}"
                 )
+        
+        # Now try to get receipt
+        try:
+            receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+            # Some RPC nodes return None instead of raising an exception
+            if receipt is None:
+                raise ValueError(
+                    f"{error('Transaction found but receipt not available:')} {error(tx_hash)}\n"
+                    f"{'This may be an RPC node inconsistency. The transaction exists but the receipt is missing.'}\n"
+                    f"{'Connected to RPC:'} {self.rpc_url}"
+                )
+        except ValueError:
+            raise  # Re-raise our custom ValueError
+        except Exception as e:
+            # Transaction exists but receipt not available - RPC inconsistency
+            raise ValueError(
+                f"{error('Transaction found but receipt not available:')} {error(tx_hash)}\n"
+                f"{'This may be an RPC node inconsistency. The transaction exists but the receipt is missing.'}\n"
+                f"{'Error:'} {str(e)}\n"
+                f"{'Try a different RPC endpoint or wait for the node to sync.'}\n"
+                f"{'Connected to RPC:'} {self.rpc_url}"
+            )
         
         # Use debug_traceTransaction if available
         debug_trace_available = True
