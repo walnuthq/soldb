@@ -601,6 +601,10 @@ class TransactionTracer:
     def simulate_call_trace(self, to, from_, calldata, block, tx_index=None, value = 0):
         """Simulate a transaction execution."""
 
+        # Normalize addresses to checksum format for consistent handling
+        to = to_checksum_address(to)
+        from_ = to_checksum_address(from_)
+
         # Prepare call object
         # Convert value to hex string 
         if isinstance(value, (int, float)):

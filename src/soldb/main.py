@@ -21,6 +21,7 @@ from .colors import error, info, warning, number
 from .auto_deploy import AutoDeployDebugger
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from eth_utils.address import is_address
+from eth_utils import to_checksum_address
 from .utils import print_contracts_in_transaction, print_contracts_events, format_error_json
 
 
@@ -471,6 +472,12 @@ def list_contracts_command(args):
 def simulate_command(args):
     """Execute the simulate command."""
 
+    # Normalize addresses to checksum format for consistent handling
+    if args.from_addr:
+        args.from_addr = to_checksum_address(args.from_addr)
+    if args.contract_address:
+        args.contract_address = to_checksum_address(args.contract_address)
+
     # If --raw-data is provided, do not provide function_signature or function_args
     if getattr(args, 'raw_data', None):
         if getattr(args, 'function_signature', None) or (hasattr(args, 'function_args') and args.function_args):
@@ -647,6 +654,9 @@ def simulate_command(args):
                 sys.exit(1)
             spec = specs[0]
             address, name, ethdebug_dir = spec.address, spec.name, spec.path
+            # Normalize address from spec to checksum format
+            if address:
+                address = to_checksum_address(address)
         except ValueError as e:
             print(error(f"Error: {e}"))
             sys.exit(1)
