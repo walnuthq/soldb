@@ -506,3 +506,30 @@ def serialize_events_to_json(tracer, receipt) -> Dict[str, Any]:
     
     # Convert all HexBytes and non-serializable objects to strings
     return _convert_hexbytes_to_string(result)
+
+def format_exception_message(e: Exception) -> str:
+    """
+    Extract a clean, user-friendly error message from any exception.
+    Works uniformly for all exception types.
+    
+    Args:
+        e: Exception instance
+        
+    Returns:
+        Clean error message string
+    """
+    # Web3RPCError and similar have args[0] as dict
+    if hasattr(e, 'args') and e.args:
+        first_arg = e.args[0]
+        
+        if isinstance(first_arg, dict):
+            # RPC error format: {'code': -32003, 'message': '...'}
+            return first_arg.get('message', str(e))
+        elif isinstance(first_arg, str):
+            return first_arg
+        else:
+            # Multiple args - use first meaningful one
+            return str(first_arg)
+    
+    # Standard exception string representation
+    return str(e)

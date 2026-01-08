@@ -14,6 +14,7 @@ from .dwarf_parser import load_dwarf_info, DwarfParser
 from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
 from .colors import *
 from web3 import Web3
+from .helpers import format_exception_message
 
 class EVMDebugger(cmd.Cmd):
     """Interactive EVM debugger REPL."""
@@ -306,9 +307,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
 
             self.init = True
         except Exception as e:
-            print(f"{error('Error in simulation:')} {e}")
-            import traceback
-            print(f"{dim('Details:')} {traceback.format_exc()}")
+            error_message = format_exception_message(e)
+            print(f"\n{error('Simulation failed:')} {error_message}")
 
     def _encode_function_call(self, function_name: str, args: list) -> Optional[str]:
         """Encode a function call into calldata."""

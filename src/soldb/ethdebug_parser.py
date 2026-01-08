@@ -131,7 +131,12 @@ class ETHDebugParser:
         # Load compilation info
         compilation_file = debug_dir / "ethdebug.json"
         if not compilation_file.exists():
-            raise FileNotFoundError(f"ethdebug.json not found in {debug_dir}")
+            # Try to get compiler version from alternative sources before raising error
+            compiler_info = self._get_compiler_info(str(debug_dir))
+            error_msg = f"ethdebug.json not found in {debug_dir}"
+            if compiler_info:
+                error_msg += f" (compiler: {compiler_info})"
+            raise FileNotFoundError(error_msg)
         
         with open(compilation_file) as f:
             compilation_data = json.load(f)
@@ -176,7 +181,12 @@ class ETHDebugParser:
                 debug_file = create_file
                 environment = 'create'
             else:
-                raise FileNotFoundError(f"No ethdebug file found for contract {contract_name_from_source} in {debug_dir}")
+                # Try to get compiler version before raising error
+                compiler_info = self._get_compiler_info(str(debug_dir))
+                error_msg = f"No ethdebug file found for contract {contract_name_from_source} in {debug_dir}"
+                if compiler_info:
+                    error_msg += f" (compiler: {compiler_info})"
+                raise FileNotFoundError(error_msg)
         else:
             ethdebug_files = list(debug_dir.glob("*_ethdebug.json"))
             runtime_files = list(debug_dir.glob("*_ethdebug-runtime.json"))
@@ -194,7 +204,12 @@ class ETHDebugParser:
                     debug_file = create_file
                     environment = 'create'
                 else:
-                    raise FileNotFoundError(f"No ethdebug file found for contract {contract_name_guess} in {debug_dir} (tried {runtime_file.name} i {create_file.name})")
+                    # Try to get compiler version before raising error
+                    compiler_info = self._get_compiler_info(str(debug_dir))
+                    error_msg = f"No ethdebug file found for contract {contract_name_guess} in {debug_dir} (tried {runtime_file.name} i {create_file.name})"
+                    if compiler_info:
+                        error_msg += f" (compiler: {compiler_info})"
+                    raise FileNotFoundError(error_msg)
             
 
         # Extract contract name from filename (for info only)
@@ -231,6 +246,50 @@ class ETHDebugParser:
         
         return self.debug_info
     
+    @staticmethod
+    def _get_compiler_info(path: str) -> Optional[str]:
+        """
+        Try to extract compiler version from ethdebug.json or combined.json.
+        """
+        path_obj = Path(path)
+        
+        # Try ethdebug.json first (for solc 0.8.29+)
+        ethdebug_file = path_obj / "ethdebug.json"
+        if ethdebug_file.exists():
+            try:
+                with open(ethdebug_file, 'r') as f:
+                    data = json.load(f)
+                    compiler = data.get("compilation", {}).get("compiler", {})
+                    version = compiler.get("version")
+                    if version:
+                        return f"solc {version}"
+            except (json.JSONDecodeError, KeyError, IOError):
+                pass
+        
+        # Try combined.json (for older solc versions with srcmap)
+        combined_file = path_obj / "combined.json"
+        if combined_file.exists():
+            try:
+                with open(combined_file, 'r') as f:
+                    data = json.load(f)
+                    # combined.json has contracts with metadata strings
+                    contracts = data.get("contracts", {})
+                    for contract_key, contract_data in contracts.items():
+                        metadata_str = contract_data.get("metadata")
+                        if metadata_str:
+                            try:
+                                metadata = json.loads(metadata_str)
+                                compiler = metadata.get("compiler", {})
+                                version = compiler.get("version")
+                                if version:
+                                    return f"solc {version}"
+                            except (json.JSONDecodeError, KeyError):
+                                continue
+            except (json.JSONDecodeError, KeyError, IOError):
+                pass
+        
+        return None
+
     def _parse_variable_locations(self, contract_data: Dict[str, Any]) -> Dict[int, List[VariableLocation]]:
         """Parse variable location information from ETHDebug data."""
         variable_locations = {}
