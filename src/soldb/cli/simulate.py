@@ -183,9 +183,16 @@ def _load_multi_contract_debug_info(tracer, args, ethdebug_dirs, json_mode) -> d
     primary_contract = multi_parser.get_contract_at_address(args.contract_address)
     if primary_contract:
         tracer.ethdebug_parser = primary_contract.parser
-        tracer.ethdebug_parser.debug_dir = str(primary_contract.debug_dir)
+        tracer.srcmap_parser = primary_contract.srcmap_parser
+        if primary_contract.parser:
+            tracer.ethdebug_parser.debug_dir = str(primary_contract.debug_dir)
         tracer.ethdebug_info = primary_contract.ethdebug_info
-        source_map = primary_contract.parser.get_source_mapping()
+        tracer.srcmap_info = primary_contract.srcmap_info
+        
+        # Get source mapping from active parser
+        active_parser = primary_contract.get_parser()
+        if active_parser:
+            source_map = active_parser.get_source_mapping()
         
         # Load ABI for primary contract
         abi_path = primary_contract.debug_dir / f"{primary_contract.name}.abi"
@@ -262,14 +269,14 @@ def _load_single_contract_debug_info(tracer, args, ethdebug_dirs, json_mode) -> 
         
         # Still load the ETHDebug info
         if not args.interactive:
-            tracer.load_ethdebug_info(ethdebug_dir, name)
+            tracer.load_ethdebug_info_auto(ethdebug_dir, name)
             _load_abi_for_contract(tracer, ethdebug_dir)
         _try_load_abi_from_common_locations(tracer, args.contract_address)
     else:
         # Address matches - load debug info
         if not args.interactive:
             try:
-                source_map = tracer.load_ethdebug_info(ethdebug_dir, name)
+                source_map = tracer.load_ethdebug_info_auto(ethdebug_dir, name)
             except FileNotFoundError as e:
                 error_msg = str(e)
                 # Try to extract compiler version from the error message or debug directory
@@ -282,14 +289,19 @@ def _load_single_contract_debug_info(tracer, args, ethdebug_dirs, json_mode) -> 
                     pass
                 print(error(error_msg))
                 sys.exit(1)
-            contract_name = tracer.ethdebug_info.contract_name if tracer.ethdebug_info else None
+            if tracer.ethdebug_info:
+                contract_name = tracer.ethdebug_info.contract_name
+            elif tracer.srcmap_info:
+                contract_name = tracer.srcmap_info.contract_name
+            else:
+                contract_name = None
             abi_path = ETHDebugDirParser.find_abi_file(spec, contract_name)
             if abi_path:
                 tracer.load_abi(abi_path)
     
     # Create multi-contract parser
     multi_parser = MultiContractETHDebugParser()
-    if tracer.ethdebug_info:
+    if tracer.ethdebug_info or tracer.srcmap_info:
         try:
             multi_parser.load_contract(address, ethdebug_dir, name)
         except FileNotFoundError:
@@ -302,8 +314,14 @@ def _load_single_contract_debug_info(tracer, args, ethdebug_dirs, json_mode) -> 
 
 def _load_abi_for_contract(tracer, ethdebug_dir):
     """Load ABI for a contract from its debug directory."""
+    contract_name = None
     if tracer.ethdebug_info:
-        abi_path = os.path.join(ethdebug_dir, f"{tracer.ethdebug_info.contract_name}.abi")
+        contract_name = tracer.ethdebug_info.contract_name
+    elif tracer.srcmap_info:
+        contract_name = tracer.srcmap_info.contract_name
+    
+    if contract_name:
+        abi_path = os.path.join(ethdebug_dir, f"{contract_name}.abi")
         if os.path.exists(abi_path):
             tracer.load_abi(abi_path)
     else:

@@ -23,17 +23,28 @@ class ContractDebugInfo:
     address: str
     name: str
     debug_dir: Path
-    ethdebug_info: ETHDebugInfo
-    parser: ETHDebugParser
+    ethdebug_info: Optional[ETHDebugInfo] = None
+    parser: Optional[ETHDebugParser] = None
+    srcmap_info: Optional[Any] = None  # SourceMapInfo
+    srcmap_parser: Optional[Any] = None  # SourceMapParser
 
+    @property
+    def has_debug_info(self) -> bool:
+        """Check if contract has any debug info loaded."""
+        return self.ethdebug_info is not None or self.srcmap_info is not None
+    
+    def get_parser(self):
+        """Get the active parser (ethdebug or srcmap)."""
+        return self.parser or self.srcmap_parser
 
 @dataclass
 class ExecutionContext:
     """Represents the current execution context during cross-contract calls."""
     address: str
-    debug_info: ETHDebugInfo
-    pc_offset: int = 0  # For DELEGATECALL scenarios
-    call_type: str = "CALL"  # CALL, DELEGATECALL, STATICCALL, etc.
+    debug_info: Optional[ETHDebugInfo] = None  # For ETHDebug
+    srcmap_info: Optional[Any] = None  # For srcmap-runtime
+    pc_offset: int = 0
+    call_type: str = "CALL"
     
     def __repr__(self):
         return f"ExecutionContext(address={self.address[:10]}..., call_type={self.call_type})"
@@ -56,7 +67,8 @@ class MultiContractETHDebugParser:
     def load_contract(self, address: str, debug_dir: Union[str, Path], 
                      contract_name: Optional[str] = None) -> ContractDebugInfo:
         """
-        Load ETHDebug information for a specific contract.
+        Load debug information for a specific contract.
+        Automatically detects ETHDebug (solc >= 0.8.29) or srcmap-runtime (legacy).
         
         Args:
             address: The contract address (with or without 0x prefix)
@@ -75,17 +87,37 @@ class MultiContractETHDebugParser:
         if not debug_dir.exists():
             raise FileNotFoundError(f"Debug directory not found: {debug_dir}")
         
-        # Create a parser for this contract
-        parser = ETHDebugParser()
-        parser.source_cache = self.source_cache  # Share source cache
-        parser.debug_dir = str(debug_dir)  # Set debug_dir for source loading
+        # Try ETHDebug first (solc >= 0.8.29)
+        ethdebug_file = debug_dir / "ethdebug.json"
+        combined_file = debug_dir / "combined.json"
         
-        # Load ETHDebug info
-        ethdebug_info = parser.load_ethdebug_files(debug_dir, contract_name)
-
-        # Use provided name or extract from ETHDebug info
-        if not contract_name:
-            contract_name = ethdebug_info.contract_name
+        ethdebug_info = None
+        parser = None
+        srcmap_info = None
+        srcmap_parser = None
+        
+        if ethdebug_file.exists():
+            # Load ETHDebug
+            parser = ETHDebugParser()
+            parser.source_cache = self.source_cache
+            parser.debug_dir = str(debug_dir)
+            ethdebug_info = parser.load_ethdebug_files(debug_dir, contract_name)
+            if not contract_name:
+                contract_name = ethdebug_info.contract_name
+        elif combined_file.exists():
+            # Fallback to srcmap-runtime (legacy solc < 0.8.29)
+            from .srcmap_parser import SourceMapParser
+            srcmap_parser = SourceMapParser()
+            srcmap_info = srcmap_parser.load_combined_json(debug_dir, contract_name)
+            if not contract_name:
+                contract_name = srcmap_info.contract_name
+        else:
+            # Neither found
+            compiler_info = ETHDebugParser._get_compiler_info(str(debug_dir))
+            error_msg = f"No debug info found in {debug_dir}. Expected ethdebug.json (solc >= 0.8.29) or combined.json (legacy solc)."
+            if compiler_info:
+                error_msg += f" (detected compiler: {compiler_info})"
+            raise FileNotFoundError(error_msg)
         
         # Create contract debug info
         contract_info = ContractDebugInfo(
@@ -93,7 +125,9 @@ class MultiContractETHDebugParser:
             name=contract_name,
             debug_dir=debug_dir,
             ethdebug_info=ethdebug_info,
-            parser=parser
+            parser=parser,
+            srcmap_info=srcmap_info,
+            srcmap_parser=srcmap_parser
         )
         
         # Register the contract
@@ -229,6 +263,7 @@ class MultiContractETHDebugParser:
             context = ExecutionContext(
                 address=address,
                 debug_info=contract_info.ethdebug_info,
+                srcmap_info=contract_info.srcmap_info,
                 pc_offset=pc_offset,
                 call_type=call_type
             )
@@ -261,8 +296,11 @@ class MultiContractETHDebugParser:
         if not contract_info:
             return None
         
-        # Get source context from the contract's parser
-        return contract_info.parser.get_source_context(pc)
+        # Get source context from the contract's parser (ethdebug or srcmap)
+        active_parser = contract_info.get_parser()
+        if active_parser:
+            return active_parser.get_source_context(pc)
+        return None
     
     def format_call_stack(self) -> str:
         """Format the current call stack for display."""

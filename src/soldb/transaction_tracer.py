@@ -17,6 +17,7 @@ from eth_abi.abi import encode as abi_encode
 from .colors import *
 from .ethdebug_parser import ETHDebugParser, ETHDebugInfo
 from .multi_contract_ethdebug_parser import MultiContractETHDebugParser, ExecutionContext
+from .srcmap_parser import SourceMapParser, SourceMapInfo
 import re
 import requests
 
@@ -134,6 +135,8 @@ class TransactionTracer:
         self.contracts = {}
         self.ethdebug_parser = ETHDebugParser()
         self.ethdebug_info: Optional[ETHDebugInfo] = None
+        self.srcmap_parser: Optional[SourceMapParser] = None
+        self.srcmap_info: Optional[SourceMapInfo] = None
         self.multi_contract_parser: Optional[MultiContractETHDebugParser] = None
         self.function_signatures = {}  # selector -> function name
         self.function_abis = {}  # selector -> full ABI item
@@ -304,19 +307,81 @@ class TransactionTracer:
             self._log(warning(f"Warning: Failed to load ethdebug info: {e}"))
             return {}
     
+    def load_srcmap_info(self, debug_dir: str, contract_name: Optional[str] = None) -> Dict[int, Tuple[str, int]]:
+        """Load srcmap-runtime from combined.json for legacy Solidity compilers (<0.8.29)."""
+        try:
+            self.srcmap_parser = SourceMapParser()
+            self.srcmap_info = self.srcmap_parser.load_combined_json(debug_dir, contract_name)
+            pc_to_source = {}
+            
+            # Convert srcmap info to simple PC to source mapping
+            for pc, instr_idx in self.srcmap_info.pc_to_instruction_index.items():
+                source_info = self.srcmap_info.get_source_info(pc)
+                if source_info:
+                    source_path, offset, length = source_info
+                    line, col = self.srcmap_parser.offset_to_line_col(source_path, offset)
+                    pc_to_source[pc] = (0, line)  # Use 0 as file_id for compatibility
+            
+            self._log(f"Loaded {success(str(len(pc_to_source)))} PC mappings from srcmap-runtime")
+            self._log(f"Contract: {info(self.srcmap_info.contract_name)}")
+            if self.srcmap_info.compiler_version:
+                self._log(f"Compiler: {info('solc ' + self.srcmap_info.compiler_version)}")
+            return pc_to_source
+            
+        except Exception as e:
+            self._log(warning(f"Warning: Failed to load srcmap info: {e}"))
+            return {}
+    
+    def load_debug_info_auto(self, debug_dir: str, contract_name: Optional[str] = None) -> Dict[int, Tuple[str, int]]:
+        """
+        Automatically load debug info from directory.
+        
+        First tries ETHDebug (solc >= 0.8.29), then falls back to srcmap-runtime (legacy).
+        
+        Args:
+            debug_dir: Directory containing ethdebug.json or combined.json
+            contract_name: Optional contract name to filter by
+            
+        Returns:
+            PC to source mapping dictionary
+        """
+        from pathlib import Path
+        debug_path = Path(debug_dir)
+        
+        # Try ETHDebug first (for solc >= 0.8.29)
+        ethdebug_file = debug_path / "ethdebug.json"
+        if ethdebug_file.exists():
+            return self.load_ethdebug_info(debug_dir, contract_name)
+        
+        # Fallback to srcmap-runtime (for legacy solc < 0.8.29)
+        combined_file = debug_path / "combined.json"
+        if combined_file.exists():
+            return self.load_srcmap_info(debug_dir, contract_name)
+        
+        # Neither found - raise error with compiler hint
+        compiler_info = ETHDebugParser._get_compiler_info(debug_dir)
+        error_msg = f"No debug info found in {debug_dir}. Expected ethdebug.json (solc >= 0.8.29) or combined.json (legacy solc)."
+        if compiler_info:
+            error_msg += f" (detected compiler: {compiler_info})"
+        raise FileNotFoundError(error_msg)
+    
     def get_source_context_for_step(self, step: TraceStep, address: Optional[str] = None, context_lines: int = 2) -> Optional[Dict[str, Any]]:
         """Get source context for a step, handling multi-contract scenarios."""
         if self.multi_contract_parser:
             # Multi-contract mode: try to get context from specific contract
             if address:
-                return self.multi_contract_parser.get_source_info_for_address(address, step.pc)
+                result = self.multi_contract_parser.get_source_info_for_address(address, step.pc)
+                return result
             else:
                 # Try to detect which contract is executing
                 # This is a fallback when address is not provided
                 return None
         elif self.ethdebug_parser and self.ethdebug_info:
-            # Single contract mode
+            # Single contract mode with ETHDebug (solc >= 0.8.29)
             return self.ethdebug_parser.get_source_context(step.pc, context_lines)
+        elif self.srcmap_parser and self.srcmap_info:
+            # Single contract mode with srcmap-runtime (legacy solc < 0.8.29)
+            return self.srcmap_parser.get_source_context(step.pc, context_lines)
         return None
     
     def get_current_contract_address(self, trace: TransactionTrace, step_index: int) -> str:
@@ -692,6 +757,7 @@ class TransactionTracer:
             'maxFeePerGas': to_hex(max_fee_per_gas),
             'maxPriorityFeePerGas': to_hex(max_priority_fee)
         }
+        
        
         # Call debug_traceCall
         try:
@@ -710,7 +776,8 @@ class TransactionTracer:
 
         # Parse trace steps (reuse logic from trace_transaction)
         steps = []
-        for i, step in enumerate(trace_result.get('structLogs', [])):
+        struct_logs = trace_result.get('structLogs', [])
+        for i, step in enumerate(struct_logs):
             trace_step = TraceStep(
                 pc=step['pc'],
                 op=step['op'],
@@ -1525,6 +1592,7 @@ class TransactionTracer:
         revert_already_marked = False  # Track if we've already marked a revert frame
         # Use instance variable to track missing mappings warning
         
+        
         # Track parent-child relationships properly
         active_parents = []  # Stack of active parent call IDs
 
@@ -2037,6 +2105,7 @@ class TransactionTracer:
         """Detect internal function calls using proper execution context."""
         # Get source context
         context = self.get_source_context_for_step(step, current_contract)
+        
         
         # NOTE: Some functions may have missing source mappings in the ETHDebug metadata
         # This is a known issue with Solidity compiler optimization where certain function
