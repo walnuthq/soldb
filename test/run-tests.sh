@@ -86,6 +86,55 @@ CHAIN_ID="${CHAIN_ID:-1}"
 PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 SOLC_PATH="${SOLC_PATH:-solc}"
 
+# Function to check and ensure solc version is 0.8.31+ for ETHDebug tests
+ensure_ethdebug_solc() {
+    local solc_bin="$1"
+    
+    # Check if solc-select is available
+    if command -v solc-select &> /dev/null; then
+        # Try to use solc 0.8.31 if available
+        # Note: solc-select versions (not list) shows installed versions
+        if solc-select versions 2>/dev/null | grep -q "0.8.31"; then
+            # Try to switch to 0.8.31 (may fail due to permissions, but that's OK)
+            solc-select use 0.8.31 >/dev/null 2>&1 || true
+            # Verify the switch worked
+            if command -v solc >/dev/null 2>&1; then
+                local version=$(solc --version 2>/dev/null | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2 || echo "")
+                if [ "$version" = "0.8.31" ]; then
+                    SOLC_PATH="solc"
+                    echo -e "${GREEN}Using solc 0.8.31 (ETHDebug) via solc-select${NC}"
+                    return 0
+                fi
+            fi
+            # If switch failed due to permissions, try direct path
+            local direct_solc="${HOME}/.solc-select/artifacts/solc-0.8.31"
+            if [ -f "$direct_solc" ] && [ -x "$direct_solc" ]; then
+                SOLC_PATH="$direct_solc"
+                echo -e "${GREEN}Using solc 0.8.31 (ETHDebug) from direct path${NC}"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Check current solc version
+    if command -v "$solc_bin" &> /dev/null; then
+        local version=$("$solc_bin" --version 2>/dev/null | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2 || echo "")
+        if [ -n "$version" ]; then
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$version"
+            if [ "$MAJOR" -eq 0 ] && [ "$MINOR" -eq 8 ] && [ "$PATCH" -ge 29 ]; then
+                echo -e "${GREEN}Using solc $version (ETHDebug compatible)${NC}"
+                return 0
+            elif [ "$MAJOR" -eq 0 ] && [ "$MINOR" -eq 8 ] && [ "$PATCH" -lt 29 ]; then
+                echo -e "${YELLOW}Warning: solc $version does not support ETHDebug (needs 0.8.29+). Some tests may fail.${NC}"
+                echo -e "${YELLOW}Consider installing solc 0.8.31: solc-select install 0.8.31 && solc-select use 0.8.31${NC}"
+                return 1
+            fi
+        fi
+    fi
+    
+    return 0
+}
+
 # Use environment variable if no command line option provided
 SEPOLIA_KEY="${SEPOLIA_KEY:-${SEPOLIA_KEY_ENV:-}}"
 
@@ -99,6 +148,7 @@ else
 fi
 
 # Export SOLC_PATH so it's available to the Python config
+# Note: Individual tests will set their own solc version via solc-select
 export SOLC_PATH
 
 # Colors
@@ -137,6 +187,11 @@ fi
 
 if [ "${NEED_DEPLOY}" = true ]; then
     echo -e "${YELLOW}Deploying TestContract for tests...${NC}"
+    
+    # Default deployment uses solc 0.8.31 (ETHDebug) for simulate/trace tests
+    # Legacy tests will override this with their own solc-select use 0.8.16
+    ensure_ethdebug_solc "$SOLC_PATH"
+    export SOLC_PATH
     
     # Use the dedicated test deployment script if it exists
     if [ -x "${SCRIPT_DIR}/deploy-test-contract.sh" ]; then
@@ -264,6 +319,8 @@ config.test_contracts = {
     "ethdebug_dir": os.path.join(project_dir, "examples", "${TEST_DEBUG_REL}")
 }
 # Determine solc path dynamically
+# Note: Most tests expect ETHDebug format (solc 0.8.31+) which shows nested internal function calls
+# Tests that explicitly use solc-select will override this (e.g., legacy tests use 0.8.16)
 solc_path = os.environ.get('SOLC_PATH')
 if not solc_path:
     # Try to find solc in PATH
@@ -313,7 +370,20 @@ fi
 if [ "$RUN_TRACE_TESTS" = true ]; then
     echo -e "${YELLOW}Running trace tests...${NC}"
     if [ -d "${SCRIPT_DIR}/trace" ]; then
-        "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/trace"
+        # First run legacy tests separately (they need solc 0.8.16)
+        # This ensures they run before other tests that might change solc version
+        echo -e "${BLUE}Running legacy tests first (solc 0.8.16)...${NC}"
+        if [ -f "${SCRIPT_DIR}/trace/increment-trace-legacy.test" ]; then
+            "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/trace/increment-trace-legacy.test"
+        fi
+        
+        # Then run all other trace tests (they use solc 0.8.31)
+        # Ensure solc is set to 0.8.31 after legacy test may have changed it
+        echo -e "${BLUE}Running ETHDebug tests (solc 0.8.31)...${NC}"
+        ensure_ethdebug_solc "$SOLC_PATH"
+        export SOLC_PATH
+        # Use lit's filter-out to exclude legacy test
+        "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/trace" --filter-out="increment-trace-legacy"
     else
         echo -e "${YELLOW}Warning: trace directory not found${NC}"
     fi
