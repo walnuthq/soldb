@@ -269,14 +269,14 @@ def _load_single_contract_debug_info(tracer, args, ethdebug_dirs, json_mode) -> 
         
         # Still load the ETHDebug info
         if not args.interactive:
-            tracer.load_ethdebug_info_auto(ethdebug_dir, name)
+            tracer.load_debug_info_auto(ethdebug_dir, name)
             _load_abi_for_contract(tracer, ethdebug_dir)
         _try_load_abi_from_common_locations(tracer, args.contract_address)
     else:
         # Address matches - load debug info
         if not args.interactive:
             try:
-                source_map = tracer.load_ethdebug_info_auto(ethdebug_dir, name)
+                source_map = tracer.load_debug_info_auto(ethdebug_dir, name)
             except FileNotFoundError as e:
                 error_msg = str(e)
                 # Try to extract compiler version from the error message or debug directory

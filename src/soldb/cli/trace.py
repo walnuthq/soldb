@@ -267,7 +267,7 @@ def _load_single_contract_debug_info(tracer, trace, args, json_mode: bool):
     # Load ETHDebug info for non-interactive mode only
     if not args.interactive:
         try:
-            source_map = tracer.load_ethdebug_info_auto(ethdebug_dir, name)
+            source_map = tracer.load_debug_info_auto(ethdebug_dir, name)
         except FileNotFoundError as e:
             error_msg = str(e)
             # Try to extract compiler version from the error message or debug directory

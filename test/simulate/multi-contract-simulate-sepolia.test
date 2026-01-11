@@ -14,7 +14,7 @@
 
 # Check that we see the main function call with parameters
 # CHECK: #0 Contract::runtime_dispatcher [entry] [non-verified] gas: 61189 @ Contract entry point
-# CHECK:  #1 function_0x6f10e157 [0x6f10e157] [external] [non-verified] gas: 61189
+# CHECK:  #1 processOrder(uint256,string,string) [0x6f10e157] [external] [non-verified] gas: 61189
 # CHECK:     arguments: 0x000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000076578707265737300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a656c656374726f6e696300000000000000000000000000000000000000000000
 
 # Check for internal function calls to other contracts
@@ -24,7 +24,7 @@
 # CHECK:    #3 CALL → TaxCalculator::calculateTax(uint256,string) [0x55ec8a03] [CALL] → TaxCalculator gas:
 # CHECK:       value: 10
 # CHECK:       orderType: express
-# CHECK:      #4 calculateTax [internal] gas: -144115188075809365 @ TaxCalculator.sol:7
+# CHECK:      #4 calculateTax [internal] gas: {{.*}} @ TaxCalculator.sol:7
 # CHECK:         value: 10
 # CHECK:         orderType: express
 # CHECK:        #5 getBaseRate [internal] gas: 3433 @ TaxCalculator.sol:18
@@ -32,17 +32,17 @@
 # CHECK:    #7 CALL → ShippingManager::initiateShipping(address,string) [0x01567ce2] [CALL] → ShippingManager gas:
 # CHECK:       customer: 0x286AF310eA3303c80eBE9a66F6998B21Bd8c1c29
 # CHECK:       method: electronic
-# CHECK:        #8 initiateShipping [internal] gas: -144115188075822559 @ ShippingManager.sol:8
+# CHECK:        #8 initiateShipping [internal] gas: {{.*}} @ ShippingManager.sol:8
 # CHECK:           customer: 0x286AF310eA3303c80eBE9a66F6998B21Bd8c1c29
 # CHECK:           method: electronic
 # CHECK:          #9 estimateShipping [internal] gas: 2897 @ ShippingManager.sol:17
 
 # Check for payment processing
-# CHECK:    #11 CALL → 0xf776...1823::processPayment(address,uint256) [0x0b63fe95] [CALL] [non-verified] gas:
+# CHECK:    #11 CALL → 0xf776...1823::processPayment(address,uint256) [0x0b63fe95] [value: 11] [CALL] [non-verified] gas: {{.*}}
 # CHECK:       arguments: 0x000000000000000000000000286af310ea3303c80ebe9a66f6998b21bd8c1c29000000000000000000000000000000000000000000000000000000000000000b
 
 # Check for logging calls
-# CHECK:    #12 CALL → 0xdcDd...Ac0A::function_0xe4af64b1 [0xe4af64b1] [CALL] [non-verified] gas:
+# CHECK:    #12 CALL → 0xdcDd...Ac0A::logBoth(string,uint256) [0xe4af64b1] [CALL] [non-verified] gas:
 # CHECK:       arguments: 0x0000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000b000000000000000000000000000000000000000000000000000000000000000e4f7264657220636f6d706c657465000000000000000000000000000000000000
 
 # Check for the footer

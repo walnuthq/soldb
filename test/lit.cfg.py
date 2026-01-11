@@ -124,4 +124,10 @@ else:
         config.substitutions.append(('FileCheck', 'FileCheck'))
 
 # Environment variables
-config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
+if not hasattr(config, 'soldb') or not config.soldb:
+    config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
+elif 'venv' in config.soldb or 'MyEnv' in config.soldb:
+    # Using venv - don't set PYTHONPATH, let venv handle it
+    pass
+else:
+    config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
