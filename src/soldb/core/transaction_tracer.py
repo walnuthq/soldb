@@ -18,6 +18,8 @@ from ..utils.colors import *
 from ..parsers.ethdebug import ETHDebugParser, ETHDebugInfo
 from ..parsers.ethdebug import MultiContractETHDebugParser, ExecutionContext
 from ..parsers.source_map import SourceMapParser, SourceMapInfo
+from ..cross_env.bridge_client import StylusBridgeIntegration, CrossEnvBridgeClient
+from ..cross_env.protocol import CrossEnvTrace, CrossEnvCall, ContractInfo
 import re
 import requests
 
@@ -148,6 +150,10 @@ class TransactionTracer:
         self._last_snapshot_id: Optional[str] = None
         self.missing_mappings_warned = False  # Track if we've already warned about missing mappings
 
+        # Cross-environment (Stylus) bridge integration
+        self.stylus_bridge: Optional[StylusBridgeIntegration] = None
+        self._stylus_traces: Dict[str, CrossEnvTrace] = {}  # Cache of Stylus traces by address
+
     def snapshot_state(self) -> Optional[str]:
         """Take an EVM snapshot (Hardhat/Anvil/Ganache). Returns snapshot id or None if unsupported."""
         try:
@@ -187,6 +193,159 @@ class TransactionTracer:
         contract_address = Web3.to_checksum_address(contract_address)
         code = self.w3.eth.get_code(contract_address)
         return code != b'' and code != '0x'
+
+    # =========================================================================
+    # Cross-Environment (Stylus) Bridge Integration
+    # =========================================================================
+
+    def setup_stylus_bridge(self, bridge_url: str = "http://127.0.0.1:8765") -> bool:
+        """
+        Set up the Stylus bridge for cross-environment tracing.
+
+        Args:
+            bridge_url: URL of the cross-environment bridge server
+
+        Returns:
+            True if bridge is connected and available
+        """
+        self.stylus_bridge = StylusBridgeIntegration(bridge_url=bridge_url)
+        if self.stylus_bridge.connect():
+            if not self.quiet_mode:
+                print(info(f"[STYLUS] Connected to cross-env bridge at {bridge_url}"))
+            return True
+        else:
+            if not self.quiet_mode:
+                print(warning(f"[STYLUS] Could not connect to bridge at {bridge_url}"))
+            self.stylus_bridge = None
+            return False
+
+    def is_stylus_contract(self, address: str) -> bool:
+        """Check if an address is a registered Stylus contract."""
+        if not self.stylus_bridge or not self.stylus_bridge.is_connected:
+            return False
+        return self.stylus_bridge.is_stylus_contract(address)
+
+    def _request_stylus_trace(
+        self,
+        target_address: str,
+        calldata: str,
+        caller_address: Optional[str] = None,
+        value: int = 0,
+        depth: int = 0,
+        parent_call_id: Optional[int] = None,
+        tx_hash: Optional[str] = None,
+        block_number: Optional[int] = None,
+    ) -> Optional[CrossEnvTrace]:
+        """
+        Request a trace from a Stylus contract via the bridge.
+
+        Returns the Stylus trace if available, None otherwise.
+        """
+        if not self.stylus_bridge or not self.stylus_bridge.is_connected:
+            return None
+
+        trace = self.stylus_bridge.request_trace(
+            target_address=target_address,
+            calldata=calldata,
+            caller_address=caller_address,
+            value=value,
+            depth=depth,
+            parent_call_id=parent_call_id,
+            transaction_hash=tx_hash,
+            block_number=block_number,
+        )
+
+        if trace:
+            # Cache the trace
+            self._stylus_traces[target_address.lower()] = trace
+            if not self.quiet_mode:
+                print(info(f"[STYLUS] Received trace for {target_address[:10]}... ({len(trace.calls)} calls)"))
+
+        return trace
+
+    def _convert_stylus_calls_to_function_calls(
+        self,
+        stylus_trace: CrossEnvTrace,
+        parent_call: Optional['FunctionCall'] = None,
+        base_call_id: int = 0,
+        depth_offset: int = 0,
+    ) -> List['FunctionCall']:
+        """
+        Convert Stylus trace calls to SolDB FunctionCall objects.
+
+        This merges the Stylus trace into the EVM call hierarchy.
+        """
+        function_calls = []
+
+        for stylus_call in stylus_trace.calls:
+            # Create a FunctionCall from the Stylus call
+            func_call = FunctionCall(
+                name=f"[Stylus] {stylus_call.function_name}",
+                selector=stylus_call.function_selector or "",
+                entry_step=-1,  # Stylus calls don't have EVM step numbers
+                exit_step=None,
+                gas_used=stylus_call.gas_used or 0,
+                depth=stylus_call.call_id + depth_offset,  # Adjust depth
+                args=[(arg.name, arg.value) for arg in stylus_call.args],
+                call_type=f"stylus:{stylus_call.call_type}",
+                contract_address=stylus_call.contract_address,
+                call_id=base_call_id + stylus_call.call_id,
+                parent_call_id=(base_call_id + stylus_call.parent_call_id) if stylus_call.parent_call_id else (parent_call.call_id if parent_call else None),
+            )
+
+            # Add source location info if available
+            if stylus_call.source_location:
+                func_call.source_line = stylus_call.source_location.line
+
+            function_calls.append(func_call)
+
+            # Recursively process children
+            if stylus_call.children:
+                child_trace = CrossEnvTrace(
+                    trace_id=stylus_trace.trace_id,
+                    calls=stylus_call.children,
+                )
+                child_calls = self._convert_stylus_calls_to_function_calls(
+                    child_trace,
+                    parent_call=func_call,
+                    base_call_id=base_call_id,
+                    depth_offset=depth_offset,
+                )
+                function_calls.extend(child_calls)
+
+        return function_calls
+
+    def register_stylus_contract(
+        self,
+        address: str,
+        name: str,
+        lib_path: Optional[str] = None,
+    ) -> bool:
+        """
+        Register a Stylus contract with the bridge.
+
+        Args:
+            address: Contract address
+            name: Contract name
+            lib_path: Path to the compiled .dylib/.so library
+
+        Returns:
+            True if registration succeeded
+        """
+        if not self.stylus_bridge or not self.stylus_bridge.is_connected:
+            return False
+
+        contract = ContractInfo(
+            address=address,
+            environment="stylus",
+            name=name,
+            lib_path=lib_path,
+        )
+        return self.stylus_bridge.register_contract(contract)
+
+    # =========================================================================
+    # End of Cross-Environment Bridge Integration
+    # =========================================================================
 
     def _encode_function_call(self, function_name: str, args: list) -> str:
         """Encode calldata for a loaded ABI function by name."""
@@ -1651,7 +1810,7 @@ class TransactionTracer:
             # Create main function call with call_id = 1
             # Try to get source line for the main function if we have debug info
             main_source_line = None
-            if self.multi_contract_parser:
+            if self.multi_contract_parser and trace.to_addr:
                 # In multi-contract mode, check if we have debug info for the target contract
                 target_contract = self.multi_contract_parser.get_contract_at_address(trace.to_addr)
                 if target_contract:
@@ -2290,7 +2449,19 @@ class TransactionTracer:
         # Get contract name and check if we have debug info for target contract
         contract_name = self.format_address_display(to_addr)
         target_contract_info = None
-        if self.multi_contract_parser:
+        is_stylus_target = False
+
+        # Check if this is a Stylus contract
+        if self.stylus_bridge and self.stylus_bridge.is_connected:
+            if self.is_stylus_contract(to_addr):
+                is_stylus_target = True
+                stylus_contract_info = self.stylus_bridge.get_contract_info(to_addr)
+                if stylus_contract_info:
+                    contract_name = f"[Stylus] {stylus_contract_info.name}"
+                else:
+                    contract_name = f"[Stylus] {self.format_address_display(to_addr)}"
+
+        if self.multi_contract_parser and not is_stylus_target:
             target_contract_info = self.multi_contract_parser.get_contract_at_address(to_addr)
             if target_contract_info:
                 contract_name = target_contract_info.name
@@ -2331,6 +2502,9 @@ class TransactionTracer:
             # Return empty decoded_params
             decoded_params = []
 
+        # Determine call type (mark Stylus calls specially)
+        call_type = f"STYLUS_{step.op}" if is_stylus_target else step.op
+
         return FunctionCall(
             name=f"{step.op} → {contract_name}::{func_name}",
             selector=selector or "",
@@ -2339,7 +2513,7 @@ class TransactionTracer:
             gas_used=0,
             depth=current_depth + 1,
             args=decoded_params,
-            call_type=step.op,
+            call_type=call_type,
             contract_address=to_addr,
             value=value
         )
