@@ -63,7 +63,29 @@ def trace_command(args):
         else:
             print(f"{error(e)}")
         return 1
-    
+
+    # Set up cross-environment (Stylus) bridge if configured
+    if hasattr(args, 'cross_env_bridge') and args.cross_env_bridge:
+        if tracer.setup_stylus_bridge(args.cross_env_bridge):
+            # Load Stylus contract registrations if provided
+            if hasattr(args, 'stylus_contracts') and args.stylus_contracts:
+                try:
+                    from .cross_env.contract_registry import ContractRegistry
+                    registry = ContractRegistry()
+                    count = registry.load_from_file(args.stylus_contracts)
+                    # Register Stylus contracts with the bridge
+                    for contract in registry.get_stylus_contracts():
+                        tracer.register_stylus_contract(
+                            contract.address,
+                            contract.name,
+                            contract.lib_path
+                        )
+                    if not args.json:
+                        print(info(f"[STYLUS] Registered {count} contracts from {args.stylus_contracts}"))
+                except Exception as e:
+                    if not args.json:
+                        print(warning(f"[STYLUS] Failed to load contracts: {e}"))
+
     # Trace transaction
     if not args.json:
         print(f"Loading transaction {info(args.tx_hash)}...")
@@ -468,7 +490,21 @@ def list_contracts_command(args):
     # Print contracts involved in the transaction
     print_contracts_in_transaction(tracer,trace)
     return 0
-          
+
+
+def bridge_command(args):
+    """Execute the bridge command - run the cross-environment debug bridge server."""
+    from .cross_env.bridge_server import run_bridge_server
+
+    run_bridge_server(
+        host=args.host,
+        port=args.port,
+        verbose=not args.quiet,
+        config_file=args.config_file,
+    )
+    return 0
+
+
 def simulate_command(args):
     """Execute the simulate command."""
 
@@ -498,6 +534,28 @@ def simulate_command(args):
         else:
             print(f"{error(e)}")
         return 1
+
+    # Set up cross-environment (Stylus) bridge if configured
+    if hasattr(args, 'cross_env_bridge') and args.cross_env_bridge:
+        if tracer.setup_stylus_bridge(args.cross_env_bridge):
+            # Load Stylus contract registrations if provided
+            if hasattr(args, 'stylus_contracts') and args.stylus_contracts:
+                try:
+                    from .cross_env.contract_registry import ContractRegistry
+                    registry = ContractRegistry()
+                    count = registry.load_from_file(args.stylus_contracts)
+                    # Register Stylus contracts with the bridge
+                    for contract in registry.get_stylus_contracts():
+                        tracer.register_stylus_contract(
+                            contract.address,
+                            contract.name,
+                            contract.lib_path
+                        )
+                    if not getattr(args, 'json', False):
+                        print(info(f"[STYLUS] Registered {count} contracts from {args.stylus_contracts}"))
+                except Exception as e:
+                    if not getattr(args, 'json', False):
+                        print(warning(f"[STYLUS] Failed to load contracts: {e}"))
 
     if args.value and args.value is not None:
         token = {}
@@ -1225,7 +1283,12 @@ def main():
     trace_parser.add_argument('--interactive', '-i', action='store_true', help='Start interactive debugger')
     trace_parser.add_argument('--raw', action='store_true', help='Show raw instruction trace instead of function call trace')
     trace_parser.add_argument('--json', action='store_true', help='Output trace data as JSON for web app consumption')
-    
+    # Cross-environment (Stylus) bridge options
+    trace_parser.add_argument('--cross-env-bridge', dest='cross_env_bridge', default=None,
+                              help='URL of the cross-environment debug bridge server (e.g., http://127.0.0.1:8765)')
+    trace_parser.add_argument('--stylus-contracts', dest='stylus_contracts', default=None,
+                              help='JSON file with Stylus contract registrations for cross-env tracing')
+
     # Create the 'simulate' subcommand
     simulate_parser = subparsers.add_parser('simulate', help='Simulate and debug an Ethereum transaction')
     simulate_parser.add_argument('--from', dest='from_addr', required=True, help='Sender address')
@@ -1262,7 +1325,20 @@ def main():
     simulate_parser.add_argument('--keep-fork', action='store_true', help='Do not terminate the forked node on exit')
     simulate_parser.add_argument('--reuse-fork', action='store_true', help='Reuse an existing local fork if available on --fork-port')
     simulate_parser.add_argument('--no-snapshot', action='store_true',default=False, help='Disable automatic initial snapshot')
-    
+    # Cross-environment (Stylus) bridge options
+    simulate_parser.add_argument('--cross-env-bridge', dest='cross_env_bridge', default=None,
+                                 help='URL of the cross-environment debug bridge server (e.g., http://127.0.0.1:8765)')
+    simulate_parser.add_argument('--stylus-contracts', dest='stylus_contracts', default=None,
+                                 help='JSON file with Stylus contract registrations for cross-env tracing')
+
+    # Create the 'bridge' subcommand for running the cross-environment bridge server
+    bridge_parser = subparsers.add_parser('bridge', help='Run the cross-environment (Stylus) debug bridge server')
+    bridge_parser.add_argument('--host', default='127.0.0.1', help='Host to bind to (default: 127.0.0.1)')
+    bridge_parser.add_argument('--port', type=int, default=8765, help='Port to listen on (default: 8765)')
+    bridge_parser.add_argument('--config', dest='config_file', default=None,
+                               help='JSON file with contract registrations to load at startup')
+    bridge_parser.add_argument('--quiet', action='store_true', help='Suppress request logging')
+
     args = parser.parse_args()
     
     # Handle commands
@@ -1272,9 +1348,10 @@ def main():
         return simulate_command(args)
     if args.command == 'list-events':
         return list_events_command(args)
-
     if args.command == 'list-contracts':
         return list_contracts_command(args)
+    if args.command == 'bridge':
+        return bridge_command(args)
 
     return 0
 

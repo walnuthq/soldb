@@ -219,6 +219,8 @@ class MultiContractETHDebugParser:
     
     def get_contract_at_address(self, address: str) -> Optional[ContractDebugInfo]:
         """Get contract debug info for a given address."""
+        if not address:
+            return None
         address = to_checksum_address(address)
         return self.contracts.get(address)
     
