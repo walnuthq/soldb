@@ -6,20 +6,17 @@ to provide rich debugging capabilities.
 """
 
 import os
-import struct
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    # Try to use pyelftools for DWARF parsing
     from elftools.elf.elffile import ELFFile
     from elftools.dwarf.descriptions import describe_form_class
     from elftools.dwarf.dwarf_expr import DWARFExprParser
     HAS_ELFTOOLS = True
 except ImportError:
     HAS_ELFTOOLS = False
-    print("Warning: pyelftools not installed. Install with: pip install pyelftools")
 
 
 @dataclass
@@ -166,7 +163,7 @@ class DwarfParser:
                         name=func_name,
                         linkage_name=func_name,
                         low_pc=current_pc,
-                        high_pc=current_pc,  # Will update
+                        high_pc=current_pc,
                         file=1,
                         line=1
                     )
@@ -197,7 +194,6 @@ class DwarfParser:
                         if 'PUSH0' in line:
                             current_pc += 1
                         else:
-                            # Extract number from PUSH1, PUSH2, etc
                             try:
                                 push_num = int(''.join(filter(str.isdigit, line.split()[0])))
                                 current_pc += 1 + push_num
@@ -208,7 +204,6 @@ class DwarfParser:
     
     def get_source_location(self, pc: int) -> Optional[Tuple[str, int]]:
         """Get source file and line for a given PC."""
-        # Find the closest line entry
         best_entry = None
         for entry in self.line_table:
             if entry.address <= pc:

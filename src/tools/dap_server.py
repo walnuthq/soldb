@@ -11,11 +11,9 @@ import io
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
-from soldb.evm_repl import EVMDebugger
-from soldb.transaction_tracer import TransactionTracer
-from soldb.ethdebug_dir_parser import ETHDebugDirParser
-from soldb.ethdebug_parser import ETHDebugInfo
-from soldb.multi_contract_ethdebug_parser import MultiContractETHDebugParser
+from soldb.core.evm_repl import EVMDebugger
+from soldb.core.transaction_tracer import TransactionTracer
+from soldb.parsers.ethdebug import ETHDebugDirParser, ETHDebugInfo, MultiContractETHDebugParser
 from eth_utils.address import is_address
 from eth_utils import to_checksum_address
 from .dap_utils import find_sol_files, ensure_0x_prefix

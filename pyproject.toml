@@ -50,7 +50,7 @@ Repository = "https://github.com/yourusername/soldb.git"
 Issues = "https://github.com/yourusername/soldb/issues"
 
 [project.scripts]
-soldb = "soldb.main:main"
+soldb = "soldb.cli.main:main"
 soldb-dap-server = "tools.dap_server:main"
 
 [tool.setuptools]

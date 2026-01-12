@@ -10,10 +10,11 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from .transaction_tracer import TransactionTracer, TransactionTrace, SourceMapper
-from .dwarf_parser import load_dwarf_info, DwarfParser
-from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
-from .colors import *
+from ..parsers.dwarf import load_dwarf_info, DwarfParser
+from ..parsers.ethdebug import ETHDebugDirParser, ETHDebugSpec
+from ..utils.colors import *
 from web3 import Web3
+from ..utils.helpers import format_exception_message
 
 class EVMDebugger(cmd.Cmd):
     """Interactive EVM debugger REPL."""
@@ -54,8 +55,11 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                 if main_contract:
                     self.tracer.ethdebug_info = main_contract.ethdebug_info
                     self.tracer.ethdebug_parser = main_contract.parser
-                    # Load source_map from the main contract
-                    self.source_map = main_contract.parser.get_source_mapping() if main_contract.parser else {}
+                    self.tracer.srcmap_info = main_contract.srcmap_info
+                    self.tracer.srcmap_parser = main_contract.srcmap_parser
+                    # Load source_map from the main contract (ethdebug or srcmap)
+                    active_parser = main_contract.get_parser()
+                    self.source_map = active_parser.get_source_mapping() if active_parser else {}
                     
                 else:
                     # No debug info for this contract
@@ -113,11 +117,22 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         self.contract_name = contract_name
         self.value = value
 
-        if self.contract_address and not self.tracer.is_contract_deployed(self.contract_address):
-            print(error(f"Error: No contract found at address {self.contract_address}"))
-            sys.exit(1)
+        # Check if contract is deployed (skip if in multi-contract mode with loaded contracts)
+        if self.contract_address:
+            # In multi-contract mode, if we have the contract loaded, skip deployment check
+            if hasattr(tracer, 'multi_contract_parser') and tracer.multi_contract_parser:
+                contract_info = tracer.multi_contract_parser.get_contract_at_address(self.contract_address)
+                if contract_info:
+                    # Contract is loaded in multi-contract parser, skip deployment check
+                    pass
+                elif not self.tracer.is_contract_deployed(self.contract_address):
+                    print(error(f"Error: No contract found at address {self.contract_address}"))
+                    sys.exit(1)
+            elif not self.tracer.is_contract_deployed(self.contract_address):
+                print(error(f"Error: No contract found at address {self.contract_address}"))
+                sys.exit(1)
 
-        # Load ETHDebug info if available
+        # Load debug info if available (ETHDebug or srcmap)
         if ethdebug_dir:
             # Use provided contract_name or extract from ethdebug_dir if in address:name:path format
             if not self.contract_name and ":" in ethdebug_dir and ethdebug_dir.startswith("0x"):
@@ -134,19 +149,24 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                     elif len(parts) == 2:
                         ethdebug_dir = parts[1]  # Extract path part
             
-            # Always load ethdebug_info to ensure pc_to_source is available
+            # Always load debug info to ensure pc_to_source is available
             # But suppress duplicate prints if already loaded
-            if not self.tracer.ethdebug_info:
-                self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir, self.contract_name)
+            if not self.tracer.ethdebug_info and not self.tracer.srcmap_info:
+                self.source_map = self.tracer.load_debug_info_auto(ethdebug_dir, self.contract_name)
             else:
                 # Re-load to get pc_to_source mapping, but suppress prints
                 import io
                 import contextlib
                 with contextlib.redirect_stdout(io.StringIO()):
-                    self.source_map = self.tracer.load_ethdebug_info(ethdebug_dir, self.contract_name)
+                    self.source_map = self.tracer.load_debug_info_auto(ethdebug_dir, self.contract_name)
             
             # Load ABI from ethdebug directory
-            contract_name = self.tracer.ethdebug_info.contract_name if self.tracer.ethdebug_info else None
+            if self.tracer.ethdebug_info:
+                contract_name = self.tracer.ethdebug_info.contract_name
+            elif self.tracer.srcmap_info:
+                contract_name = self.tracer.srcmap_info.contract_name
+            else:
+                contract_name = None
             abi_path = ETHDebugDirParser.find_abi_file(ETHDebugSpec(path=ethdebug_dir), contract_name)
             if abi_path:
                 self.tracer.load_abi(abi_path)
@@ -210,15 +230,24 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         """Load source files for a specific contract."""
 
         print(f"Loading source files for specific contract: {contract_info.name}")
-        if not contract_info or not contract_info.ethdebug_info:
+        if not contract_info:
             return
-            
-        # Load all source files for this contract
-        for source_id, source_path in contract_info.ethdebug_info.sources.items():
-            if source_path not in self.source_lines:  # Avoid reloading already loaded files
-                lines = contract_info.parser.load_source_file(source_path)
-                if lines:
-                    self.source_lines[source_path] = lines
+        
+        # Load source files from ethdebug_info if available
+        if contract_info.ethdebug_info and contract_info.parser:
+            for source_id, source_path in contract_info.ethdebug_info.sources.items():
+                if source_path not in self.source_lines:  # Avoid reloading already loaded files
+                    lines = contract_info.parser.load_source_file(source_path)
+                    if lines:
+                        self.source_lines[source_path] = lines
+        
+        # Load source files from srcmap_info if available
+        elif contract_info.srcmap_info and contract_info.srcmap_parser:
+            for source_path in contract_info.srcmap_info.sources:
+                if source_path not in self.source_lines:  # Avoid reloading already loaded files
+                    lines = contract_info.srcmap_parser.load_source_file(source_path)
+                    if lines:
+                        self.source_lines[source_path] = lines
     
     
     def do_run(self, tx_hash: str):
@@ -306,9 +335,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
 
             self.init = True
         except Exception as e:
-            print(f"{error('Error in simulation:')} {e}")
-            import traceback
-            print(f"{dim('Details:')} {traceback.format_exc()}")
+            error_message = format_exception_message(e)
+            print(f"\n{error('Simulation failed:')} {error_message}")
 
     def _encode_function_call(self, function_name: str, args: list) -> Optional[str]:
         """Encode a function call into calldata."""
@@ -463,6 +491,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             print("No transaction loaded. Use 'run <tx_hash>' first.")
             return
         
+        
         if self.current_step >= len(self.current_trace.steps) - 1:
             print(info("Already at end of execution."))
             return
@@ -470,7 +499,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         # Set next mode flag to prevent automatic contract switching
         self._in_step_mode = False
 
-        if not self.source_map and not self.tracer.ethdebug_info:
+        if not self.source_map and not self.tracer.ethdebug_info and not getattr(self.tracer, 'srcmap_info', None):
             print("No source mapping available. Use 'nexti' for instruction stepping.")
             self.do_nexti(arg)
             return
@@ -744,7 +773,10 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                 self.contract_address = call_context['contract']
                 self.tracer.ethdebug_info = calling_contract.ethdebug_info
                 self.tracer.ethdebug_parser = calling_contract.parser
-                self.source_map = calling_contract.parser.get_source_mapping() if calling_contract.parser else {}
+                self.tracer.srcmap_info = calling_contract.srcmap_info
+                self.tracer.srcmap_parser = calling_contract.srcmap_parser
+                active_parser = calling_contract.get_parser()
+                self.source_map = active_parser.get_source_mapping() if active_parser else {}
                 self._load_source_files_for_contract(calling_contract)
                 
                 print(f"\n  {success('Returned to contract:')} {calling_contract.name}")
@@ -828,7 +860,10 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                         
                         self.tracer.ethdebug_info = target_contract.ethdebug_info
                         self.tracer.ethdebug_parser = target_contract.parser
-                        self.source_map = target_contract.parser.get_source_mapping() if target_contract.parser else {}
+                        self.tracer.srcmap_info = target_contract.srcmap_info
+                        self.tracer.srcmap_parser = target_contract.srcmap_parser
+                        active_parser = target_contract.get_parser()
+                        self.source_map = active_parser.get_source_mapping() if active_parser else {}
                         self._load_source_files_for_contract(target_contract)
                         self.contract_address = best_match.contract_address
                         self.manual_contract_switch = True  # Prevent auto-switching back
@@ -863,7 +898,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             return
         
         # If not on a CALL opcode, behave like next but look for CALL opcodes
-        if not self.source_map and not self.tracer.ethdebug_info:
+        if not self.source_map and not self.tracer.ethdebug_info and not getattr(self.tracer, 'srcmap_info', None):
             print("No source mapping available. Use 'nexti' for instruction stepping.")
             self.do_nexti(arg)
             return
@@ -1050,7 +1085,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
     
     def do_list(self, arg):
         """List source code around current position. Alias: l"""
-        if not self.current_trace or not self.source_lines:
+        if not self.current_trace:
             print("No source available.")
             return
         
@@ -1059,58 +1094,35 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             print(f"Error: Current step {self.current_step} is out of range. Total steps: {len(self.current_trace.steps)}")
             return
         
-        step = self.current_trace.steps[self.current_step]
-        source_info = self.source_map.get(step.pc)
+        # Use _get_source_info_for_step which handles all parser types
+        source_info = self._get_source_info_for_step(self.current_step)
         
         if source_info:
-            if isinstance(source_info, tuple) and len(source_info) >= 2:
-                try:
-                    if len(source_info) == 2:
-                        file_id, line_num = source_info
-                        source_file_name = None
-                    elif len(source_info) == 3:
-                        file_id, line_num, _ = source_info  # file_id, line_num, column
-                        source_file_name = None
-                    else:
-                        print(f"Error: source_info has unexpected number of elements: {source_info}")
-                        return
-                except ValueError:
-                    print(f"Error: source_info has unexpected format: {source_info}")
+            source_file_path, line_num = source_info
+            
+            # Load source file if not already loaded
+            if source_file_path not in self.source_lines:
+                if self.tracer.ethdebug_parser:
+                    self.source_lines[source_file_path] = self.tracer.ethdebug_parser.load_source_file(source_file_path)
+                elif getattr(self.tracer, 'srcmap_parser', None):
+                    self.source_lines[source_file_path] = self.tracer.srcmap_parser.load_source_file(source_file_path)
+                else:
+                    print(f"Could not load source file: {source_file_path}")
                     return
-            else:
-                print(f"Error: source_info is not a tuple with at least 2 elements: {source_info}")
+            
+            source_lines = self.source_lines.get(source_file_path)
+            if not source_lines:
+                print(f"Source file not found: {source_file_path}")
                 return
             
-            # Find the source file that contains this line number
-            # First try to find by specific file name if available
-            source_lines = None
-            source_file = None
-            
-            # If we have a specific file name from source_info, try to find it first
-            if len(source_info) >= 3 and isinstance(source_info[0], str) and source_info[0].endswith('.sol'):
-                source_file_name = source_info[0]
-                for file_path, lines in self.source_lines.items():
-                    if file_path.endswith(source_file_name) and 0 < line_num <= len(lines):
-                        source_lines = lines
-                        source_file = file_path
-                        break
-            
-            # If not found by specific name, fall back to any file that contains the line
-            if not source_lines:
-                for file_path, lines in self.source_lines.items():
-                    if 0 < line_num <= len(lines):
-                        source_lines = lines
-                        source_file = file_path
-                        break
-            
-            if source_lines:
+            if 0 < line_num <= len(source_lines):
                 # Show 5 lines before and after
                 start = max(0, line_num - 5)
                 end = min(len(source_lines), line_num + 5)
                 
                 # Show filename if multiple files
                 if len(self.source_lines) > 1:
-                    print(f"File: {os.path.basename(source_file)}")
+                    print(f"File: {os.path.basename(source_file_path)}")
                 
                 # Show available lines info if we can't show full range
                 lines_before = line_num - 1
@@ -1124,8 +1136,9 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                     marker = "=>" if i + 1 == line_num else "  "
                     print(f"{marker} {i+1:4d}: {source_lines[i].rstrip()}")
             else:
-                print(f"No source file found for line {line_num}")
+                print(f"Line {line_num} is out of range for file {source_file_path} (file has {len(source_lines)} lines)")
         else:
+            step = self.current_trace.steps[self.current_step]
             print(f"No source mapping for PC {step.pc}")
     
     def do_l(self, arg):
@@ -1689,6 +1702,13 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=2)
             if context:
                 return (context['file'], context['line'])
+        elif getattr(self.tracer, 'srcmap_info', None) and getattr(self.tracer, 'srcmap_parser', None):
+            # Use srcmap-runtime parser (legacy solc < 0.8.29)
+            source_info = self.tracer.srcmap_info.get_source_info(step.pc)
+            if source_info:
+                source_path, offset, length = source_info
+                line, col = self.tracer.srcmap_parser.offset_to_line_col(source_path, offset)
+                return (source_path, line)
         elif self.source_map:
             # Use basic source map
             source_info = self.source_map.get(step.pc)
@@ -1749,7 +1769,10 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                 if target_contract:
                     self.tracer.ethdebug_info = target_contract.ethdebug_info
                     self.tracer.ethdebug_parser = target_contract.parser
-                    self.source_map = target_contract.parser.get_source_mapping() if target_contract.parser else {}
+                    self.tracer.srcmap_info = target_contract.srcmap_info
+                    self.tracer.srcmap_parser = target_contract.srcmap_parser
+                    active_parser = target_contract.get_parser()
+                    self.source_map = active_parser.get_source_mapping() if active_parser else {}
                     
                     # Load source files for the new contract
                     self._load_source_files_for_contract(target_contract)
@@ -1856,7 +1879,10 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
                         if calling_contract:
                             self.tracer.ethdebug_info = calling_contract.ethdebug_info
                             self.tracer.ethdebug_parser = calling_contract.parser
-                            self.source_map = calling_contract.parser.get_source_mapping() if calling_contract.parser else {}
+                            self.tracer.srcmap_info = calling_contract.srcmap_info
+                            self.tracer.srcmap_parser = calling_contract.srcmap_parser
+                            active_parser = calling_contract.get_parser()
+                            self.source_map = active_parser.get_source_mapping() if active_parser else {}
                             self._load_source_files_for_contract(calling_contract)
                         self.manual_contract_switch = False  # Reset manual switch flag
                         
@@ -1951,6 +1977,12 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         
         if self.tracer.ethdebug_info:
             context = self.tracer.ethdebug_parser.get_source_context(step.pc, context_lines=2)
+            if context:
+                source_file = os.path.basename(context['file'])
+                source_line_num = context['line']
+                source_content = context['content']
+        elif getattr(self.tracer, 'srcmap_info', None) and getattr(self.tracer, 'srcmap_parser', None):
+            context = self.tracer.srcmap_parser.get_source_context(step.pc, context_lines=2)
             if context:
                 source_file = os.path.basename(context['file'])
                 source_line_num = context['line']

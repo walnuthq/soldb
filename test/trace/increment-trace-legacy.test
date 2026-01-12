@@ -1,0 +1,19 @@
+# Test tracing of increment function call with solc 0.8.16 (legacy srcmap format)
+# REQUIRES: soldb
+# This test verifies that legacy format does not show nested internal function calls in detail
+# RUN: SOLC_BIN="" && if command -v solc-0.8.16 >/dev/null 2>&1; then SOLC_BIN=solc-0.8.16; elif [ -f ~/.solc-select/artifacts/solc-0.8.16/solc-0.8.16 ]; then SOLC_BIN=~/.solc-select/artifacts/solc-0.8.16/solc-0.8.16; elif SOLC_VER=$(solc --version 2>&1 | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2) && [ "$SOLC_VER" = "0.8.16" ]; then SOLC_BIN=solc; elif command -v solc-select >/dev/null 2>&1 && solc-select use 0.8.16 >/dev/null 2>&1 && command -v solc >/dev/null 2>&1; then SOLC_BIN=solc; else echo "Error: solc 0.8.16 not found. Install with: solc-select install 0.8.16" && exit 1; fi && cd %S/../examples && rm -rf out_legacy && %S/deploy-contract.sh --solc=$SOLC_BIN --rpc=%{rpc_url} TestContract TestContract.sol --debug-dir=out_legacy >/dev/null 2>&1 && CONTRACT_ADDR=$(cat out_legacy/deployment.json | jq -r '.address') && TX=$(DEBUG_DIR=out_legacy RPC_URL=%{rpc_url} %S/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && sleep 1 && %soldb trace $TX --ethdebug-dir $CONTRACT_ADDR:TestContract:%S/../examples/out_legacy --rpc %{rpc_url} 2>&1 | FileCheck %s
+
+# Check for the specific function calls we expect
+# CHECK: Loading transaction
+# Legacy format uses srcmap-runtime
+# CHECK: srcmap-runtime
+# CHECK: Contract: TestContract
+# CHECK: Compiler: solc 0.8.16
+
+# Check for the call hierarchy with increment function (legacy format - basic structure only)
+# CHECK: #0 TestContract::runtime_dispatcher
+# CHECK: #1 increment
+# CHECK: arguments: 0x0000000000000000000000000000000000000000000000000000000000000004
+
+# Legacy format may show some nested calls but not all details
+# CHECK: increment [internal]

@@ -12,9 +12,9 @@ from web3 import Web3
 from typing import Any, List, Optional, Dict
 
 from .evm_repl import EVMDebugger
-from .colors import info, warning, error
-from .compiler_config import CompilationError
-from .compile_ethdebug import compile_ethdebug_run
+from ..utils.colors import info, warning, error
+from ..compiler.config import CompilationError
+from ..compiler.ethdebug import compile_ethdebug_run
 
 class AutoDeployDebugger:
     def __init__(

@@ -1,7 +1,8 @@
-# Test tracing of increment function call
+# Test tracing of increment function call with solc 0.8.31 (ETHDebug format)
 # REQUIRES: soldb
-# First deploy the contract, then send an increment transaction, then trace it
-# RUN: cd %S/../examples && rm -rf out && %S/deploy-contract.sh --solc=%{solc_path} --rpc=%{rpc_url} TestContract TestContract.sol --debug-dir=out >/dev/null 2>&1 && CONTRACT_ADDR=$(cat out/deployment.json | jq -r '.address') && TX=$(DEBUG_DIR=out RPC_URL=%{rpc_url} %S/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && %soldb trace $TX --ethdebug-dir $CONTRACT_ADDR:TestContract:%S/../examples/out --rpc %{rpc_url} 2>&1 | FileCheck %s
+# This test uses ETHDebug format (solc 0.8.31+) which shows nested internal function calls
+# RUN: command -v solc-select >/dev/null 2>&1 && solc-select use 0.8.31 >/dev/null 2>&1 || true && \
+# RUN: cd %S/../examples && rm -rf out && %S/deploy-contract.sh --solc=solc --rpc=%{rpc_url} TestContract TestContract.sol --debug-dir=out >/dev/null 2>&1 && CONTRACT_ADDR=$(cat out/deployment.json | jq -r '.address') && TX=$(DEBUG_DIR=out RPC_URL=%{rpc_url} %S/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && %soldb trace $TX --ethdebug-dir $CONTRACT_ADDR:TestContract:%S/../examples/out --rpc %{rpc_url} 2>&1 | FileCheck %s
 
 # Check for the specific function calls we expect
 # CHECK: Loading transaction
