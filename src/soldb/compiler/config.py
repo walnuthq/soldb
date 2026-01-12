@@ -35,8 +35,6 @@ class CompilerConfig:
                 "--ethdebug-runtime",
                 "--bin",
                 "--abi",
-                #"--optimize",
-                #"--optimize-runs", "200",
                 "--overwrite"
             ]
         
@@ -70,16 +68,13 @@ class CompilerConfig:
         
         self.ensure_directories()
         
-        # Prepare compilation command
         cmd = [self.solc_path] + self.ethdebug_flags + ["-o", output_dir, contract_file]
         
-        # Run compilation
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
             raise CompilationError(f"Compilation failed:\n{result.stderr}")
         
-        # Find generated files
         output_files = {
             "ethdebug": None,
             "contracts": {}
@@ -87,12 +82,10 @@ class CompilerConfig:
         
         output_path = Path(output_dir)
         
-        # Look for the main ethdebug.json file
         ethdebug_file = output_path / "ethdebug.json"
         if ethdebug_file.exists():
             output_files["ethdebug"] = str(ethdebug_file)
         
-        # Find contract-specific files
         for file_path in output_path.iterdir():
             if file_path.suffix == ".bin":
                 contract_name = file_path.stem
@@ -103,7 +96,6 @@ class CompilerConfig:
                     "ethdebug_runtime": str(output_path / f"{contract_name}_ethdebug-runtime.json")
                 }
                 
-                # Verify files exist
                 for key, path in list(contract_files.items()):
                     if not Path(path).exists():
                         contract_files[key] = None
@@ -121,23 +113,14 @@ class CompilerConfig:
     def compile_for_production(self, contract_file: str, output_dir: Optional[str] = None) -> Dict[str, Any]:
         """
         Compile a Solidity contract for production (without debug info).
-        
-        Args:
-            contract_file: Path to the Solidity source file
-            output_dir: Optional output directory (defaults to build_dir)
-            
-        Returns:
-            Dictionary containing compilation results
         """
         if output_dir is None:
             output_dir = self.build_dir
         
         self.ensure_directories()
         
-        # Prepare compilation command
         cmd = [self.solc_path] + self.production_flags + ["-o", output_dir, contract_file]
         
-        # Run compilation
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
@@ -161,7 +144,6 @@ class CompilerConfig:
             
             version_output = result.stdout
             
-            # Extract version number
             import re
             version_match = re.search(r'Version: (\d+\.\d+\.\d+)', version_output)
             if not version_match:
@@ -191,7 +173,6 @@ class CompilerConfig:
     def from_soldb_config(cls, config_file: str = "soldb.config.yaml") -> "CompilerConfig":
         """Load configuration from soldb config file."""
         if not Path(config_file).exists():
-            # Return default config if file doesn't exist
             return cls()
         
         import yaml
@@ -215,13 +196,11 @@ class CompilerConfig:
             with open(config_file, 'r') as f:
                 config_data = yaml.safe_load(f) or {}
         
-        # Ensure structure exists
         if 'debug' not in config_data:
             config_data['debug'] = {}
         if 'ethdebug' not in config_data['debug']:
             config_data['debug']['ethdebug'] = {}
         
-        # Update ETHDebug configuration
         config_data['debug']['ethdebug'].update({
             'enabled': True,
             'path': self.debug_output_dir,
@@ -234,7 +213,6 @@ class CompilerConfig:
             }
         })
         
-        # Save build directory
         config_data['build_dir'] = self.build_dir
         
         with open(config_file, 'w') as f:
@@ -249,13 +227,6 @@ class CompilationError(Exception):
 def dual_compile(contract_file: str, config: Optional[CompilerConfig] = None) -> Dict[str, Any]:
     """
     Perform dual compilation: both production and debug builds.
-    
-    Args:
-        contract_file: Path to the Solidity source file
-        config: Optional compiler configuration
-        
-    Returns:
-        Dictionary with both production and debug compilation results
     """
     if config is None:
         config = CompilerConfig()
@@ -265,13 +236,11 @@ def dual_compile(contract_file: str, config: Optional[CompilerConfig] = None) ->
         "debug": None
     }
     
-    # Production build
     try:
         results["production"] = config.compile_for_production(contract_file)
     except CompilationError as e:
         results["production"] = {"success": False, "error": str(e)}
     
-    # Debug build with ETHDebug
     try:
         results["debug"] = config.compile_with_ethdebug(contract_file)
     except CompilationError as e:

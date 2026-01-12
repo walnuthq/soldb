@@ -14,10 +14,10 @@ from dataclasses import dataclass, field
 from web3 import HTTPProvider, Web3
 from eth_utils import to_hex, to_checksum_address,keccak
 from eth_abi.abi import encode as abi_encode
-from .colors import *
-from .ethdebug_parser import ETHDebugParser, ETHDebugInfo
-from .multi_contract_ethdebug_parser import MultiContractETHDebugParser, ExecutionContext
-from .srcmap_parser import SourceMapParser, SourceMapInfo
+from ..utils.colors import *
+from ..parsers.ethdebug import ETHDebugParser, ETHDebugInfo
+from ..parsers.ethdebug import MultiContractETHDebugParser, ExecutionContext
+from ..parsers.source_map import SourceMapParser, SourceMapInfo
 import re
 import requests
 
@@ -2116,7 +2116,7 @@ class TransactionTracer:
             # Check if ETHDebug was actually loaded (not just parser created)
             if (self.ethdebug_info or (self.ethdebug_parser and self.ethdebug_parser.debug_info)) and not self.missing_mappings_warned:
                 import sys
-                from .colors import yellow, dim
+                from ..utils.colors import yellow, dim
                 print(f"\n{yellow('Warning:')} Detected incomplete ETHDebug metadata", file=sys.stderr)
                 print(f"{dim('  Some JUMPDEST instructions lack source mappings, which may result in an incomplete trace.')}", file=sys.stderr)
                 print(f"{dim('  This is typically caused by compiler optimizations. Consider recompiling with different settings.')}\n", file=sys.stderr)

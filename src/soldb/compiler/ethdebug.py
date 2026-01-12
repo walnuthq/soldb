@@ -5,13 +5,12 @@ Can be used standalone or integrated into the soldb workflow.
 """
 
 import argparse
-from logging import info
 import sys
 import json
 from pathlib import Path
 from typing import Optional
 
-from .compiler_config import CompilerConfig, CompilationError, dual_compile
+from .config import CompilerConfig, CompilationError, dual_compile
 
 
 def main():
@@ -68,14 +67,12 @@ def main():
     
     args = parser.parse_args()
     
-    # Create compiler configuration
     config = CompilerConfig(
         solc_path=args.solc,
         debug_output_dir=args.output_dir,
         build_dir=args.production_dir
     )
     
-    # Verify version if requested
     if args.verify_version:
         version_info = config.verify_solc_version()
         if args.json:
@@ -87,12 +84,10 @@ def main():
                 print(f"✗ {version_info['error']}")
         sys.exit(0 if version_info["supported"] else 1)
     
-    # Verify contract file exists
     if not Path(args.contract_file).exists():
         print(f"Error: Contract file '{args.contract_file}' not found", file=sys.stderr)
         sys.exit(1)
     
-    # Save configuration if requested
     if args.save_config:
         try:
             config.save_to_soldb_config()
@@ -104,23 +99,19 @@ def main():
     
     try:
         if args.dual_compile:
-            # Perform dual compilation
             results = dual_compile(args.contract_file, config)
             
             if args.json:
                 print(json.dumps(results, indent=2))
             else:
-                # Production build status
                 if results["production"]["success"]:
                     print(f"✓ Production build created in {results['production']['output_dir']}")
                 else:
                     print(f"✗ Production build failed: {results['production'].get('error', 'Unknown error')}")
                 
-                # Debug build status
                 if results["debug"]["success"]:
                     print(f"✓ ETHDebug build created in {results['debug']['output_dir']}")
                     
-                    # List generated files
                     if results["debug"]["files"]["ethdebug"]:
                         print("  - ethdebug.json")
                     
@@ -139,7 +130,6 @@ def main():
                     sys.exit(1)
         
         else:
-            # ETHDebug compilation only
             result = config.compile_with_ethdebug(args.contract_file)
             
             if args.json:
@@ -148,7 +138,6 @@ def main():
                 print(f"✓ ETHDebug compilation successful")
                 print(f"Output directory: {result['output_dir']}")
                 
-                # List generated files
                 if result["files"]["ethdebug"]:
                     print("\nGenerated files:")
                     print("  - ethdebug.json")
@@ -164,7 +153,6 @@ def main():
                     if files["ethdebug_runtime"]:
                         print(f"    - {contract_name}_ethdebug-runtime.json")
                 
-                # Show any warnings
                 if result["stderr"]:
                     print("\nCompiler warnings:")
                     print(result["stderr"])
@@ -182,6 +170,7 @@ def main():
             print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+
 def compile_ethdebug_run(
     contract_file: str,
     solc_path: str = "solc",
@@ -195,6 +184,8 @@ def compile_ethdebug_run(
     """
     Runs ETHDebug compilation. Returns dict with compilation results.
     """
+    from soldb.utils.colors import info
+    
     config = CompilerConfig(
         solc_path=solc_path,
         debug_output_dir=debug_output_dir,
@@ -208,8 +199,6 @@ def compile_ethdebug_run(
             raise CompilationError(version_info.get("error", "Unsupported solc version"))
         print(info(f"solc {version_info['version']} OK (ETHDebug supported)"))
 
-
-
     if save_config:
         config.save_to_soldb_config()
         return {"mode": "save_config", "saved": True}
@@ -221,6 +210,7 @@ def compile_ethdebug_run(
         return dual_compile(contract_file, config)
     else:
         return config.compile_with_ethdebug(contract_file)
+
 
 if __name__ == "__main__":
     main()

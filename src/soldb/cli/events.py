@@ -9,10 +9,9 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from soldb.transaction_tracer import TransactionTracer
-from soldb.multi_contract_ethdebug_parser import MultiContractETHDebugParser
-from soldb.ethdebug_dir_parser import ETHDebugDirParser
-from soldb.colors import error
+from soldb.core.transaction_tracer import TransactionTracer
+from soldb.parsers.ethdebug import MultiContractETHDebugParser, ETHDebugDirParser
+from soldb.utils.colors import error
 from soldb.utils.exceptions import format_error_json
 from soldb.utils.logging import logger
 from soldb.cli.common import (
@@ -119,7 +118,7 @@ def _load_contract_from_spec(multi_parser: MultiContractETHDebugParser, spec) ->
 
 def _print_events(tracer: TransactionTracer, receipt, json_mode: bool) -> None:
     """Print decoded events from transaction."""
-    from soldb.helpers import print_contracts_events
+    from soldb.utils.helpers import print_contracts_events
     
     if json_mode:
         events_data = print_contracts_events(tracer, receipt, json_output=True)

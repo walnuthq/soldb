@@ -12,9 +12,8 @@ from typing import List, Optional, Tuple, Any
 from eth_utils import to_checksum_address
 from eth_utils.address import is_address
 
-from soldb.transaction_tracer import TransactionTracer
-from soldb.multi_contract_ethdebug_parser import MultiContractETHDebugParser
-from soldb.ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
+from soldb.core.transaction_tracer import TransactionTracer
+from soldb.parsers.ethdebug import MultiContractETHDebugParser, ETHDebugDirParser, ETHDebugSpec
 from soldb.utils.exceptions import (
     SoldbError, 
     RPCConnectionError, 
@@ -23,7 +22,7 @@ from soldb.utils.exceptions import (
     format_error_json
 )
 from soldb.utils.logging import logger
-from soldb.colors import error, info, warning
+from soldb.utils.colors import error, info, warning
 
 
 def create_tracer(rpc_url: str, quiet_mode: bool = False) -> TransactionTracer:
@@ -147,7 +146,7 @@ def load_multi_contract_parser(
                     contract_name = spec.name or spec.address or "unknown"
                     error_msg = str(e)
                     # Try to extract compiler version from the error message or debug directory
-                    from soldb.ethdebug_parser import ETHDebugParser
+                    from soldb.parsers.ethdebug import ETHDebugParser
                     try:
                         compiler_info = ETHDebugParser._get_compiler_info(spec.path)
                         if compiler_info and compiler_info not in error_msg:

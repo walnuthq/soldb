@@ -5,7 +5,10 @@ This module provides the command-line interface for soldb,
 including trace, simulate, and list commands.
 """
 
+from .main import main
+
 __all__ = [
+    'main',
     'trace_command',
     'simulate_command', 
     'list_events_command',

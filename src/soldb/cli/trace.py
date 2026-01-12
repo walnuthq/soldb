@@ -11,12 +11,11 @@ import json
 from pathlib import Path
 from typing import Optional, Any
 
-from soldb.transaction_tracer import TransactionTracer
-from soldb.multi_contract_ethdebug_parser import MultiContractETHDebugParser
-from soldb.ethdebug_dir_parser import ETHDebugDirParser
-from soldb.evm_repl import EVMDebugger
-from soldb.json_serializer import TraceSerializer
-from soldb.colors import error, info, warning
+from soldb.core.transaction_tracer import TransactionTracer
+from soldb.parsers.ethdebug import MultiContractETHDebugParser, ETHDebugDirParser
+from soldb.core.evm_repl import EVMDebugger
+from soldb.core.serializer import TraceSerializer
+from soldb.utils.colors import error, info, warning
 from soldb.utils.exceptions import format_error_json
 from soldb.utils.logging import logger
 from soldb.cli.common import (
@@ -271,7 +270,7 @@ def _load_single_contract_debug_info(tracer, trace, args, json_mode: bool):
         except FileNotFoundError as e:
             error_msg = str(e)
             # Try to extract compiler version from the error message or debug directory
-            from soldb.ethdebug_parser import ETHDebugParser
+            from soldb.parsers.ethdebug import ETHDebugParser
             try:
                 compiler_info = ETHDebugParser._get_compiler_info(ethdebug_dir)
                 if compiler_info and compiler_info not in error_msg:

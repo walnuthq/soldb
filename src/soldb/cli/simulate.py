@@ -17,12 +17,11 @@ from eth_utils.address import is_address
 from eth_abi.abi import encode
 from eth_hash.auto import keccak
 
-from soldb.transaction_tracer import TransactionTracer
-from soldb.multi_contract_ethdebug_parser import MultiContractETHDebugParser
-from soldb.ethdebug_dir_parser import ETHDebugDirParser
-from soldb.evm_repl import EVMDebugger
-from soldb.json_serializer import TraceSerializer
-from soldb.colors import error, info, warning, number
+from soldb.core.transaction_tracer import TransactionTracer
+from soldb.parsers.ethdebug import MultiContractETHDebugParser, ETHDebugDirParser
+from soldb.core.evm_repl import EVMDebugger
+from soldb.core.serializer import TraceSerializer
+from soldb.utils.colors import error, info, warning, number
 from soldb.utils.exceptions import format_error_json
 from soldb.utils.logging import logger
 from soldb.cli.common import (
@@ -233,7 +232,7 @@ def _load_contract_from_spec_with_error(multi_parser, spec):
         contract_name = spec.name or spec.address or "unknown"
         error_msg = str(e)
         # Try to extract compiler version from the error message or debug directory
-        from soldb.ethdebug_parser import ETHDebugParser
+        from soldb.parsers.ethdebug import ETHDebugParser
         try:
             compiler_info = ETHDebugParser._get_compiler_info(spec.path)
             if compiler_info and compiler_info not in error_msg:
@@ -280,7 +279,7 @@ def _load_single_contract_debug_info(tracer, args, ethdebug_dirs, json_mode) -> 
             except FileNotFoundError as e:
                 error_msg = str(e)
                 # Try to extract compiler version from the error message or debug directory
-                from soldb.ethdebug_parser import ETHDebugParser
+                from soldb.parsers.ethdebug import ETHDebugParser
                 try:
                     compiler_info = ETHDebugParser._get_compiler_info(ethdebug_dir)
                     if compiler_info and compiler_info not in error_msg:
@@ -419,13 +418,13 @@ def _simulate_with_function(tracer, args, source_map, token_value, json_mode) ->
 
 def _parse_signature(signature: str) -> Tuple[str, List[str]]:
     """Parse function signature into name and types."""
-    from soldb.abi_utils import parse_signature
+    from soldb.parsers.abi import parse_signature
     return parse_signature(signature)
 
 
 def _find_abi_item(tracer, func_name: str, func_types: List[str]) -> Optional[dict]:
     """Find matching ABI item for function."""
-    from soldb.abi_utils import match_abi_types
+    from soldb.parsers.abi import match_abi_types
     
     # First try exact name match
     for item in tracer.function_abis.values():
@@ -453,7 +452,7 @@ def _find_abi_item(tracer, func_name: str, func_types: List[str]) -> Optional[di
 
 def _parse_function_args(args, func_types: List[str], abi_item: Optional[dict], has_abi: bool) -> Optional[List[Any]]:
     """Parse function arguments based on types."""
-    from soldb.abi_utils import parse_tuple_arg
+    from soldb.parsers.abi import parse_tuple_arg
     
     if has_abi and abi_item:
         input_types = [inp['type'] for inp in abi_item['inputs']]
@@ -482,7 +481,7 @@ def _parse_function_args(args, func_types: List[str], abi_item: Optional[dict], 
 
 def _parse_single_arg(val: str, typ: str, abi_input: dict) -> Any:
     """Parse a single argument with ABI type information."""
-    from soldb.abi_utils import parse_tuple_arg
+    from soldb.parsers.abi import parse_tuple_arg
     
     if typ.startswith('uint') or typ.startswith('int'):
         return int(val, 0)
@@ -563,7 +562,7 @@ def _output_trace(tracer, trace, args, source_map, json_mode) -> int:
 
 def _interactive_mode(args, tracer, value: int = 0) -> int:
     """Start interactive debugger mode."""
-    from soldb.auto_deploy import AutoDeployDebugger
+    from soldb.core.auto_deploy import AutoDeployDebugger
     
     # Validate required arguments
     if not getattr(args, 'contract_address', None):
@@ -641,7 +640,7 @@ def _interactive_mode(args, tracer, value: int = 0) -> int:
 
 def _setup_auto_deploy(args):
     """Set up auto-deploy debugger session."""
-    from soldb.auto_deploy import AutoDeployDebugger
+    from soldb.core.auto_deploy import AutoDeployDebugger
     
     try:
         session = AutoDeployDebugger(

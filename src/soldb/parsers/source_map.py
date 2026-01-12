@@ -16,12 +16,16 @@ Entries are separated by `;`. Empty fields inherit from previous entry.
 
 import json
 import os
-from typing import Dict, List, Optional, Tuple, Any, Union
-from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any, Union, Set
+from dataclasses import dataclass
 from pathlib import Path
 
-from soldb.source_file_loader import source_loader
+from .ethdebug import source_loader
 
+
+# =============================================================================
+# EVM Opcodes
+# =============================================================================
 
 # EVM opcodes and their sizes (PUSH1-PUSH32 are multi-byte)
 PUSH_OPCODES = {
@@ -59,6 +63,10 @@ PUSH_OPCODES = {
     0x7f: 32, # PUSH32
 }
 
+
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 @dataclass
 class SourceMapEntry:
@@ -100,6 +108,27 @@ class SourceMapInfo:
             return None
         return (self.sources[entry.file_index], entry.offset, entry.length)
 
+
+@dataclass
+class SourceLocation:
+    """Represents a source code location."""
+    file_path: str
+    line_number: int
+    column: int
+    content: str
+
+
+@dataclass
+class PCMapping:
+    """Represents a mapping between PC and source location."""
+    pc: int
+    source_location: SourceLocation
+    opcode: str
+
+
+# =============================================================================
+# Source Map Parser
+# =============================================================================
 
 class SourceMapParser:
     """Parser for srcmap-runtime from combined.json."""
@@ -144,39 +173,30 @@ class SourceMapParser:
         target_contract_data = None
         
         if contract_name:
-            # First, try exact match with contract name (parts[1])
             for key, contract_data in contracts.items():
-                # Key format is "SourceFile.sol:ContractName"
                 parts = key.split(":")
                 if len(parts) >= 2 and parts[1] == contract_name:
-                    # Make sure it has bytecode (not an interface)
                     if contract_data.get("bin-runtime"):
                         target_contract_key = key
                         target_contract_data = contract_data
                         break
             
-            # If not found, try to find contract with matching name in sourceList
             if not target_contract_data:
-                # Check if contract_name matches a source file name
                 for source_file in source_list:
                     source_stem = Path(source_file).stem
                     if contract_name.lower() == source_stem.lower():
-                        # Look for contract with this source file
                         for key, contract_data in contracts.items():
                             parts = key.split(":")
                             if len(parts) >= 1 and parts[0] == source_file:
-                                # Prefer contract with same name as source file
                                 if len(parts) >= 2 and parts[1] == contract_name and contract_data.get("bin-runtime"):
                                     target_contract_key = key
                                     target_contract_data = contract_data
                                     break
-                                # Or any contract from this source with bytecode
                                 elif contract_data.get("bin-runtime") and not target_contract_data:
                                     target_contract_key = key
                                     target_contract_data = contract_data
         
         if not target_contract_data:
-            # Use first contract with non-empty bytecode
             for key, contract_data in contracts.items():
                 bin_runtime = contract_data.get("bin-runtime", "")
                 if bin_runtime and len(bin_runtime) > 0:
@@ -187,7 +207,6 @@ class SourceMapParser:
         if not target_contract_data:
             raise ValueError(f"No contract found with runtime bytecode in combined.json")
         
-        # Extract data
         bin_runtime = target_contract_data.get("bin-runtime", "")
         srcmap_runtime = target_contract_data.get("srcmap-runtime", "")
         metadata_str = target_contract_data.get("metadata", "")
@@ -198,7 +217,6 @@ class SourceMapParser:
         if not srcmap_runtime:
             raise ValueError(f"No srcmap-runtime found for contract {target_contract_key}")
         
-        # Parse compiler version from metadata
         compiler_version = None
         if metadata_str:
             try:
@@ -207,16 +225,10 @@ class SourceMapParser:
             except json.JSONDecodeError:
                 pass
         
-        # Convert hex bytecode to bytes
         bytecode = bytes.fromhex(bin_runtime)
-        
-        # Build PC to instruction index mapping
         pc_to_idx = self._build_pc_to_instruction_map(bytecode)
-        
-        # Parse source map entries
         entries = self._parse_srcmap(srcmap_runtime)
         
-        # Extract contract name from key
         parts = target_contract_key.split(":")
         final_contract_name = parts[1] if len(parts) >= 2 else parts[0].replace(".sol", "")
         
@@ -236,8 +248,6 @@ class SourceMapParser:
         Build mapping from PC (bytecode offset) to instruction index.
         
         CRITICAL: PUSH opcodes are followed by N bytes of data.
-        e.g., PUSH1 (0x60) is followed by 1 byte, PUSH32 (0x7f) by 32 bytes.
-        These data bytes are NOT separate instructions.
         """
         pc_to_idx = {}
         pc = 0
@@ -247,13 +257,10 @@ class SourceMapParser:
             pc_to_idx[pc] = instr_idx
             opcode = bytecode[pc]
             
-            # Calculate instruction size
             if opcode in PUSH_OPCODES:
-                # PUSH instructions: 1 byte opcode + N bytes data
                 data_size = PUSH_OPCODES[opcode]
                 pc += 1 + data_size
             else:
-                # All other instructions are 1 byte
                 pc += 1
             
             instr_idx += 1
@@ -266,14 +273,12 @@ class SourceMapParser:
         
         Format: "s:l:f:j:m;s:l:f:j:m;..."
         Empty fields inherit from previous entry.
-        Missing trailing fields use defaults.
         """
         if not srcmap:
             return []
         
         entries = []
         
-        # Default values
         prev_offset = 0
         prev_length = 0
         prev_file_index = -1
@@ -282,7 +287,6 @@ class SourceMapParser:
         
         for part in srcmap.split(";"):
             if not part:
-                # Empty entry - inherit all from previous
                 entries.append(SourceMapEntry(
                     offset=prev_offset,
                     length=prev_length,
@@ -294,7 +298,6 @@ class SourceMapParser:
             
             fields = part.split(":")
             
-            # Parse each field, using previous value if empty
             offset = int(fields[0]) if len(fields) > 0 and fields[0] and fields[0].strip() else prev_offset
             length = int(fields[1]) if len(fields) > 1 and fields[1] and fields[1].strip() else prev_length
             file_index = int(fields[2]) if len(fields) > 2 and fields[2] and fields[2].strip() else prev_file_index
@@ -310,7 +313,6 @@ class SourceMapParser:
             )
             entries.append(entry)
             
-            # Update previous values
             prev_offset = offset
             prev_length = length
             prev_file_index = file_index
@@ -321,7 +323,7 @@ class SourceMapParser:
     
     def load_source_file(self, source_path: str) -> List[str]:
         """Load and cache source file lines using centralized loader."""
-        return source_loader.load_source_file(source_path, self.debug_dir)
+        return source_loader.load_source_file(source_path, str(self.debug_dir) if self.debug_dir else None)
     
     def offset_to_line_col(self, source_path: str, offset: int) -> Tuple[int, int]:
         """Convert byte offset to line and column in source file."""
@@ -350,12 +352,10 @@ class SourceMapParser:
         lines = self.load_source_file(source_path)
         line_num, col = self.offset_to_line_col(source_path, offset)
         
-        # Get current line content
         current_content = ""
         if 0 < line_num <= len(lines):
             current_content = lines[line_num - 1].rstrip()
         
-        # Get context lines
         start_line = max(1, line_num - context_lines)
         end_line = min(len(lines), line_num + context_lines)
         
@@ -385,7 +385,6 @@ class SourceMapParser:
             return {}
         
         pc_to_source = {}
-        unique_lines = set()
         
         for pc, instr_idx in self.source_map_info.pc_to_instruction_index.items():
             source_info = self.source_map_info.get_source_info(pc)
@@ -393,25 +392,15 @@ class SourceMapParser:
                 source_path, offset, length = source_info
                 line, col = self.offset_to_line_col(source_path, offset)
                 pc_to_source[pc] = (source_path, line, col)
-                unique_lines.add((source_path, line))
         
         return pc_to_source
     
     @staticmethod
     def is_legacy_compiler(version: str) -> bool:
-        """
-        Check if compiler version is older than 0.8.29 (needs srcmap fallback).
-        
-        Args:
-            version: Compiler version string like "0.8.26+commit.xxx"
-        
-        Returns:
-            True if version < 0.8.29
-        """
+        """Check if compiler version is older than 0.8.29 (needs srcmap fallback)."""
         if not version:
             return True
         
-        # Extract major.minor.patch
         parts = version.split("+")[0].split(".")
         if len(parts) < 3:
             return True
@@ -421,7 +410,6 @@ class SourceMapParser:
             minor = int(parts[1])
             patch = int(parts[2])
             
-            # Compare with 0.8.29
             if major < 0:
                 return True
             if major == 0:
@@ -434,6 +422,231 @@ class SourceMapParser:
             return True
 
 
+# =============================================================================
+# Source Mapping Manager
+# =============================================================================
+
+class SourceMappingManager:
+    """Manages mappings between source code and EVM bytecode."""
+    
+    def __init__(self, ethdebug_parser=None, ethdebug_info=None):
+        self.ethdebug_parser = ethdebug_parser
+        self.ethdebug_info = ethdebug_info
+        
+        self._line_to_pcs_cache: Dict[str, Dict[int, Set[int]]] = {}
+        self._line_to_steps_cache: Dict[str, Dict[int, List[int]]] = {}
+        self._pc_to_source_cache: Dict[int, SourceLocation] = {}
+        self._step_to_source_cache: Dict[int, SourceLocation] = {}
+        
+    def get_pcs_for_line(self, file_path: str, line_num: int) -> Set[int]:
+        """Get all PCs that map to a specific line in a file."""
+        if not self.ethdebug_info:
+            return set()
+        
+        file_key = os.path.basename(file_path)
+        if file_key in self._line_to_pcs_cache and line_num in self._line_to_pcs_cache[file_key]:
+            return self._line_to_pcs_cache[file_key][line_num]
+        
+        pcs = set()
+        for instruction in self.ethdebug_info.instructions:
+            if instruction.source_location:
+                source_file = self.ethdebug_info.sources.get(instruction.source_location.source_id)
+                if source_file == file_path:
+                    lines = self.ethdebug_parser.load_source_file(source_file)
+                    if lines:
+                        line_num_for_pc, col = self.ethdebug_parser.offset_to_line_col(
+                            source_file, instruction.source_location.offset
+                        )
+                        if line_num_for_pc == line_num:
+                            pcs.add(instruction.offset)
+        
+        if file_key not in self._line_to_pcs_cache:
+            self._line_to_pcs_cache[file_key] = {}
+        self._line_to_pcs_cache[file_key][line_num] = pcs
+        
+        return pcs
+    
+    def get_steps_for_line(self, file_path: str, line_num: int, trace_steps: List, 
+                          contract_address: str = None, contract_address_getter=None) -> List[int]:
+        """Get all steps that belong to a specific source line."""
+        file_key = os.path.basename(file_path)
+        cache_key = f"{line_num}:{contract_address}" if contract_address else str(line_num)
+        
+        if file_key in self._line_to_steps_cache and cache_key in self._line_to_steps_cache[file_key]:
+            return self._line_to_steps_cache[file_key][cache_key]
+        
+        pcs = self.get_pcs_for_line(file_path, line_num)
+        if not pcs:
+            if file_key not in self._line_to_steps_cache:
+                self._line_to_steps_cache[file_key] = {}
+            self._line_to_steps_cache[file_key][cache_key] = []
+            return []
+        
+        steps = []
+        for step_idx, step in enumerate(trace_steps):
+            if step.pc in pcs:
+                if contract_address and contract_address_getter:
+                    step_contract = contract_address_getter(step_idx)
+                    if step_contract != contract_address:
+                        continue
+                
+                steps.append(step_idx)
+        
+        if file_key not in self._line_to_steps_cache:
+            self._line_to_steps_cache[file_key] = {}
+        self._line_to_steps_cache[file_key][cache_key] = steps
+        
+        return steps
+    
+    def get_source_info_for_step(self, step_idx: int, trace_steps: List) -> Optional[Tuple[str, int]]:
+        """Get source file and line for a given step."""
+        if step_idx >= len(trace_steps):
+            return None
+        
+        step = trace_steps[step_idx]
+        
+        if step_idx in self._step_to_source_cache:
+            loc = self._step_to_source_cache[step_idx]
+            return (loc.file_path, loc.line_number)
+        
+        if self.ethdebug_parser and self.ethdebug_info:
+            context = self.ethdebug_parser.get_source_context(step.pc, context_lines=2)
+            if context:
+                file_path = context['file']
+                line_num = context['line']
+                
+                self._step_to_source_cache[step_idx] = SourceLocation(
+                    file_path=file_path,
+                    line_number=line_num,
+                    column=0,
+                    content=context.get('content', '')
+                )
+                
+                return (file_path, line_num)
+        
+        return None
+    
+    def get_source_info_for_pc(self, pc: int) -> Optional[SourceLocation]:
+        """Get source location for a given PC."""
+        if pc in self._pc_to_source_cache:
+            return self._pc_to_source_cache[pc]
+        
+        if not self.ethdebug_info:
+            return None
+        
+        for instruction in self.ethdebug_info.instructions:
+            if instruction.offset == pc and instruction.source_location:
+                source_file = self.ethdebug_info.sources.get(instruction.source_location.source_id)
+                if source_file and self.ethdebug_parser:
+                    lines = self.ethdebug_parser.load_source_file(source_file)
+                    if lines:
+                        line_num, col = self.ethdebug_parser.offset_to_line_col(
+                            source_file, instruction.source_location.offset
+                        )
+                        content = lines[line_num - 1].strip() if line_num <= len(lines) else ""
+                        
+                        source_location = SourceLocation(
+                            file_path=source_file,
+                            line_number=line_num,
+                            column=col,
+                            content=content
+                        )
+                        
+                        self._pc_to_source_cache[pc] = source_location
+                        return source_location
+        
+        return None
+    
+    def get_line_content(self, file_path: str, line_num: int) -> Optional[str]:
+        """Get the content of a specific line in a file."""
+        if not self.ethdebug_parser:
+            return None
+        
+        lines = self.ethdebug_parser.load_source_file(file_path)
+        if lines and 1 <= line_num <= len(lines):
+            return lines[line_num - 1].strip()
+        
+        return None
+    
+    def is_contract_declaration_line(self, file_path: str, line_num: int) -> bool:
+        """Check if a line is a contract declaration."""
+        content = self.get_line_content(file_path, line_num)
+        if not content:
+            return False
+        
+        return "contract" in content and "{" in content
+    
+    def is_function_return_line(self, file_path: str, line_num: int) -> bool:
+        """Check if a line contains a function return statement."""
+        content = self.get_line_content(file_path, line_num)
+        if not content:
+            return False
+        
+        return "return" in content and ";" in content
+    
+    def get_all_mappings_for_file(self, file_path: str) -> Dict[int, List[PCMapping]]:
+        """Get all line to PC mappings for a file."""
+        if not self.ethdebug_info:
+            return {}
+        
+        mappings = {}
+        for instruction in self.ethdebug_info.instructions:
+            if instruction.source_location:
+                source_file = self.ethdebug_info.sources.get(instruction.source_location.source_id)
+                if source_file == file_path:
+                    lines = self.ethdebug_parser.load_source_file(source_file)
+                    if lines:
+                        line_num, col = self.ethdebug_parser.offset_to_line_col(
+                            source_file, instruction.source_location.offset
+                        )
+                        content = lines[line_num - 1].strip() if line_num <= len(lines) else ""
+                        
+                        if line_num not in mappings:
+                            mappings[line_num] = []
+                        
+                        mappings[line_num].append(PCMapping(
+                            pc=instruction.offset,
+                            source_location=SourceLocation(
+                                file_path=source_file,
+                                line_number=line_num,
+                                column=col,
+                                content=content
+                            ),
+                            opcode=instruction.mnemonic
+                        ))
+        
+        return mappings
+    
+    def find_next_available_line(self, file_path: str, current_line: int, trace_steps: List, max_lines_ahead: int = 20) -> Optional[Tuple[int, List[int]]]:
+        """Find the next line after current_line that has actual PC/step mappings."""
+        for line_num in range(current_line + 1, current_line + max_lines_ahead + 1):
+            steps = self.get_steps_for_line(file_path, line_num, trace_steps)
+            if steps:
+                return (line_num, steps)
+        
+        return None
+    
+    def clear_cache(self):
+        """Clear all cached mappings."""
+        self._line_to_pcs_cache.clear()
+        self._line_to_steps_cache.clear()
+        self._pc_to_source_cache.clear()
+        self._step_to_source_cache.clear()
+    
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Get statistics about cache usage."""
+        return {
+            "line_to_pcs_cache_entries": sum(len(file_mappings) for file_mappings in self._line_to_pcs_cache.values()),
+            "line_to_steps_cache_entries": sum(len(file_mappings) for file_mappings in self._line_to_steps_cache.values()),
+            "pc_to_source_cache_entries": len(self._pc_to_source_cache),
+            "step_to_source_cache_entries": len(self._step_to_source_cache)
+        }
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
 def load_debug_info(debug_dir: Union[str, Path], contract_name: Optional[str] = None):
     """
     Load debug info from directory, automatically selecting parser.
@@ -441,15 +654,14 @@ def load_debug_info(debug_dir: Union[str, Path], contract_name: Optional[str] = 
     First tries ETHDebug (for solc >= 0.8.29), then falls back to srcmap (legacy).
     
     Returns:
-        Tuple of (parser_instance, debug_info) where parser_instance is either
-        ETHDebugParser or SourceMapParser
+        Tuple of (parser_instance, debug_info)
     """
     debug_dir = Path(debug_dir)
     
     # Try ETHDebug first
     ethdebug_file = debug_dir / "ethdebug.json"
     if ethdebug_file.exists():
-        from soldb.ethdebug_parser import ETHDebugParser
+        from .ethdebug import ETHDebugParser
         parser = ETHDebugParser()
         info = parser.load_ethdebug_files(debug_dir, contract_name)
         return (parser, info)

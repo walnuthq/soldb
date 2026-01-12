@@ -298,7 +298,7 @@ def format_error(e: Exception, json_mode: bool = False) -> str:
         if json_mode:
             return e.to_json()
         else:
-            from soldb.colors import error
+            from soldb.utils.colors import error
             return error(e.message)
     else:
         if json_mode:
@@ -308,7 +308,7 @@ def format_error(e: Exception, json_mode: bool = False) -> str:
                 "message": str(e)
             }, indent=2)
         else:
-            from soldb.colors import error
+            from soldb.utils.colors import error
             return error(str(e))
 
 

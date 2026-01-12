@@ -9,7 +9,7 @@ import logging
 import sys
 from typing import Optional
 
-from soldb.colors import Colors
+from soldb.utils.colors import Colors
 
 # Custom log level for very detailed tracing
 TRACE = 5

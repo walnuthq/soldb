@@ -2,8 +2,8 @@
 ABI/type parsing and matching utilities for SolDB.
 """
 import re
-import ast
 from typing import Any, List, Tuple, Dict
+
 
 def match_abi_types(parsed_types: List[str], abi_types: List[str]) -> bool:
     """Recursively match parsed signature types with ABI types."""
@@ -13,6 +13,7 @@ def match_abi_types(parsed_types: List[str], abi_types: List[str]) -> bool:
         if not match_single_type(parsed_type, abi_type):
             return False
     return True
+
 
 def match_single_type(parsed_type: str, abi_type: str) -> bool:
     """Match a single parsed type with ABI type."""
@@ -33,6 +34,7 @@ def match_single_type(parsed_type: str, abi_type: str) -> bool:
         return True
     return False
 
+
 def parse_signature(signature: str) -> Tuple[str, List[str]]:
     """Parse a function signature like 'foo(uint256,(string,uint256))' into name and argument types."""
     match = re.match(r'(\w+)\((.*)\)', signature)
@@ -40,6 +42,7 @@ def parse_signature(signature: str) -> Tuple[str, List[str]]:
         return "", []
     name = match.group(1)
     args = match.group(2)
+    
     def split_args(s):
         args, depth, current = [], 0, ''
         for c in s:
@@ -47,14 +50,18 @@ def parse_signature(signature: str) -> Tuple[str, List[str]]:
                 args.append(current)
                 current = ''
             else:
-                if c == '(': depth += 1
-                elif c == ')': depth -= 1
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
                 current += c
         if current:
             args.append(current)
         return [a.strip() for a in args if a.strip()]
+    
     arg_types = split_args(args)
     return name, arg_types
+
 
 def parse_tuple_arg(val: Any, abi_input: Dict) -> Tuple:
     """Recursively parse a tuple argument according to ABI input definition."""

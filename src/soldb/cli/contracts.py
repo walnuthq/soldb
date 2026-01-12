@@ -9,10 +9,9 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from soldb.transaction_tracer import TransactionTracer
-from soldb.multi_contract_ethdebug_parser import MultiContractETHDebugParser
-from soldb.ethdebug_dir_parser import ETHDebugDirParser
-from soldb.colors import error
+from soldb.core.transaction_tracer import TransactionTracer
+from soldb.parsers.ethdebug import MultiContractETHDebugParser, ETHDebugDirParser
+from soldb.utils.colors import error
 from soldb.utils.logging import logger
 from soldb.cli.common import (
     get_ethdebug_dirs,
@@ -110,7 +109,7 @@ def _load_contract_from_spec(multi_parser: MultiContractETHDebugParser, spec) ->
         contract_name = spec.name or spec.address or "unknown"
         error_msg = str(e)
         # Try to extract compiler version from the error message or debug directory
-        from soldb.ethdebug_parser import ETHDebugParser
+        from soldb.parsers.ethdebug import ETHDebugParser
         try:
             compiler_info = ETHDebugParser._get_compiler_info(spec.path)
             if compiler_info and compiler_info not in error_msg:
@@ -123,5 +122,5 @@ def _load_contract_from_spec(multi_parser: MultiContractETHDebugParser, spec) ->
 
 def _print_contracts_in_transaction(tracer: TransactionTracer, trace) -> None:
     """Print all contracts involved in a transaction."""
-    from soldb.helpers import print_contracts_in_transaction
+    from soldb.utils.helpers import print_contracts_in_transaction
     print_contracts_in_transaction(tracer, trace)

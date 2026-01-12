@@ -10,11 +10,11 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from .transaction_tracer import TransactionTracer, TransactionTrace, SourceMapper
-from .dwarf_parser import load_dwarf_info, DwarfParser
-from .ethdebug_dir_parser import ETHDebugDirParser, ETHDebugSpec
-from .colors import *
+from ..parsers.dwarf import load_dwarf_info, DwarfParser
+from ..parsers.ethdebug import ETHDebugDirParser, ETHDebugSpec
+from ..utils.colors import *
 from web3 import Web3
-from .helpers import format_exception_message
+from ..utils.helpers import format_exception_message
 
 class EVMDebugger(cmd.Cmd):
     """Interactive EVM debugger REPL."""

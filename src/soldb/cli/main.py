@@ -10,7 +10,10 @@ import sys
 import argparse
 
 # Import refactored CLI commands
-from .cli import trace_command, simulate_command, list_events_command, list_contracts_command
+from .trace import trace_command
+from .simulate import simulate_command
+from .events import list_events_command
+from .contracts import list_contracts_command
 
 
 def main():
