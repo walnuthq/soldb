@@ -267,6 +267,7 @@ class ContractInfo:
     # Debug info paths
     debug_dir: Optional[str] = None  # For EVM (ethdebug directory)
     lib_path: Optional[str] = None   # For Stylus (.dylib/.so path)
+    project_path: Optional[str] = None  # For Stylus (path to project directory)
 
     # Optional metadata
     compiler_version: Optional[str] = None
@@ -282,6 +283,8 @@ class ContractInfo:
             result["debug_dir"] = self.debug_dir
         if self.lib_path:
             result["lib_path"] = self.lib_path
+        if self.project_path:
+            result["project_path"] = self.project_path
         if self.compiler_version:
             result["compiler_version"] = self.compiler_version
         if self.source_files:
@@ -296,6 +299,7 @@ class ContractInfo:
             name=data.get("name", ""),
             debug_dir=data.get("debug_dir"),
             lib_path=data.get("lib_path"),
+            project_path=data.get("project_path"),
             compiler_version=data.get("compiler_version"),
             source_files=data.get("source_files", []),
         )
@@ -314,11 +318,12 @@ class TraceRequest:
     # Transaction context
     transaction_hash: Optional[str] = None
     block_number: Optional[int] = None
+    rpc_endpoint: Optional[str] = None
 
     # Call context
     target_address: str = ""
     caller_address: Optional[str] = None
-    calldata: str = ""  # Hex-encoded calldata
+    calldata: str = ""
     value: int = 0
 
     # Call hierarchy context
@@ -334,6 +339,7 @@ class TraceRequest:
             "request_id": self.request_id,
             "transaction_hash": self.transaction_hash,
             "block_number": self.block_number,
+            "rpc_endpoint": self.rpc_endpoint,
             "target_address": self.target_address,
             "caller_address": self.caller_address,
             "calldata": self.calldata,
@@ -350,6 +356,7 @@ class TraceRequest:
             request_id=data.get("request_id", ""),
             transaction_hash=data.get("transaction_hash"),
             block_number=data.get("block_number"),
+            rpc_endpoint=data.get("rpc_endpoint"),
             target_address=data.get("target_address", ""),
             caller_address=data.get("caller_address"),
             calldata=data.get("calldata", ""),

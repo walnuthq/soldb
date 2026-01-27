@@ -8,8 +8,10 @@ import json
 import uuid
 import threading
 import time
+import subprocess
+import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Dict, Optional, Callable, Any
+from typing import Dict, Optional, Callable, Any, List
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
 
@@ -19,6 +21,9 @@ from .protocol import (
     TraceRequest,
     TraceResponse,
     CrossEnvTrace,
+    CrossEnvCall,
+    CallArgument,
+    SourceLocation,
     MessageType,
 )
 from .contract_registry import ContractRegistry
@@ -121,6 +126,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     registry: ContractRegistry = None
     trace_store: TraceStore = None
     trace_handlers: Dict[str, Callable] = None
+    trace_commands: Dict[str, str] = None  # address -> command template
 
     def log_message(self, format: str, *args) -> None:
         """Override to use custom logging or suppress."""
@@ -285,6 +291,641 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         else:
             self._send_error_response(f"Contract not found: {address}", 404)
 
+    def _get_rust_toolchain(self, project_dir: str) -> str:
+        toolchain_file = os.path.join(project_dir, "rust-toolchain.toml")
+        if not os.path.exists(toolchain_file):
+            return "stable"
+        try:
+            import tomllib
+            with open(toolchain_file, "rb") as f:
+                data = tomllib.load(f)
+            return data.get("toolchain", {}).get("channel", "stable")
+        except Exception:
+            return "stable"
+
+
+    def _ensure_wasm_target(self, toolchain: str):
+        result = subprocess.run(
+            f"rustup target list --toolchain {toolchain}",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+
+        if "wasm32-unknown-unknown (installed)" not in result.stdout:
+            subprocess.run(
+                f"rustup target add wasm32-unknown-unknown --toolchain {toolchain}",
+                shell=True,
+                check=True,
+            )
+
+
+    def _prepare_rustup_env(self, project_dir: str) -> dict:
+        """Prepare environment for rustup/cargo with correct PATH priority."""
+        env = os.environ.copy()
+        toolchain = self._get_rust_toolchain(project_dir)
+
+        env["RUSTUP_TOOLCHAIN"] = toolchain
+        env["CARGO_TARGET_DIR"] = os.path.join(project_dir, "target")
+
+        # Prioritize ~/.cargo/bin over system paths (e.g., Homebrew)
+        # This ensures rustup's cargo/rustc are used instead of Homebrew's
+        cargo_bin = os.path.expanduser("~/.cargo/bin")
+        current_path = env.get("PATH", "")
+
+        # Remove cargo_bin from current position and add it at the beginning
+        path_parts = [p for p in current_path.split(":") if p != cargo_bin]
+        env["PATH"] = f"{cargo_bin}:{':'.join(path_parts)}"
+
+        return env
+
+    def rustup_override_set(self, project_dir: str, toolchain: str):
+        try:
+            subprocess.run(
+                ["rustup", "override", "set", toolchain],
+                cwd=project_dir,
+                check=True
+            )
+            print(f"[Bridge] Rust override set: {toolchain} in {project_dir}")
+        except subprocess.CalledProcessError as e:
+            print(f"[Bridge] ERROR: Failed to set rustup override: {e}")
+
+    def _invoke_soldb_trace(
+        self,
+        request: TraceRequest,
+        contract: ContractInfo,
+    ) -> Optional[CrossEnvTrace]:
+        """
+        Invoke soldb simulate command for EVM/Solidity contract.
+
+        Command: soldb simulate ADDRESS --raw-data CALLDATA --from CALLER --rpc RPC --ethdebug-dir ADDR:NAME:PATH
+
+        Args:
+            request: The trace request
+            contract: The target contract info (must have debug_dir)
+
+        Returns:
+            CrossEnvTrace if successful, None otherwise
+        """
+        # print("=" * 80)
+        # print(f"[Bridge] ===== INVOKING SOLDB TRACE (EVM/Solidity) =====")
+        # print(f"[Bridge] Contract: {contract.address} ({contract.name})")
+        # print(f"[Bridge] Request ID: {request.request_id}")
+        # print(f"[Bridge] Calldata: {request.calldata}")
+        # print(f"[Bridge] Caller: {request.caller_address}")
+        # print(f"[Bridge] Target: {request.target_address}")
+        # print(f"[Bridge] Value: {request.value} wei")
+        # print(f"[Bridge] Block: {request.block_number}")
+        # print(f"[Bridge] Project path: {contract.project_path}")
+        # print(f"[Bridge] Debug dir: {contract.debug_dir}")
+        # print("=" * 80)
+
+        if not contract.debug_dir:
+            print(f"[Bridge] ERROR: No debug_dir configured for contract")
+            return None
+
+        if not contract.project_path:
+            print(f"[Bridge] ERROR: No project_path configured for contract")
+            return None
+
+        # Determine working directory and ethdebug path
+        cwd = contract.project_path
+        # debug_dir is relative to project_path
+        ethdebug_path = contract.debug_dir
+
+        # Build soldb simulate command
+        # Format: soldb simulate ADDRESS --raw-data DATA --from CALLER --rpc RPC --ethdebug-dir ADDR:NAME:PATH --json
+        cmd = ["soldb", "simulate", contract.address]
+
+        if request.calldata:
+            cmd.extend(["--raw-data", request.calldata])
+        if request.caller_address:
+            cmd.extend(["--from", request.caller_address])
+        if request.value and request.value > 0:
+            cmd.extend(["--value", str(request.value)])
+        if request.block_number:
+            cmd.extend(["--block", str(request.block_number)])
+        # RPC endpoint - try to get from environment or use default
+        rpc_url = os.environ.get("RPC_URL", "http://localhost:8547")
+        cmd.extend(["--rpc", rpc_url])
+        # ethdebug-dir format: ADDRESS:NAME:PATH (PATH is relative to cwd)
+        ethdebug_dir = f"{contract.address}:{contract.name}:{ethdebug_path}"
+        cmd.extend(["--ethdebug-dir", ethdebug_dir])
+        # Request JSON output
+        cmd.append("--json")
+
+        # print(f"[Bridge] Command: {' '.join(cmd)}")
+        # print(f"[Bridge] CWD: {cwd}")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=cwd,  # Run from project_path
+            )
+
+            if result.stderr:
+                print(f"[Bridge] soldb stderr: {result.stderr[:500]}")
+
+            if result.returncode != 0:
+                print(f"[Bridge] ERROR: soldb simulate failed")
+                return None
+
+            # Parse JSON output
+            if result.stdout:
+                try:
+                    trace_data = json.loads(result.stdout)
+                    # Convert to CrossEnvTrace
+                    trace = self._convert_soldb_trace_to_cross_env(trace_data, request, contract)
+                    if trace:
+                        trace.trace_id = request.request_id
+                        self.trace_store.store_trace(trace)
+                    return trace
+
+                except json.JSONDecodeError as e:
+                    print(f"[Bridge] ERROR: Failed to parse soldb JSON: {e}")
+                    return None
+            else:
+                print(f"[Bridge] WARNING: No stdout from soldb")
+                return None
+
+        except subprocess.TimeoutExpired:
+            print(f"[Bridge] ERROR: soldb simulate timed out")
+            return None
+        except Exception as e:
+            return None
+
+    def _convert_soldb_trace_to_cross_env(
+        self,
+        soldb_trace: Dict,
+        request: TraceRequest,
+        contract: ContractInfo,
+    ) -> Optional[CrossEnvTrace]:
+        """
+        Convert soldb trace JSON to CrossEnvTrace format.
+
+        soldb --json output format:
+        {
+          "status": "success",
+          "traceCall": {
+            "type": "ENTRY",
+            "functionName": "Contract::runtime_dispatcher",
+            "callId": 0,
+            "calls": [
+              {
+                "type": "CALL",
+                "functionName": "add(uint256,uint256)",
+                "callId": 1,
+                "parentCallId": 0,
+                "calls": [...],
+                ...
+              }
+            ],
+            ...
+          }
+        }
+        """
+        try:
+            calls = []
+
+            # Get the root traceCall object
+            trace_call = soldb_trace.get("traceCall", {})
+            if not trace_call:
+                print(f"[Bridge] WARNING: No 'traceCall' found in soldb output")
+                return None
+
+            # TODO move this function to soldb/utils.py
+            def _parse_gas(val):
+                """Convert gas value (int or hex string) to int."""
+                if val is None:
+                    return None
+                if isinstance(val, int):
+                    return val
+                if isinstance(val, str):
+                    try:
+                        return int(val, 16) if val.startswith("0x") else int(val)
+                    except ValueError:
+                        return None
+                return None
+
+            # Recursive function to extract calls from nested structure
+            def extract_calls(call_obj: Dict, parent_id: Optional[int] = None) -> List[CrossEnvCall]:
+                result = []
+
+                call_id = call_obj.get("callId", 0)
+                func_name = call_obj.get("functionName", "function_0x")
+                call_type = call_obj.get("type", "CALL")
+
+                # Extract input arguments if available
+                args = []
+                inputs = call_obj.get("inputs", {})
+                if inputs:
+                    arg_names = inputs.get("argumentsName", [])
+                    arg_types = inputs.get("argumentsType", [])
+                    arg_values = inputs.get("argumentsDecodedValue", [])
+                    for i in range(len(arg_names)):
+                        args.append(CallArgument(
+                            name=arg_names[i] if i < len(arg_names) else "",
+                            type=arg_types[i] if i < len(arg_types) else "",
+                            value=str(arg_values[i]) if i < len(arg_values) else "",
+                        ))
+
+                # Extract return value if available
+                outputs = call_obj.get("outputs", {})
+                return_value = None
+                if outputs:
+                    ret_values = outputs.get("argumentsDecodedValue", [])
+                    if ret_values:
+                        return_value = str(ret_values[0]) if len(ret_values) == 1 else str(ret_values)
+
+                cross_call = CrossEnvCall(
+                    call_id=call_id,
+                    parent_call_id=parent_id,
+                    environment="evm",
+                    contract_address=call_obj.get("address", contract.address),
+                    function_name=func_name,
+                    function_selector=call_obj.get("selector"),
+                    source_location=None,
+                    args=args,
+                    return_data=call_obj.get("output"),
+                    return_value=return_value,
+                    gas_used=_parse_gas(call_obj.get("gasUsed")),
+                    success=call_obj.get("success", True),
+                    error=call_obj.get("error"),
+                    call_type=call_type.lower(),
+                    children=[],
+                )
+                result.append(cross_call)
+
+                # Recursively process nested calls
+                nested_calls = call_obj.get("calls", [])
+                for nested in nested_calls:
+                    child_calls = extract_calls(nested, call_id)
+                    result.extend(child_calls)
+
+                return result
+
+            # Extract all calls starting from root
+            calls = extract_calls(trace_call)
+
+            trace = CrossEnvTrace(
+                trace_id=request.request_id,
+                transaction_hash=request.transaction_hash,
+                root_call=calls[0] if calls else None,
+                calls=calls,
+                from_address=request.caller_address,
+                to_address=request.target_address,
+                value=request.value,
+                success=soldb_trace.get("status") == "success",
+            )
+
+            return trace
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _invoke_stylus_trace(
+        self,
+        request: TraceRequest,
+        contract: ContractInfo,
+    ) -> Optional[CrossEnvTrace]:
+        """
+        Invoke Stylus usertrace command in SIMULATE mode and read trace from output file.
+
+        Command: cargo stylus-beta usertrace --simulate --data <calldata> --to <addr> --from <addr> [--value <wei>]
+
+        Note: TX mode is NOT supported via bridge because the tx hash exists only on EVM side.
+        The bridge always uses simulate mode with calldata extracted from the EVM trace.
+
+        Args:
+            request: The trace request (must have calldata, target_address, caller_address)
+            contract: The target contract info (must have project_path pointing to Stylus project root)
+
+        Returns:
+            CrossEnvTrace if successful, None otherwise
+        """
+        # Stylus trace output file
+        STYLUS_TRACE_FILE = "/tmp/lldb_function_trace.json"
+
+        # print("=" * 80)
+        # print(f"[Bridge] ===== INVOKING STYLUS TRACE (SIMULATE MODE) =====")
+        # print(f"[Bridge] Contract: {contract.address} ({contract.name})")
+        # print(f"[Bridge] Request ID: {request.request_id}")
+        # print(f"[Bridge] Calldata: {request.calldata}")
+        # print(f"[Bridge] Caller: {request.caller_address}")
+        # print(f"[Bridge] Target: {request.target_address}")
+        # print(f"[Bridge] Value: {request.value} wei")
+        # print("=" * 80)
+
+        # Get project_path - can be explicit or inferred from lib_path
+        cwd = contract.project_path
+
+        # Try to infer project_path from lib_path if not set
+        # lib_path is typically: /path/to/project/target/wasm32-unknown-unknown/release/contract.wasm
+        if not cwd and contract.lib_path:
+            lib_path = contract.lib_path
+            # Find 'target' directory and go to parent
+            if '/target/' in lib_path:
+                cwd = lib_path.split('/target/')[0]
+
+        if not cwd:
+            print(f"[Bridge] ERROR: Cannot determine project_path for Stylus contract")
+            print(f"[Bridge] Please set 'project_path' in stylus-contracts.json or provide lib_path")
+            return None
+        
+        if not os.path.isdir(cwd):
+            print(f"[Bridge] ERROR: Project directory does not exist: {cwd}")
+            return None
+
+        # Always use 'cargo stylus-beta' command (not the binary path directly)
+        stylus_cmd = "cargo stylus-beta"
+        toolchain = self._get_rust_toolchain(cwd)
+        if toolchain.startswith("1.") and toolchain.count(".") == 1:
+            toolchain = toolchain + ".0"
+
+        env = self._prepare_rustup_env(cwd) 
+        
+        result = subprocess.run(
+            f"rustup toolchain list | grep {toolchain}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        
+        if result.returncode == 0:
+            cmd_prefix = f"+{toolchain}"
+        else:
+            cmd_prefix = ""
+            self.rustup_override_set(cwd, toolchain)
+            self._ensure_wasm_target(toolchain)
+            env = self._prepare_rustup_env(cwd)
+
+        try:
+            result = subprocess.run(
+                "which rustc",
+                shell=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if result.returncode == 0:
+                result = subprocess.run(
+                    "rustc --version",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                print(f"[Bridge] rustc version: {result.stdout.strip()}")
+                
+                # Rustc target list
+                result = subprocess.run(
+                    "rustc --print target-list | grep wasm32",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                print(f"[Bridge] Available wasm targets: {result.stdout.strip()}")
+            else:
+                print(f"[Bridge] WARNING: rustc not found in PATH")
+        except Exception as e:
+            print(f"[Bridge] WARNING: Failed to check rustc: {e}")
+
+        try:
+            result = subprocess.run(
+                "which cargo",
+                shell=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if result.returncode == 0:
+                result = subprocess.run(
+                    "cargo --version",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                print(f"[Bridge] cargo version: {result.stdout.strip()}")
+            else:
+                print(f"[Bridge] WARNING: cargo not found in PATH")
+        except Exception as e:
+            print(f"[Bridge] WARNING: Failed to check cargo: {e}")
+        
+        stylus_cmd = f"rustup run {toolchain} {stylus_cmd}"
+        
+        # Build simulate command
+        # cargo stylus-beta usertrace --simulate --data <calldata> --to <addr> --from <addr> [--value <wei>]
+        cmd = f"cd {cwd} && {stylus_cmd} usertrace --simulate"
+        cmd += f" --data {request.calldata or '0x'}"
+        cmd += f" --to {request.target_address}"
+        cmd += f" --from {request.caller_address or '0x0000000000000000000000000000000000000000'}"
+        if request.value:
+            cmd += f" --value {request.value}"
+
+        try:
+            # Extract working directory from command (if cd is used)
+            import re
+            cwd_match = re.search(r'cd\s+([^\s&|;]+)', cmd)
+            if cwd_match:
+                cwd = cwd_match.group(1)
+            else:
+                cwd = contract.project_path or os.getcwd()
+            
+            env = self._prepare_rustup_env(cwd)
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,  # 60 second timeout
+                    cwd=cwd,
+                    env=env,
+                )
+                print(f"[Bridge] Subprocess completed successfully")
+            except subprocess.TimeoutExpired as e:
+                return None
+            except Exception as e:
+                print(f"[Bridge] ERROR: Exception during subprocess execution: {e}")
+                import traceback
+                traceback.print_exc()
+                return None
+            
+            if result.returncode != 0:
+                return None
+            
+            if result.stderr:
+                print(f"[Bridge] stderr output (first 500 chars):")
+                print(f"  {result.stderr[:500]}")
+
+            if not os.path.exists(STYLUS_TRACE_FILE):
+                return None
+
+            try:
+                with open(STYLUS_TRACE_FILE, 'r') as f:
+                    trace_content = f.read()
+
+                trace_dict = json.loads(trace_content)
+
+                # Convert to CrossEnvTrace format
+                trace = self._convert_stylus_trace_to_cross_env(trace_dict, request, contract)
+
+                if trace:
+                    trace.trace_id = request.request_id
+                    self.trace_store.store_trace(trace)
+                    return trace
+                else:
+                    return None
+
+            except json.JSONDecodeError as e:
+                return None
+            except Exception as e:
+                print(f"[Bridge] ERROR: Failed to read trace file: {e}")
+                import traceback
+                traceback.print_exc()
+                return None
+            
+        except Exception as e:
+            print(f"[Bridge] ERROR: Exception in _invoke_stylus_trace: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _convert_stylus_trace_to_cross_env(
+        self,
+        stylus_trace: Dict,
+        request: TraceRequest,
+        contract: ContractInfo,
+    ) -> Optional[CrossEnvTrace]:
+        """
+        Convert Stylus trace JSON format to CrossEnvTrace.
+
+        Args:
+            stylus_trace: Raw JSON dict from /tmp/lldb_function_trace.json
+            request: The original trace request
+            contract: The target contract info
+
+        Returns:
+            CrossEnvTrace if conversion successful, None otherwise
+        """
+        
+        try:
+            calls = []
+            call_id_counter = 1
+
+            # Parse Stylus trace format
+            # The trace can be either:
+            # 1. A list of calls directly: [{call_id, function, file, line, args}, ...]
+            # 2. A dict with "function_calls" or "calls" key
+            if isinstance(stylus_trace, list):
+                # Direct list of calls
+                raw_calls = stylus_trace
+                print(f"[Bridge] Trace is a list with {len(raw_calls)} call(s)")
+            else:
+                # Dict format
+                raw_calls = stylus_trace.get("function_calls", stylus_trace.get("calls", []))
+
+            # Stylus trace is a FLAT list with parent_call_id references
+            # We need to convert it to a hierarchical structure
+
+            # First pass: create all CrossEnvCall objects
+            call_map = {}  # call_id -> CrossEnvCall
+
+            for raw_call in raw_calls:
+                call_id = raw_call.get("call_id", call_id_counter)
+                parent_id = raw_call.get("parent_call_id")  # 0 means root
+
+                # Extract function info
+                func_name = raw_call.get("function", raw_call.get("name", raw_call.get("function_name", "unknown")))
+                func_selector = raw_call.get("selector", raw_call.get("function_selector"))
+
+                # Extract source location
+                source_loc = None
+                if "source_location" in raw_call:
+                    src = raw_call["source_location"]
+                    source_loc = SourceLocation(
+                        file=src.get("file", ""),
+                        line=src.get("line", 0),
+                        column=src.get("column"),
+                    )
+                elif "file" in raw_call and "line" in raw_call:
+                    source_loc = SourceLocation(
+                        file=raw_call["file"],
+                        line=raw_call["line"],
+                        column=raw_call.get("column"),
+                    )
+
+                # Extract arguments
+                args = []
+                raw_args = raw_call.get("args", raw_call.get("arguments", []))
+                for arg in raw_args:
+                    if isinstance(arg, dict):
+                        args.append(CallArgument(
+                            name=arg.get("name", ""),
+                            type=arg.get("type", ""),
+                            value=str(arg.get("value", "")),
+                        ))
+                    else:
+                        args.append(CallArgument(name="", type="", value=str(arg)))
+
+                cross_call = CrossEnvCall(
+                    call_id=call_id,
+                    parent_call_id=parent_id if parent_id and parent_id != 0 else None,
+                    environment="stylus",
+                    contract_address=raw_call.get("contract_address", contract.address),
+                    function_name=func_name,
+                    function_selector=func_selector,
+                    source_location=source_loc,
+                    args=args,
+                    return_data=raw_call.get("return_data"),
+                    return_value=raw_call.get("return_value"),
+                    gas_used=raw_call.get("gas_used"),
+                    success=raw_call.get("success", True),
+                    error=raw_call.get("error"),
+                    call_type=raw_call.get("call_type", "internal"),
+                    children=[],  # Will be populated in second pass
+                )
+
+                call_map[call_id] = cross_call
+                calls.append(cross_call)
+
+            # Second pass: build children lists based on parent_call_id
+            for cross_call in calls:
+                parent_id = cross_call.parent_call_id
+                if parent_id and parent_id in call_map:
+                    call_map[parent_id].children.append(cross_call)
+
+            print(f"[Bridge] Built hierarchy: {len(calls)} calls, {sum(1 for c in calls if not c.parent_call_id)} root calls")
+
+            # Create CrossEnvTrace
+            trace = CrossEnvTrace(
+                trace_id=request.request_id,
+                transaction_hash=request.transaction_hash,
+                root_call=calls[0] if calls else None,
+                calls=calls,
+                from_address=request.caller_address,
+                to_address=request.target_address,
+                value=request.value,
+                success=True,
+            )
+
+            return trace
+
+        except Exception as e:
+            print(f"[Bridge] ERROR converting Stylus trace: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def _handle_trace_request(self, body: Dict) -> None:
         """
         Handle a trace request from one environment.
@@ -297,14 +938,21 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             if not request.request_id:
                 request.request_id = str(uuid.uuid4())
 
+            # print(f"[Bridge] Received trace request:")
+            # print(f"  Request ID: {request.request_id}")
+            # print(f"  Target: {request.target_address}")
+            # print(f"  Caller: {request.caller_address}")
+            # print(f"  Calldata: {request.calldata}")
+            # print(f"  Value: {request.value} wei")
+            # print(f"  Depth: {request.depth}")
+
             # Determine target environment
             target_contract = self.registry.get(request.target_address)
             if not target_contract:
-                self._send_json_response({
-                    "request_id": request.request_id,
-                    "status": "not_found",
-                    "error_message": f"Contract not registered: {request.target_address}",
-                })
+                self._send_error_response(
+                    f"Contract not registered: {request.target_address}",
+                    404
+                )
                 return
 
             target_env = target_contract.environment
@@ -327,6 +975,44 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                         error_message=str(e),
                     )
                 self._send_json_response(response.to_dict())
+            elif target_env == "evm":
+                # Automatically invoke soldb trace command
+                trace = self._invoke_soldb_trace(request, target_contract)
+                if trace:
+                    response = TraceResponse(
+                        request_id=request.request_id,
+                        status="success",
+                        trace=trace,
+                    )
+                    self._send_json_response(response.to_dict())
+                else:
+                    # Command failed - store as pending
+                    self.trace_store.add_pending_request(request)
+                    self._send_json_response({
+                        "request_id": request.request_id,
+                        "status": "pending",
+                        "message": f"Request queued for {target_env} environment (Solidity trace generation failed)",
+                        "target_environment": target_env,
+                    })
+            elif target_env == "stylus":
+                # Automatically invoke Stylus trace command
+                trace = self._invoke_stylus_trace(request, target_contract)
+                if trace:
+                    response = TraceResponse(
+                        request_id=request.request_id,
+                        status="success",
+                        trace=trace,
+                    )
+                    self._send_json_response(response.to_dict())
+                else:
+                    # Command failed - store as pending
+                    self.trace_store.add_pending_request(request)
+                    self._send_json_response({
+                        "request_id": request.request_id,
+                        "status": "pending",
+                        "message": f"Request queued for {target_env} environment (Stylus trace generation failed or not available)",
+                        "target_environment": target_env,
+                    })
             else:
                 # No handler - store as pending request
                 self.trace_store.add_pending_request(request)
@@ -338,6 +1024,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 })
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self._send_error_response(f"Failed to process trace request: {e}")
 
     def _handle_submit_trace(self, body: Dict) -> None:
@@ -405,6 +1093,7 @@ class CrossEnvBridgeServer:
         self.registry = ContractRegistry()
         self.trace_store = TraceStore()
         self.trace_handlers: Dict[str, Callable] = {}
+        self.trace_commands: Dict[str, str] = {}  # address -> command template
 
         # Server instance
         self._server: Optional[HTTPServer] = None
@@ -437,6 +1126,8 @@ class CrossEnvBridgeServer:
             registry = server.registry
             trace_store = server.trace_store
             trace_handlers = server.trace_handlers
+            trace_commands = server.trace_commands
+            bridge_server = server  # Reference to CrossEnvBridgeServer instance
 
         return Handler
 

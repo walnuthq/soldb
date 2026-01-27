@@ -168,6 +168,7 @@ class CrossEnvBridgeClient:
         parent_trace_id: Optional[str] = None,
         transaction_hash: Optional[str] = None,
         block_number: Optional[int] = None,
+        rpc_endpoint: Optional[str] = None,
     ) -> TraceResponse:
         """
         Request a trace from a Stylus contract.
@@ -182,6 +183,7 @@ class CrossEnvBridgeClient:
             parent_trace_id: ID of the SolDB trace
             transaction_hash: Transaction hash (if tracing existing tx)
             block_number: Block number for context
+            rpc_endpoint: RPC endpoint URL for tx mode
 
         Returns:
             TraceResponse containing the Stylus trace
@@ -190,6 +192,7 @@ class CrossEnvBridgeClient:
             request_id=str(uuid.uuid4()),
             transaction_hash=transaction_hash,
             block_number=block_number,
+            rpc_endpoint=rpc_endpoint,
             target_address=target_address,
             caller_address=caller_address,
             calldata=calldata,
@@ -337,6 +340,7 @@ class StylusBridgeIntegration:
         parent_call_id: Optional[int] = None,
         transaction_hash: Optional[str] = None,
         block_number: Optional[int] = None,
+        rpc_endpoint: Optional[str] = None,
     ) -> Optional[CrossEnvTrace]:
         """
         Request a trace from a Stylus contract.
@@ -356,6 +360,7 @@ class StylusBridgeIntegration:
                 parent_call_id=parent_call_id,
                 transaction_hash=transaction_hash,
                 block_number=block_number,
+                rpc_endpoint=rpc_endpoint,
             )
 
             if response.status == "success" and response.trace:

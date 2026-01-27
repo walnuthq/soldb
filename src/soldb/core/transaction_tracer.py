@@ -253,6 +253,7 @@ class TransactionTracer:
             parent_call_id=parent_call_id,
             transaction_hash=tx_hash,
             block_number=block_number,
+            rpc_endpoint=self.rpc_url,
         )
 
         if trace:
@@ -274,23 +275,26 @@ class TransactionTracer:
         Convert Stylus trace calls to SolDB FunctionCall objects.
 
         This merges the Stylus trace into the EVM call hierarchy.
+        Only processes ROOT calls (parent_call_id is None), recursion handles children.
         """
         function_calls = []
 
-        for stylus_call in stylus_trace.calls:
-            # Create a FunctionCall from the Stylus call
+        root_calls = [c for c in stylus_trace.calls if c.parent_call_id is None]
+
+        def convert_recursive(stylus_call: 'CrossEnvCall', depth: int) -> 'FunctionCall':
+            """Recursively convert a Stylus call and its children."""
             func_call = FunctionCall(
                 name=f"[Stylus] {stylus_call.function_name}",
                 selector=stylus_call.function_selector or "",
                 entry_step=-1,  # Stylus calls don't have EVM step numbers
                 exit_step=None,
                 gas_used=stylus_call.gas_used or 0,
-                depth=stylus_call.call_id + depth_offset,  # Adjust depth
+                depth=depth,
                 args=[(arg.name, arg.value) for arg in stylus_call.args],
                 call_type=f"stylus:{stylus_call.call_type}",
                 contract_address=stylus_call.contract_address,
-                call_id=base_call_id + stylus_call.call_id,
-                parent_call_id=(base_call_id + stylus_call.parent_call_id) if stylus_call.parent_call_id else (parent_call.call_id if parent_call else None),
+                call_id=stylus_call.call_id,  # Will be remapped in merge loop
+                parent_call_id=stylus_call.parent_call_id,  # Will be remapped in merge loop
             )
 
             # Add source location info if available
@@ -299,19 +303,15 @@ class TransactionTracer:
 
             function_calls.append(func_call)
 
-            # Recursively process children
-            if stylus_call.children:
-                child_trace = CrossEnvTrace(
-                    trace_id=stylus_trace.trace_id,
-                    calls=stylus_call.children,
-                )
-                child_calls = self._convert_stylus_calls_to_function_calls(
-                    child_trace,
-                    parent_call=func_call,
-                    base_call_id=base_call_id,
-                    depth_offset=depth_offset,
-                )
-                function_calls.extend(child_calls)
+            # Recursively process children (children_call_ids will be built in merge loop)
+            for child in stylus_call.children:
+                convert_recursive(child, depth + 1)
+
+            return func_call
+
+        # Convert all root calls
+        for root_call in root_calls:
+            convert_recursive(root_call, depth_offset + 1)
 
         return function_calls
 
@@ -640,30 +640,71 @@ class TransactionTracer:
             return None
     
     
-    def extract_calldata_from_step(self, step):
+    def extract_calldata_from_step(self, step, raw_step = None):
         stack = step.stack
         memory = step.memory
-        if len(stack) < 7 or not memory:
+        op = step.op
+
+        # Different opcodes have different stack layouts:
+        # CALL:         [gas, to, value, argsOffset, argsSize, retOffset, retSize] - 7 items
+        # STATICCALL:   [gas, to, argsOffset, argsSize, retOffset, retSize] - 6 items (no value)
+        # DELEGATECALL: [gas, to, argsOffset, argsSize, retOffset, retSize] - 6 items (no value)
+        if op == "CALL":
+            required_stack = 7
+            args_offset_idx = -4
+            args_size_idx = -5
+        else:  # STATICCALL, DELEGATECALL
+            required_stack = 6
+            args_offset_idx = -3
+            args_size_idx = -4
+
+        if len(stack) < required_stack:
             return None
 
-        # CALL: [gas, to, value, argsOffset, argsSize, retOffset, retSize]
-        args_offset = int(stack[-4], 16)
-        args_size = int(stack[-5], 16)
+        args_offset = int(stack[args_offset_idx], 16)
+        args_size = int(stack[args_size_idx], 16)
 
+        # If args_size is 0, no calldata needed                                              
+        if args_size == 0: 
+            return "0x"                                                                      
+        
+        # Try to get memory bytes                                                            
+        memory_bytes = b''
+        
         # If memory is a string (hex), decode it directly
-        if isinstance(memory, str):
+        if isinstance(memory, str) and memory:
             # Remove '0x' if present
             mem_hex = memory[2:] if memory.startswith('0x') else memory
             # If odd number of characters, add '0' at the beginning
             if len(mem_hex) % 2 != 0:
                 mem_hex = '0' + mem_hex
-            memory_bytes = decode_hex(mem_hex)
-        else:
-            # fallback for list of strings (if ever)
+            if mem_hex:
+                memory_bytes = decode_hex(mem_hex)
+        elif isinstance(memory, list) and memory:
             memory_bytes = b''.join(decode_hex(m[2:] if m.startswith('0x') else m) for m in memory)
-
+    
+        # If memory is empty, try raw_step as fallback
+        if not memory_bytes and raw_step:
+            raw_memory = raw_step.memory.get('memory')
+            if isinstance(raw_memory, str) and raw_memory:
+                # Each element is a 32-byte hex string (without 0x prefix typically)
+                try:                                                          
+                    memory_bytes = b''.join(bytes.fromhex(m) for m in raw_memory if m)                                                                      
+                except Exception as e:         
+                    pass                               
+            elif isinstance(raw_memory, str) and raw_memory:                  
+                mem_hex = raw_memory[2:] if raw_memory.startswith('0x') else raw_memory                                                                     
+                if mem_hex:                                                   
+                    memory_bytes = decode_hex(mem_hex)                        
+    
+        # Check if we have enough memory                                      
+        if len(memory_bytes) < args_offset + args_size:                       
+            return None   
+        
         calldata = memory_bytes[args_offset:args_offset + args_size]
-        return '0x' + calldata.hex()
+        result = '0x' + calldata.hex()
+
+        return result
     
     def is_likely_memory_offset(self, value: str) -> bool:
         """Check if a stack value is likely a memory offset rather than an address.
@@ -754,8 +795,12 @@ class TransactionTracer:
         try:
             trace_result = self.w3.manager.request_blocking(
                 "debug_traceTransaction",
+<<<<<<< HEAD:src/soldb/core/transaction_tracer.py
                 [tx_hash, {"disableStorage": False, "disableMemory": False, "enableMemory": True}]
             )
+=======
+                [tx_hash, {"disableStorage": False, "disableMemory": False, "enableMemory": True}])
+>>>>>>> 9634164 (Implement invoking soldb/stylus trace):src/soldb/transaction_tracer.py
         except Exception as e:
             debug_trace_available = False
             debug_error = str(e)
@@ -767,6 +812,9 @@ class TransactionTracer:
         # Parse trace steps
         steps = []
         for i, step in enumerate(trace_result.get('structLogs', [])):
+            if step['op'] in ['CALL', 'STATICCALL', 'DELEGATECALL']:          
+                raw_memory = step.get('memory')                               
+                
             trace_step = TraceStep(
                 pc=step['pc'],
                 op=step['op'],
@@ -935,8 +983,10 @@ class TransactionTracer:
 
         # Parse trace steps (reuse logic from trace_transaction)
         steps = []
-        struct_logs = trace_result.get('structLogs', [])
-        for i, step in enumerate(struct_logs):
+        for i, step in enumerate(trace_result.get('structLogs', [])):
+            if step['op'] in ['CALL', 'STATICCALL', 'DELEGATECALL']:          
+                raw_memory = step.get('memory')                               
+            
             trace_step = TraceStep(
                 pc=step['pc'],
                 op=step['op'],
@@ -1843,8 +1893,6 @@ class TransactionTracer:
             call_stack.append(main_call)
             # Update dispatcher to have main as child
             dispatcher_call.children_call_ids.append(main_call.call_id)
-
-        
         # Find the main function entry
         prev_depth = 0
         for i, step in enumerate(trace.steps):
@@ -1915,6 +1963,69 @@ class TransactionTracer:
                     })
                     current_contract = call.contract_address
                     current_depth += 1
+                    
+                    # If this is a Stylus contract call, request trace and merge
+                    if call.call_type.startswith("STYLUS_"):
+                        # Extract calldata from the step
+                        calldata = self.extract_calldata_from_step(step)
+                        
+                        # Request Stylus trace via bridge
+                        stylus_trace = self._request_stylus_trace(
+                            target_address=call.contract_address,
+                            calldata=calldata or "0x",
+                            caller_address=current_contract,
+                            value=call.value or 0,
+                            depth=call.depth,
+                            parent_call_id=call.call_id,
+                            tx_hash=trace.tx_hash,
+                            block_number=None,
+                        )
+                        
+                        if stylus_trace:
+                            # Convert Stylus calls to FunctionCall objects
+                            stylus_calls = self._convert_stylus_calls_to_function_calls(
+                                stylus_trace,
+                                parent_call=call,
+                                base_call_id=next_call_id,
+                                depth_offset=call.depth,
+                            )
+                            
+                            # Insert Stylus calls preserving their internal hierarchy
+                            # Build mapping: old Stylus call_id -> new call_id
+                            # Stylus trace starts from 1, parent_call_id=0 means root (child of EVM CALL)
+                            stylus_id_map = {0: call.call_id}  # parent=0 maps to EVM CALL
+
+                            # First pass: assign new call_ids
+                            for stylus_call in stylus_calls:
+                                old_id = stylus_call.call_id
+                                stylus_id_map[old_id] = next_call_id
+                                stylus_call.call_id = next_call_id
+                                next_call_id += 1
+
+                            # Second pass: remap parent_call_ids and set depth
+                            for stylus_call in stylus_calls:
+                                old_parent = stylus_call.parent_call_id or 0
+                                new_parent = stylus_id_map.get(old_parent, call.call_id)
+                                stylus_call.parent_call_id = new_parent
+
+                                # Calculate depth: find parent and add 1
+                                if new_parent == call.call_id:
+                                    stylus_call.depth = call.depth + 1
+                                    call.children_call_ids.append(stylus_call.call_id)
+                                else:
+                                    # Find parent stylus call
+                                    for p in stylus_calls:
+                                        if p.call_id == new_parent:
+                                            stylus_call.depth = p.depth + 1
+                                            p.children_call_ids.append(stylus_call.call_id)
+                                            break
+
+                                insert_call_sorted(stylus_call)
+                        else:
+                            print(warning(f"[STYLUS] No trace received for {call.contract_address}"))
+                            print(f"  This may be because:")
+                            print(f"    - Stylus trace is still pending on bridge")
+                            print(f"    - Trace request failed")
                     
                     # Switch to the target contract's ETHDebug info if available
                     if self.multi_contract_parser and call.contract_address:
@@ -2446,6 +2557,7 @@ class TransactionTracer:
             value = int(step.stack[-3], 16)
         else:
             value = None
+
         # Get contract name and check if we have debug info for target contract
         contract_name = self.format_address_display(to_addr)
         target_contract_info = None
@@ -2645,10 +2757,39 @@ class TransactionTracer:
             # Fallback: show entry point
             print(f"#0 {cyan('Contract::fallback()')} {dim('(no function selector matched)')}")
         else:
-            # Sort calls by entry_step to ensure proper ordering
-            # Handle None entry_step values by treating them as -1 (before all others)
-            # sorted_calls = sorted(function_calls, key=lambda x: x.entry_step if x.entry_step is not None else -1)
-            sorted_calls = function_calls
+            # Build tree-ordered list based on parent-child relationships
+            # This ensures Stylus calls appear nested under their parent EVM calls
+            call_map = {c.call_id: c for c in function_calls}
+            children_map = {}  # parent_id -> list of children (sorted by entry_step for EVM calls)
+            root_calls = []
+
+            for c in function_calls:
+                parent_id = c.parent_call_id
+                if parent_id is None or parent_id not in call_map:
+                    root_calls.append(c)
+                else:
+                    if parent_id not in children_map:
+                        children_map[parent_id] = []
+                    children_map[parent_id].append(c)
+
+            # Sort children: EVM calls (entry_step >= 0) first by entry_step, then Stylus calls (entry_step < 0)
+            for parent_id in children_map:
+                children_map[parent_id].sort(key=lambda x: (x.entry_step < 0, x.entry_step if x.entry_step >= 0 else x.call_id))
+
+            # Sort root calls by entry_step
+            root_calls.sort(key=lambda x: x.entry_step if x.entry_step is not None and x.entry_step >= 0 else 0)
+
+            # Depth-first traversal to build display order
+            sorted_calls = []
+            def traverse(call):
+                sorted_calls.append(call)
+                for child in children_map.get(call.call_id, []):
+                    traverse(child)
+
+            for root in root_calls:
+                traverse(root)
+
+
             for i, call in enumerate(sorted_calls):
                 indent = "  " * call.depth
                 
