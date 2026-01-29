@@ -363,7 +363,9 @@ class StylusBridgeIntegration:
                 rpc_endpoint=rpc_endpoint,
             )
 
-            if response.status == "success" and response.trace:
+            # Return trace even if status is "error" - the trace contains valuable
+            # debugging info about which call failed and why
+            if response.trace:
                 return response.trace
             return None
         except BridgeClientError:

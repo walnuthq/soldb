@@ -41,6 +41,7 @@ class FunctionCall:
     parent_entry_step: Optional[int] = None
     call_id: int = 0
     caused_revert: bool = False  # True if this frame initiated the revert
+    error: Optional[str] = None  # Error message if this call failed
     parent_call_id: Optional[int] = None
     contract_call_id: Optional[int] = None  # ID of the contract call that contains this function call
     children_call_ids: List[int] = field(default_factory=list)
@@ -259,8 +260,6 @@ class TransactionTracer:
         if trace:
             # Cache the trace
             self._stylus_traces[target_address.lower()] = trace
-            if not self.quiet_mode:
-                print(info(f"[STYLUS] Received trace for {target_address[:10]}... ({len(trace.calls)} calls)"))
 
         return trace
 
@@ -295,6 +294,8 @@ class TransactionTracer:
                 contract_address=stylus_call.contract_address,
                 call_id=stylus_call.call_id,  # Will be remapped in merge loop
                 parent_call_id=stylus_call.parent_call_id,  # Will be remapped in merge loop
+                caused_revert=not stylus_call.success,  # Mark as revert if call failed
+                error=stylus_call.error,  # Capture error message
             )
 
             # Add source location info if available
@@ -2747,8 +2748,17 @@ class TransactionTracer:
             print(f"{dim('Status:')} {success('SUCCESS')}")
         else:
             print(f"{dim('Status:')} {error('REVERTED')}")
-            if trace.error:
-                print(f"{error('Error:')} {trace.error}")
+            # Find the deepest error - this is the root cause
+            deepest_error = None
+            deepest_depth = -1
+            for call in function_calls:
+                if call.caused_revert and call.error and call.depth > deepest_depth:
+                    deepest_error = call.error
+                    deepest_depth = call.depth
+            # Use deepest error, fall back to trace.error
+            error_msg = deepest_error or trace.error
+            if error_msg:
+                print(f"{error('Error:')} {error_msg}")
         
         print(f"\n{bold('Call Stack:')}")
         print(dim("-" * 60))
@@ -2789,6 +2799,13 @@ class TransactionTracer:
             for root in root_calls:
                 traverse(root)
 
+            # Find the deepest call with an error - only this one should show !!!
+            deepest_error_call_id = None
+            deepest_error_depth = -1
+            for call in sorted_calls:
+                if call.caused_revert and call.error and call.depth > deepest_error_depth:
+                    deepest_error_call_id = call.call_id
+                    deepest_error_depth = call.depth
 
             for i, call in enumerate(sorted_calls):
                 indent = "  " * call.depth
@@ -2884,8 +2901,8 @@ class TransactionTracer:
                     else:
                         source_info = dim(f" @ Contract entry point")
                 
-                # Add indicator for the frame that caused the revert
-                revert_indicator = f" {error('!!!')}" if call.caused_revert else ""
+                # Add indicator only for the deepest frame that caused the revert (root cause)
+                revert_indicator = f" {error('!!!')}" if call.call_id == deepest_error_call_id else ""
                 print(f"{indent}#{i} {func_display} {call_type_display} {gas_info}{source_info}{revert_indicator}")
                 
                 # Show entry/exit steps for non-entry-point functions

@@ -880,6 +880,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     else:
                         args.append(CallArgument(name="", type="", value=str(arg)))
 
+                # Determine success: explicit success field, or infer from error field
+                has_error = raw_call.get("error", False)
+                call_success = raw_call.get("success", not has_error)
+
+                # Get error message: use error_message if present, otherwise None
+                error_msg = raw_call.get("error_message")
+
                 cross_call = CrossEnvCall(
                     call_id=call_id,
                     parent_call_id=parent_id if parent_id and parent_id != 0 else None,
@@ -892,8 +899,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     return_data=raw_call.get("return_data"),
                     return_value=raw_call.get("return_value"),
                     gas_used=raw_call.get("gas_used"),
-                    success=raw_call.get("success", True),
-                    error=raw_call.get("error"),
+                    success=call_success,
+                    error=error_msg,
                     call_type=raw_call.get("call_type", "internal"),
                     children=[],  # Will be populated in second pass
                 )
@@ -909,6 +916,16 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
             print(f"[Bridge] Built hierarchy: {len(calls)} calls, {sum(1 for c in calls if not c.parent_call_id)} root calls")
 
+            # Determine trace-level success from status field or by checking if any call has an error
+            trace_status = stylus_trace.get("status", "success") if isinstance(stylus_trace, dict) else "success"
+            trace_success = trace_status != "error"
+            # Also check if any call failed
+            if trace_success:
+                trace_success = all(c.success for c in calls)
+
+            # Get trace-level error message if present
+            trace_error = stylus_trace.get("error_message") if isinstance(stylus_trace, dict) else None
+
             # Create CrossEnvTrace
             trace = CrossEnvTrace(
                 trace_id=request.request_id,
@@ -918,7 +935,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 from_address=request.caller_address,
                 to_address=request.target_address,
                 value=request.value,
-                success=True,
+                success=trace_success,
+                error=trace_error,
             )
 
             return trace
