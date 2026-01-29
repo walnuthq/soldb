@@ -437,6 +437,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             if result.stdout:
                 try:
                     trace_data = json.loads(result.stdout)
+                    # print(f"[Bridge] soldb stdout: {trace_data}")
                     # Convert to CrossEnvTrace
                     trace = self._convert_soldb_trace_to_cross_env(trace_data, request, contract)
                     if trace:
@@ -540,6 +541,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     if ret_values:
                         return_value = str(ret_values[0]) if len(ret_values) == 1 else str(ret_values)
 
+                status = call_obj.get("isRevertedFrame", False)
+                # print(f"[Bridge] soldb call status: {status}")
                 cross_call = CrossEnvCall(
                     call_id=call_id,
                     parent_call_id=parent_id,
@@ -552,7 +555,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                     return_data=call_obj.get("output"),
                     return_value=return_value,
                     gas_used=_parse_gas(call_obj.get("gasUsed")),
-                    success=call_obj.get("success", True),
+                    success=not status,
                     error=call_obj.get("error"),
                     call_type=call_type.lower(),
                     children=[],
@@ -963,9 +966,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 # Invoke the handler to get the trace
                 try:
                     trace = handler(request, target_contract)
+                    # Set response status based on trace success (transaction outcome)
+                    response_status = "success" if trace.success else "error"
                     response = TraceResponse(
                         request_id=request.request_id,
-                        status="success",
+                        status=response_status,
                         trace=trace,
                     )
                 except Exception as e:
@@ -979,11 +984,14 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 # Automatically invoke soldb trace command
                 trace = self._invoke_soldb_trace(request, target_contract)
                 if trace:
+                    # Set response status based on trace success (transaction outcome)
+                    response_status = "success" if trace.success else "error"
                     response = TraceResponse(
                         request_id=request.request_id,
-                        status="success",
+                        status=response_status,
                         trace=trace,
                     )
+                    # print(f"[Bridge] Trace generated {response.to_dict()}")
                     self._send_json_response(response.to_dict())
                 else:
                     # Command failed - store as pending
@@ -998,9 +1006,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 # Automatically invoke Stylus trace command
                 trace = self._invoke_stylus_trace(request, target_contract)
                 if trace:
+                    # Set response status based on trace success (transaction outcome)
+                    response_status = "success" if trace.success else "error"
                     response = TraceResponse(
                         request_id=request.request_id,
-                        status="success",
+                        status=response_status,
                         trace=trace,
                     )
                     self._send_json_response(response.to_dict())

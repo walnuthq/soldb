@@ -946,14 +946,10 @@ class TransactionTracer:
             # Cap at reasonable maximum (5M gas) to avoid excessive costs
             gas_limit = min(gas_limit, 5000000)
         except Exception as e:
-            # If estimation fails, use a reasonable default based on call type
-            # Simple calls: ~21k, contract calls: ~100k-500k
-            if calldata and calldata != "0x" and len(calldata) > 2:
-                # Contract call - use 500k as safe default
-                gas_limit = 500000
-            else:
-                # Simple transfer - use 21k
-                gas_limit = 21000
+            # If estimation fails, use a high default
+            # On L2s, intrinsic gas includes L1 data costs which can be much higher
+            # Use 10M gas as safe default for all calls
+            gas_limit = 10000000
         
         call_obj = {
             'to': to,
@@ -1005,10 +1001,14 @@ class TransactionTracer:
         if not error_msg and is_failed:
             # Try to decode revert reason from return value
             return_value = trace_result.get('returnValue', '')
-            if return_value and return_value.startswith('08c379a0') or return_value.startswith('0x08c379a0'):
+            if return_value and (return_value.startswith('08c379a0') or return_value.startswith('0x08c379a0')):
                 # This is Error(string) - decode the revert reason
                 try:
-                    data = return_value[8:]  # Skip selector
+                    # Skip selector (8 hex chars) plus '0x' prefix if present
+                    if return_value.startswith('0x'):
+                        data = return_value[10:]  # Skip '0x' + 4-byte selector
+                    else:
+                        data = return_value[8:]   # Skip 4-byte selector only
                     offset = int(data[:64], 16)
                     length = int(data[64:128], 16)
                     string_hex = data[128:128+length*2]
@@ -1017,7 +1017,7 @@ class TransactionTracer:
                     error_msg = "Execution reverted"
             elif return_value:
                 # Other revert types (custom errors, etc.)
-                    error_msg = f"Reverted with data: 0x{return_value}"
+                error_msg = f"Reverted with data: 0x{return_value}"
             else:
                 error_msg = "Execution reverted"
         

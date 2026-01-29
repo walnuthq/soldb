@@ -372,6 +372,9 @@ class TraceSerializer:
         
         if hasattr(call, 'caused_revert') and call.caused_revert:
             trace_call["isRevertedFrame"] = True
+            # Include the error message from the trace if available
+            if trace.error:
+                trace_call["error"] = trace.error
         
         if call.call_type == "entry":
             has_debug_info = False
