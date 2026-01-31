@@ -220,6 +220,29 @@ class TransactionTracer:
             self.stylus_bridge = None
             return False
 
+    def register_stylus_contract(self, address: str, name: str, lib_path: str) -> bool:
+        """
+        Register a Stylus contract with the bridge.
+
+        Args:
+            address: Contract address
+            name: Contract name
+            lib_path: Path to the contract's shared library (.so file)
+
+        Returns:
+            True if registration was successful
+        """
+        if not self.stylus_bridge or not self.stylus_bridge.is_connected:
+            return False
+
+        contract = ContractInfo(
+            address=address,
+            name=name,
+            environment="stylus",
+            lib_path=lib_path
+        )
+        return self.stylus_bridge.register_contract(contract)
+
     def is_stylus_contract(self, address: str) -> bool:
         """Check if an address is a registered Stylus contract."""
         if not self.stylus_bridge or not self.stylus_bridge.is_connected:
@@ -796,12 +819,8 @@ class TransactionTracer:
         try:
             trace_result = self.w3.manager.request_blocking(
                 "debug_traceTransaction",
-<<<<<<< HEAD:src/soldb/core/transaction_tracer.py
                 [tx_hash, {"disableStorage": False, "disableMemory": False, "enableMemory": True}]
             )
-=======
-                [tx_hash, {"disableStorage": False, "disableMemory": False, "enableMemory": True}])
->>>>>>> 9634164 (Implement invoking soldb/stylus trace):src/soldb/transaction_tracer.py
         except Exception as e:
             debug_trace_available = False
             debug_error = str(e)

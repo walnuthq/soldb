@@ -59,6 +59,29 @@ def simulate_command(args) -> int:
     # Create tracer
     try:
         tracer = TransactionTracer(args.rpc_url)
+        
+        # Set up cross-environment (Stylus) bridge if configured
+        if getattr(args, 'cross_env_bridge', None):
+            if tracer.setup_stylus_bridge(args.cross_env_bridge):
+                # Load Stylus contract registrations if provided
+                if getattr(args, 'stylus_contracts', None):
+                    try:
+                        from soldb.cross_env.contract_registry import ContractRegistry
+                        registry = ContractRegistry()
+                        count = registry.load_from_file(args.stylus_contracts)
+                        # Register Stylus contracts with the bridge
+                        for contract in registry.get_stylus_contracts():
+                            tracer.register_stylus_contract(
+                                contract.address,
+                                contract.name,
+                                contract.lib_path
+                            )
+                        if not json_mode:
+                            print(info(f"[STYLUS] Registered {count} contracts from {args.stylus_contracts}"))
+                    except Exception as e:
+                        if not json_mode:
+                            print(warning(f"[STYLUS] Failed to load contracts: {e}"))
+            
     except Exception as e:
         return _handle_connection_error(e, json_mode)
     
