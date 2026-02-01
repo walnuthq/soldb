@@ -1,0 +1,18 @@
+{
+  "contracts": [
+    {
+      "address": "0x809fe0e639527a927977e64c0ed107dbf09cb248",
+      "environment": "stylus",
+      "name": "Counter",
+      "lib_path": "/Users/mami/Documents/walnut/walnut-evm/soldb/test/stylus/counter/target/aarch64-apple-darwin/debug/libcounter.dylib",
+      "project_path": "/Users/mami/Documents/walnut/walnut-evm/soldb/test/stylus/counter"
+    },
+    {
+      "address": "0xfB9006C56aA4cF7a8583CfD7662E51DFE26B738C",
+      "environment": "evm",
+      "name": "StylusCounterCaller",
+      "project_path": "/Users/mami/Documents/walnut/walnut-evm/soldb/test/stylus/solidity-caller",
+      "debug_dir": "out"
+    }
+  ]
+}

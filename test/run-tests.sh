@@ -330,6 +330,26 @@ if not solc_path:
     solc_path = 'solc'
 config.solc_path = solc_path
 
+# Stylus interop test configuration
+# Load from deployment.env if it exists
+stylus_deployment = os.path.join(script_dir, 'stylus', 'deployment.env')
+if os.path.exists(stylus_deployment):
+    stylus_vars = {}
+    with open(stylus_deployment) as f:
+        for line in f:
+            if '=' in line:
+                key, value = line.strip().split('=', 1)
+                stylus_vars[key] = value
+    config.stylus_config = {
+        'rpc_url': stylus_vars.get('RPC_URL', 'http://localhost:8547'),
+        'bridge_url': 'http://127.0.0.1:8765',
+        'test_tx': stylus_vars.get('TEST_TX', ''),
+        'caller_address': stylus_vars.get('SOLIDITY_CALLER_ADDRESS', ''),
+        'counter_address': stylus_vars.get('STYLUS_COUNTER_ADDRESS', ''),
+        'debug_dir': os.path.join(script_dir, 'stylus', 'solidity-caller', 'out'),
+        'contracts_json': os.path.join(script_dir, 'stylus', 'stylus-contracts.json')
+    }
+
 # Load the main config
 lit_config.load_config(config, os.path.join(script_dir, "lit.cfg.py"))
 EOF

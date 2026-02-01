@@ -9,10 +9,11 @@ test/
 ├── trace/           # Trace command tests
 ├── simulate/        # Simulate command tests
 ├── events/          # Events command tests
+├── stylus/          # Stylus interop test contracts and scripts
 ├── run-tests.sh     # Main test runner script
 ├── lit.cfg.py       # Test framework configuration
-├── lit.site.cfg.py - Generated site-specific configuration (gitignored)
-└── README.md        
+├── lit.site.cfg.py  # Generated site-specific configuration (gitignored)
+└── README.md
 ```
 
 ## Test Categories
@@ -29,6 +30,12 @@ Tests for the `soldb simulate` command:
 - **json-simulate.test**: JSON output format testing
 - **raw-data-simulate.test**: Raw calldata simulation
 - **raw-simulate.test**: Raw instruction trace for simulation
+
+### Stylus Interop Tests (`test/stylus/`)
+Tests for Solidity <> Stylus cross-environment tracing:
+- **stylus-interop.test**: Cross-environment trace with Stylus bridge
+
+These tests require additional setup. See `test/stylus/README.md` for details.
 
 ## Running Tests
 
@@ -76,6 +83,19 @@ lit trace/
 lit simulate/
 ```
 
+### Run Stylus Interop Tests
+Stylus tests require additional setup (nitro-testnode, cargo-stylus-beta, cross-env-bridge).
+See `test/stylus/README.md` for full instructions.
+
+```bash
+# Deploy contracts first
+cd test/stylus
+./deploy.sh
+
+# Then run the test (requires stylus-bridge feature)
+lit trace/stylus-interop.test -v
+```
+
 ## Prerequisites
 
 1. **Anvil or local Ethereum node** running on `http://localhost:8545`
@@ -84,6 +104,13 @@ lit simulate/
    - `lit` test runner
    - `FileCheck` test verification
 4. **SolDB** installed and available
+
+### Additional Prerequisites for Stylus Tests
+
+5. **Nitro debug testnode with Stylus support** running on `http://localhost:8547`
+6. **cargo-stylus-beta** from walnut fork:
+   - Installation: https://github.com/walnuthq/stylus-sdk-rs/blob/main/cargo-stylus/docs/StylusDebugger.md
+7. **cross-env-bridge** running on `http://127.0.0.1:8765`
 
 ## Test Environment
 

@@ -131,7 +131,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         """Override to use custom logging or suppress."""
         if self.server.verbose:
-            print(f"[Bridge] {args[0]} {args[1]} {args[2]}")
+            try:
+                # Properly format the message using the provided arguments
+                message = format % args
+                print(f"[Bridge] {message}")
+            except (TypeError, IndexError):
+                # Fallback if formatting fails
+                print(f"[Bridge] {format} {args}")
 
     def _send_json_response(self, data: Dict, status: int = 200) -> None:
         """Send a JSON response."""

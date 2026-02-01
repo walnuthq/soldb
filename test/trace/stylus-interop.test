@@ -1,0 +1,55 @@
+# Test Solidity <> Stylus cross-environment tracing
+# REQUIRES: soldb, stylus-bridge
+# RUN: %soldb trace %{stylus_test_tx} --ethdebug-dir %{stylus_caller_address}:StylusCounterCaller:%{stylus_debug_dir} --cross-env-bridge %{stylus_bridge_url} --stylus-contracts %{stylus_contracts_json} --rpc %{stylus_rpc_url} 2>&1 | FileCheck %s
+
+# Check that we connect to the Stylus bridge
+# CHECK: Connecting to RPC:
+# CHECK: [STYLUS] Connected to cross-env bridge
+# CHECK: [STYLUS] Registered {{[0-9]+}} contracts from
+
+# Check basic trace info
+# CHECK: Loading transaction
+# CHECK: Contract: StylusCounterCaller
+# CHECK: Environment: runtime
+
+# Check function call trace header
+# CHECK: Function Call Trace:
+# CHECK: StylusCounterCaller
+# CHECK: Status: SUCCESS
+
+# Check the call stack structure
+# CHECK: Call Stack:
+# CHECK: ------------------------------------------------------------
+# CHECK: #0 StylusCounterCaller::runtime_dispatcher
+
+# Check for Solidity external function call
+# CHECK: complexStylusOperation(uint256,uint256,uint256)
+# CHECK: initialValue:
+# CHECK: incrementTimes:
+# CHECK: addValue:
+
+# Check for Stylus CALL transitions (Solidity -> Stylus)
+# CHECK: CALL {{.*}} [Stylus] Counter::setNumber
+# CHECK: [STYLUS_CALL]
+
+# Check for Stylus internal function traces
+# CHECK: [Stylus] counter::
+# CHECK: [stylus:internal]
+
+# Check for Stylus set_number function
+# CHECK: set_number
+
+# Check for Stylus incrementBy or increment calls
+# CHECK: CALL {{.*}} [Stylus] Counter::increment
+# CHECK: [STYLUS_CALL]
+
+# Check for Stylus addNumber call
+# CHECK: CALL {{.*}} [Stylus] Counter::addNumber
+# CHECK: [STYLUS_CALL]
+
+# Check for Stylus STATICCALL (read-only call for number())
+# CHECK: STATICCALL {{.*}} [Stylus] Counter::number
+# CHECK: [STYLUS_STATICCALL]
+
+# Check footer
+# CHECK: ------------------------------------------------------------
