@@ -330,6 +330,26 @@ if not solc_path:
     solc_path = 'solc'
 config.solc_path = solc_path
 
+# Stylus interop test configuration
+# Load from deployment.env if it exists
+stylus_deployment = os.path.join(script_dir, 'stylus', 'deployment.env')
+if os.path.exists(stylus_deployment):
+    stylus_vars = {}
+    with open(stylus_deployment) as f:
+        for line in f:
+            if '=' in line:
+                key, value = line.strip().split('=', 1)
+                stylus_vars[key] = value
+    config.stylus_config = {
+        'rpc_url': stylus_vars.get('RPC_URL', 'http://localhost:8547'),
+        'bridge_url': 'http://127.0.0.1:8765',
+        'test_tx': stylus_vars.get('TEST_TX', ''),
+        'caller_address': stylus_vars.get('SOLIDITY_CALLER_ADDRESS', ''),
+        'counter_address': stylus_vars.get('STYLUS_COUNTER_ADDRESS', ''),
+        'debug_dir': os.path.join(script_dir, 'stylus', 'solidity-caller', 'out'),
+        'contracts_json': os.path.join(script_dir, 'stylus', 'stylus-contracts.json')
+    }
+
 # Load the main config
 lit_config.load_config(config, os.path.join(script_dir, "lit.cfg.py"))
 EOF
@@ -360,10 +380,11 @@ fi
 # Run tests
 echo -e "${YELLOW}Running tests...${NC}"
 
-# Set up lit command with verbose flag if requested
-LIT_VERBOSE=""
+# Set up lit command options
+# Use -j1 to run tests sequentially (avoids race conditions when tests share resources)
+LIT_OPTS="-j1"
 if [ "$VERBOSE" = true ]; then
-    LIT_VERBOSE="-v"
+    LIT_OPTS="$LIT_OPTS -v"
 fi
 
 # Run trace tests
@@ -374,7 +395,7 @@ if [ "$RUN_TRACE_TESTS" = true ]; then
         # This ensures they run before other tests that might change solc version
         echo -e "${BLUE}Running legacy tests first (solc 0.8.16)...${NC}"
         if [ -f "${SCRIPT_DIR}/trace/increment-trace-legacy.test" ]; then
-            "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/trace/increment-trace-legacy.test"
+            "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/trace/increment-trace-legacy.test"
         fi
         
         # Then run all other trace tests (they use solc 0.8.31)
@@ -383,7 +404,7 @@ if [ "$RUN_TRACE_TESTS" = true ]; then
         ensure_ethdebug_solc "$SOLC_PATH"
         export SOLC_PATH
         # Use lit's filter-out to exclude legacy test
-        "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/trace" --filter-out="increment-trace-legacy"
+        "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/trace" --filter-out="increment-trace-legacy"
     else
         echo -e "${YELLOW}Warning: trace directory not found${NC}"
     fi
@@ -393,7 +414,7 @@ fi
 if [ "$RUN_SIMULATE_TESTS" = true ]; then
     echo -e "${YELLOW}Running simulate tests...${NC}"
     if [ -d "${SCRIPT_DIR}/simulate" ]; then
-        "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/simulate"
+        "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/simulate"
     else
         echo -e "${YELLOW}Warning: simulate directory not found${NC}"
     fi
@@ -403,7 +424,7 @@ fi
 if [ "$RUN_EVENTS_TESTS" = true ]; then
     echo -e "${YELLOW}Running events tests...${NC}"
     if [ -d "${SCRIPT_DIR}/events" ]; then
-        "$LIT_CMD" $LIT_VERBOSE "${SCRIPT_DIR}/events"
+        "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/events"
     else
         echo -e "${YELLOW}Warning: events directory not found${NC}"
     fi

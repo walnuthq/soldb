@@ -14,6 +14,7 @@ from .trace import trace_command
 from .simulate import simulate_command
 from .events import list_events_command
 from .contracts import list_contracts_command
+from .bridge import bridge_command
 
 
 def main():
@@ -24,6 +25,15 @@ def main():
     # Create subparsers for different commands
     subparsers = parser.add_subparsers(dest='command', help='Commands')
     subparsers.required = True
+
+    # bridge command
+    bridge_parser = subparsers.add_parser('bridge', help='Run the cross-environment (Stylus) debug bridge server')
+    bridge_parser.add_argument('--host', default='127.0.0.1', help='Host to bind to (default: 127.0.0.1)')
+    bridge_parser.add_argument('--port', type=int, default=8765, help='Port to listen on (default: 8765)')
+    bridge_parser.add_argument('--config', dest='config_file', default=None,
+                               help='JSON file with contract registrations to load at startup')
+    bridge_parser.add_argument('--quiet', action='store_true', help='Suppress request logging')
+    bridge_parser.add_argument('--json', action='store_true', help='Output in JSON format')
 
     # list-contracts command
     list_parser = subparsers.add_parser('list-contracts', help='List all contracts in the project')
@@ -53,6 +63,11 @@ def main():
     trace_parser.add_argument('--interactive', '-i', action='store_true', help='Start interactive debugger')
     trace_parser.add_argument('--raw', action='store_true', help='Show raw instruction trace instead of function call trace')
     trace_parser.add_argument('--json', action='store_true', help='Output trace data as JSON for web app consumption')
+    # Cross-environment (Stylus) bridge options
+    trace_parser.add_argument('--cross-env-bridge', dest='cross_env_bridge', default=None,
+                              help='URL of the cross-environment debug bridge server (e.g., http://127.0.0.1:8765)')
+    trace_parser.add_argument('--stylus-contracts', dest='stylus_contracts', default=None,
+                              help='JSON file with Stylus contract registrations for cross-env tracing')
     
     # simulate command
     simulate_parser = subparsers.add_parser('simulate', help='Simulate and debug an Ethereum transaction')
@@ -90,6 +105,11 @@ def main():
     simulate_parser.add_argument('--keep-fork', action='store_true', help='Do not terminate the forked node on exit')
     simulate_parser.add_argument('--reuse-fork', action='store_true', help='Reuse an existing local fork if available on --fork-port')
     simulate_parser.add_argument('--no-snapshot', action='store_true', default=False, help='Disable automatic initial snapshot')
+    # Cross-environment (Stylus) bridge options
+    simulate_parser.add_argument('--cross-env-bridge', dest='cross_env_bridge', default=None,
+                                 help='URL of the cross-environment debug bridge server (e.g., http://127.0.0.1:8765)')
+    simulate_parser.add_argument('--stylus-contracts', dest='stylus_contracts', default=None,
+                                 help='JSON file with Stylus contract registrations for cross-env tracing')
     
     args = parser.parse_args()
     
@@ -98,6 +118,8 @@ def main():
         return trace_command(args)
     elif args.command == 'simulate':
         return simulate_command(args)
+    elif args.command == 'bridge':
+        return bridge_command(args)
     elif args.command == 'list-events':
         return list_events_command(args)
     elif args.command == 'list-contracts':

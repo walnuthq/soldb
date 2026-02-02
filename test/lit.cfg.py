@@ -92,6 +92,31 @@ if check_soldb():
 if hasattr(config, 'sepolia_rpc_url') and config.sepolia_rpc_url:
     config.available_features.add('sepolia-rpc')
 
+# Check if Stylus bridge is configured and available
+if hasattr(config, 'stylus_config') and config.stylus_config:
+    stylus_cfg = config.stylus_config
+    # Add Stylus-related substitutions
+    config.substitutions.append(('%{stylus_rpc_url}', stylus_cfg.get('rpc_url', 'http://localhost:8547')))
+    config.substitutions.append(('%{stylus_bridge_url}', stylus_cfg.get('bridge_url', 'http://127.0.0.1:8765')))
+    config.substitutions.append(('%{stylus_test_tx}', stylus_cfg.get('test_tx', '')))
+    config.substitutions.append(('%{stylus_caller_address}', stylus_cfg.get('caller_address', '')))
+    config.substitutions.append(('%{stylus_counter_address}', stylus_cfg.get('counter_address', '')))
+    config.substitutions.append(('%{stylus_debug_dir}', stylus_cfg.get('debug_dir', '')))
+    config.substitutions.append(('%{stylus_contracts_json}', stylus_cfg.get('contracts_json', '')))
+
+    # Check if bridge is actually running
+    def check_stylus_bridge():
+        try:
+            import urllib.request
+            bridge_url = stylus_cfg.get('bridge_url', 'http://127.0.0.1:8765')
+            urllib.request.urlopen(bridge_url, timeout=2)
+            return True
+        except Exception as e:
+            return False
+
+    if check_stylus_bridge():
+        config.available_features.add('stylus-bridge')
+
 # Add 'not' command
 not_path = shutil.which('not')
 if not not_path:

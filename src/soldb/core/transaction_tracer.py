@@ -18,6 +18,8 @@ from ..utils.colors import *
 from ..parsers.ethdebug import ETHDebugParser, ETHDebugInfo
 from ..parsers.ethdebug import MultiContractETHDebugParser, ExecutionContext
 from ..parsers.source_map import SourceMapParser, SourceMapInfo
+from ..cross_env.bridge_client import StylusBridgeIntegration, CrossEnvBridgeClient
+from ..cross_env.protocol import CrossEnvTrace, CrossEnvCall, ContractInfo
 import re
 import requests
 
@@ -39,6 +41,7 @@ class FunctionCall:
     parent_entry_step: Optional[int] = None
     call_id: int = 0
     caused_revert: bool = False  # True if this frame initiated the revert
+    error: Optional[str] = None  # Error message if this call failed
     parent_call_id: Optional[int] = None
     contract_call_id: Optional[int] = None  # ID of the contract call that contains this function call
     children_call_ids: List[int] = field(default_factory=list)
@@ -148,6 +151,10 @@ class TransactionTracer:
         self._last_snapshot_id: Optional[str] = None
         self.missing_mappings_warned = False  # Track if we've already warned about missing mappings
 
+        # Cross-environment (Stylus) bridge integration
+        self.stylus_bridge: Optional[StylusBridgeIntegration] = None
+        self._stylus_traces: Dict[str, CrossEnvTrace] = {}  # Cache of Stylus traces by address
+
     def snapshot_state(self) -> Optional[str]:
         """Take an EVM snapshot (Hardhat/Anvil/Ganache). Returns snapshot id or None if unsupported."""
         try:
@@ -187,6 +194,182 @@ class TransactionTracer:
         contract_address = Web3.to_checksum_address(contract_address)
         code = self.w3.eth.get_code(contract_address)
         return code != b'' and code != '0x'
+
+    # =========================================================================
+    # Cross-Environment (Stylus) Bridge Integration
+    # =========================================================================
+
+    def setup_stylus_bridge(self, bridge_url: str = "http://127.0.0.1:8765") -> bool:
+        """
+        Set up the Stylus bridge for cross-environment tracing.
+
+        Args:
+            bridge_url: URL of the cross-environment bridge server
+
+        Returns:
+            True if bridge is connected and available
+        """
+        self.stylus_bridge = StylusBridgeIntegration(bridge_url=bridge_url)
+        if self.stylus_bridge.connect():
+            if not self.quiet_mode:
+                print(info(f"[STYLUS] Connected to cross-env bridge at {bridge_url}"))
+            return True
+        else:
+            if not self.quiet_mode:
+                print(warning(f"[STYLUS] Could not connect to bridge at {bridge_url}"))
+            self.stylus_bridge = None
+            return False
+
+    def register_stylus_contract(self, address: str, name: str, lib_path: str) -> bool:
+        """
+        Register a Stylus contract with the bridge.
+
+        Args:
+            address: Contract address
+            name: Contract name
+            lib_path: Path to the contract's shared library (.so file)
+
+        Returns:
+            True if registration was successful
+        """
+        if not self.stylus_bridge or not self.stylus_bridge.is_connected:
+            return False
+
+        contract = ContractInfo(
+            address=address,
+            name=name,
+            environment="stylus",
+            lib_path=lib_path
+        )
+        return self.stylus_bridge.register_contract(contract)
+
+    def is_stylus_contract(self, address: str) -> bool:
+        """Check if an address is a registered Stylus contract."""
+        if not self.stylus_bridge or not self.stylus_bridge.is_connected:
+            return False
+        return self.stylus_bridge.is_stylus_contract(address)
+
+    def _request_stylus_trace(
+        self,
+        target_address: str,
+        calldata: str,
+        caller_address: Optional[str] = None,
+        value: int = 0,
+        depth: int = 0,
+        parent_call_id: Optional[int] = None,
+        tx_hash: Optional[str] = None,
+        block_number: Optional[int] = None,
+    ) -> Optional[CrossEnvTrace]:
+        """
+        Request a trace from a Stylus contract via the bridge.
+
+        Returns the Stylus trace if available, None otherwise.
+        """
+        if not self.stylus_bridge or not self.stylus_bridge.is_connected:
+            return None
+
+        trace = self.stylus_bridge.request_trace(
+            target_address=target_address,
+            calldata=calldata,
+            caller_address=caller_address,
+            value=value,
+            depth=depth,
+            parent_call_id=parent_call_id,
+            transaction_hash=tx_hash,
+            block_number=block_number,
+            rpc_endpoint=self.rpc_url,
+        )
+
+        if trace:
+            # Cache the trace
+            self._stylus_traces[target_address.lower()] = trace
+
+        return trace
+
+    def _convert_stylus_calls_to_function_calls(
+        self,
+        stylus_trace: CrossEnvTrace,
+        parent_call: Optional['FunctionCall'] = None,
+        base_call_id: int = 0,
+        depth_offset: int = 0,
+    ) -> List['FunctionCall']:
+        """
+        Convert Stylus trace calls to SolDB FunctionCall objects.
+
+        This merges the Stylus trace into the EVM call hierarchy.
+        Only processes ROOT calls (parent_call_id is None), recursion handles children.
+        """
+        function_calls = []
+
+        root_calls = [c for c in stylus_trace.calls if c.parent_call_id is None]
+
+        def convert_recursive(stylus_call: 'CrossEnvCall', depth: int) -> 'FunctionCall':
+            """Recursively convert a Stylus call and its children."""
+            func_call = FunctionCall(
+                name=f"[Stylus] {stylus_call.function_name}",
+                selector=stylus_call.function_selector or "",
+                entry_step=-1,  # Stylus calls don't have EVM step numbers
+                exit_step=None,
+                gas_used=stylus_call.gas_used or 0,
+                depth=depth,
+                args=[(arg.name, arg.value) for arg in stylus_call.args],
+                call_type=f"stylus:{stylus_call.call_type}",
+                contract_address=stylus_call.contract_address,
+                call_id=stylus_call.call_id,  # Will be remapped in merge loop
+                parent_call_id=stylus_call.parent_call_id,  # Will be remapped in merge loop
+                caused_revert=not stylus_call.success,  # Mark as revert if call failed
+                error=stylus_call.error,  # Capture error message
+            )
+
+            # Add source location info if available
+            if stylus_call.source_location:
+                func_call.source_line = stylus_call.source_location.line
+
+            function_calls.append(func_call)
+
+            # Recursively process children (children_call_ids will be built in merge loop)
+            for child in stylus_call.children:
+                convert_recursive(child, depth + 1)
+
+            return func_call
+
+        # Convert all root calls
+        for root_call in root_calls:
+            convert_recursive(root_call, depth_offset + 1)
+
+        return function_calls
+
+    def register_stylus_contract(
+        self,
+        address: str,
+        name: str,
+        lib_path: Optional[str] = None,
+    ) -> bool:
+        """
+        Register a Stylus contract with the bridge.
+
+        Args:
+            address: Contract address
+            name: Contract name
+            lib_path: Path to the compiled .dylib/.so library
+
+        Returns:
+            True if registration succeeded
+        """
+        if not self.stylus_bridge or not self.stylus_bridge.is_connected:
+            return False
+
+        contract = ContractInfo(
+            address=address,
+            environment="stylus",
+            name=name,
+            lib_path=lib_path,
+        )
+        return self.stylus_bridge.register_contract(contract)
+
+    # =========================================================================
+    # End of Cross-Environment Bridge Integration
+    # =========================================================================
 
     def _encode_function_call(self, function_name: str, args: list) -> str:
         """Encode calldata for a loaded ABI function by name."""
@@ -481,30 +664,71 @@ class TransactionTracer:
             return None
     
     
-    def extract_calldata_from_step(self, step):
+    def extract_calldata_from_step(self, step, raw_step = None):
         stack = step.stack
         memory = step.memory
-        if len(stack) < 7 or not memory:
+        op = step.op
+
+        # Different opcodes have different stack layouts:
+        # CALL:         [gas, to, value, argsOffset, argsSize, retOffset, retSize] - 7 items
+        # STATICCALL:   [gas, to, argsOffset, argsSize, retOffset, retSize] - 6 items (no value)
+        # DELEGATECALL: [gas, to, argsOffset, argsSize, retOffset, retSize] - 6 items (no value)
+        if op == "CALL":
+            required_stack = 7
+            args_offset_idx = -4
+            args_size_idx = -5
+        else:  # STATICCALL, DELEGATECALL
+            required_stack = 6
+            args_offset_idx = -3
+            args_size_idx = -4
+
+        if len(stack) < required_stack:
             return None
 
-        # CALL: [gas, to, value, argsOffset, argsSize, retOffset, retSize]
-        args_offset = int(stack[-4], 16)
-        args_size = int(stack[-5], 16)
+        args_offset = int(stack[args_offset_idx], 16)
+        args_size = int(stack[args_size_idx], 16)
 
+        # If args_size is 0, no calldata needed                                              
+        if args_size == 0: 
+            return "0x"                                                                      
+        
+        # Try to get memory bytes                                                            
+        memory_bytes = b''
+        
         # If memory is a string (hex), decode it directly
-        if isinstance(memory, str):
+        if isinstance(memory, str) and memory:
             # Remove '0x' if present
             mem_hex = memory[2:] if memory.startswith('0x') else memory
             # If odd number of characters, add '0' at the beginning
             if len(mem_hex) % 2 != 0:
                 mem_hex = '0' + mem_hex
-            memory_bytes = decode_hex(mem_hex)
-        else:
-            # fallback for list of strings (if ever)
+            if mem_hex:
+                memory_bytes = decode_hex(mem_hex)
+        elif isinstance(memory, list) and memory:
             memory_bytes = b''.join(decode_hex(m[2:] if m.startswith('0x') else m) for m in memory)
-
+    
+        # If memory is empty, try raw_step as fallback
+        if not memory_bytes and raw_step:
+            raw_memory = raw_step.memory.get('memory')
+            if isinstance(raw_memory, str) and raw_memory:
+                # Each element is a 32-byte hex string (without 0x prefix typically)
+                try:                                                          
+                    memory_bytes = b''.join(bytes.fromhex(m) for m in raw_memory if m)                                                                      
+                except Exception as e:         
+                    pass                               
+            elif isinstance(raw_memory, str) and raw_memory:                  
+                mem_hex = raw_memory[2:] if raw_memory.startswith('0x') else raw_memory                                                                     
+                if mem_hex:                                                   
+                    memory_bytes = decode_hex(mem_hex)                        
+    
+        # Check if we have enough memory                                      
+        if len(memory_bytes) < args_offset + args_size:                       
+            return None   
+        
         calldata = memory_bytes[args_offset:args_offset + args_size]
-        return '0x' + calldata.hex()
+        result = '0x' + calldata.hex()
+
+        return result
     
     def is_likely_memory_offset(self, value: str) -> bool:
         """Check if a stack value is likely a memory offset rather than an address.
@@ -608,6 +832,9 @@ class TransactionTracer:
         # Parse trace steps
         steps = []
         for i, step in enumerate(trace_result.get('structLogs', [])):
+            if step['op'] in ['CALL', 'STATICCALL', 'DELEGATECALL']:          
+                raw_memory = step.get('memory')                               
+                
             trace_step = TraceStep(
                 pc=step['pc'],
                 op=step['op'],
@@ -739,14 +966,10 @@ class TransactionTracer:
             # Cap at reasonable maximum (5M gas) to avoid excessive costs
             gas_limit = min(gas_limit, 5000000)
         except Exception as e:
-            # If estimation fails, use a reasonable default based on call type
-            # Simple calls: ~21k, contract calls: ~100k-500k
-            if calldata and calldata != "0x" and len(calldata) > 2:
-                # Contract call - use 500k as safe default
-                gas_limit = 500000
-            else:
-                # Simple transfer - use 21k
-                gas_limit = 21000
+            # If estimation fails, use a high default
+            # On L2s, intrinsic gas includes L1 data costs which can be much higher
+            # Use 10M gas as safe default for all calls
+            gas_limit = 10000000
         
         call_obj = {
             'to': to,
@@ -776,8 +999,10 @@ class TransactionTracer:
 
         # Parse trace steps (reuse logic from trace_transaction)
         steps = []
-        struct_logs = trace_result.get('structLogs', [])
-        for i, step in enumerate(struct_logs):
+        for i, step in enumerate(trace_result.get('structLogs', [])):
+            if step['op'] in ['CALL', 'STATICCALL', 'DELEGATECALL']:          
+                raw_memory = step.get('memory')                               
+            
             trace_step = TraceStep(
                 pc=step['pc'],
                 op=step['op'],
@@ -796,10 +1021,14 @@ class TransactionTracer:
         if not error_msg and is_failed:
             # Try to decode revert reason from return value
             return_value = trace_result.get('returnValue', '')
-            if return_value and return_value.startswith('08c379a0') or return_value.startswith('0x08c379a0'):
+            if return_value and (return_value.startswith('08c379a0') or return_value.startswith('0x08c379a0')):
                 # This is Error(string) - decode the revert reason
                 try:
-                    data = return_value[8:]  # Skip selector
+                    # Skip selector (8 hex chars) plus '0x' prefix if present
+                    if return_value.startswith('0x'):
+                        data = return_value[10:]  # Skip '0x' + 4-byte selector
+                    else:
+                        data = return_value[8:]   # Skip 4-byte selector only
                     offset = int(data[:64], 16)
                     length = int(data[64:128], 16)
                     string_hex = data[128:128+length*2]
@@ -808,7 +1037,7 @@ class TransactionTracer:
                     error_msg = "Execution reverted"
             elif return_value:
                 # Other revert types (custom errors, etc.)
-                    error_msg = f"Reverted with data: 0x{return_value}"
+                error_msg = f"Reverted with data: 0x{return_value}"
             else:
                 error_msg = "Execution reverted"
         
@@ -1651,7 +1880,7 @@ class TransactionTracer:
             # Create main function call with call_id = 1
             # Try to get source line for the main function if we have debug info
             main_source_line = None
-            if self.multi_contract_parser:
+            if self.multi_contract_parser and trace.to_addr:
                 # In multi-contract mode, check if we have debug info for the target contract
                 target_contract = self.multi_contract_parser.get_contract_at_address(trace.to_addr)
                 if target_contract:
@@ -1684,8 +1913,6 @@ class TransactionTracer:
             call_stack.append(main_call)
             # Update dispatcher to have main as child
             dispatcher_call.children_call_ids.append(main_call.call_id)
-
-        
         # Find the main function entry
         prev_depth = 0
         for i, step in enumerate(trace.steps):
@@ -1756,6 +1983,69 @@ class TransactionTracer:
                     })
                     current_contract = call.contract_address
                     current_depth += 1
+                    
+                    # If this is a Stylus contract call, request trace and merge
+                    if call.call_type.startswith("STYLUS_"):
+                        # Extract calldata from the step
+                        calldata = self.extract_calldata_from_step(step)
+                        
+                        # Request Stylus trace via bridge
+                        stylus_trace = self._request_stylus_trace(
+                            target_address=call.contract_address,
+                            calldata=calldata or "0x",
+                            caller_address=current_contract,
+                            value=call.value or 0,
+                            depth=call.depth,
+                            parent_call_id=call.call_id,
+                            tx_hash=trace.tx_hash,
+                            block_number=None,
+                        )
+                        
+                        if stylus_trace:
+                            # Convert Stylus calls to FunctionCall objects
+                            stylus_calls = self._convert_stylus_calls_to_function_calls(
+                                stylus_trace,
+                                parent_call=call,
+                                base_call_id=next_call_id,
+                                depth_offset=call.depth,
+                            )
+                            
+                            # Insert Stylus calls preserving their internal hierarchy
+                            # Build mapping: old Stylus call_id -> new call_id
+                            # Stylus trace starts from 1, parent_call_id=0 means root (child of EVM CALL)
+                            stylus_id_map = {0: call.call_id}  # parent=0 maps to EVM CALL
+
+                            # First pass: assign new call_ids
+                            for stylus_call in stylus_calls:
+                                old_id = stylus_call.call_id
+                                stylus_id_map[old_id] = next_call_id
+                                stylus_call.call_id = next_call_id
+                                next_call_id += 1
+
+                            # Second pass: remap parent_call_ids and set depth
+                            for stylus_call in stylus_calls:
+                                old_parent = stylus_call.parent_call_id or 0
+                                new_parent = stylus_id_map.get(old_parent, call.call_id)
+                                stylus_call.parent_call_id = new_parent
+
+                                # Calculate depth: find parent and add 1
+                                if new_parent == call.call_id:
+                                    stylus_call.depth = call.depth + 1
+                                    call.children_call_ids.append(stylus_call.call_id)
+                                else:
+                                    # Find parent stylus call
+                                    for p in stylus_calls:
+                                        if p.call_id == new_parent:
+                                            stylus_call.depth = p.depth + 1
+                                            p.children_call_ids.append(stylus_call.call_id)
+                                            break
+
+                                insert_call_sorted(stylus_call)
+                        else:
+                            print(warning(f"[STYLUS] No trace received for {call.contract_address}"))
+                            print(f"  This may be because:")
+                            print(f"    - Stylus trace is still pending on bridge")
+                            print(f"    - Trace request failed")
                     
                     # Switch to the target contract's ETHDebug info if available
                     if self.multi_contract_parser and call.contract_address:
@@ -2287,10 +2577,23 @@ class TransactionTracer:
             value = int(step.stack[-3], 16)
         else:
             value = None
+
         # Get contract name and check if we have debug info for target contract
         contract_name = self.format_address_display(to_addr)
         target_contract_info = None
-        if self.multi_contract_parser:
+        is_stylus_target = False
+
+        # Check if this is a Stylus contract
+        if self.stylus_bridge and self.stylus_bridge.is_connected:
+            if self.is_stylus_contract(to_addr):
+                is_stylus_target = True
+                stylus_contract_info = self.stylus_bridge.get_contract_info(to_addr)
+                if stylus_contract_info:
+                    contract_name = f"[Stylus] {stylus_contract_info.name}"
+                else:
+                    contract_name = f"[Stylus] {self.format_address_display(to_addr)}"
+
+        if self.multi_contract_parser and not is_stylus_target:
             target_contract_info = self.multi_contract_parser.get_contract_at_address(to_addr)
             if target_contract_info:
                 contract_name = target_contract_info.name
@@ -2331,6 +2634,9 @@ class TransactionTracer:
             # Return empty decoded_params
             decoded_params = []
 
+        # Determine call type (mark Stylus calls specially)
+        call_type = f"STYLUS_{step.op}" if is_stylus_target else step.op
+
         return FunctionCall(
             name=f"{step.op} → {contract_name}::{func_name}",
             selector=selector or "",
@@ -2339,7 +2645,7 @@ class TransactionTracer:
             gas_used=0,
             depth=current_depth + 1,
             args=decoded_params,
-            call_type=step.op,
+            call_type=call_type,
             contract_address=to_addr,
             value=value
         )
@@ -2461,8 +2767,17 @@ class TransactionTracer:
             print(f"{dim('Status:')} {success('SUCCESS')}")
         else:
             print(f"{dim('Status:')} {error('REVERTED')}")
-            if trace.error:
-                print(f"{error('Error:')} {trace.error}")
+            # Find the deepest error - this is the root cause
+            deepest_error = None
+            deepest_depth = -1
+            for call in function_calls:
+                if call.caused_revert and call.error and call.depth > deepest_depth:
+                    deepest_error = call.error
+                    deepest_depth = call.depth
+            # Use deepest error, fall back to trace.error
+            error_msg = deepest_error or trace.error
+            if error_msg:
+                print(f"{error('Error:')} {error_msg}")
         
         print(f"\n{bold('Call Stack:')}")
         print(dim("-" * 60))
@@ -2471,10 +2786,46 @@ class TransactionTracer:
             # Fallback: show entry point
             print(f"#0 {cyan('Contract::fallback()')} {dim('(no function selector matched)')}")
         else:
-            # Sort calls by entry_step to ensure proper ordering
-            # Handle None entry_step values by treating them as -1 (before all others)
-            # sorted_calls = sorted(function_calls, key=lambda x: x.entry_step if x.entry_step is not None else -1)
-            sorted_calls = function_calls
+            # Build tree-ordered list based on parent-child relationships
+            # This ensures Stylus calls appear nested under their parent EVM calls
+            call_map = {c.call_id: c for c in function_calls}
+            children_map = {}  # parent_id -> list of children (sorted by entry_step for EVM calls)
+            root_calls = []
+
+            for c in function_calls:
+                parent_id = c.parent_call_id
+                if parent_id is None or parent_id not in call_map:
+                    root_calls.append(c)
+                else:
+                    if parent_id not in children_map:
+                        children_map[parent_id] = []
+                    children_map[parent_id].append(c)
+
+            # Sort children: EVM calls (entry_step >= 0) first by entry_step, then Stylus calls (entry_step < 0)
+            for parent_id in children_map:
+                children_map[parent_id].sort(key=lambda x: (x.entry_step < 0, x.entry_step if x.entry_step >= 0 else x.call_id))
+
+            # Sort root calls by entry_step
+            root_calls.sort(key=lambda x: x.entry_step if x.entry_step is not None and x.entry_step >= 0 else 0)
+
+            # Depth-first traversal to build display order
+            sorted_calls = []
+            def traverse(call):
+                sorted_calls.append(call)
+                for child in children_map.get(call.call_id, []):
+                    traverse(child)
+
+            for root in root_calls:
+                traverse(root)
+
+            # Find the deepest call with an error - only this one should show !!!
+            deepest_error_call_id = None
+            deepest_error_depth = -1
+            for call in sorted_calls:
+                if call.caused_revert and call.error and call.depth > deepest_error_depth:
+                    deepest_error_call_id = call.call_id
+                    deepest_error_depth = call.depth
+
             for i, call in enumerate(sorted_calls):
                 indent = "  " * call.depth
                 
@@ -2569,8 +2920,8 @@ class TransactionTracer:
                     else:
                         source_info = dim(f" @ Contract entry point")
                 
-                # Add indicator for the frame that caused the revert
-                revert_indicator = f" {error('!!!')}" if call.caused_revert else ""
+                # Add indicator only for the deepest frame that caused the revert (root cause)
+                revert_indicator = f" {error('!!!')}" if call.call_id == deepest_error_call_id else ""
                 print(f"{indent}#{i} {func_display} {call_type_display} {gas_info}{source_info}{revert_indicator}")
                 
                 # Show entry/exit steps for non-entry-point functions

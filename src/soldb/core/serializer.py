@@ -372,6 +372,11 @@ class TraceSerializer:
         
         if hasattr(call, 'caused_revert') and call.caused_revert:
             trace_call["isRevertedFrame"] = True
+            # Include the error message - prefer call-level error (for Stylus), fall back to trace error
+            if hasattr(call, 'error') and call.error:
+                trace_call["error"] = call.error
+            elif trace.error:
+                trace_call["error"] = trace.error
         
         if call.call_type == "entry":
             has_debug_info = False
@@ -672,7 +677,17 @@ class TraceSerializer:
             response["isContractCreation"] = True
             response["deployedContractAddress"] = trace.contract_address
         
-        if not trace.success and trace.error:
-            response["error"] = trace.error
+        # Add error message if transaction reverted
+        # Find the deepest call with an error - this is the root cause
+        if not trace.success:
+            deepest_error = None
+            deepest_depth = -1
+            for call in function_calls:
+                if call.caused_revert and call.error and call.depth > deepest_depth:
+                    deepest_error = call.error
+                    deepest_depth = call.depth
+
+            # Use deepest error, fall back to trace.error
+            response["error"] = deepest_error or trace.error
         
         return self._convert_to_serializable(response)
