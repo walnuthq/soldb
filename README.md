@@ -149,11 +149,10 @@ SolDB supports cross-environment debugging for Solidity<>Stylus interactions. Th
 
 2. **cargo-stylus-beta** (Walnut fork with debug support)
 
-   Follow the installation guide: [StylusDebugger.md](https://github.com/walnuthq/stylus-sdk-rs/blob/main/cargo-stylus/docs/StylusDebugger.md)
+   Follow the installation guide: [StylusDebugger.md](https://github.com/OffchainLabs/stylus-sdk-rs/blob/main/cargo-stylus/docs/StylusDebugger.md)
 
    ```bash
-   git clone https://github.com/walnuthq/stylus-sdk-rs.git
-   cd stylus-sdk-rs/cargo-stylus
+   git clone https://github.com/OffchainLabs/stylus-sdk-rs.git
    cargo install --path cargo-stylus
    ```
 
