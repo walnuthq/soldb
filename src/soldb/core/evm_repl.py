@@ -36,11 +36,11 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
     def prompt(self):
         return self._get_prompt()
     
-    def __init__(self, contract_address: str = None, debug_file: str = None, 
-                 rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
-                 function_name: str = None, function_args: List[str] = [],
-                 abi_path: str = None, from_addr: str = None, block: int = None,
-                 tracer: TransactionTracer = None, contract_name: str = None, value: int = 0):
+    def __init__(self, contract_address: Optional[str] = None, debug_file: Optional[str] = None,
+                 rpc_url: str = "http://localhost:8545", ethdebug_dir: Optional[str] = None, constructor_args: List[str] = [],
+                 function_name: Optional[str] = None, function_args: List[str] = [],
+                 abi_path: Optional[str] = None, from_addr: Optional[str] = None, block: Optional[int] = None,
+                 tracer: Optional[TransactionTracer] = None, contract_name: Optional[str] = None, value: int = 0):
         super().__init__()
 
         if not tracer:
