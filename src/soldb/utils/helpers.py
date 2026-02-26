@@ -204,7 +204,7 @@ def decode_event_log(tracer, log_entry: Dict[str, Any]) -> Dict[str, Any]:
                         text_signature = response_data['text_signature']
                         if isinstance(text_signature, list) and text_signature:
                             text_signature = text_signature[0]
-                except:
+                except Exception:
                     pass
                 
                 if data_length % 32 == 0:

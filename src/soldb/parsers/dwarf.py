@@ -197,7 +197,7 @@ class DwarfParser:
                             try:
                                 push_num = int(''.join(filter(str.isdigit, line.split()[0])))
                                 current_pc += 1 + push_num
-                            except:
+                            except ValueError:
                                 current_pc += 1
                     else:
                         current_pc += 1

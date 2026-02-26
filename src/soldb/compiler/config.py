@@ -21,10 +21,10 @@ class CompilerConfig:
     build_dir: str = "./build"
     
     # ETHDebug compilation flags
-    ethdebug_flags: List[str] = None
-    
+    ethdebug_flags: Optional[List[str]] = None
+
     # Production compilation flags (optional)
-    production_flags: List[str] = None
+    production_flags: Optional[List[str]] = None
     
     def __post_init__(self):
         if self.ethdebug_flags is None:
