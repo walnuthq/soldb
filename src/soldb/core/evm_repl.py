@@ -37,8 +37,8 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         return self._get_prompt()
     
     def __init__(self, contract_address: str = None, debug_file: str = None, 
-                 rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: List[str] = [],
-                 function_name: str = None, function_args: List[str] = [],
+                 rpc_url: str = "http://localhost:8545", ethdebug_dir: str = None, constructor_args: Optional[List[str]] = None,
+                 function_name: str = None, function_args: Optional[List[str]] = None,
                  abi_path: str = None, from_addr: str = None, block: int = None,
                  tracer: TransactionTracer = None, contract_name: str = None, value: int = 0):
         super().__init__()
@@ -109,7 +109,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         self.source_lines = {}  # filename -> lines
         self.current_function = None  # Current function context
         self.function_name = function_name
-        self.function_args = function_args
+        self.function_args = function_args or []
         self.init = False
         self.abi_path = abi_path
         self.from_addr = from_addr
