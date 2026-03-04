@@ -1,5 +1,9 @@
 # SolDB – Local Solidity Debugger
 
+[![CI](https://github.com/walnuthq/soldb/actions/workflows/ci.yml/badge.svg)](https://github.com/walnuthq/soldb/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+
 > **Note**: SolDB is in public beta; expect ongoing changes and occasional inaccuracies.  
 
 > **Note**: SolDB relies on ETHDebug metadata. Complete, accurate debug info implies better breakpoints/stepping/variable views; incomplete info can cause gaps or inconsistencies.
