@@ -20,13 +20,13 @@ dev:
 	pip install -r requirements.txt
 
 test:
-	./run-tests.sh
+	./test/run-tests.sh
 
 test-setup:
-	./test-setup.sh
+	./test/test-setup.sh
 
 test-deploy:
-	./test-setup.sh --deploy-test
+	./test/test-setup.sh --deploy-test
 
 publish:
 	./scripts/publish-pypi.sh
