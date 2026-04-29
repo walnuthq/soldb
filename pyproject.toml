@@ -10,14 +10,13 @@ readme = "README.md"
 authors = [
     {name = "Walnut", email = "hi@walnut.dev"}
 ]
-license = {text = "GPL-3.0-only"}
+license = "GPL-3.0-only"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Debuggers",
     "Topic :: Software Development :: Testing",
     "Topic :: System :: Monitoring",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -37,6 +36,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "lit>=18.0.0",
     "black>=22.0.0",
     "mypy>=0.990",
     "build>=0.10.0",
@@ -54,8 +54,10 @@ soldb = "soldb.cli.main:main"
 soldb-dap-server = "tools.dap_server:main"
 
 [tool.setuptools]
-packages = ["soldb","tools"]
 package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
 soldb = ["py.typed"]

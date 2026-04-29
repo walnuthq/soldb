@@ -1,8 +1,6 @@
 include README.md
-include LICENSE
+include LICENSE.md
 include requirements.txt
-include setup-soldb.sh
-include test-setup.sh
 recursive-include scripts *.sh
 recursive-include examples *.sol
 exclude soldb.py

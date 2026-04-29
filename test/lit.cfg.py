@@ -34,9 +34,11 @@ else:
     soldb_path = shutil.which('soldb')
     if not soldb_path and hasattr(config, 'soldb_dir'):
         # Try to find it in the virtual environment
-        venv_path = os.path.join(config.soldb_dir, 'MyEnv', 'bin', 'soldb')
-        if os.path.exists(venv_path):
-            soldb_path = venv_path
+        for venv_name in ('.venv', 'MyEnv'):
+            venv_path = os.path.join(config.soldb_dir, venv_name, 'bin', 'soldb')
+            if os.path.exists(venv_path):
+                soldb_path = venv_path
+                break
 
 if soldb_path:
     config.substitutions.append(('%soldb', soldb_path))
