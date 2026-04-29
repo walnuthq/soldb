@@ -7,17 +7,84 @@ on:
     branches: [main]
 
 jobs:
-  check:
+  test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.9", "3.11"]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: pip install -e .
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install system test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq llvm
+          LLVM_BIN="$(dirname "$(find /usr/lib/llvm-* -name FileCheck | sort -V | tail -1)")"
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
+
+      - name: Install Solidity compilers
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+
+          curl -fsSL \
+            -o "$HOME/.local/bin/solc-0.8.31" \
+            https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.31+commit.fd3a2265
+          echo "aac9cd0116e9ae0cd3d8f64a8641381845dc9f12e2a52653de36fb619323e557  $HOME/.local/bin/solc-0.8.31" | sha256sum -c -
+
+          curl -fsSL \
+            -o "$HOME/.local/bin/solc-0.8.16" \
+            https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.16+commit.07a7930e
+          echo "1632786c6c1f856a4a899232ec975a12f305118f43cce90e724ed0b2eebfeee1  $HOME/.local/bin/solc-0.8.16" | sha256sum -c -
+
+          chmod +x "$HOME/.local/bin/solc-0.8.31" "$HOME/.local/bin/solc-0.8.16"
+          ln -sf "$HOME/.local/bin/solc-0.8.31" "$HOME/.local/bin/solc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
       - name: Syntax check
         run: python -m compileall src/
+
+      - name: Build package
+        run: python -m build
+
+      - name: Run lit tests
+        run: |
+          set -euo pipefail
+          anvil --steps-tracing --host 127.0.0.1 --port 8545 > anvil.log 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID"' EXIT
+
+          for _ in {1..30}; do
+            if curl -fsS \
+              -X POST \
+              -H "Content-Type: application/json" \
+              --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+              http://127.0.0.1:8545 > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          if ! curl -fsS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+            http://127.0.0.1:8545 > /dev/null; then
+            cat anvil.log
+            exit 1
+          fi
+
+          RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh

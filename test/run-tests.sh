@@ -6,6 +6,13 @@ set -e
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
 # Parse command line arguments
 RUN_TRACE_TESTS=true
 RUN_SIMULATE_TESTS=true
@@ -79,8 +86,8 @@ for arg in "$@"; do
 done
 
 # Configuration
-# Set fixed RPC URL for tests
-RPC_URL="http://localhost:8545"
+# Default to IPv4 localhost; allow overrides for custom Anvil/RPC setups.
+RPC_URL="${RPC_URL:-http://127.0.0.1:8545}"
 echo -e "${BLUE}Using RPC: ${RPC_URL}${NC}"
 CHAIN_ID="${CHAIN_ID:-1}"
 PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
@@ -150,12 +157,6 @@ fi
 # Export SOLC_PATH so it's available to the Python config
 # Note: Individual tests will set their own solc version via solc-select
 export SOLC_PATH
-
-# Colors
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
 
 echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
 echo -e "${GREEN}Organized test structure:${NC}"
@@ -273,13 +274,18 @@ echo ""
 SOLDB_CMD=""
 SOLDB_TYPE=""
 if command -v soldb &> /dev/null; then
-    # Use system soldb if available
+    # Use the soldb executable already selected by PATH.
     SOLDB_CMD="soldb"
-    SOLDB_TYPE="system"
-    echo -e "${GREEN}Using system soldb${NC}"
+    SOLDB_TYPE="path"
+    echo -e "${GREEN}Using PATH soldb${NC}"
+elif [ -f "${PROJECT_DIR}/.venv/bin/soldb" ]; then
+    # Fall back to local virtual environment
+    SOLDB_CMD="${PROJECT_DIR}/.venv/bin/soldb"
+    SOLDB_TYPE="venv"
+    echo -e "${GREEN}Using .venv soldb${NC}"
 elif [ -f "${PROJECT_DIR}/MyEnv/bin/soldb" ]; then
     # Fall back to virtual environment
-    SOLDB_CMD="MyEnv/bin/soldb"
+    SOLDB_CMD="${PROJECT_DIR}/MyEnv/bin/soldb"
     SOLDB_TYPE="venv"
     echo -e "${GREEN}Using venv soldb${NC}"
 else
@@ -303,6 +309,8 @@ config.soldb_dir = project_dir
 # Find soldb dynamically
 if shutil.which('soldb'):
     config.soldb = shutil.which('soldb')
+elif os.path.exists(os.path.join(project_dir, '.venv', 'bin', 'soldb')):
+    config.soldb = os.path.join(project_dir, '.venv', 'bin', 'soldb')
 elif os.path.exists(os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')):
     config.soldb = os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')
 else:
