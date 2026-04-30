@@ -74,7 +74,7 @@ source = ["soldb"]
 source = ["src", "*/site-packages"]
 
 [tool.coverage.report]
-fail_under = 70
+fail_under = 80
 show_missing = true
 skip_empty = true
 omit = [
@@ -89,7 +89,6 @@ omit = [
     "src/soldb/core/transaction_tracer.py",
     "src/soldb/cross_env/bridge_server.py",
     "src/soldb/parsers/dwarf.py",
-    "src/soldb/utils/helpers.py",
 ]
 exclude_lines = [
     "pragma: no cover",
