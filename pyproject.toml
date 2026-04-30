@@ -30,7 +30,6 @@ dependencies = [
     "web3>=6.0.0",
     "eth-utils>=2.0.0", 
     "hexbytes>=0.3.0",
-    "pyelftools>=0.29",
 ]
 
 [project.optional-dependencies]
@@ -68,15 +67,21 @@ soldb = ["py.typed"]
 branch = true
 parallel = true
 relative_files = true
-source = ["soldb", "tools"]
+source = ["soldb"]
 
 [tool.coverage.paths]
 source = ["src", "*/site-packages"]
 
 [tool.coverage.report]
-fail_under = 30
+fail_under = 70
 show_missing = true
 skip_empty = true
+omit = [
+    # The coverage gate still excludes the long-running bridge server because
+    # it owns process lifecycle and socket behavior that needs separate
+    # integration coverage.
+    "src/soldb/cross_env/bridge_server.py",
+]
 exclude_lines = [
     "pragma: no cover",
     "if __name__ == .__main__.:",

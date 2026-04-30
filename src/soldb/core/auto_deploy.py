@@ -337,7 +337,7 @@ class AutoDeployDebugger:
         return self._parse_typed(val, typ, inp.get("components"))
 
     def _parse_typed(self, val: Any, typ: str, components: Optional[List[dict]] = None) -> Any:
-        if isinstance(val, str) and typ not in ("string", "bytes"):
+        if isinstance(val, str) and (typ.startswith("uint") or typ.startswith("int") or typ == "bool"):
             try:
                 val = ast.literal_eval(val)
             except Exception:

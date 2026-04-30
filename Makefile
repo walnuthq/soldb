@@ -21,10 +21,12 @@ dev:
 	pip install -r requirements.txt
 
 test:
+	pytest test/unit
 	./test/run-tests.sh
 
 coverage:
 	coverage erase
+	coverage run --parallel-mode -m pytest test/unit
 	./test/run-tests.sh --coverage
 	coverage combine
 	coverage report

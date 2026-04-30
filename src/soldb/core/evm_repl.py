@@ -10,7 +10,6 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from .transaction_tracer import TransactionTracer, TransactionTrace, SourceMapper
-from ..parsers.dwarf import load_dwarf_info, DwarfParser
 from ..parsers.ethdebug import ETHDebugDirParser, ETHDebugSpec
 from ..utils.colors import *
 from web3 import Web3
@@ -105,7 +104,6 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
         self.ethdebug_dir = ethdebug_dir
         self.source_map = {}
         self.source_mapper = None
-        self.dwarf_info = None
         self.source_lines = {}  # filename -> lines
         self.current_function = None  # Current function context
         self.function_name = function_name
@@ -173,19 +171,6 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             
         elif debug_file:
             self.source_map = self.tracer.load_debug_info(debug_file)
-            
-            # Try to load DWARF debug ELF
-            debug_elf = debug_file.replace('.zasm', '.debug.elf')
-            if not os.path.exists(debug_elf):
-                # Try in same directory with different naming
-                base_name = os.path.basename(debug_file).split('.')[0].split('_')[0]
-                debug_elf = os.path.join(os.path.dirname(debug_file), f"{base_name}.debug.elf")
-            
-            if os.path.exists(debug_elf):
-                print(f"Loading DWARF debug info from: {info(debug_elf)}")
-                self.dwarf_info = load_dwarf_info(debug_elf)
-                if self.dwarf_info:
-                    print(f"Loaded {success(str(len(self.dwarf_info.functions)))} functions from DWARF")
         
         # Load source files
         self._load_source_files()
