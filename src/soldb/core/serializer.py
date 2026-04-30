@@ -90,7 +90,7 @@ class TraceSerializer:
                                         data = "0x" + memory_data
                                     else:
                                         data = "0x" + "00" * safe_size
-                            except:
+                            except Exception:
                                 data = "0x" + "00" * safe_size
                         else:
                             data = "0x" + "00" * safe_size

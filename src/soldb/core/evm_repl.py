@@ -454,7 +454,7 @@ Use {info('next')} to step to next source line, {info('step')} to step into cont
             try:
                 import json
                 return json.loads(arg)
-            except:
+            except json.JSONDecodeError:
                 return arg
     
     def do_nexti(self, arg):
