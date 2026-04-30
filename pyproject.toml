@@ -37,6 +37,8 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "lit>=18.0.0",
+    "coverage[toml]>=7.0.0",
+    "diff-cover>=9.0.0",
     "black>=22.0.0",
     "mypy>=0.990",
     "build>=0.10.0",
@@ -61,3 +63,27 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 soldb = ["py.typed"]
+
+[tool.coverage.run]
+branch = true
+parallel = true
+relative_files = true
+source = ["soldb", "tools"]
+
+[tool.coverage.paths]
+source = ["src", "*/site-packages"]
+
+[tool.coverage.report]
+fail_under = 30
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.xml]
+output = "coverage.xml"

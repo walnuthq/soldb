@@ -9,6 +9,7 @@ test/
 ├── trace/           # Trace command tests
 ├── simulate/        # Simulate command tests
 ├── events/          # Events command tests
+├── cli/             # CLI command and validation tests
 ├── stylus/          # Stylus interop test contracts and scripts
 ├── run-tests.sh     # Main test runner script
 ├── lit.cfg.py       # Test framework configuration
@@ -30,6 +31,27 @@ Tests for the `soldb simulate` command:
 - **json-simulate.test**: JSON output format testing
 - **raw-data-simulate.test**: Raw calldata simulation
 - **raw-simulate.test**: Raw instruction trace for simulation
+- **no-debug-info.test**: Simulation without ETHDebug or ABI metadata
+- **invalid-value-json.test**: JSON error output for invalid values
+- **missing-function-signature.test**: Required signature validation
+- **raw-data-argument-error.test**: Raw calldata argument validation
+- **wrong-argument-count.test**: ABI-backed argument count validation
+
+### Events Tests (`test/events/`)
+Tests for the `soldb list-events` command:
+- **multiple-events.test**: Event listing for a transaction with logs
+- **multiple-events-json.test**: JSON event output
+- **no-events.test**: Empty event output
+- **balance-updated-decoded.test**: ABI-decoded indexed and non-indexed event fields
+- **balance-updated-decoded-json.test**: JSON ABI-decoded event fields
+- **invalid-transaction-json.test**: JSON error output for missing receipts
+
+### CLI Tests (`test/cli/`)
+Tests for command-line parsing and shared command behavior:
+- **help.test**: Top-level and subcommand help output
+- **missing-command.test**: Required command validation
+- **list-contracts-basic.test**: Contract listing for a local transaction
+- **bridge-invalid-host.test**: Bridge command startup error handling
 
 ### Stylus Interop Tests (`test/stylus/`)
 Tests for Solidity <> Stylus cross-environment tracing:
@@ -55,12 +77,28 @@ cd test
 
 # Run only events tests
 ./run-tests.sh --events-only
+
+# Run only CLI tests
+./run-tests.sh --cli-only
 ```
 
 ### Run with Verbose Output
 ```bash
 ./run-tests.sh -v
 ```
+
+### Run with Coverage
+```bash
+coverage erase
+./run-tests.sh --coverage
+coverage combine
+coverage report
+coverage html
+coverage xml
+```
+
+This wraps each `soldb` CLI invocation in `coverage run --parallel-mode`, then combines the subprocess data after lit finishes.
+CI also enforces at least 80% coverage on Python lines changed in each pull request.
 
 ### Run Remote Tests with Sepolia API Key
 ```bash

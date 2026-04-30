@@ -2,6 +2,7 @@
 
 import os
 import platform
+import shlex
 import subprocess
 import sys
 
@@ -81,7 +82,7 @@ elif platform.system() == 'Linux':
 def check_soldb():
     try:
         if soldb_path:
-            subprocess.run([soldb_path, '--help'], check=True, capture_output=True)
+            subprocess.run(shlex.split(soldb_path) + ['--help'], check=True, capture_output=True)
             return True
     except:
         pass
@@ -151,6 +152,10 @@ else:
         config.substitutions.append(('FileCheck', 'FileCheck'))
 
 # Environment variables
+for env_var in ('COVERAGE_FILE', 'COVERAGE_RCFILE'):
+    if env_var in os.environ:
+        config.environment[env_var] = os.environ[env_var]
+
 if not hasattr(config, 'soldb') or not config.soldb:
     config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
 elif 'venv' in config.soldb or 'MyEnv' in config.soldb:

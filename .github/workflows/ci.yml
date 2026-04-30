@@ -14,6 +14,8 @@ jobs:
         python-version: ["3.9", "3.11"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -60,7 +62,7 @@ jobs:
       - name: Build package
         run: python -m build
 
-      - name: Run lit tests
+      - name: Run lit tests with coverage
         run: |
           set -euo pipefail
           anvil --steps-tracing --host 127.0.0.1 --port 8545 > anvil.log 2>&1 &
@@ -87,4 +89,23 @@ jobs:
             exit 1
           fi
 
-          RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh
+          coverage erase
+          COVERAGE_FILE="$PWD/.coverage" RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh --coverage
+          coverage combine
+          coverage report
+          coverage xml
+          coverage html
+
+      - name: Check changed Python coverage
+        if: github.event_name == 'pull_request'
+        run: |
+          diff-cover coverage.xml \
+            --compare-branch origin/${{ github.base_ref }} \
+            --fail-under 80
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/

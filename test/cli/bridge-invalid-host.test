@@ -1,0 +1,7 @@
+# Test bridge command error handling without starting a long-running server
+# REQUIRES: soldb
+# RUN: not %soldb bridge --host 999.999.999.999 --port 8765 --json 2>&1 | FileCheck %s
+
+# CHECK: Cross-Environment Debug Bridge
+# CHECK: URL: http://999.999.999.999:8765
+# CHECK: Error starting bridge server:
