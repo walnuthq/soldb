@@ -30,7 +30,6 @@ dependencies = [
     "web3>=6.0.0",
     "eth-utils>=2.0.0", 
     "hexbytes>=0.3.0",
-    "pyelftools>=0.29",
 ]
 
 [project.optional-dependencies]
@@ -88,7 +87,6 @@ omit = [
     "src/soldb/core/evm_repl.py",
     "src/soldb/core/transaction_tracer.py",
     "src/soldb/cross_env/bridge_server.py",
-    "src/soldb/parsers/dwarf.py",
 ]
 exclude_lines = [
     "pragma: no cover",

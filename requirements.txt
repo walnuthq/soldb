@@ -5,9 +5,6 @@ web3>=6.0.0           # For connecting to Ethereum nodes
 eth-utils>=2.0.0     # Ethereum utilities
 hexbytes>=0.3.0      # Hex string handling
 
-# DWARF debug info parsing
-pyelftools>=0.29      # For parsing ELF/DWARF debug information
-
 # Optional dependencies (install separately if needed)
 # py-evm>=0.7.0       # For local EVM simulation (currently has version conflicts)
 # pytest>=7.0.0       # Testing

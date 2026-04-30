@@ -5,7 +5,6 @@ This module contains all parsers for debug information formats:
 - ETHDebug (solc >= 0.8.29)
 - Source maps (legacy solc)
 - ABI utilities
-- DWARF debug info
 """
 
 from .ethdebug import (
@@ -37,14 +36,6 @@ from .abi import (
     parse_signature,
     parse_tuple_arg,
 )
-from .dwarf import (
-    DwarfParser,
-    DwarfFunction,
-    DwarfVariable,
-    DwarfLineEntry,
-    load_dwarf_info,
-    HAS_ELFTOOLS,
-)
 
 __all__ = [
     # ETHDebug
@@ -73,11 +64,4 @@ __all__ = [
     'match_single_type',
     'parse_signature',
     'parse_tuple_arg',
-    # DWARF
-    'DwarfParser',
-    'DwarfFunction',
-    'DwarfVariable',
-    'DwarfLineEntry',
-    'load_dwarf_info',
-    'HAS_ELFTOOLS',
 ]

@@ -1630,7 +1630,7 @@ class TransactionTracer:
         """Try to find parameter value by analyzing the stack.
         
         NOTE: Without proper debug information about variable locations (which would come
-        from an enhanced ETHDebug format or DWARF-style debug info), we cannot reliably
+        from an enhanced ETHDebug format), we cannot reliably
         locate parameters on the stack.
         """
         # TODO: Only ETHDebug data is reliable, what can we do more?????
