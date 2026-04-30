@@ -1,0 +1,13 @@
+[package]
+name = "soldb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "SolDB - LLDB-style debugger for Solidity and the EVM (Rust port, work in progress)"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/walnuthq/soldb"
+publish = false
+
+[[bin]]
+name = "soldb-rs"
+path = "src/main.rs"
