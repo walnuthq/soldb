@@ -195,7 +195,7 @@ def decode_event_log(tracer, log_entry: Dict[str, Any]) -> Dict[str, Any]:
                 text_signature = None
                 event_name = "Unknown"
                 try:
-                    r = requests.get(f"https://www.4byte.directory/api/v1/event-signatures/?hex_signature={event_hash}")
+                    r = requests.get(f"https://www.4byte.directory/api/v1/event-signatures/?hex_signature={event_hash}", timeout=5)
                     response_data = r.json()
                     
                     if 'results' in response_data and response_data['results']:
