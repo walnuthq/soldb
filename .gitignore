@@ -12,5 +12,3 @@ test/Output/
 test/lit.site.cfg.py
 .soldb_cache/
 .DS_Store
-
-examples/
