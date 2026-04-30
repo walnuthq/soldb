@@ -68,15 +68,29 @@ soldb = ["py.typed"]
 branch = true
 parallel = true
 relative_files = true
-source = ["soldb", "tools"]
+source = ["soldb"]
 
 [tool.coverage.paths]
 source = ["src", "*/site-packages"]
 
 [tool.coverage.report]
-fail_under = 30
+fail_under = 70
 show_missing = true
 skip_empty = true
+omit = [
+    # The coverage gate currently tracks deterministic parser, serializer,
+    # protocol, and utility modules. These integration-heavy surfaces are still
+    # exercised by lit tests, but are excluded from the percentage denominator
+    # until they have stable unit-test seams.
+    "src/soldb/cli/*",
+    "src/soldb/compiler/*",
+    "src/soldb/core/auto_deploy.py",
+    "src/soldb/core/evm_repl.py",
+    "src/soldb/core/transaction_tracer.py",
+    "src/soldb/cross_env/bridge_server.py",
+    "src/soldb/parsers/dwarf.py",
+    "src/soldb/utils/helpers.py",
+]
 exclude_lines = [
     "pragma: no cover",
     "if __name__ == .__main__.:",

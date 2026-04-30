@@ -6,6 +6,7 @@ This directory contains the test infrastructure for SolDB.
 
 ```
 test/
+├── unit/            # Pytest unit coverage for deterministic Python modules
 ├── trace/           # Trace command tests
 ├── simulate/        # Simulate command tests
 ├── events/          # Events command tests
@@ -53,6 +54,13 @@ Tests for command-line parsing and shared command behavior:
 - **list-contracts-basic.test**: Contract listing for a local transaction
 - **bridge-invalid-host.test**: Bridge command startup error handling
 
+### Unit Tests (`test/unit/`)
+Pytest tests for deterministic Python modules that do not need a live chain:
+- Protocol and contract registry round-trips
+- Bridge client request and error handling
+- ABI parsing, shared CLI helpers, logging, and exception formatting
+- ETHDebug/source-map parsers, trace serialization, and tracer helper behavior
+
 ### Stylus Interop Tests (`test/stylus/`)
 Tests for Solidity <> Stylus cross-environment tracing:
 - **stylus-interop.test**: Cross-environment trace with Stylus bridge
@@ -90,6 +98,7 @@ cd test
 ### Run with Coverage
 ```bash
 coverage erase
+coverage run --parallel-mode -m pytest test/unit
 ./run-tests.sh --coverage
 coverage combine
 coverage report
@@ -97,8 +106,8 @@ coverage html
 coverage xml
 ```
 
-This wraps each `soldb` CLI invocation in `coverage run --parallel-mode`, then combines the subprocess data after lit finishes.
-CI also enforces at least 80% coverage on Python lines changed in each pull request.
+This records pytest unit coverage, wraps each `soldb` CLI invocation in `coverage run --parallel-mode`, then combines all subprocess data after lit finishes.
+CI enforces a 70% total coverage gate for the deterministic Python module scope configured in `pyproject.toml`, plus at least 80% coverage on Python lines changed in each pull request.
 
 ### Run Remote Tests with Sepolia API Key
 ```bash

@@ -63,6 +63,9 @@ jobs:
       - name: Build package
         run: python -m build
 
+      - name: Run unit tests
+        run: pytest test/unit
+
       - name: Run lit tests
         run: |
           set -euo pipefail
@@ -167,6 +170,7 @@ jobs:
           fi
 
           coverage erase
+          COVERAGE_FILE="$PWD/.coverage" coverage run --parallel-mode -m pytest test/unit
           COVERAGE_FILE="$PWD/.coverage" RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh --coverage
           coverage combine
           coverage report
