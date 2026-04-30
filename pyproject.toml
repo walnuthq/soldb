@@ -73,19 +73,13 @@ source = ["soldb"]
 source = ["src", "*/site-packages"]
 
 [tool.coverage.report]
-fail_under = 80
+fail_under = 70
 show_missing = true
 skip_empty = true
 omit = [
-    # The coverage gate currently tracks deterministic parser, serializer,
-    # protocol, and utility modules. These integration-heavy surfaces are still
-    # exercised by lit tests, but are excluded from the percentage denominator
-    # until they have stable unit-test seams.
-    "src/soldb/cli/*",
-    "src/soldb/compiler/*",
-    "src/soldb/core/auto_deploy.py",
-    "src/soldb/core/evm_repl.py",
-    "src/soldb/core/transaction_tracer.py",
+    # The coverage gate still excludes the long-running bridge server because
+    # it owns process lifecycle and socket behavior that needs separate
+    # integration coverage.
     "src/soldb/cross_env/bridge_server.py",
 ]
 exclude_lines = [

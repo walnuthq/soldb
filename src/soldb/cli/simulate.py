@@ -112,9 +112,9 @@ def simulate_command(args) -> int:
 
 def _normalize_addresses(args):
     """Normalize addresses to checksum format."""
-    if args.from_addr:
+    if args.from_addr and is_address(args.from_addr):
         args.from_addr = to_checksum_address(args.from_addr)
-    if args.contract_address:
+    if args.contract_address and is_address(args.contract_address):
         args.contract_address = to_checksum_address(args.contract_address)
     return args
 

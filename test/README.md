@@ -107,7 +107,7 @@ coverage xml
 ```
 
 This records pytest unit coverage, wraps each `soldb` CLI invocation in `coverage run --parallel-mode`, then combines all subprocess data after lit finishes.
-CI enforces an 80% total coverage gate for the deterministic Python module scope configured in `pyproject.toml`, plus at least 80% coverage on Python lines changed in each pull request.
+CI enforces a 70% total coverage gate for the expanded Python module scope configured in `pyproject.toml`, plus at least 80% coverage on Python lines changed in each pull request.
 
 ### Run Remote Tests with Sepolia API Key
 ```bash

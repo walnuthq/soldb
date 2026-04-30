@@ -13,7 +13,6 @@ from soldb.core.transaction_tracer import (
 )
 from soldb.parsers.ethdebug import ETHDebugInfo, VariableLocation
 
-
 ADDR = "0x00000000000000000000000000000000000000aa"
 OTHER_ADDR = "0x00000000000000000000000000000000000000bb"
 
@@ -56,9 +55,16 @@ def test_trace_step_and_address_memory_helpers():
     tracer = make_tracer()
     long_value = "0x" + "12" * 32
     assert TraceStep(0, "PUSH1", 1, 1, 0, []).format_stack() == "[empty]"
-    assert "0x1212..." in TraceStep(0, "PUSH1", 1, 1, 0, [long_value, "0x2", "0x3", "0x4"]).format_stack()
+    assert (
+        "0x1212..."
+        in TraceStep(
+            0, "PUSH1", 1, 1, 0, [long_value, "0x2", "0x3", "0x4"]
+        ).format_stack()
+    )
 
-    assert tracer.extract_address_from_stack("0x" + "00" * 12 + "11" * 20).endswith("1111")
+    assert tracer.extract_address_from_stack("0x" + "00" * 12 + "11" * 20).endswith(
+        "1111"
+    )
     memory = "00" * 12 + "22" * 20
     assert tracer.extract_address_from_memory(memory, 0).endswith("2222")
     assert tracer.extract_address_from_memory("00", 1) is None
@@ -73,7 +79,10 @@ def test_trace_step_and_address_memory_helpers():
         memory="12345678",
     )
     assert tracer.extract_calldata_from_step(step) == "0x12345678"
-    assert tracer.extract_calldata_from_step(TraceStep(0, "STATICCALL", 1, 1, 1, [])) is None
+    assert (
+        tracer.extract_calldata_from_step(TraceStep(0, "STATICCALL", 1, 1, 1, []))
+        is None
+    )
     assert tracer.is_likely_memory_offset("0xff")
     assert not tracer.is_likely_memory_offset("0x" + "ff" * 20)
     assert tracer.format_address_display("") == "<unknown>"
@@ -120,14 +129,26 @@ def test_abi_decoding_and_value_extraction(tmp_path):
     assert tracer.extract_from_storage({"2": "0x01"}, 2, "bool") is True
     assert tracer.extract_from_storage({}, 3, "uint256") is None
 
-    formatted = tracer.format_tuple_value((7, OTHER_ADDR), [{"name": "n", "type": "uint256"}, {"name": "a", "type": "address"}])
+    formatted = tracer.format_tuple_value(
+        (7, OTHER_ADDR),
+        [{"name": "n", "type": "uint256"}, {"name": "a", "type": "address"}],
+    )
     assert "n[uint256]=7" in formatted
     assert Web3.to_checksum_address(OTHER_ADDR) in formatted
 
     abi_path = tmp_path / "Contract.abi"
-    abi_path.write_text(json.dumps([tracer.function_abis[selector], {"type": "event", "name": "Updated", "inputs": []}]))
+    abi_path.write_text(
+        json.dumps(
+            [
+                tracer.function_abis[selector],
+                {"type": "event", "name": "Updated", "inputs": []},
+            ]
+        )
+    )
     tracer.load_abi(str(abi_path))
-    assert any(sig["name"].startswith("set(") for sig in tracer.function_signatures.values())
+    assert any(
+        sig["name"].startswith("set(") for sig in tracer.function_signatures.values()
+    )
     assert any(sig == "Updated()" for sig in tracer.event_signatures.values())
 
 
@@ -157,11 +178,22 @@ def test_call_pattern_ethdebug_parameter_and_call_processing(monkeypatch):
             ]
         },
     )
-    assert tracer.find_parameter_value_from_ethdebug(trace, 2, "amount", "uint256") == 42
-    assert tracer.find_parameter_value_from_ethdebug(trace, 2, "stored", "uint256") == 11
-    assert tracer.find_parameter_value_from_ethdebug(trace, 99, "amount", "uint256") is None
+    assert (
+        tracer.find_parameter_value_from_ethdebug(trace, 2, "amount", "uint256") == 42
+    )
+    assert (
+        tracer.find_parameter_value_from_ethdebug(trace, 2, "stored", "uint256") == 11
+    )
+    assert (
+        tracer.find_parameter_value_from_ethdebug(trace, 99, "amount", "uint256")
+        is None
+    )
 
-    monkeypatch.setattr(tracer, "lookup_function_signature", lambda selector: "transfer(address,uint256)")
+    monkeypatch.setattr(
+        tracer,
+        "lookup_function_signature",
+        lambda selector: "transfer(address,uint256)",
+    )
     call_step = TraceStep(
         10,
         "CALL",
@@ -175,12 +207,168 @@ def test_call_pattern_ethdebug_parameter_and_call_processing(monkeypatch):
     assert call.call_type == "CALL"
     assert "transfer(address,uint256)" in call.name
 
-    create_step = TraceStep(11, "CREATE2", 100, 1, 0, ["0x1234", "0x06", "0x00", "0x00"], memory="600160020300")
-    monkeypatch.setattr(tracer, "_extract_created_address", lambda idx, tx_trace: OTHER_ADDR)
+    create_step = TraceStep(
+        11,
+        "CREATE2",
+        100,
+        1,
+        0,
+        ["0x1234", "0x06", "0x00", "0x00"],
+        memory="600160020300",
+    )
+    monkeypatch.setattr(
+        tracer, "_extract_created_address", lambda idx, tx_trace: OTHER_ADDR
+    )
     created = tracer._process_create_call(create_step, 11, ADDR, 0, trace)
     assert created.call_type == "CREATE2"
     assert created.contract_address == OTHER_ADDR
     assert ("init_code", "0x600160020300...") in created.args
+
+
+def test_function_boundary_return_and_signature_lookup(monkeypatch, capsys):
+    tracer = make_tracer()
+    trace = make_trace(
+        [
+            TraceStep(0, "PUSH1", 100, 1, 0, []),
+            TraceStep(1, "CALL", 99, 1, 0, []),
+            TraceStep(
+                2,
+                "RETURN",
+                98,
+                1,
+                1,
+                ["0x0", "0x20"],
+                memory=f"{7:064x}",
+            ),
+            TraceStep(3, "STOP", 97, 1, 1, []),
+        ]
+    )
+
+    source_lines = {
+        10: {
+            "content": "function set(uint256 amount, address user) public {",
+            "line": 4,
+        },
+        20: {"content": "constructor(uint256 supply) {", "line": 8},
+        30: {"content": "receive() external payable {", "line": 12},
+        40: {"content": "fallback(bytes calldata data) external {", "line": 16},
+        50: {"content": "function set(uint256 amount) public {", "line": 20},
+        60: None,
+    }
+    tracer.ethdebug_info = SimpleNamespace(
+        instructions=[
+            SimpleNamespace(offset=10, context=True),
+            SimpleNamespace(offset=20, context=True),
+            SimpleNamespace(offset=30, context=True),
+            SimpleNamespace(offset=40, context=True),
+            SimpleNamespace(offset=50, context=True),
+            SimpleNamespace(offset=60, context=False),
+        ]
+    )
+    tracer.ethdebug_parser = SimpleNamespace(
+        get_source_context=lambda pc, context_lines=5: source_lines[pc]
+    )
+    boundaries = tracer.identify_function_boundaries_from_ethdebug(trace)
+    assert boundaries[10]["name"] == "set"
+    assert boundaries[10]["params"] == [
+        {"type": "uint256", "name": "amount"},
+        {"type": "address", "name": "user"},
+    ]
+    assert boundaries[20]["name"] == "constructor"
+    assert boundaries[30]["name"] == "receive"
+    assert boundaries[40]["name"] == "fallback"
+    assert 50 not in boundaries
+
+    assert tracer.detect_call_type(trace, 99) == "internal"
+    assert tracer.detect_call_type(trace, 1) == "CALL"
+    assert tracer.detect_call_type(trace, 2) == "CALL"
+    assert (
+        tracer.detect_call_type(make_trace([TraceStep(0, "CREATE2", 1, 1, 0, [])]), 0)
+        == "CREATE2"
+    )
+
+    selector = "0xabcdef01"
+    tracer.function_abis[selector] = {
+        "name": "answer",
+        "outputs": [{"name": "value", "type": "uint256"}],
+    }
+    assert tracer.extract_return_value(trace, 2, "answer", selector) == 7
+    assert (
+        tracer.extract_return_value(
+            make_trace(
+                [
+                    TraceStep(
+                        0,
+                        "RETURN",
+                        1,
+                        1,
+                        0,
+                        ["0x0", "0x02"],
+                        memory="aabb",
+                    )
+                ]
+            ),
+            0,
+            "raw",
+        )
+        == "0xaabb"
+    )
+    tracer.function_abis["0xvoid"] = {"name": "void", "outputs": []}
+    assert tracer.extract_return_value(trace, 2, "void", "0xvoid") is None
+    assert tracer.extract_return_value(trace, 99, "answer") is None
+    assert (
+        tracer.extract_return_value(
+            make_trace([TraceStep(0, "RETURN", 1, 1, 0, ["nothex", "0x20"])]),
+            0,
+            "answer",
+        )
+        is None
+    )
+    assert "Failed to extract return value" in capsys.readouterr().err
+
+    class Response:
+        def __init__(self, status_code, data):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    calls = []
+
+    def fake_get(url, timeout=5):
+        calls.append(url)
+        if "openchain" in url:
+            return Response(
+                200,
+                {
+                    "result": {
+                        "function": {
+                            "0x12345678": [{"name": "set(uint256)"}],
+                        }
+                    }
+                },
+            )
+        return Response(
+            200,
+            {
+                "results": [
+                    {"id": 20, "text_signature": "newer()"},
+                    {"id": 1, "text_signature": "older()"},
+                ]
+            },
+        )
+
+    monkeypatch.setattr("soldb.core.transaction_tracer.requests.get", fake_get)
+    assert tracer.lookup_function_signature("0x12345678") == "set(uint256)"
+    monkeypatch.setattr(tracer, "_lookup_openchain", lambda selector: None)
+    assert tracer.lookup_function_signature("12345678") == "older()"
+    monkeypatch.setattr(
+        "soldb.core.transaction_tracer.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    assert tracer._lookup_4byte("12345678") is None
+    assert tracer._lookup_openchain("12345678") is None
 
 
 def test_context_lookup_and_source_mapper(tmp_path):
@@ -188,29 +376,53 @@ def test_context_lookup_and_source_mapper(tmp_path):
     step = TraceStep(0, "PUSH1", 100, 1, 0, [])
     trace = make_trace([step])
 
-    tracer.ethdebug_parser = SimpleNamespace(get_source_context=lambda pc, context_lines=2: {"file": "C.sol", "line": 2, "column": 5})
+    tracer.ethdebug_parser = SimpleNamespace(
+        get_source_context=lambda pc, context_lines=2: {
+            "file": "C.sol",
+            "line": 2,
+            "column": 5,
+        }
+    )
     tracer.ethdebug_info = object()
     assert tracer.get_source_context_for_step(step)["line"] == 2
     assert tracer.get_current_contract_address(trace, 0) == ADDR
 
     tracer.ethdebug_info = None
-    tracer.srcmap_parser = SimpleNamespace(get_source_context=lambda pc, context_lines=2: {"file": "Legacy.sol", "line": 3})
+    tracer.srcmap_parser = SimpleNamespace(
+        get_source_context=lambda pc, context_lines=2: {"file": "Legacy.sol", "line": 3}
+    )
     tracer.srcmap_info = object()
     assert tracer.get_source_context_for_step(step)["file"] == "Legacy.sol"
 
-    assert tracer._extract_function_name("function increment(uint256 amount) public") == "increment"
+    assert (
+        tracer._extract_function_name("function increment(uint256 amount) public")
+        == "increment"
+    )
     assert tracer._extract_function_name("constructor()") == "constructor"
     assert tracer._extract_function_name("fallback() external") == "fallback"
     assert tracer._extract_function_name("receive() external payable") == "receive"
     assert tracer._extract_function_name("uint256 value;") is None
 
-    assert tracer._extract_memory_slice(TraceStep(0, "CREATE", 1, 1, 0, [], memory="aabbcc"), 1, 2) == "bbcc"
-    assert tracer._extract_memory_slice(TraceStep(0, "CREATE", 1, 1, 0, [], memory=None), 0, 1) is None
+    assert (
+        tracer._extract_memory_slice(
+            TraceStep(0, "CREATE", 1, 1, 0, [], memory="aabbcc"), 1, 2
+        )
+        == "bbcc"
+    )
+    assert (
+        tracer._extract_memory_slice(
+            TraceStep(0, "CREATE", 1, 1, 0, [], memory=None), 0, 1
+        )
+        is None
+    )
 
     contract_info = SimpleNamespace(
         ethdebug_info=SimpleNamespace(instructions=[SimpleNamespace(offset=0)]),
         parser=SimpleNamespace(
-            get_source_context=lambda pc, context_lines=5: {"content": "contract Contract {", "line": 4}
+            get_source_context=lambda pc, context_lines=5: {
+                "content": "contract Contract {",
+                "line": 4,
+            }
         ),
     )
     assert tracer._find_contract_definition_line(contract_info) == 4
