@@ -162,7 +162,7 @@ def _extract_error_detail(trace_error: str) -> Optional[str]:
             error_dict = ast.literal_eval(trace_error)
             if isinstance(error_dict, dict) and 'message' in error_dict:
                 return error_dict['message']
-    except:
+    except (ValueError, SyntaxError):
         pass
     
     return trace_error
