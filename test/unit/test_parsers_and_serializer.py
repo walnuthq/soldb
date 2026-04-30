@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from hexbytes import HexBytes
 
 from soldb.core.serializer import TraceSerializer
@@ -10,6 +11,7 @@ from soldb.parsers.ethdebug import (
     ETHDebugDirParser,
     ETHDebugInfo,
     ETHDebugParser,
+    ETHDebugSpec,
     Instruction,
     MultiContractETHDebugParser,
     SourceLocation as ETHSourceLocation,
@@ -179,6 +181,67 @@ def test_ethdebug_parser_and_multi_contract_helpers(tmp_path):
     assert multi.get_all_loaded_contracts() == []
 
 
+def test_ethdebug_error_paths_loader_fallbacks_and_create_files(tmp_path, monkeypatch, capsys):
+    with pytest.raises(ValueError, match="Must use format"):
+        ETHDebugDirParser.parse_single_contract(f"abc:Contract:{tmp_path}")
+    with pytest.raises(ValueError, match="Address must start"):
+        ETHDebugSpec(address="abc", path=str(tmp_path))
+    with pytest.raises(ValueError, match="Path cannot be empty"):
+        ETHDebugSpec(address="0xabc", path="")
+    with pytest.raises(ValueError, match="Invalid ethdebug specification"):
+        ETHDebugDirParser.parse_ethdebug_dirs(["not-a-spec"])
+    assert ETHDebugDirParser.parse_ethdebug_dirs([]) == []
+    assert ETHDebugDirParser.parse_multi_contract(str(tmp_path)).address is None
+    assert ETHDebugDirParser.find_abi_file(ETHDebugDirParser.parse_multi_contract(str(tmp_path)), "Missing") is None
+
+    source_loader._source_cache.clear()
+    source_loader._warning_shown.clear()
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "A.sol").write_text("contract A {}\n")
+    (tmp_path / "B.sol").write_text("contract B {}\n")
+    assert source_loader.load_source_file("nested/A.sol", str(tmp_path)) == ["contract A {}\n"]
+    assert source_loader.load_source_file("contracts/B.sol", str(tmp_path)) == ["contract B {}\n"]
+    assert source_loader.load_source_file("Missing.sol", str(tmp_path)) == []
+    assert "Source file not found" in capsys.readouterr().out
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    assert source_loader._find_root_project_directory() == tmp_path
+    assert ETHDebugParser._get_compiler_info(str(tmp_path)) is None
+
+    create_dir = tmp_path / "create"
+    create_dir.mkdir()
+    (create_dir / "Contract.sol").write_text("contract Contract {}\n")
+    (create_dir / "ethdebug.json").write_text(
+        json.dumps({"compilation": {"sources": [{"id": 0, "path": "Contract.sol"}]}})
+    )
+    (create_dir / "Contract_ethdebug.json").write_text(
+        json.dumps({"instructions": [{"offset": 0, "operation": {"mnemonic": "CREATE"}}]})
+    )
+    create_info = ETHDebugParser().load_ethdebug_files(create_dir)
+    assert create_info.environment == "create"
+    assert create_info.contract_name == "Contract"
+
+    with pytest.raises(FileNotFoundError, match="No source found"):
+        ETHDebugParser().load_ethdebug_files(create_dir, "Missing")
+
+    no_contract_file = tmp_path / "no-contract-file"
+    no_contract_file.mkdir()
+    (no_contract_file / "ethdebug.json").write_text(
+        json.dumps({"compilation": {"compiler": {"version": "0.8.31"}, "sources": [{"id": 0, "path": "Only.sol"}]}})
+    )
+    with pytest.raises(FileNotFoundError, match="No ethdebug file found.*solc 0.8.31"):
+        ETHDebugParser().load_ethdebug_files(no_contract_file)
+
+    legacy_dir = tmp_path / "legacy-info"
+    legacy_dir.mkdir()
+    legacy_metadata = json.dumps({"compiler": {"version": "0.8.16"}})
+    (legacy_dir / "combined.json").write_text(json.dumps({"contracts": {"A.sol:A": {"metadata": legacy_metadata}}}))
+    assert ETHDebugParser._get_compiler_info(str(legacy_dir)) == "solc 0.8.16"
+    with pytest.raises(FileNotFoundError, match="compiler: solc 0.8.16"):
+        ETHDebugParser().load_ethdebug_files(legacy_dir)
+
+
 def test_source_map_parser_manager_and_loader(tmp_path):
     fn_offset, ret_offset = write_combined_dir(tmp_path)
 
@@ -231,6 +294,47 @@ def test_source_map_parser_manager_and_loader(tmp_path):
     assert manager.get_cache_stats()["line_to_pcs_cache_entries"] >= 1
     manager.clear_cache()
     assert manager.get_cache_stats()["pc_to_source_cache_entries"] == 0
+
+
+def test_source_map_parser_error_paths_and_inheritance(tmp_path):
+    parser = SourceMapParser()
+    with pytest.raises(FileNotFoundError, match="combined.json not found"):
+        parser.load_combined_json(tmp_path)
+
+    (tmp_path / "combined.json").write_text(json.dumps({"sourceList": [], "contracts": {}}))
+    with pytest.raises(ValueError, match="No contracts found"):
+        parser.load_combined_json(tmp_path)
+
+    (tmp_path / "combined.json").write_text(
+        json.dumps({"sourceList": ["A.sol"], "contracts": {"A.sol:A": {"srcmap-runtime": "0:1:0:-:0"}}})
+    )
+    with pytest.raises(ValueError, match="No contract found with runtime bytecode"):
+        parser.load_combined_json(tmp_path)
+
+    (tmp_path / "combined.json").write_text(
+        json.dumps({"sourceList": ["A.sol"], "contracts": {"A.sol:A": {"bin-runtime": "6001"}}})
+    )
+    with pytest.raises(ValueError, match="No srcmap-runtime found"):
+        parser.load_combined_json(tmp_path)
+
+    entries = parser._parse_srcmap("1:2:0:i:0;;:3::o:")
+    assert [(entry.offset, entry.length, entry.file_index, entry.jump_type) for entry in entries] == [
+        (1, 2, 0, "i"),
+        (1, 2, 0, "i"),
+        (1, 3, 0, "o"),
+    ]
+    assert parser._parse_srcmap("") == []
+    assert parser._build_pc_to_instruction_map(bytes.fromhex("6001600201")) == {0: 0, 2: 1, 4: 2}
+
+    with pytest.raises(FileNotFoundError, match="No debug info found"):
+        load_debug_info(tmp_path / "missing")
+
+    ethdebug_dir = tmp_path / "ethdebug"
+    ethdebug_dir.mkdir()
+    write_ethdebug_dir(ethdebug_dir)
+    loaded_parser, loaded_info = load_debug_info(ethdebug_dir)
+    assert isinstance(loaded_parser, ETHDebugParser)
+    assert loaded_info.environment == "runtime"
 
 
 def test_trace_serializer_outputs_contract_calls_logs_and_abis():
@@ -311,3 +415,45 @@ def test_trace_serializer_outputs_contract_calls_logs_and_abis():
     assert response["steps"][2]["debugInfo"] is False
     assert next(iter(response["abis"].values()))[0]["name"] == "increment"
     assert response["error"] == "child revert"
+
+
+def test_trace_serializer_log_and_input_edge_cases():
+    serializer = TraceSerializer()
+    trace = TransactionTrace(
+        tx_hash="0xtx",
+        from_addr="0x0000000000000000000000000000000000000001",
+        to_addr=ADDR,
+        value=0,
+        input_data=b"\xaa\xbb",
+        gas_used=0,
+        output="0x",
+        steps=[
+            TraceStep(0, "LOG0", 10, 1, 0, ["0x00", "0x02"], memory=None),
+            TraceStep(1, "LOG1", 10, 1, 0, ["bad", "size", "0x" + "22" * 32], memory="abcd"),
+            TraceStep(2, "LOG1", 10, 1, 0, ["0x10", "0x02", 1 << 248], memory="abcd"),
+            TraceStep(3, "LOG1", 10, 1, 0, ["0x00", "0x01", 0], memory="ff"),
+            TraceStep(4, "LOG2", 10, 1, 0, ["0x00", "0x00", "0x01"]),
+            TraceStep(5, "PUSH1", 10, 1, 0, []),
+        ],
+        success=True,
+    )
+
+    logs = serializer.extract_logs_from_trace(trace)
+    assert logs[0][1]["data"] == "0x0000"
+    assert logs[1][1]["topics"][0].startswith("0x22")
+    assert logs[2][1]["data"] == "0x0000"
+    assert logs[2][1]["topics"][0].startswith("0x01")
+    assert len(logs) == 3
+
+    depth_one = FunctionCall("external", "", 0, 0, 0, 1, [])
+    assert serializer.encode_function_input(depth_one, trace) == "0xaabb"
+    assert serializer.encode_function_input(FunctionCall("empty", "", 0, 0, 0, 0, []), trace) == "0x"
+    assert serializer.encode_function_input(
+        FunctionCall("unknown", "12345678", 0, 0, 0, 0, [("x", "<unknown>")], call_type="internal"),
+        trace,
+    ) == "0x12345678"
+    encoded = serializer.encode_function_input(
+        FunctionCall("mixed", "0x12345678", 0, 0, 0, 0, [("negative", -1), ("hex", "0x2a"), ("other", "text")]),
+        trace,
+    )
+    assert encoded.endswith(("0" * 63) + "0" + ("0" * 62) + "2a" + ("0" * 64))
