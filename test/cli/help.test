@@ -1,0 +1,50 @@
+# Test top-level and subcommand help output
+# REQUIRES: soldb
+# RUN: %soldb --help 2>&1 | FileCheck %s --check-prefix=MAIN
+# RUN: %soldb --version 2>&1 | FileCheck %s --check-prefix=VERSION
+# RUN: %soldb trace --help 2>&1 | FileCheck %s --check-prefix=TRACE
+# RUN: %soldb simulate --help 2>&1 | FileCheck %s --check-prefix=SIMULATE
+# RUN: %soldb list-events --help 2>&1 | FileCheck %s --check-prefix=EVENTS
+# RUN: %soldb list-contracts --help 2>&1 | FileCheck %s --check-prefix=CONTRACTS
+# RUN: %soldb bridge --help 2>&1 | FileCheck %s --check-prefix=BRIDGE
+
+# MAIN-DAG: usage:
+# MAIN-DAG: SolDB - Ethereum transaction analysis tool
+# MAIN-DAG: list-contracts
+# MAIN-DAG: list-events
+# MAIN-DAG: trace
+# MAIN-DAG: simulate
+
+# VERSION: 0.1.0
+
+# TRACE-DAG: usage:
+# TRACE-DAG: tx_hash
+# TRACE-DAG: --ethdebug-dir
+# TRACE-DAG: --multi-contract
+# TRACE-DAG: --rpc
+# TRACE-DAG: --json
+
+# SIMULATE-DAG: usage:
+# SIMULATE-DAG: --from
+# SIMULATE-DAG: contract_address
+# SIMULATE-DAG: function_signature
+# SIMULATE-DAG: --raw-data
+# SIMULATE-DAG: --fork-url
+
+# EVENTS-DAG: usage:
+# EVENTS-DAG: tx_hash
+# EVENTS-DAG: --ethdebug-dir
+# EVENTS-DAG: --rpc-url
+# EVENTS-DAG: --json-events
+
+# CONTRACTS-DAG: usage:
+# CONTRACTS-DAG: tx_hash
+# CONTRACTS-DAG: --rpc-url
+# CONTRACTS-DAG: --ethdebug-dir
+# CONTRACTS-DAG: --multi-contract
+
+# BRIDGE-DAG: usage:
+# BRIDGE-DAG: --host
+# BRIDGE-DAG: --port
+# BRIDGE-DAG: --config
+# BRIDGE-DAG: --json

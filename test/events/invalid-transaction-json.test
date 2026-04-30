@@ -1,0 +1,6 @@
+# Test JSON error output when a transaction receipt cannot be found
+# REQUIRES: soldb
+# RUN: not %soldb list-events 0x0000000000000000000000000000000000000000000000000000000000000000 --rpc-url %{rpc_url} --json-events 2>&1 | FileCheck %s
+
+# CHECK: "error": true,
+# CHECK: "type": "TransactionReceiptError"

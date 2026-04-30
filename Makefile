@@ -1,4 +1,4 @@
-.PHONY: help install dev test test-setup test-deploy publish clean
+.PHONY: help install dev test coverage test-setup test-deploy publish clean
 
 help:
 	@echo "SolDB - Build and Distribution"
@@ -7,6 +7,7 @@ help:
 	@echo "  make install         Install package locally"
 	@echo "  make dev            Install in development mode"
 	@echo "  make test           Run tests"
+	@echo "  make coverage       Run tests with Python coverage"
 	@echo "  make test-setup     Setup and verify test environment"
 	@echo "  make test-deploy    Deploy test contracts"
 	@echo "  make publish        Publish to PyPI"
@@ -21,6 +22,14 @@ dev:
 
 test:
 	./test/run-tests.sh
+
+coverage:
+	coverage erase
+	./test/run-tests.sh --coverage
+	coverage combine
+	coverage report
+	coverage html
+	coverage xml
 
 test-setup:
 	./test/test-setup.sh

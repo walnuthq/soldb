@@ -1,0 +1,8 @@
+# Test JSON error output for invalid simulation value
+# REQUIRES: soldb
+# RUN: not %soldb simulate %{contract_address} "increment(uint256)" 1 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --rpc-url %{rpc_url} --value bad --json 2>&1 | FileCheck %s
+
+# CHECK: "error": true,
+# CHECK: "type": "InvalidValue"
+# CHECK: "message": "Invalid value for --value: bad",
+# CHECK: "provided_value": "bad"

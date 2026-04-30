@@ -1,0 +1,6 @@
+# Test JSON error output when a transaction cannot be traced
+# REQUIRES: soldb
+# RUN: not %soldb trace 0x0000000000000000000000000000000000000000000000000000000000000000 --rpc %{rpc_url} --json 2>&1 | FileCheck %s
+
+# CHECK: "error": true,
+# CHECK: "type": "TransactionError"

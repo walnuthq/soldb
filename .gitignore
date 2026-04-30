@@ -1,7 +1,12 @@
 cache/
 dist/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 examples/debug/
 examples/debug*/
+examples/out*/
 out/
 __pycache__/
 *.txt

@@ -17,7 +17,9 @@ NC='\033[0m'
 RUN_TRACE_TESTS=true
 RUN_SIMULATE_TESTS=true
 RUN_EVENTS_TESTS=true
+RUN_CLI_TESTS=true
 VERBOSE=false
+RUN_COVERAGE=false
 SEPOLIA_KEY=""
 
 for arg in "$@"; do
@@ -33,20 +35,33 @@ for arg in "$@"; do
         --trace-only)
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
+            RUN_CLI_TESTS=false
             shift
             ;;
         --simulate-only)
             RUN_TRACE_TESTS=false
             RUN_EVENTS_TESTS=false
+            RUN_CLI_TESTS=false
             shift
             ;;
         --events-only)
             RUN_TRACE_TESTS=false
             RUN_SIMULATE_TESTS=false
+            RUN_CLI_TESTS=false
+            shift
+            ;;
+        --cli-only)
+            RUN_TRACE_TESTS=false
+            RUN_SIMULATE_TESTS=false
+            RUN_EVENTS_TESTS=false
             shift
             ;;
         -v|--verbose)
             VERBOSE=true
+            shift
+            ;;
+        --coverage)
+            RUN_COVERAGE=true
             shift
             ;;
         -h|--help)
@@ -56,7 +71,9 @@ for arg in "$@"; do
             echo "  --trace-only       Run only trace tests (from test/trace/)"
             echo "  --simulate-only    Run only simulate tests (from test/simulate/)"
             echo "  --events-only      Run only events tests (from test/events/)"
+            echo "  --cli-only         Run only CLI tests (from test/cli/)"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
+            echo "  --coverage         Run soldb CLI invocations under coverage.py"
             echo "  -v, --verbose      Run tests with verbose output"
             echo "  -h, --help         Show this help message"
             echo ""
@@ -64,12 +81,14 @@ for arg in "$@"; do
             echo "  test/trace/        Contains trace command tests"
             echo "  test/simulate/     Contains simulate command tests"
             echo "  test/events/       Contains list-events command tests"
+            echo "  test/cli/          Contains CLI command and error tests"
             echo ""
             echo "Environment variables:"
             echo "  RPC_URL            RPC endpoint (default: http://localhost:8545)"
             echo "  SOLC_PATH          Path to solc binary (default: solc)"
             echo "  TEST_TX            Specific transaction hash to test"
             echo "  SEPOLIA_KEY        Optimism Sepolia API key (can also use --sepolia-key)"
+            echo "  COVERAGE_FILE      Coverage data file base path (default: .coverage in project root)"
             echo ""
             echo "Examples:"
             echo "  $0                           # Run all tests"
@@ -163,6 +182,7 @@ echo -e "${GREEN}Organized test structure:${NC}"
 echo -e "${GREEN}  - test/trace/     : Trace command tests${NC}"
 echo -e "${GREEN}  - test/simulate/  : Simulate command tests${NC}"
 echo -e "${GREEN}  - test/events/    : List-events command tests${NC}"
+echo -e "${GREEN}  - test/cli/       : CLI command and error tests${NC}"
 
 # Test-specific debug directory (relative to examples)
 TEST_DEBUG_REL="out"
@@ -179,7 +199,18 @@ if [ -f "${DEPLOYMENT_JSON}" ]; then
         echo -e "${YELLOW}Found deployment for ${DEPLOYED_CONTRACT}, but need TestContract${NC}"
         NEED_DEPLOY=true
     else
-        echo -e "${GREEN}Found existing TestContract deployment${NC}"
+        DEPLOYED_ADDRESS=$(jq -r '.address // .contract_address // empty' "${DEPLOYMENT_JSON}")
+        if command -v cast >/dev/null 2>&1 && [ -n "$DEPLOYED_ADDRESS" ]; then
+            DEPLOYED_CODE=$(cast code "$DEPLOYED_ADDRESS" --rpc-url "$RPC_URL" 2>/dev/null || echo "0x")
+            if [ -z "$DEPLOYED_CODE" ] || [ "$DEPLOYED_CODE" = "0x" ]; then
+                echo -e "${YELLOW}Found TestContract deployment file, but no code at ${DEPLOYED_ADDRESS}${NC}"
+                NEED_DEPLOY=true
+            else
+                echo -e "${GREEN}Found existing TestContract deployment${NC}"
+            fi
+        else
+            echo -e "${GREEN}Found existing TestContract deployment${NC}"
+        fi
     fi
 else
     echo -e "${YELLOW}No test deployment found${NC}"
@@ -294,6 +325,27 @@ else
     exit 1
 fi
 
+if [ "$RUN_COVERAGE" = true ]; then
+    PYTHON_CMD="${PYTHON:-python}"
+    if [[ "$PYTHON_CMD" != /* && -x "${PROJECT_DIR}/${PYTHON_CMD}" ]]; then
+        PYTHON_CMD="${PROJECT_DIR}/${PYTHON_CMD}"
+    elif [[ "$PYTHON_CMD" != */* ]]; then
+        PYTHON_CMD="$(command -v "$PYTHON_CMD" || echo "$PYTHON_CMD")"
+    fi
+    if ! "$PYTHON_CMD" -m coverage --version >/dev/null 2>&1; then
+        echo -e "${RED}Error: coverage.py not found${NC}"
+        echo "Install with: pip install -e '${PROJECT_DIR}[dev]'"
+        exit 1
+    fi
+    COVERAGE_FILE="${COVERAGE_FILE:-${PROJECT_DIR}/.coverage}"
+    COVERAGE_RCFILE="${COVERAGE_RCFILE:-${PROJECT_DIR}/pyproject.toml}"
+    export COVERAGE_FILE
+    export COVERAGE_RCFILE
+    SOLDB_CMD="$PYTHON_CMD -m coverage run --parallel-mode -m soldb.cli.main"
+    SOLDB_TYPE="coverage"
+    echo -e "${GREEN}Using coverage-wrapped soldb (${COVERAGE_FILE}.*)${NC}"
+fi
+
 # Create lit config with relative paths
 cat > "${SCRIPT_DIR}/lit.site.cfg.py" << EOF
 import sys
@@ -307,7 +359,9 @@ project_dir = os.path.dirname(script_dir)
 config.soldb_dir = project_dir
 
 # Find soldb dynamically
-if shutil.which('soldb'):
+if "${SOLDB_CMD}":
+    config.soldb = "${SOLDB_CMD}"
+elif shutil.which('soldb'):
     config.soldb = shutil.which('soldb')
 elif os.path.exists(os.path.join(project_dir, '.venv', 'bin', 'soldb')):
     config.soldb = os.path.join(project_dir, '.venv', 'bin', 'soldb')
@@ -435,6 +489,16 @@ if [ "$RUN_EVENTS_TESTS" = true ]; then
         "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/events"
     else
         echo -e "${YELLOW}Warning: events directory not found${NC}"
+    fi
+fi
+
+# Run CLI tests
+if [ "$RUN_CLI_TESTS" = true ]; then
+    echo -e "${YELLOW}Running CLI tests...${NC}"
+    if [ -d "${SCRIPT_DIR}/cli" ]; then
+        "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/cli"
+    else
+        echo -e "${YELLOW}Warning: cli directory not found${NC}"
     fi
 fi
 

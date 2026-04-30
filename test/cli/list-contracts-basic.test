@@ -1,0 +1,7 @@
+# Test list-contracts for a basic transaction with no external contract calls
+# REQUIRES: soldb
+# RUN: %soldb list-contracts %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --multi-contract --rpc-url %{rpc_url} 2>&1 | FileCheck %s
+
+# CHECK: Looking for contracts in transaction:
+# CHECK: Contracts detected in transaction:
+# CHECK: No contract calls detected in this transaction.
