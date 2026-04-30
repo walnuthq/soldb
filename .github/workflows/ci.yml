@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  FOUNDRY_VERSION: v1.0.0
+
 jobs:
   test:
     name: test (python ${{ matrix.python-version }})
@@ -24,7 +27,7 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: ${{ env.FOUNDRY_VERSION }}
 
       - name: Install system test tools
         run: |
@@ -109,7 +112,7 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: ${{ env.FOUNDRY_VERSION }}
 
       - name: Install system test tools
         run: |
