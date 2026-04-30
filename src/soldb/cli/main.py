@@ -97,7 +97,7 @@ def main():
     simulate_parser.add_argument('--production-dir', default='./build/contracts', help='Production directory for compiled contracts (default: ./build/contracts)')
     simulate_parser.add_argument('--save-config', action='store_true', help='Save configuration to walnut.config.yaml')
     simulate_parser.add_argument('--verify-version', action='store_true', help='Verify solc version supports ETHDebug and exit')
-    simulate_parser.add_argument('--no-cache', action='store_true', default=False, help='Enable deployment cache')
+    simulate_parser.add_argument('--no-cache', action='store_true', default=False, help='Disable deployment cache')
     simulate_parser.add_argument('--cache-dir', default='.soldb_cache', help='Cache directory')
     simulate_parser.add_argument('--fork-url', help='Upstream RPC URL to fork (launch anvil)')
     simulate_parser.add_argument('--fork-block', type=int, help='Specific block number to fork')
