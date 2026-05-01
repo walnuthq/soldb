@@ -6,12 +6,14 @@ This directory contains the test infrastructure for SolDB.
 
 ```
 test/
-├── unit/            # Pytest unit coverage for deterministic Python modules
-├── trace/           # Trace command tests
-├── simulate/        # Simulate command tests
-├── events/          # Events command tests
-├── cli/             # CLI command and validation tests
+├── unit/            # Pytest unit tests for isolated Python modules
+├── integration/     # Pytest integration tests
+├── trace/           # Trace command tests (lit + FileCheck)
+├── simulate/        # Simulate command tests (lit + FileCheck)
+├── events/          # Events command tests (lit + FileCheck)
+├── cli/             # CLI command and validation tests (lit + FileCheck)
 ├── stylus/          # Stylus interop test contracts and scripts
+├── conftest.py      # Shared pytest constants
 ├── run-tests.sh     # Main test runner script
 ├── lit.cfg.py       # Test framework configuration
 ├── lit.site.cfg.py  # Generated site-specific configuration (gitignored)
@@ -21,13 +23,17 @@ test/
 ## Test Categories
 
 ### Trace Tests (`test/trace/`)
+
 Tests for the `soldb trace` command:
+
 - **basic-trace.test**: Basic transaction tracing
 - **increment-trace.test**: Function call tracing with nested calls
 - **raw-trace.test**: Raw instruction trace with `--raw` flag
 
 ### Simulate Tests (`test/simulate/`)
+
 Tests for the `soldb simulate` command:
+
 - **basic-simulate.test**: Basic function simulation
 - **json-simulate.test**: JSON output format testing
 - **raw-data-simulate.test**: Raw calldata simulation
@@ -39,7 +45,9 @@ Tests for the `soldb simulate` command:
 - **wrong-argument-count.test**: ABI-backed argument count validation
 
 ### Events Tests (`test/events/`)
+
 Tests for the `soldb list-events` command:
+
 - **multiple-events.test**: Event listing for a transaction with logs
 - **multiple-events-json.test**: JSON event output
 - **no-events.test**: Empty event output
@@ -48,21 +56,43 @@ Tests for the `soldb list-events` command:
 - **invalid-transaction-json.test**: JSON error output for missing receipts
 
 ### CLI Tests (`test/cli/`)
+
 Tests for command-line parsing and shared command behavior:
+
 - **help.test**: Top-level and subcommand help output
 - **missing-command.test**: Required command validation
 - **list-contracts-basic.test**: Contract listing for a local transaction
 - **bridge-invalid-host.test**: Bridge command startup error handling
 
 ### Unit Tests (`test/unit/`)
-Pytest tests for deterministic Python modules that do not need a live chain:
-- Protocol and contract registry round-trips
+
+Pytest tests for isolated Python modules — each test targets a single module with mocked dependencies:
+
 - Bridge client request and error handling
-- ABI parsing, shared CLI helpers, logging, and exception formatting
-- ETHDebug/source-map parsers, trace serialization, and tracer helper behavior
+- Protocol and contract registry round-trips
+- ABI parsing, exception formatting, logging helpers
+- Tracer decode/format/extract helpers
+- Serializer log extraction, encoding, and contract mapping
+- REPL debugger commands, stepping, and source loading
+- Compiler ETHDebug main, SourceMapper, tuple formatting
+
+### Integration Tests (`test/integration/`)
+
+Pytest tests that exercise multiple modules together with real parsers and ETHDebug data:
+
+- CLI command flows (trace, simulate, events, contracts) end-to-end
+- Full `analyze_function_calls` with CALL/DELEGATECALL/CREATE/REVERT traces
+- EVMDebugger sessions with real ETHDebug — stepping, breakpoints, variables
+- Auto-deploy compile and deploy lifecycle
+- ETHDebug/source-map parser edge cases and SourceMappingManager
+- Multi-contract trace analysis and serialization
+
+Shared fixtures (`conftest.py`) provide `write_ethdebug_project`, `build_tracer`, and automatic source cache cleanup.
 
 ### Stylus Interop Tests (`test/stylus/`)
+
 Tests for Solidity <> Stylus cross-environment tracing:
+
 - **stylus-interop.test**: Cross-environment trace with Stylus bridge
 
 These tests require additional setup. See `test/stylus/README.md` for details.
@@ -70,12 +100,14 @@ These tests require additional setup. See `test/stylus/README.md` for details.
 ## Running Tests
 
 ### Run All Tests
+
 ```bash
 cd test
 ./run-tests.sh
 ```
 
 ### Run Specific Test Categories
+
 ```bash
 # Run only trace tests
 ./run-tests.sh --trace-only
@@ -91,14 +123,22 @@ cd test
 ```
 
 ### Run with Verbose Output
+
 ```bash
 ./run-tests.sh -v
 ```
 
+### Run Unit and Integration Tests
+
+```bash
+pytest test/unit test/integration
+```
+
 ### Run with Coverage
+
 ```bash
 coverage erase
-coverage run --parallel-mode -m pytest test/unit
+coverage run --parallel-mode -m pytest test/unit test/integration
 ./run-tests.sh --coverage
 coverage combine
 coverage report
@@ -106,10 +146,11 @@ coverage html
 coverage xml
 ```
 
-This records pytest unit coverage, wraps each `soldb` CLI invocation in `coverage run --parallel-mode`, then combines all subprocess data after lit finishes.
-CI enforces a 70% total coverage gate for the expanded Python module scope configured in `pyproject.toml`, plus at least 80% coverage on Python lines changed in each pull request.
+This records pytest unit and integration coverage, wraps each `soldb` CLI invocation in `coverage run --parallel-mode`, then combines all subprocess data after lit finishes.
+CI enforces a 70% total coverage gate for the Python module scope configured in `pyproject.toml`, plus at least 80% coverage on Python lines changed in each pull request.
 
 ### Run Remote Tests with Sepolia API Key
+
 ```bash
 # Via command line option
 ./run-tests.sh --sepolia-key=YOUR_API_KEY
@@ -120,6 +161,7 @@ export SEPOLIA_KEY_ENV=YOUR_API_KEY
 ```
 
 ### Run Individual Tests
+
 ```bash
 # Run a specific test file
 lit trace/basic-trace.test
@@ -131,6 +173,7 @@ lit simulate/
 ```
 
 ### Run Stylus Interop Tests
+
 Stylus tests require additional setup (nitro-testnode, cargo-stylus-beta, cross-env-bridge).
 See `test/stylus/README.md` for full instructions.
 
@@ -162,6 +205,7 @@ lit trace/stylus-interop.test -v
 ## Test Environment
 
 The tests use the following environment:
+
 - **RPC URL**: `http://localhost:8545` (configurable via `RPC_URL` environment variable)
 - **Sepolia RPC**: Optimism Sepolia testnet (requires API key via `--sepolia-key` or `SEPOLIA_KEY_ENV`)
 - **Private Key**: Default Anvil private key for deployment
@@ -171,6 +215,7 @@ The tests use the following environment:
 ## Test Configuration
 
 The test suite uses the following configuration files:
+
 - **lit.cfg.py**: Main lit configuration with substitutions and features
 - **lit.site.cfg.py**: Site-specific configuration (auto-generated by run-tests.sh)
 - **run-tests.sh**: Main test runner with deployment and execution logic
@@ -194,6 +239,7 @@ The test suite uses the following configuration files:
    - `%{project_root}` - Project root directory path
 
 ### Test Format Example
+
 ```bash
 # Test description
 # REQUIRES: soldb
