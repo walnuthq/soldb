@@ -7,13 +7,11 @@ This module handles listing and decoding events from transaction logs.
 import sys
 import json
 from pathlib import Path
-from typing import Optional
 
 from soldb.core.transaction_tracer import TransactionTracer
 from soldb.parsers.ethdebug import MultiContractETHDebugParser, ETHDebugDirParser
 from soldb.utils.colors import error
 from soldb.utils.exceptions import format_error_json
-from soldb.utils.logging import logger
 from soldb.cli.common import (
     get_ethdebug_dirs,
     is_multi_contract_mode,
