@@ -69,8 +69,14 @@ class Colors:
     @classmethod
     def enable(cls):
         """Re-enable colors."""
-        cls.__init__()
+        for attr, value in cls._DEFAULTS.items():
+            setattr(cls, attr, value)
 
+
+# Snapshot the original codes so enable() can restore them after a disable().
+Colors._DEFAULTS = {
+    a: getattr(Colors, a) for a in dir(Colors) if a.isupper() and not a.startswith('_')
+}
 
 # Disable colors if not supported
 if not SUPPORTS_COLOR:

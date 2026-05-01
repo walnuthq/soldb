@@ -91,9 +91,23 @@ def test_disable_zeroes_every_color_code_and_helpers_become_passthrough():
         _restore_color_attrs(snapshot)
 
 
-def test_enable_currently_raises_type_error():
-    # `Colors.enable()` calls `cls.__init__()` which dispatches to
-    # `object.__init__` and raises TypeError because no instance is passed.
-    # Captured here so a future fix flips this assertion intentionally.
-    with pytest.raises(TypeError):
+def test_enable_restores_defaults_after_disable():
+    snapshot = _snapshot_color_attrs()
+    try:
+        Colors.disable()
+        assert Colors.RED == ""
+        assert Colors.RESET == ""
+
         Colors.enable()
+        # `enable()` restores from `_DEFAULTS`, which was snapshotted at
+        # module load before the conditional `if not SUPPORTS_COLOR` blank,
+        # so the originals come back regardless of whether the test
+        # process was attached to a TTY.
+        assert Colors.RED == "\033[31m"
+        assert Colors.RESET == "\033[0m"
+        assert Colors.BOLD == "\033[1m"
+        # And every attr matches what `_DEFAULTS` records.
+        for attr in snapshot:
+            assert getattr(Colors, attr) == Colors._DEFAULTS[attr]
+    finally:
+        _restore_color_attrs(snapshot)
