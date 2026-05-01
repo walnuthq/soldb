@@ -67,7 +67,7 @@ jobs:
         run: python -m build
 
       - name: Run unit tests
-        run: pytest test/unit
+        run: pytest test/unit test/integration
 
       - name: Run lit tests
         run: |
@@ -173,7 +173,7 @@ jobs:
           fi
 
           coverage erase
-          COVERAGE_FILE="$PWD/.coverage" coverage run --parallel-mode -m pytest test/unit
+          COVERAGE_FILE="$PWD/.coverage" coverage run --parallel-mode -m pytest test/unit test/integration
           COVERAGE_FILE="$PWD/.coverage" RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh --coverage
           coverage combine
           coverage report

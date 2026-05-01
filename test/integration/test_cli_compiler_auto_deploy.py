@@ -400,6 +400,142 @@ def test_auto_deploy_cache_compile_deploy_and_fork(monkeypatch, tmp_path):
     assert proc.terminated is True
 
 
+def test_auto_deploy_compile_contract_single(monkeypatch, tmp_path, capsys):
+    session = make_auto_session(tmp_path)
+    monkeypatch.setattr(
+        auto_deploy, "compile_ethdebug_run",
+        lambda **kw: {"success": True, "output_dir": str(tmp_path)},
+    )
+    session.compile_contract()
+    assert session.debug_dir == tmp_path
+    out = capsys.readouterr().out
+    assert "Compiled" in out
+
+
+def test_auto_deploy_compile_contract_dual(monkeypatch, tmp_path, capsys):
+    session = make_auto_session(tmp_path)
+    session.dual_compile = True
+    prod_dir = tmp_path / "prod"
+    prod_dir.mkdir(exist_ok=True)
+    (prod_dir / "Token.abi").write_text("[]")
+    (prod_dir / "Token.bin").write_text("6000")
+    monkeypatch.setattr(
+        auto_deploy, "compile_ethdebug_run",
+        lambda **kw: {
+            "production": {"success": True, "output_dir": str(prod_dir)},
+            "debug": {"success": True, "output_dir": str(tmp_path)},
+        },
+    )
+    session.compile_contract()
+    assert session.abi_path == prod_dir / "Token.abi"
+    out = capsys.readouterr().out
+    assert "Dual compile" in out
+
+
+def test_auto_deploy_compile_contract_failure(monkeypatch, tmp_path):
+    session = make_auto_session(tmp_path)
+    monkeypatch.setattr(
+        auto_deploy, "compile_ethdebug_run",
+        lambda **kw: {"success": False, "error": "bad solc"},
+    )
+    with pytest.raises(auto_deploy.CompilationError):
+        session.compile_contract()
+
+
+def test_auto_deploy_compile_contract_exception(monkeypatch, tmp_path):
+    session = make_auto_session(tmp_path)
+    monkeypatch.setattr(
+        auto_deploy, "compile_ethdebug_run",
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("solc crash")),
+    )
+    with pytest.raises(auto_deploy.CompilationError, match="solc crash"):
+        session.compile_contract()
+
+
+def test_auto_deploy_compile_dual_failure(monkeypatch, tmp_path):
+    session = make_auto_session(tmp_path)
+    session.dual_compile = True
+    monkeypatch.setattr(
+        auto_deploy, "compile_ethdebug_run",
+        lambda **kw: {
+            "production": {"success": True, "output_dir": str(tmp_path)},
+            "debug": {"success": False},
+        },
+    )
+    with pytest.raises(auto_deploy.CompilationError, match="Dual compile"):
+        session.compile_contract()
+
+
+def test_auto_deploy_compile_verify_version(monkeypatch, tmp_path, capsys):
+    session = make_auto_session(tmp_path)
+    session.verify_version = True
+    monkeypatch.setattr(
+        auto_deploy, "compile_ethdebug_run",
+        lambda **kw: {"success": True, "output_dir": str(tmp_path), "supported": True, "version": "0.8.31"},
+    )
+    session.compile_contract()
+    out = capsys.readouterr().out
+    assert "0.8.31" in out
+
+
+def test_auto_deploy_compile_missing_artifacts(monkeypatch, tmp_path):
+    session = make_auto_session(tmp_path)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(
+        auto_deploy, "compile_ethdebug_run",
+        lambda **kw: {"success": True, "output_dir": str(empty)},
+    )
+    with pytest.raises(FileNotFoundError, match="Missing ABI"):
+        session.compile_contract()
+
+
+def test_auto_deploy_deploy_contract(monkeypatch, tmp_path, capsys):
+    session = make_auto_session(tmp_path)
+
+    class FakeEth:
+        accounts = ["0x0000000000000000000000000000000000000001"]
+
+        def contract(self, abi, bytecode):
+            class Ctor:
+                def transact(self, tx):
+                    return "0xtx"
+
+            return SimpleNamespace(constructor=lambda *args: Ctor())
+
+        def wait_for_transaction_receipt(self, tx_hash):
+            return SimpleNamespace(contractAddress=ADDR)
+
+    class FakeWeb3:
+        eth = FakeEth()
+
+        def __init__(self, provider=None):
+            pass
+
+        @staticmethod
+        def HTTPProvider(url, request_kwargs=None):
+            return ("provider", url)
+
+        def is_connected(self):
+            return True
+
+    monkeypatch.setattr(auto_deploy, "Web3", FakeWeb3)
+    session.deploy_contract()
+    assert session.contract_address == ADDR
+    out = capsys.readouterr().out
+    assert "Deployed" in out
+
+
+def test_auto_deploy_cleanup_keep_fork(monkeypatch, tmp_path, capsys):
+    session = make_auto_session(tmp_path)
+    proc = SimpleNamespace(poll=lambda: None, terminate=lambda: None)
+    session._fork_proc = proc
+    session.keep_fork = True
+    session.cleanup()
+    out = capsys.readouterr().out
+    assert "keeping fork alive" in out
+
+
 def test_cli_common_helpers(monkeypatch, tmp_path, capsys):
     tracer = SimpleNamespace(is_contract_deployed=lambda address: address == ADDR)
     monkeypatch.setattr(
