@@ -13,11 +13,15 @@ from soldb.utils.logging import TRACE, ColoredFormatter, SoldbLogger, get_logger
 def test_abi_parsing_and_matching():
     assert match_abi_types(["uint256", "(address,uint256)", "uint256[]"], ["uint256", "tuple", "uint256[]"])
     assert not match_abi_types(["uint256"], ["uint256", "address"])
+    assert not match_abi_types(["address"], ["uint256"])
     assert match_single_type("(uint256)", "tuple")
     assert match_single_type("tuple(uint256)", "tuple")
     assert not match_single_type("address", "uint256")
+    assert match_single_type("uint256[]", "uint256[]")
+    assert not match_single_type("uint8[]", "uint256[]")
     assert parse_signature("transfer(address,uint256)") == ("transfer", ["address", "uint256"])
     assert parse_signature("foo((uint256,address),uint8[])") == ("foo", ["(uint256,address)", "uint8[]"])
+    assert parse_signature("noop()") == ("noop", [])
     assert parse_signature("not a signature") == ("", [])
 
     abi_input = {
@@ -61,9 +65,12 @@ def test_exception_types_and_formatting():
 
     assert exceptions.format_error(ValueError("plain"), json_mode=True)
     assert "plain" in exceptions.format_error(ValueError("plain"), json_mode=False)
+    assert "bad rpc" in exceptions.format_error(exceptions.RPCConnectionError("bad rpc"), json_mode=False)
     assert exceptions.format_error_json("msg", "Kind", extra=1)["extra"] == 1
     assert exceptions.format_exception_message(Exception({"message": "rpc message"})) == "rpc message"
+    assert exceptions.format_exception_message(Exception("plain string")) == "plain string"
     assert exceptions.format_exception_message(Exception(7)) == "7"
+    assert exceptions.format_exception_message(Exception()) == ""
     assert exceptions.ConnectionError is exceptions.RPCConnectionError
 
 
