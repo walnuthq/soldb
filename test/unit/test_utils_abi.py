@@ -145,3 +145,76 @@ def test_cli_common_helpers(tmp_path, monkeypatch, capsys):
     (debug_dir / "Contract.runtime.zasm").write_text("zasm")
     monkeypatch.chdir(tmp_path)
     assert common.find_debug_file("0xabc").endswith(".runtime.zasm")
+
+
+def test_cli_shim_dispatches_to_subcommand_modules(monkeypatch):
+    """The cli package re-exports four command entry points lazily so that
+    importing the package does not pull in heavy submodules. Verify each shim
+    forwards its args to the target implementation and returns its value.
+    """
+    from soldb import cli
+    import soldb.cli.contracts as contracts_mod
+    import soldb.cli.events as events_mod
+    import soldb.cli.simulate as simulate_mod
+    import soldb.cli.trace as trace_mod
+
+    captured = {}
+
+    def make_recorder(label):
+        def recorder(args):
+            captured[label] = args
+            return f"{label}-result"
+        return recorder
+
+    monkeypatch.setattr(trace_mod, "trace_command", make_recorder("trace"))
+    monkeypatch.setattr(simulate_mod, "simulate_command", make_recorder("simulate"))
+    monkeypatch.setattr(events_mod, "list_events_command", make_recorder("events"))
+    monkeypatch.setattr(
+        contracts_mod, "list_contracts_command", make_recorder("contracts")
+    )
+
+    assert cli.trace_command("ARGS-T") == "trace-result"
+    assert cli.simulate_command("ARGS-S") == "simulate-result"
+    assert cli.list_events_command("ARGS-E") == "events-result"
+    assert cli.list_contracts_command("ARGS-C") == "contracts-result"
+
+    assert captured == {
+        "trace": "ARGS-T",
+        "simulate": "ARGS-S",
+        "events": "ARGS-E",
+        "contracts": "ARGS-C",
+    }
+
+
+def test_create_tracer_wraps_connection_failures(monkeypatch):
+    def boom(rpc_url, quiet_mode=False):
+        raise RuntimeError("dial tcp: connection refused")
+
+    monkeypatch.setattr(common, "TransactionTracer", boom)
+    with pytest.raises(exceptions.RPCConnectionError) as excinfo:
+        common.create_tracer("http://nope")
+    assert "connection refused" in str(excinfo.value)
+    # The RPC URL is preserved in the structured error details for downstream JSON output.
+    assert excinfo.value.details["rpc_url"] == "http://nope"
+
+
+def test_create_tracer_returns_constructed_instance(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(
+        common, "TransactionTracer",
+        lambda rpc_url, quiet_mode=False: sentinel,
+    )
+    assert common.create_tracer("http://ok", quiet_mode=True) is sentinel
+
+
+def test_handle_command_error_routes_json_to_stdout(capsys):
+    code = common.handle_command_error(
+        exceptions.RPCConnectionError("nope", rpc_url="http://x"),
+        json_mode=True,
+        exit_code=7,
+    )
+    captured = capsys.readouterr()
+    assert code == 7
+    # JSON mode writes the structured error to stdout, not stderr.
+    assert "RPCConnectionError" in captured.out
+    assert captured.err == ""
