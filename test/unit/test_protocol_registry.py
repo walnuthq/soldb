@@ -139,3 +139,72 @@ def test_detect_stylus_bytecode_patterns():
     assert not detect_stylus_bytecode(b"\x01\x02\x03")
     assert detect_stylus_bytecode(bytes.fromhex("ef0001") + b"payload")
     assert detect_stylus_bytecode(b"\x00asm" + b"\x00" * 10)
+
+
+def test_detect_stylus_bytecode_returns_false_for_unrelated_payload():
+    # 4-byte minimum so we get past the length guard, but neither the WASM
+    # marker nor the EOF prefix is present — must fall through to False.
+    assert detect_stylus_bytecode(b"\x60\x80\x60\x40" * 8) is False
+
+
+def test_get_environment_returns_none_for_unregistered_address():
+    registry = ContractRegistry()
+    assert registry.get_environment("0xdeadbeef") is None
+
+
+def test_unregister_unknown_address_returns_none():
+    registry = ContractRegistry()
+    assert registry.unregister("0xdeadbeef") is None
+
+
+def test_register_moves_contract_between_environment_sets():
+    registry = ContractRegistry()
+    addr = "0xabc"
+    registry.register(ContractInfo(address=addr, environment="evm", name="X"))
+    assert registry.is_evm(addr)
+    assert not registry.is_stylus(addr)
+
+    # Re-registering as Stylus must drop the EVM set entry, not duplicate it.
+    registry.register(ContractInfo(address=addr, environment=Environment.STYLUS, name="X"))
+    assert registry.is_stylus(addr)
+    assert not registry.is_evm(addr)
+
+    # And back again.
+    registry.register(ContractInfo(address=addr, environment=Environment.EVM, name="X"))
+    assert registry.is_evm(addr)
+    assert not registry.is_stylus(addr)
+
+
+def test_load_from_file_supports_list_format(tmp_path):
+    registry = ContractRegistry()
+    config = tmp_path / "list.json"
+    config.write_text(
+        json.dumps(
+            {
+                "contracts": [
+                    {"address": "0xaaa", "environment": "evm", "name": "A", "debug_dir": "d"},
+                    {"address": "0xbbb", "environment": "stylus", "name": "B", "lib_path": "l"},
+                ]
+            }
+        )
+    )
+    assert registry.load_from_file(str(config)) == 2
+    assert registry.is_evm("0xaaa")
+    assert registry.is_stylus("0xbbb")
+
+
+def test_contract_info_round_trip_preserves_optional_fields():
+    info = ContractInfo(
+        address="0x1",
+        environment="stylus",
+        name="S",
+        lib_path="lib.so",
+        project_path="proj",
+        compiler_version="1.0",
+        source_files=["a.rs", "b.rs"],
+    )
+    restored = ContractInfo.from_dict(info.to_dict())
+    assert restored == info
+    # Default ContractInfo omits optional fields entirely from to_dict().
+    minimal = ContractInfo(address="0x2", environment="evm", name="E")
+    assert minimal.to_dict() == {"address": "0x2", "environment": "evm", "name": "E"}
