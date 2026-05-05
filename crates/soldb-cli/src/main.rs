@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand};
+use serde_json::json;
 use soldb_core::{SoldbResult, TransactionTrace};
 use soldb_ethdebug::{encode_function_call, parse_ethdebug_spec, parse_signature};
+use soldb_rpc::RpcLog;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -54,7 +56,12 @@ struct BridgeArgs {
 #[derive(Debug, Args)]
 struct ListContractsArgs {
     tx_hash: String,
-    #[arg(long = "rpc-url", short = 'r', default_value = "http://localhost:8545")]
+    #[arg(
+        long = "rpc-url",
+        alias = "rpc",
+        short = 'r',
+        default_value = "http://localhost:8545"
+    )]
     rpc_url: String,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
@@ -71,7 +78,12 @@ struct ListEventsArgs {
     ethdebug_dir: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
-    #[arg(long = "rpc-url", short = 'r', default_value = "http://localhost:8545")]
+    #[arg(
+        long = "rpc-url",
+        alias = "rpc",
+        short = 'r',
+        default_value = "http://localhost:8545"
+    )]
     rpc_url: String,
     #[arg(long)]
     multi_contract: bool,
@@ -182,11 +194,10 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Trace(args) => trace_command(&args),
         Command::Simulate(args) => simulate_command(&args),
-        Command::Bridge(_) | Command::ListContracts(_) | Command::ListEvents(_) => {
-            Err(soldb_core::SoldbError::Message(
-                "soldb Rust CLI skeleton: command implementation is not ported yet".to_owned(),
-            ))
-        }
+        Command::ListEvents(args) => list_events_command(&args),
+        Command::Bridge(_) | Command::ListContracts(_) => Err(soldb_core::SoldbError::Message(
+            "soldb Rust CLI skeleton: command implementation is not ported yet".to_owned(),
+        )),
     };
 
     match result {
@@ -249,6 +260,16 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
         print_simulation_summary(&trace, args, &calldata, &display_function_name);
     }
 
+    Ok(())
+}
+
+fn list_events_command(args: &ListEventsArgs) -> SoldbResult<()> {
+    let logs = soldb_rpc::transaction_logs(&args.rpc_url, &args.tx_hash)?;
+    if args.json_events {
+        println!("{}", events_to_json(&args.tx_hash, &logs)?);
+    } else {
+        print_events(&logs);
+    }
     Ok(())
 }
 
@@ -348,6 +369,56 @@ fn print_simulation_summary(
     println!("Use --raw flag to see detailed instruction trace");
 }
 
+fn print_events(logs: &[RpcLog]) {
+    println!("Events emitted in Transaction:");
+    if logs.is_empty() {
+        println!("No events found.");
+        return;
+    }
+
+    for (index, log) in logs.iter().enumerate() {
+        println!();
+        println!("Event #{}: Contract Address: {}", index + 1, log.address);
+        for topic in &log.topics {
+            println!("    topic: {topic}");
+        }
+        println!("    data: {}", normalize_hex(&log.data));
+    }
+}
+
+fn events_to_json(tx_hash: &str, logs: &[RpcLog]) -> SoldbResult<String> {
+    let events = logs
+        .iter()
+        .enumerate()
+        .map(|(index, log)| {
+            let data = normalize_hex(&log.data);
+            let signature = log.topics.first().cloned().unwrap_or_default();
+            json!({
+                "index": index,
+                "address": log.address,
+                "topics": log.topics,
+                "data": data,
+                "datas": [
+                    {
+                        "name": null,
+                        "type": "hex",
+                        "value": data,
+                    }
+                ],
+                "event": "",
+                "signature": signature,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::to_string_pretty(&json!({
+        "transaction_hash": tx_hash,
+        "events": events,
+        "total_events": logs.len(),
+    }))
+    .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))
+}
+
 fn trace_contract_name(args: &TraceArgs) -> Option<String> {
     args.ethdebug_dir
         .first()
@@ -416,6 +487,14 @@ fn decode_single_uint256_arg(raw_data: &str) -> Option<u128> {
     let data = raw_data.trim_start_matches("0x");
     let arg = data.get(8..72)?;
     u128::from_str_radix(arg, 16).ok()
+}
+
+fn normalize_hex(value: &str) -> String {
+    if value.starts_with("0x") {
+        value.to_owned()
+    } else {
+        format!("0x{value}")
+    }
 }
 
 fn format_stack(stack: &[String]) -> String {

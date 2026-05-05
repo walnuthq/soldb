@@ -234,6 +234,17 @@ pub struct RpcReceipt {
     pub status: Option<String>,
     #[serde(rename = "contractAddress")]
     pub contract_address: Option<String>,
+    #[serde(default)]
+    pub logs: Vec<RpcLog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcLog {
+    pub address: String,
+    #[serde(default)]
+    pub topics: Vec<String>,
+    #[serde(default)]
+    pub data: String,
 }
 
 impl DebugTraceResult {
@@ -328,6 +339,11 @@ pub fn simulate_call(
     simulate_call_with_client(&client, request)
 }
 
+pub fn transaction_logs(rpc_url: &str, tx_hash: &str) -> SoldbResult<Vec<RpcLog>> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    transaction_logs_with_client(&client, tx_hash)
+}
+
 pub fn trace_transaction_with_client(
     client: &HttpJsonRpcClient,
     tx_hash: &str,
@@ -365,6 +381,16 @@ pub fn trace_transaction_with_client(
         debug_error: None,
     };
     Ok(build_transaction_trace(envelope, &debug_result))
+}
+
+pub fn transaction_logs_with_client(
+    client: &HttpJsonRpcClient,
+    tx_hash: &str,
+) -> SoldbResult<Vec<RpcLog>> {
+    let receipt = client
+        .request::<Option<RpcReceipt>>("eth_getTransactionReceipt", json!([tx_hash]))?
+        .ok_or_else(|| SoldbError::Message(format!("Transaction receipt not found: {tx_hash}")))?;
+    Ok(receipt.logs)
 }
 
 pub fn simulate_call_with_client(
@@ -484,7 +510,7 @@ mod tests {
 
     use super::{
         build_transaction_trace, decode_revert_reason, simulate_call, trace_transaction,
-        DebugTraceResult, SimulateCallRequest, StructLog, TraceEnvelope,
+        transaction_logs, DebugTraceResult, SimulateCallRequest, StructLog, TraceEnvelope,
     };
     use serde_json::json;
 
@@ -651,6 +677,20 @@ mod tests {
         assert_eq!(trace.steps[1].op, "CALLDATASIZE");
     }
 
+    #[test]
+    fn fetches_transaction_logs_from_receipt() {
+        let rpc_url = start_trace_server(1);
+        let logs = transaction_logs(&rpc_url, "0xabc").expect("logs");
+
+        assert_eq!(logs.len(), 3);
+        assert_eq!(logs[0].address, "0x2");
+        assert_eq!(
+            logs[0].topics[0],
+            "0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c"
+        );
+        assert!(logs[0].data.ends_with("04"));
+    }
+
     fn bytes_to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -688,7 +728,12 @@ mod tests {
                 "result": {
                     "gasUsed": "0x5208",
                     "status": "0x1",
-                    "contractAddress": null
+                    "contractAddress": null,
+                    "logs": [
+                        event_log("0x2", "04"),
+                        event_log("0x2", "05"),
+                        event_log("0x2", "06")
+                    ]
                 }
             })
         } else if request.contains("\"debug_traceTransaction\"") {
@@ -762,5 +807,13 @@ mod tests {
 
     fn find_header_end(data: &[u8]) -> Option<usize> {
         data.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn event_log(address: &str, data_suffix: &str) -> serde_json::Value {
+        json!({
+            "address": address,
+            "topics": ["0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c"],
+            "data": format!("0x{}{}", "0".repeat(62), data_suffix),
+        })
     }
 }

@@ -275,6 +275,53 @@ fn simulate_abi_call_reports_unsupported_dynamic_types_before_rpc() {
     assert!(stderr.contains("ABI encoding for type 'string' is not ported yet"));
 }
 
+#[test]
+fn list_events_prints_raw_receipt_logs() {
+    let rpc_url = start_rpc_server(1);
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args(["list-events", "0xabc", "--rpc", &rpc_url])
+        .output()
+        .expect("run soldb");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("Events emitted in Transaction:"));
+    assert!(stdout.contains("Event #1: Contract Address: 0x2"));
+    assert!(stdout
+        .contains("topic: 0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c"));
+    assert!(
+        stdout.contains("data: 0x0000000000000000000000000000000000000000000000000000000000000004")
+    );
+}
+
+#[test]
+fn list_events_json_prints_receipt_logs() {
+    let rpc_url = start_rpc_server(1);
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args(["list-events", "0xabc", "--rpc", &rpc_url, "--json-events"])
+        .output()
+        .expect("run soldb");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"transaction_hash\": \"0xabc\""));
+    assert!(stdout.contains("\"events\""));
+    assert!(stdout.contains("\"index\": 0"));
+    assert!(stdout.contains("\"address\": \"0x2\""));
+    assert!(stdout.contains(
+        "\"signature\": \"0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c\""
+    ));
+    assert!(stdout.contains("\"total_events\": 3"));
+}
+
 fn start_rpc_server(request_count: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc server");
     let address = listener.local_addr().expect("local addr");
@@ -308,7 +355,12 @@ fn respond_to_rpc_request(mut stream: TcpStream) {
             "result": {
                 "gasUsed": "0x5208",
                 "status": "0x1",
-                "contractAddress": null
+                "contractAddress": null,
+                "logs": [
+                    event_log("0x2", "04"),
+                    event_log("0x2", "05"),
+                    event_log("0x2", "06")
+                ]
             }
         })
     } else if request.contains("\"debug_traceTransaction\"") {
@@ -353,6 +405,14 @@ fn respond_to_rpc_request(mut stream: TcpStream) {
     stream
         .write_all(http_response.as_bytes())
         .expect("write response");
+}
+
+fn event_log(address: &str, data_suffix: &str) -> serde_json::Value {
+    json!({
+        "address": address,
+        "topics": ["0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c"],
+        "data": format!("0x{}{}", "0".repeat(62), data_suffix),
+    })
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
