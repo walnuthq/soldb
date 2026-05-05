@@ -1,4 +1,4 @@
-.PHONY: help install dev test coverage test-setup test-deploy publish clean
+.PHONY: help install dev test coverage rust-test test-setup test-deploy publish clean
 
 help:
 	@echo "SolDB - Build and Distribution"
@@ -8,6 +8,7 @@ help:
 	@echo "  make dev            Install in development mode"
 	@echo "  make test           Run tests"
 	@echo "  make coverage       Run tests with Python coverage"
+	@echo "  make rust-test      Run Rust workspace tests"
 	@echo "  make test-setup     Setup and verify test environment"
 	@echo "  make test-deploy    Deploy test contracts"
 	@echo "  make publish        Publish to PyPI"
@@ -21,17 +22,20 @@ dev:
 	pip install -r requirements.txt
 
 test:
-	pytest test/unit
+	pytest test/unit test/integration
 	./test/run-tests.sh
 
 coverage:
 	coverage erase
-	coverage run --parallel-mode -m pytest test/unit
+	coverage run --parallel-mode -m pytest test/unit test/integration
 	./test/run-tests.sh --coverage
 	coverage combine
 	coverage report
 	coverage html
 	coverage xml
+
+rust-test:
+	cargo test --workspace --all-targets
 
 test-setup:
 	./test/test-setup.sh

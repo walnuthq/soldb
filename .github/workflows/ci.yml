@@ -10,6 +10,26 @@ env:
   FOUNDRY_VERSION: v1.0.0
 
 jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --workspace --all-targets
+
   test:
     name: test (python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -145,6 +165,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]'
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Rust coverage tool
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Run Rust coverage
+        run: cargo llvm-cov --workspace --all-targets --cobertura --output-path rust-coverage.xml
+
       - name: Run coverage
         run: |
           set -euo pipefail
@@ -192,4 +223,5 @@ jobs:
           name: coverage
           path: |
             coverage.xml
+            rust-coverage.xml
             htmlcov/

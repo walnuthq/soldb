@@ -86,6 +86,7 @@ for arg in "$@"; do
             echo "Environment variables:"
             echo "  RPC_URL            RPC endpoint (default: http://localhost:8545)"
             echo "  SOLC_PATH          Path to solc binary (default: solc)"
+            echo "  SOLDB_BIN          Path to soldb executable override"
             echo "  TEST_TX            Specific transaction hash to test"
             echo "  SEPOLIA_KEY        Optimism Sepolia API key (can also use --sepolia-key)"
             echo "  COVERAGE_FILE      Coverage data file base path (default: .coverage in project root)"
@@ -304,7 +305,11 @@ echo ""
 # Find soldb - prefer system-wide installation
 SOLDB_CMD=""
 SOLDB_TYPE=""
-if command -v soldb &> /dev/null; then
+if [ -n "${SOLDB_BIN:-}" ]; then
+    SOLDB_CMD="${SOLDB_BIN}"
+    SOLDB_TYPE="override"
+    echo -e "${GREEN}Using SOLDB_BIN override: ${SOLDB_CMD}${NC}"
+elif command -v soldb &> /dev/null; then
     # Use the soldb executable already selected by PATH.
     SOLDB_CMD="soldb"
     SOLDB_TYPE="path"
