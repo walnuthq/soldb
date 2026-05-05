@@ -44,17 +44,78 @@ pub fn trace_to_web_json(trace: &TransactionTrace) -> SoldbResult<String> {
         .map_err(|err| soldb_core::SoldbError::Message(err.to_string()))
 }
 
+pub fn simulate_to_web_json(trace: &TransactionTrace, function_name: &str) -> SoldbResult<String> {
+    let steps = trace
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            json!({
+                "step": index,
+                "pc": step.pc,
+                "op": step.op,
+                "gas": step.gas,
+                "gasCost": step.gas_cost,
+                "depth": step.depth,
+                "stack": step.stack,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let response = json!({
+        "status": if trace.success { "success" } else { "reverted" },
+        "traceCall": {
+            "type": "ENTRY",
+            "from": trace.from_addr,
+            "to": trace.to_addr,
+            "value": trace.value,
+            "gas": trace.steps.first().map_or(0, |step| step.gas),
+            "gasUsed": trace.gas_used,
+            "input": trace.input_data,
+            "output": trace.output,
+            "callId": 0,
+        },
+        "steps": steps,
+        "function_name": function_name,
+        "isVerified": false,
+    });
+
+    serde_json::to_string_pretty(&response)
+        .map_err(|err| soldb_core::SoldbError::Message(err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use soldb_core::{TraceStep, TransactionTrace};
 
-    use super::trace_to_web_json;
+    use super::{simulate_to_web_json, trace_to_web_json};
 
     #[test]
     fn serializes_trace_to_web_shape() {
-        let trace = TransactionTrace {
+        let trace = sample_trace();
+
+        let json = trace_to_web_json(&trace).expect("json");
+        assert!(json.contains("\"status\": \"success\""));
+        assert!(json.contains("\"traceCall\""));
+        assert!(json.contains("\"gasUsed\": 21000"));
+        assert!(json.contains("\"contracts\""));
+    }
+
+    #[test]
+    fn serializes_simulation_to_web_shape() {
+        let trace = sample_trace();
+
+        let json = simulate_to_web_json(&trace, "raw_data").expect("json");
+        assert!(json.contains("\"type\": \"ENTRY\""));
+        assert!(json.contains("\"callId\": 0"));
+        assert!(json.contains("\"function_name\": \"raw_data\""));
+        assert!(json.contains("\"isVerified\": false"));
+    }
+
+    fn sample_trace() -> TransactionTrace {
+        TransactionTrace {
             tx_hash: Some("0xabc".to_owned()),
             from_addr: "0x1".to_owned(),
             to_addr: Some("0x2".to_owned()),
@@ -77,12 +138,6 @@ mod tests {
                 storage: Some(BTreeMap::new()),
                 error: None,
             }],
-        };
-
-        let json = trace_to_web_json(&trace).expect("json");
-        assert!(json.contains("\"status\": \"success\""));
-        assert!(json.contains("\"traceCall\""));
-        assert!(json.contains("\"gasUsed\": 21000"));
-        assert!(json.contains("\"contracts\""));
+        }
     }
 }

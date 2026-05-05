@@ -281,6 +281,16 @@ pub struct TraceEnvelope {
     pub debug_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulateCallRequest {
+    pub from_addr: String,
+    pub to_addr: String,
+    pub calldata: String,
+    pub value: String,
+    pub block: Option<u64>,
+    pub tx_index: Option<u64>,
+}
+
 pub fn build_transaction_trace(
     envelope: TraceEnvelope,
     debug_result: &DebugTraceResult,
@@ -308,6 +318,14 @@ pub fn build_transaction_trace(
 pub fn trace_transaction(rpc_url: &str, tx_hash: &str) -> SoldbResult<TransactionTrace> {
     let client = HttpJsonRpcClient::new(rpc_url)?;
     trace_transaction_with_client(&client, tx_hash)
+}
+
+pub fn simulate_call(
+    rpc_url: &str,
+    request: &SimulateCallRequest,
+) -> SoldbResult<TransactionTrace> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    simulate_call_with_client(&client, request)
 }
 
 pub fn trace_transaction_with_client(
@@ -349,6 +367,51 @@ pub fn trace_transaction_with_client(
     Ok(build_transaction_trace(envelope, &debug_result))
 }
 
+pub fn simulate_call_with_client(
+    client: &HttpJsonRpcClient,
+    request: &SimulateCallRequest,
+) -> SoldbResult<TransactionTrace> {
+    let mut trace_config = json!({
+        "disableStorage": false,
+        "disableMemory": false,
+        "enableMemory": true,
+    });
+    if let Some(tx_index) = request.tx_index {
+        trace_config["txIndex"] = Value::String(format_quantity(tx_index));
+    }
+
+    let call_object = json!({
+        "from": request.from_addr,
+        "to": request.to_addr,
+        "data": normalize_hex_output(&request.calldata),
+        "value": parse_value_quantity(&request.value)?,
+    });
+    let block = request.block.map_or_else(
+        || Value::String("latest".to_owned()),
+        |block| Value::String(format_quantity(block)),
+    );
+    let debug_result = client.request::<DebugTraceResult>(
+        "debug_traceCall",
+        json!([call_object, block, trace_config]),
+    )?;
+
+    let failure = debug_result.failure_message();
+    Ok(TransactionTrace {
+        tx_hash: None,
+        from_addr: request.from_addr.clone(),
+        to_addr: Some(request.to_addr.clone()),
+        value: parse_value_quantity(&request.value)?,
+        input_data: normalize_hex_output(&request.calldata),
+        gas_used: debug_result.gas.unwrap_or(0),
+        output: normalize_hex_output(&debug_result.return_value),
+        success: failure.is_none(),
+        error: failure,
+        debug_trace_available: true,
+        contract_address: None,
+        steps: debug_result.steps(),
+    })
+}
+
 #[must_use]
 pub fn decode_revert_reason(return_value: &str) -> Option<String> {
     let data = return_value.trim_start_matches("0x");
@@ -386,6 +449,22 @@ fn quantity_is_one(value: &str) -> bool {
     parse_quantity(value).is_ok_and(|quantity| quantity == 1)
 }
 
+fn parse_value_quantity(value: &str) -> SoldbResult<String> {
+    if value.starts_with("0x") {
+        parse_quantity(value)?;
+        Ok(value.to_owned())
+    } else {
+        let parsed = value.parse::<u64>().map_err(|error| {
+            SoldbError::Message(format!("Invalid call value '{value}': {error}"))
+        })?;
+        Ok(format_quantity(parsed))
+    }
+}
+
+fn format_quantity(value: u64) -> String {
+    format!("0x{value:x}")
+}
+
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return None;
@@ -404,8 +483,8 @@ mod tests {
     use std::thread;
 
     use super::{
-        build_transaction_trace, decode_revert_reason, trace_transaction, DebugTraceResult,
-        StructLog, TraceEnvelope,
+        build_transaction_trace, decode_revert_reason, simulate_call, trace_transaction,
+        DebugTraceResult, SimulateCallRequest, StructLog, TraceEnvelope,
     };
     use serde_json::json;
 
@@ -533,7 +612,7 @@ mod tests {
 
     #[test]
     fn traces_transaction_through_http_json_rpc_client() {
-        let rpc_url = start_trace_server();
+        let rpc_url = start_trace_server(3);
         let trace = trace_transaction(&rpc_url, "0xabc").expect("trace");
 
         assert_eq!(trace.tx_hash.as_deref(), Some("0xabc"));
@@ -546,15 +625,41 @@ mod tests {
         assert_eq!(trace.steps[1].memory.as_deref(), Some("aabb"));
     }
 
+    #[test]
+    fn simulates_call_through_http_json_rpc_client() {
+        let rpc_url = start_trace_server(1);
+        let trace = simulate_call(
+            &rpc_url,
+            &SimulateCallRequest {
+                from_addr: "0x1".to_owned(),
+                to_addr: "0x2".to_owned(),
+                calldata: "0x1234".to_owned(),
+                value: "0".to_owned(),
+                block: Some(10),
+                tx_index: Some(1),
+            },
+        )
+        .expect("simulate");
+
+        assert_eq!(trace.tx_hash, None);
+        assert_eq!(trace.from_addr, "0x1");
+        assert_eq!(trace.to_addr.as_deref(), Some("0x2"));
+        assert_eq!(trace.value, "0x0");
+        assert_eq!(trace.input_data, "0x1234");
+        assert_eq!(trace.gas_used, 42_000);
+        assert!(trace.success);
+        assert_eq!(trace.steps[1].op, "CALLDATASIZE");
+    }
+
     fn bytes_to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    fn start_trace_server() -> String {
+    fn start_trace_server(request_count: usize) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc server");
         let address = listener.local_addr().expect("local addr");
         thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..request_count {
                 let (stream, _) = listener.accept().expect("accept rpc request");
                 respond_to_rpc_request(stream);
             }
@@ -596,6 +701,21 @@ mod tests {
                         {"pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3, "depth": 0, "stack": []},
                         {"pc": 2, "op": "MSTORE", "gas": 97, "gasCost": 3, "depth": 0, "memory": ["aa", "bb"]},
                         {"pc": 3, "op": "STOP", "gas": 94, "gasCost": 0, "depth": 0}
+                    ]
+                }
+            })
+        } else if request.contains("\"debug_traceCall\"") {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "gas": 42000,
+                    "returnValue": "2a",
+                    "failed": false,
+                    "structLogs": [
+                        {"pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3, "depth": 0, "stack": []},
+                        {"pc": 1, "op": "CALLDATASIZE", "gas": 97, "gasCost": 2, "depth": 0, "stack": ["0x01"]},
+                        {"pc": 2, "op": "STOP", "gas": 95, "gasCost": 0, "depth": 0}
                     ]
                 }
             })

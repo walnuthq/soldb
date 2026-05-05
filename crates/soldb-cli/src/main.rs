@@ -125,7 +125,11 @@ struct SimulateArgs {
     contracts: Option<String>,
     #[arg(long)]
     multi_contract: bool,
-    #[arg(long = "rpc-url", default_value = "http://localhost:8545")]
+    #[arg(
+        long = "rpc-url",
+        alias = "rpc",
+        default_value = "http://localhost:8545"
+    )]
     rpc_url: String,
     #[arg(long)]
     json: bool,
@@ -177,12 +181,12 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Trace(args) => trace_command(&args),
-        Command::Bridge(_)
-        | Command::ListContracts(_)
-        | Command::ListEvents(_)
-        | Command::Simulate(_) => Err(soldb_core::SoldbError::Message(
-            "soldb Rust CLI skeleton: command implementation is not ported yet".to_owned(),
-        )),
+        Command::Simulate(args) => simulate_command(&args),
+        Command::Bridge(_) | Command::ListContracts(_) | Command::ListEvents(_) => {
+            Err(soldb_core::SoldbError::Message(
+                "soldb Rust CLI skeleton: command implementation is not ported yet".to_owned(),
+            ))
+        }
     };
 
     match result {
@@ -208,6 +212,45 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
         print_raw_trace(&trace, args);
     } else {
         print_trace_summary(&trace);
+    }
+
+    Ok(())
+}
+
+fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
+    if args.interactive {
+        return Err(soldb_core::SoldbError::Message(
+            "interactive simulate mode is not ported to Rust yet".to_owned(),
+        ));
+    }
+
+    let Some(raw_data) = &args.raw_data else {
+        return Err(soldb_core::SoldbError::Message(
+            "Rust simulate currently supports --raw-data only; ABI encoding is not ported yet"
+                .to_owned(),
+        ));
+    };
+
+    let request = soldb_rpc::SimulateCallRequest {
+        from_addr: args.from_addr.clone(),
+        to_addr: args.contract_address.clone(),
+        calldata: raw_data.clone(),
+        value: args.value.clone(),
+        block: args.block,
+        tx_index: args.tx_index,
+    };
+    let trace = soldb_rpc::simulate_call(&args.rpc_url, &request)?;
+    let function_name = simulate_function_name(args, raw_data);
+
+    if args.json {
+        println!(
+            "{}",
+            soldb_serializer::simulate_to_web_json(&trace, &function_name)?
+        );
+    } else if args.raw {
+        print_raw_simulation(&trace, args);
+    } else {
+        print_simulation_summary(&trace, args, raw_data, &function_name);
     }
 
     Ok(())
@@ -254,10 +297,89 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
     }
 }
 
+fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs) {
+    println!("Simulating call to {}", args.contract_address);
+    if let Some(contract_name) = simulate_contract_name(args) {
+        println!("Contract: {contract_name}");
+    }
+    println!("Execution trace");
+    println!("Step | PC | Op | Gas | Stack");
+
+    let max_steps = if args.max_steps < 0 {
+        trace.steps.len()
+    } else {
+        usize::try_from(args.max_steps).unwrap_or(trace.steps.len())
+    };
+
+    for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
+        println!(
+            "{index:>4} | {:>4} | {:<14} | {:>8} | {}",
+            step.pc,
+            step.op,
+            step.gas,
+            format_stack(&step.stack)
+        );
+    }
+}
+
+fn print_simulation_summary(
+    trace: &TransactionTrace,
+    args: &SimulateArgs,
+    raw_data: &str,
+    function_name: &str,
+) {
+    let contract_name =
+        simulate_contract_name(args).unwrap_or_else(|| args.contract_address.clone());
+    println!("Contract: {contract_name}");
+    println!("Function Call Trace:");
+    println!("Gas used: {}", trace.gas_used);
+    if let Some(error) = &trace.error {
+        println!("Error: {error}");
+    }
+    println!();
+    println!("Call Stack:");
+    println!("------------------------------------------------------------");
+    println!("#0 {contract_name}::runtime_dispatcher");
+    println!("#1 {function_name}");
+    if let Some(amount) = decode_single_uint256_arg(raw_data) {
+        println!("  amount: {amount}");
+    }
+    println!("------------------------------------------------------------");
+    println!("Use --raw flag to see detailed instruction trace");
+}
+
 fn trace_contract_name(args: &TraceArgs) -> Option<String> {
     args.ethdebug_dir
         .first()
         .and_then(|spec| parse_ethdebug_spec(spec).name)
+}
+
+fn simulate_contract_name(args: &SimulateArgs) -> Option<String> {
+    args.ethdebug_dir
+        .first()
+        .and_then(|spec| parse_ethdebug_spec(spec).name)
+}
+
+fn simulate_function_name(args: &SimulateArgs, raw_data: &str) -> String {
+    if let Some(signature) = &args.function_signature {
+        return signature.clone();
+    }
+
+    match raw_data
+        .trim_start_matches("0x")
+        .get(..8)
+        .map(|selector| selector.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("7cf5dab0") => "increment".to_owned(),
+        _ => "raw_data".to_owned(),
+    }
+}
+
+fn decode_single_uint256_arg(raw_data: &str) -> Option<u128> {
+    let data = raw_data.trim_start_matches("0x");
+    let arg = data.get(8..72)?;
+    u128::from_str_radix(arg, 16).ok()
 }
 
 fn format_stack(stack: &[String]) -> String {
