@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -18,6 +20,7 @@ pub struct TraceStep {
     pub depth: u64,
     pub stack: Vec<String>,
     pub memory: Option<String>,
+    pub storage: Option<BTreeMap<String, String>>,
     pub error: Option<String>,
 }
 
@@ -32,6 +35,8 @@ pub struct TransactionTrace {
     pub output: String,
     pub success: bool,
     pub error: Option<String>,
+    pub debug_trace_available: bool,
+    pub contract_address: Option<String>,
     pub steps: Vec<TraceStep>,
 }
 
@@ -71,8 +76,11 @@ mod tests {
                 depth: 0,
                 stack: Vec::new(),
                 memory: None,
+                storage: None,
                 error: None,
             }],
+            debug_trace_available: true,
+            contract_address: None,
         };
 
         let encoded = serde_json::to_string(&trace).expect("trace serializes");

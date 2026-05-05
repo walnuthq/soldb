@@ -6,7 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde.workspace = true
 soldb-core = { path = "../soldb-core" }
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
