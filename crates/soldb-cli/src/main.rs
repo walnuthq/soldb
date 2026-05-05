@@ -1,4 +1,7 @@
 use clap::{Args, Parser, Subcommand};
+use soldb_core::{SoldbResult, TransactionTrace};
+use soldb_ethdebug::parse_ethdebug_spec;
+use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -170,16 +173,114 @@ struct SimulateArgs {
     stylus_contracts: Option<String>,
 }
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
+        Command::Trace(args) => trace_command(&args),
         Command::Bridge(_)
         | Command::ListContracts(_)
         | Command::ListEvents(_)
-        | Command::Trace(_)
-        | Command::Simulate(_) => {
-            eprintln!("soldb Rust CLI skeleton: command implementation is not ported yet");
-            std::process::exit(2);
+        | Command::Simulate(_) => Err(soldb_core::SoldbError::Message(
+            "soldb Rust CLI skeleton: command implementation is not ported yet".to_owned(),
+        )),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(2)
         }
+    }
+}
+
+fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
+    if args.interactive {
+        return Err(soldb_core::SoldbError::Message(
+            "interactive trace mode is not ported to Rust yet".to_owned(),
+        ));
+    }
+
+    let trace = soldb_rpc::trace_transaction(&args.rpc, &args.tx_hash)?;
+    if args.json {
+        println!("{}", soldb_serializer::trace_to_web_json(&trace)?);
+    } else if args.raw {
+        print_raw_trace(&trace, args);
+    } else {
+        print_trace_summary(&trace);
+    }
+
+    Ok(())
+}
+
+fn print_trace_summary(trace: &TransactionTrace) {
+    println!(
+        "Transaction {}",
+        trace.tx_hash.as_deref().unwrap_or("<simulated>")
+    );
+    println!(
+        "Status: {}",
+        if trace.success { "SUCCESS" } else { "REVERTED" }
+    );
+    println!("Gas used: {}", trace.gas_used);
+    println!("Steps: {}", trace.steps.len());
+    if let Some(error) = &trace.error {
+        println!("Error: {error}");
+    }
+}
+
+fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
+    println!("Loading transaction {}", args.tx_hash);
+    if let Some(contract_name) = trace_contract_name(args) {
+        println!("Contract: {contract_name}");
+    }
+    println!("Execution trace");
+    println!("Step | PC | Op | Gas | Stack");
+
+    let max_steps = if args.max_steps < 0 {
+        trace.steps.len()
+    } else {
+        usize::try_from(args.max_steps).unwrap_or(trace.steps.len())
+    };
+
+    for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
+        println!(
+            "{index:>4} | {:>4} | {:<14} | {:>8} | {}",
+            step.pc,
+            step.op,
+            step.gas,
+            format_stack(&step.stack)
+        );
+    }
+}
+
+fn trace_contract_name(args: &TraceArgs) -> Option<String> {
+    args.ethdebug_dir
+        .first()
+        .and_then(|spec| parse_ethdebug_spec(spec).name)
+}
+
+fn format_stack(stack: &[String]) -> String {
+    if stack.is_empty() {
+        return "[empty]".to_owned();
+    }
+
+    let mut items = stack
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(index, value)| format!("[{index}] {}", shorten_hex(value)))
+        .collect::<Vec<_>>();
+    if stack.len() > 3 {
+        items.push(format!("... +{} more", stack.len() - 3));
+    }
+    items.join(" ")
+}
+
+fn shorten_hex(value: &str) -> String {
+    if value.len() > 10 && value.starts_with("0x") {
+        format!("0x{}...", &value[2..6])
+    } else {
+        value.to_owned()
     }
 }

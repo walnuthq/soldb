@@ -7,10 +7,8 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
-soldb-core = { path = "../soldb-core" }
-
-[dev-dependencies]
 serde_json.workspace = true
+soldb-core = { path = "../soldb-core" }
 
 [lints]
 workspace = true

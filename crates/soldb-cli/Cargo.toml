@@ -12,6 +12,12 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 soldb-core = { path = "../soldb-core" }
+soldb-ethdebug = { path = "../soldb-ethdebug" }
+soldb-rpc = { path = "../soldb-rpc" }
+soldb-serializer = { path = "../soldb-serializer" }
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
