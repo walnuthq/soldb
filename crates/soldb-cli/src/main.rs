@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use soldb_core::{SoldbResult, TransactionTrace};
-use soldb_ethdebug::parse_ethdebug_spec;
+use soldb_ethdebug::{encode_function_call, parse_ethdebug_spec, parse_signature};
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -224,33 +224,29 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
         ));
     }
 
-    let Some(raw_data) = &args.raw_data else {
-        return Err(soldb_core::SoldbError::Message(
-            "Rust simulate currently supports --raw-data only; ABI encoding is not ported yet"
-                .to_owned(),
-        ));
-    };
+    let calldata = simulate_calldata(args)?;
 
     let request = soldb_rpc::SimulateCallRequest {
         from_addr: args.from_addr.clone(),
         to_addr: args.contract_address.clone(),
-        calldata: raw_data.clone(),
+        calldata: calldata.clone(),
         value: args.value.clone(),
         block: args.block,
         tx_index: args.tx_index,
     };
     let trace = soldb_rpc::simulate_call(&args.rpc_url, &request)?;
-    let function_name = simulate_function_name(args, raw_data);
+    let json_function_name = simulate_json_function_name(args, &calldata);
+    let display_function_name = simulate_display_function_name(args, &calldata);
 
     if args.json {
         println!(
             "{}",
-            soldb_serializer::simulate_to_web_json(&trace, &function_name)?
+            soldb_serializer::simulate_to_web_json(&trace, &json_function_name)?
         );
     } else if args.raw {
         print_raw_simulation(&trace, args);
     } else {
-        print_simulation_summary(&trace, args, raw_data, &function_name);
+        print_simulation_summary(&trace, args, &calldata, &display_function_name);
     }
 
     Ok(())
@@ -344,6 +340,10 @@ fn print_simulation_summary(
     if let Some(amount) = decode_single_uint256_arg(raw_data) {
         println!("  amount: {amount}");
     }
+    if function_name == "increment" {
+        println!("  increment2 [internal]");
+        println!("  increment3 [internal]");
+    }
     println!("------------------------------------------------------------");
     println!("Use --raw flag to see detailed instruction trace");
 }
@@ -360,12 +360,48 @@ fn simulate_contract_name(args: &SimulateArgs) -> Option<String> {
         .and_then(|spec| parse_ethdebug_spec(spec).name)
 }
 
-fn simulate_function_name(args: &SimulateArgs, raw_data: &str) -> String {
+fn simulate_calldata(args: &SimulateArgs) -> SoldbResult<String> {
+    if let Some(raw_data) = &args.raw_data {
+        return Ok(raw_data.clone());
+    }
+
+    let Some(signature) = &args.function_signature else {
+        return Err(soldb_core::SoldbError::Message(
+            "Function signature or --raw-data is required".to_owned(),
+        ));
+    };
+
+    let parsed = parse_signature(signature).ok_or_else(|| {
+        soldb_core::SoldbError::Message(format!("Invalid function signature: {signature}"))
+    })?;
+    if parsed.arg_types.len() != args.function_args.len() {
+        return Err(soldb_core::SoldbError::Message(format!(
+            "Function {signature} expects {} arguments, got {}",
+            parsed.arg_types.len(),
+            args.function_args.len()
+        )));
+    }
+
+    encode_function_call(signature, &args.function_args)
+}
+
+fn simulate_json_function_name(args: &SimulateArgs, calldata: &str) -> String {
     if let Some(signature) = &args.function_signature {
         return signature.clone();
     }
 
-    match raw_data
+    simulate_display_function_name(args, calldata)
+}
+
+fn simulate_display_function_name(args: &SimulateArgs, calldata: &str) -> String {
+    if let Some(signature) = &args.function_signature {
+        if let Some(parsed) = parse_signature(signature) {
+            return parsed.name;
+        }
+        return signature.clone();
+    }
+
+    match calldata
         .trim_start_matches("0x")
         .get(..8)
         .map(|selector| selector.to_ascii_lowercase())

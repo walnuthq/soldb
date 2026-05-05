@@ -3,8 +3,8 @@ pub mod metadata;
 pub mod source_map;
 
 pub use abi::{
-    match_abi_types, match_single_type, parse_signature, parse_tuple_arg, AbiInput,
-    FunctionSignature,
+    encode_function_call, function_selector, keccak256, match_abi_types, match_single_type,
+    parse_signature, parse_tuple_arg, AbiInput, FunctionSignature,
 };
 pub use metadata::{
     parse_ethdebug_spec, parse_multi_contract_spec, parse_single_contract_spec,
