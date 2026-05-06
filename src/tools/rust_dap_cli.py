@@ -1,8 +1,8 @@
 """
 Python console-script shim for the Rust soldb-dap-server binary.
 
-The VS Code/debug-adapter entrypoint now dispatches to Rust while the legacy
-Python module remains importable during the migration.
+The Python package only keeps the installed debug-adapter entrypoint; all DAP
+behavior lives in the Rust binary.
 """
 from __future__ import annotations
 

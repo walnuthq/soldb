@@ -429,7 +429,7 @@ fn encode_static_arg(arg_type: &str, value: &str) -> SoldbResult<String> {
     }
 
     Err(SoldbError::Message(format!(
-        "ABI encoding for type '{arg_type}' is not ported yet"
+        "ABI encoding for type '{arg_type}' is not supported"
     )))
 }
 

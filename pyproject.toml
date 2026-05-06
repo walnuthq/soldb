@@ -26,11 +26,7 @@ classifiers = [
 ]
 keywords = ["ethereum", "solidity", "debugger", "evm", "blockchain", "smart-contracts"]
 requires-python = ">=3.8"
-dependencies = [
-    "web3>=6.0.0",
-    "eth-utils>=2.0.0", 
-    "hexbytes>=0.3.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [
@@ -77,10 +73,6 @@ fail_under = 70
 show_missing = true
 skip_empty = true
 omit = [
-    # The coverage gate still excludes the long-running bridge server because
-    # it owns process lifecycle and socket behavior that needs separate
-    # integration coverage.
-    "src/soldb/cross_env/bridge_server.py",
 ]
 exclude_lines = [
     "pragma: no cover",

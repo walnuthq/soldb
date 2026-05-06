@@ -174,8 +174,8 @@ else
     echo -e "${YELLOW}No Sepolia API key provided (use --sepolia-key=KEY to enable remote tests)${NC}"
 fi
 
-# Export SOLC_PATH so it's available to the Python config
-# Note: Individual tests will set their own solc version via solc-select
+# Export SOLC_PATH so it is available to deployment and lit helpers.
+# Note: Individual tests will set their own solc version via solc-select.
 export SOLC_PATH
 
 echo -e "${GREEN}=== SolDB Test Suite ===${NC}"

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/walnuthq/soldb/actions/workflows/ci.yml/badge.svg)](https://github.com/walnuthq/soldb/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 
 > **Note**: SolDB is in public beta; expect ongoing changes and occasional inaccuracies.  
 
@@ -221,7 +221,7 @@ git clone https://github.com/walnuthq/soldb.git
 cd soldb
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+cargo build --bin soldb --bin soldb-dap-server
 pip install -e .
 ```
 

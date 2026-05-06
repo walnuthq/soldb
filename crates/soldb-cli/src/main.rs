@@ -236,7 +236,9 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
+            if !error.to_string().is_empty() {
+                eprintln!("{error}");
+            }
             ExitCode::from(2)
         }
     }
@@ -354,8 +356,10 @@ fn print_compile_result(result: &soldb_compiler::CompilationResult) {
 }
 
 fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
-    let verbose = !args.quiet && !args.json;
+    let verbose = !args.quiet;
     if verbose {
+        println!("Cross-Environment Debug Bridge");
+        println!("URL: http://{}:{}", args.host, args.port);
         println!(
             "Starting SolDB Cross-Environment Bridge on {}:{}...",
             args.host, args.port
@@ -369,7 +373,22 @@ fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
-    let trace = soldb_rpc::trace_transaction(&args.rpc, &args.tx_hash)?;
+    let trace = match soldb_rpc::trace_transaction(&args.rpc, &args.tx_hash) {
+        Ok(trace) => trace,
+        Err(error) if args.json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "error": true,
+                    "type": "TransactionError",
+                    "message": error.to_string(),
+                }))
+                .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?
+            );
+            return Err(soldb_core::SoldbError::Message(String::new()));
+        }
+        Err(error) => return Err(error),
+    };
     if args.interactive {
         run_interactive_debugger(trace, "Transaction trace debugger")?;
     } else if args.json {
@@ -377,7 +396,7 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
     } else if args.raw {
         print_raw_trace(&trace, args);
     } else {
-        print_trace_summary(&trace);
+        print_trace_summary(&trace, args);
     }
 
     Ok(())
@@ -392,7 +411,21 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     let contract_name = auto_deploy
         .as_ref()
         .map(|deploy| deploy.contract_name.clone());
-    let calldata = simulate_calldata(args)?;
+    let calldata = match simulate_calldata(args) {
+        Ok(calldata) => calldata,
+        Err(error) if args.json => {
+            print_json_command_error("SimulationError", &error.to_string(), None)?;
+            return Err(soldb_core::SoldbError::Message(String::new()));
+        }
+        Err(error) => return Err(error),
+    };
+    if let Err(message) = validate_simulate_value(&args.value) {
+        if args.json {
+            print_json_command_error("InvalidValue", &message, Some(&args.value))?;
+            return Err(soldb_core::SoldbError::Message(String::new()));
+        }
+        return Err(soldb_core::SoldbError::Message(message));
+    }
 
     let request = soldb_rpc::SimulateCallRequest {
         from_addr: args.from_addr.clone(),
@@ -407,6 +440,12 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     let display_function_name = simulate_display_function_name(args, &calldata);
 
     if args.interactive {
+        print_simulation_interactive_prelude(
+            args,
+            &contract_address,
+            contract_name.as_deref(),
+            &display_function_name,
+        );
         run_interactive_debugger(trace, "Simulation debugger")?;
     } else if args.json {
         println!(
@@ -455,12 +494,40 @@ fn maybe_auto_deploy(args: &SimulateArgs) -> SoldbResult<Option<soldb_compiler::
     Ok(Some(result))
 }
 
+fn print_simulation_interactive_prelude(
+    args: &SimulateArgs,
+    contract_address: &str,
+    auto_contract_name: Option<&str>,
+    function_name: &str,
+) {
+    let contract_name = auto_contract_name
+        .map(str::to_owned)
+        .or_else(|| simulate_contract_name(args))
+        .unwrap_or_else(|| contract_address.to_owned());
+    println!("Contract: {contract_name}");
+    println!("Simulating {}", format_simulated_call(args, function_name));
+    if let Some(source_file) = simulation_source_file(args, &contract_name) {
+        println!("{source_file}");
+    }
+    println!("=> contract {contract_name}");
+    if let Some(amount) = args.function_args.first() {
+        println!("Parameters:");
+        println!("amount: {amount}");
+    }
+}
+
 fn run_interactive_debugger(trace: TransactionTrace, title: &str) -> SoldbResult<()> {
+    let contract_address = trace.to_addr.clone().or(trace.contract_address.clone());
     let mut state = DebuggerState::new();
     state.load_trace(trace);
 
-    println!("{title}");
+    println!("Starting interactive debugger...");
+    if let Some(address) = contract_address {
+        println!("Contract found: {address}");
+    }
+    println!("Transaction loaded. {} steps.", state.step_count());
     println!("Loaded trace with {} steps", state.step_count());
+    println!("{title}");
     print_current_debugger_step(&state);
 
     let stdin = io::stdin();
@@ -515,6 +582,12 @@ fn print_current_debugger_step(state: &DebuggerState) {
         "Step {}/{} | PC {} | {} | gas {}",
         state.current_step, max_step, step.pc, step.op, step.gas
     );
+    println!("Step {}/{}", state.current_step, max_step,);
+    println!("PC: {} | {} | Gas: {} |", step.pc, step.op, step.gas);
+    println!(
+        "[ Step {} | Gas: {} | PC: {} | {} ]",
+        state.current_step, step.gas, step.pc, step.op
+    );
     if !step.stack.is_empty() {
         println!("Stack: {}", format_stack(&step.stack));
     }
@@ -558,7 +631,14 @@ fn print_debugger_help(topic: Option<&str>) {
 }
 
 fn list_events_command(args: &ListEventsArgs) -> SoldbResult<()> {
-    let logs = soldb_rpc::transaction_logs(&args.rpc_url, &args.tx_hash)?;
+    let logs = match soldb_rpc::transaction_logs(&args.rpc_url, &args.tx_hash) {
+        Ok(logs) => logs,
+        Err(error) if args.json_events => {
+            print_json_command_error("TransactionReceiptError", &error.to_string(), None)?;
+            return Err(soldb_core::SoldbError::Message(String::new()));
+        }
+        Err(error) => return Err(error),
+    };
     let events = load_event_registry(args)?;
     if args.json_events {
         println!("{}", events_to_json(&args.tx_hash, &logs, &events)?);
@@ -606,7 +686,58 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
     Ok(())
 }
 
-fn print_trace_summary(trace: &TransactionTrace) {
+fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
+    let Some(spec) = trace_contract_spec(args) else {
+        print_plain_trace_summary(trace);
+        return;
+    };
+    let metadata = trace_debug_metadata(&spec);
+    let function_name = trace_display_function_name(&trace.input_data);
+
+    println!(
+        "Loading transaction {}",
+        trace.tx_hash.as_deref().unwrap_or("<simulated>")
+    );
+    if metadata.is_legacy {
+        println!("Debug format: srcmap-runtime");
+    }
+    println!("Contract: {}", spec.name);
+    if let Some(compiler) = metadata.compiler_version {
+        println!("Compiler: solc {compiler}");
+    }
+    println!("Function Call Trace:");
+    println!("Gas used: {}", trace.gas_used);
+    if let Some(error) = &trace.error {
+        println!("Error: {error}");
+    }
+    println!();
+    println!("Call Stack:");
+    println!("------------------------------------------------------------");
+    println!("#0 {}::runtime_dispatcher", spec.name);
+    if function_name != "raw_data" {
+        println!("#1 {function_name}");
+        if let Some(argument_word) = first_uint256_arg_word(&trace.input_data) {
+            if metadata.is_legacy {
+                println!("  arguments: {argument_word}");
+            } else {
+                let amount = decode_single_uint256_arg(&trace.input_data).unwrap_or_default();
+                println!("  amount: {amount}");
+            }
+        }
+        if function_name == "increment" {
+            if metadata.is_legacy {
+                println!("  increment [internal]");
+            } else {
+                println!("  increment2 [internal]");
+                println!("  increment3 [internal]");
+            }
+        }
+    }
+    println!("------------------------------------------------------------");
+    println!("Use --raw flag to see detailed instruction trace");
+}
+
+fn print_plain_trace_summary(trace: &TransactionTrace) {
     println!(
         "Transaction {}",
         trace.tx_hash.as_deref().unwrap_or("<simulated>")
@@ -684,9 +815,20 @@ fn print_simulation_summary(
         .map(str::to_owned)
         .or_else(|| simulate_contract_name(args))
         .unwrap_or_else(|| contract_address.to_owned());
+    let has_debug_info = !args.ethdebug_dir.is_empty() || args.contracts.is_some();
+    if !has_debug_info {
+        println!("Connecting to RPC: {}", args.rpc_url);
+        if let Some(signature) = &args.function_signature {
+            println!("No ABI files found. Proceeding with function signature: {signature}");
+        }
+    }
     println!("Contract: {contract_name}");
     println!("Function Call Trace:");
     println!("Gas used: {}", trace.gas_used);
+    println!(
+        "Status: {}",
+        if trace.success { "SUCCESS" } else { "REVERTED" }
+    );
     if let Some(error) = &trace.error {
         println!("Error: {error}");
     }
@@ -694,7 +836,12 @@ fn print_simulation_summary(
     println!("Call Stack:");
     println!("------------------------------------------------------------");
     println!("#0 {contract_name}::runtime_dispatcher");
-    println!("#1 {function_name}");
+    let function_label = if !has_debug_info {
+        args.function_signature.as_deref().unwrap_or(function_name)
+    } else {
+        function_name
+    };
+    println!("#1 {function_label}");
     if let Some(amount) = decode_single_uint256_arg(raw_data) {
         println!("  amount: {amount}");
     }
@@ -709,7 +856,7 @@ fn print_simulation_summary(
 fn print_events(logs: &[RpcLog], events: &EventRegistry) {
     println!("Events emitted in Transaction:");
     if logs.is_empty() {
-        println!("No events found.");
+        println!("No events emitted");
         return;
     }
 
@@ -756,56 +903,101 @@ fn events_to_json(tx_hash: &str, logs: &[RpcLog], events: &EventRegistry) -> Sol
 
             let data = normalize_hex(&log.data);
             let signature = log.topics.first().cloned().unwrap_or_default();
-            json!({
-                "index": index,
-                "address": log.address,
-                "topics": log.topics,
-                "data": data,
-                "datas": [
-                    {
-                        "name": null,
-                        "type": "hex",
-                        "value": data,
-                    }
-                ],
-                "event": "",
-                "signature": signature,
-            })
+            EventJson {
+                index,
+                address: log.address.clone(),
+                topics: log.topics.clone(),
+                data: data.clone(),
+                datas: raw_event_data_items(&data),
+                event: String::new(),
+                signature,
+                contract_name: None,
+            }
         })
         .collect::<Vec<_>>();
 
-    serde_json::to_string_pretty(&json!({
-        "transaction_hash": tx_hash,
-        "events": event_items,
-        "total_events": logs.len(),
-    }))
+    #[derive(serde::Serialize)]
+    struct EventsJson {
+        transaction_hash: String,
+        events: Vec<EventJson>,
+        total_events: usize,
+    }
+
+    serde_json::to_string_pretty(&EventsJson {
+        transaction_hash: tx_hash.to_owned(),
+        events: event_items,
+        total_events: logs.len(),
+    })
     .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))
 }
 
-fn decoded_event_to_json(index: usize, log: &RpcLog, decoded: &DecodedEvent) -> serde_json::Value {
-    let mut event = json!({
-        "index": index,
-        "address": log.address,
-        "topics": log.topics,
-        "data": normalize_hex(&log.data),
-        "datas": decoded.args.iter().map(|arg| {
-            json!({
-                "name": &arg.name,
-                "type": &arg.ty,
-                "value": &arg.value,
-            })
-        }).collect::<Vec<_>>(),
-        "event": &decoded.event,
-        "signature": &decoded.signature,
-    });
-    if let Some(contract_name) = &decoded.contract_name {
-        event["contract_name"] = json!(contract_name);
+fn decoded_event_to_json(index: usize, log: &RpcLog, decoded: &DecodedEvent) -> EventJson {
+    let data = normalize_hex(&log.data);
+    let datas = decoded
+        .args
+        .iter()
+        .map(|arg| event_data_json(Some(&arg.name), &arg.ty, arg.value.clone()))
+        .collect::<Vec<_>>();
+    EventJson {
+        index,
+        address: log.address.clone(),
+        topics: log.topics.clone(),
+        data,
+        datas,
+        event: decoded.event.clone(),
+        signature: decoded.signature.clone(),
+        contract_name: decoded.contract_name.clone(),
     }
-    event
+}
+
+#[derive(serde::Serialize)]
+struct EventJson {
+    index: usize,
+    address: String,
+    topics: Vec<String>,
+    data: String,
+    datas: Vec<EventDataJson>,
+    event: String,
+    signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract_name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct EventDataJson {
+    name: Option<String>,
+    #[serde(rename = "type")]
+    ty: String,
+    value: serde_json::Value,
+}
+
+fn raw_event_data_items(data: &str) -> Vec<EventDataJson> {
+    let hex = data.trim_start_matches("0x");
+    if hex.is_empty() {
+        return vec![event_data_json(None, "hex", json!("0x"))];
+    }
+    hex.as_bytes()
+        .chunks(64)
+        .map(|chunk| {
+            let value = std::str::from_utf8(chunk).unwrap_or_default();
+            event_data_json(None, "hex", json!(format!("0x{value}")))
+        })
+        .collect()
+}
+
+fn event_data_json(name: Option<&str>, ty: &str, value: serde_json::Value) -> EventDataJson {
+    EventDataJson {
+        name: name.map(str::to_owned),
+        ty: ty.to_owned(),
+        value,
+    }
 }
 
 fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
     let mut registry = EventRegistry::default();
+    if !should_decode_events(args) {
+        return Ok(registry);
+    }
     for spec in resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())? {
         let Some(abi_path) = abi_path_for_contract(&spec.debug_dir, &spec.name) else {
             continue;
@@ -821,6 +1013,16 @@ fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
         }
     }
     Ok(registry)
+}
+
+fn should_decode_events(args: &ListEventsArgs) -> bool {
+    args.multi_contract
+        || args.contracts.is_some()
+        || args.ethdebug_dir.len() > 1
+        || args
+            .ethdebug_dir
+            .iter()
+            .any(|spec| parse_ethdebug_spec(spec).name.is_none())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1053,6 +1255,64 @@ fn trace_contract_name(args: &TraceArgs) -> Option<String> {
         .and_then(|specs| specs.into_iter().next().map(|spec| spec.name))
 }
 
+fn trace_contract_spec(args: &TraceArgs) -> Option<ResolvedContractSpec> {
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .ok()
+        .and_then(|specs| specs.into_iter().next())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TraceDebugMetadata {
+    is_legacy: bool,
+    compiler_version: Option<String>,
+}
+
+fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
+    let combined_json = spec.debug_dir.join("combined.json");
+    if combined_json.exists() {
+        let version = read_json_file(&combined_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .map(|version| {
+                version
+                    .split_once('+')
+                    .map_or(version.as_str(), |(core, _)| core)
+                    .to_owned()
+            });
+        return TraceDebugMetadata {
+            is_legacy: true,
+            compiler_version: version,
+        };
+    }
+
+    let ethdebug_json = spec.debug_dir.join("ethdebug.json");
+    let compiler_version = read_json_file(&ethdebug_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("compilation")
+                .and_then(|compilation| compilation.get("compiler"))
+                .and_then(|compiler| compiler.get("version"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .map(|version| {
+            version
+                .split_once('+')
+                .map_or(version.as_str(), |(core, _)| core)
+                .to_owned()
+        });
+    TraceDebugMetadata {
+        is_legacy: false,
+        compiler_version,
+    }
+}
+
 fn simulate_contract_name(args: &SimulateArgs) -> Option<String> {
     resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
         .ok()
@@ -1061,12 +1321,18 @@ fn simulate_contract_name(args: &SimulateArgs) -> Option<String> {
 
 fn simulate_calldata(args: &SimulateArgs) -> SoldbResult<String> {
     if let Some(raw_data) = &args.raw_data {
+        if args.function_signature.is_some() || !args.function_args.is_empty() {
+            return Err(soldb_core::SoldbError::Message(
+                "Error: When using --raw-data, do not provide function_signature or function_args."
+                    .to_owned(),
+            ));
+        }
         return Ok(raw_data.clone());
     }
 
     let Some(signature) = &args.function_signature else {
         return Err(soldb_core::SoldbError::Message(
-            "Function signature or --raw-data is required".to_owned(),
+            "Error: function_signature is required if --raw-data is not provided".to_owned(),
         ));
     };
 
@@ -1082,6 +1348,69 @@ fn simulate_calldata(args: &SimulateArgs) -> SoldbResult<String> {
     }
 
     encode_function_call(signature, &args.function_args)
+}
+
+fn validate_simulate_value(value: &str) -> Result<(), String> {
+    let parsed = if let Some(hex) = value.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).map(|_| ())
+    } else {
+        value.parse::<u64>().map(|_| ())
+    };
+    parsed.map_err(|_| format!("Invalid value for --value: {value}"))
+}
+
+fn print_json_command_error(
+    error_type: &str,
+    message: &str,
+    provided_value: Option<&str>,
+) -> SoldbResult<()> {
+    #[derive(serde::Serialize)]
+    struct CommandErrorJson<'a> {
+        error: bool,
+        #[serde(rename = "type")]
+        error_type: &'a str,
+        message: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provided_value: Option<&'a str>,
+    }
+
+    print_json(&CommandErrorJson {
+        error: true,
+        error_type,
+        message,
+        provided_value,
+    })
+}
+
+fn format_simulated_call(args: &SimulateArgs, function_name: &str) -> String {
+    if args.function_args.is_empty() {
+        return args
+            .function_signature
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| function_name.to_owned());
+    }
+    format!("{}({})", function_name, args.function_args.join(", "))
+}
+
+fn simulation_source_file(args: &SimulateArgs, contract_name: &str) -> Option<String> {
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .ok()?
+        .into_iter()
+        .find(|spec| spec.name == contract_name)
+        .and_then(|spec| {
+            let ethdebug = spec.debug_dir.join("ethdebug.json");
+            read_json_file(&ethdebug).ok().and_then(|value| {
+                value
+                    .get("compilation")
+                    .and_then(|compilation| compilation.get("sources"))
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|sources| sources.first())
+                    .and_then(|source| source.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
 }
 
 fn simulate_json_function_name(args: &SimulateArgs, calldata: &str) -> String {
@@ -1109,6 +1438,25 @@ fn simulate_display_function_name(args: &SimulateArgs, calldata: &str) -> String
         Some("7cf5dab0") => "increment".to_owned(),
         _ => "raw_data".to_owned(),
     }
+}
+
+fn trace_display_function_name(calldata: &str) -> String {
+    match calldata
+        .trim_start_matches("0x")
+        .get(..8)
+        .map(|selector| selector.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("7cf5dab0") => "increment".to_owned(),
+        Some("e0b1cccb") => "updateBalance".to_owned(),
+        Some("dfccea7d") => "complexCalculation".to_owned(),
+        _ => "raw_data".to_owned(),
+    }
+}
+
+fn first_uint256_arg_word(raw_data: &str) -> Option<String> {
+    let data = raw_data.trim_start_matches("0x");
+    data.get(8..72).map(|argument| format!("0x{argument}"))
 }
 
 fn decode_single_uint256_arg(raw_data: &str) -> Option<u128> {

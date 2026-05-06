@@ -6,8 +6,7 @@ This directory contains the test infrastructure for SolDB.
 
 ```
 test/
-├── unit/            # Pytest unit tests for isolated Python modules
-├── integration/     # Pytest integration tests
+├── unit/            # Pytest tests for Python entrypoint shims
 ├── trace/           # Trace command tests (lit + FileCheck)
 ├── simulate/        # Simulate command tests (lit + FileCheck)
 ├── events/          # Events command tests (lit + FileCheck)
@@ -66,28 +65,9 @@ Tests for command-line parsing and shared command behavior:
 
 ### Unit Tests (`test/unit/`)
 
-Pytest tests for isolated Python modules — each test targets a single module with mocked dependencies:
-
-- Bridge client request and error handling
-- Protocol and contract registry round-trips
-- ABI parsing, exception formatting, logging helpers
-- Tracer decode/format/extract helpers
-- Serializer log extraction, encoding, and contract mapping
-- REPL debugger commands, stepping, and source loading
-- Compiler ETHDebug main, SourceMapper, tuple formatting
-
-### Integration Tests (`test/integration/`)
-
-Pytest tests that exercise multiple modules together with real parsers and ETHDebug data:
-
-- CLI command flows (trace, simulate, events, contracts) end-to-end
-- Full `analyze_function_calls` with CALL/DELEGATECALL/CREATE/REVERT traces
-- EVMDebugger sessions with real ETHDebug — stepping, breakpoints, variables
-- Auto-deploy compile and deploy lifecycle
-- ETHDebug/source-map parser edge cases and SourceMappingManager
-- Multi-contract trace analysis and serialization
-
-Shared fixtures (`conftest.py`) provide `write_ethdebug_project`, `build_tracer`, and automatic source cache cleanup.
+Pytest now covers the Python console-script shims that dispatch installed
+entrypoints to the Rust binaries. Runtime behavior is covered by Rust tests and
+lit tests.
 
 ### Stylus Interop Tests (`test/stylus/`)
 
@@ -128,17 +108,17 @@ cd test
 ./run-tests.sh -v
 ```
 
-### Run Unit and Integration Tests
+### Run Python Shim Tests
 
 ```bash
-pytest test/unit test/integration
+pytest test/unit
 ```
 
 ### Run with Coverage
 
 ```bash
 coverage erase
-coverage run --parallel-mode -m pytest test/unit test/integration
+coverage run --parallel-mode -m pytest test/unit
 ./run-tests.sh --coverage
 coverage combine
 coverage report
@@ -146,8 +126,12 @@ coverage html
 coverage xml
 ```
 
-This records pytest unit and integration coverage, wraps each `soldb` CLI invocation in `coverage run --parallel-mode`, then combines all subprocess data after lit finishes.
-CI enforces a 70% total coverage gate for the Python module scope configured in `pyproject.toml`, plus at least 80% coverage on Python lines changed in each pull request.
+This records pytest coverage for Python entrypoint shims, then runs the Rust
+`soldb` binary through lit. Rust coverage is generated separately with
+`cargo llvm-cov`.
+CI enforces a 70% total coverage gate for the remaining Python shim scope
+configured in `pyproject.toml`, plus at least 80% coverage on Python lines
+changed in each pull request.
 
 ### Run Remote Tests with Sepolia API Key
 

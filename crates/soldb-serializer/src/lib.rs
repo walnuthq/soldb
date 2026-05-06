@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::json;
 use soldb_core::{SoldbResult, TransactionTrace};
 
@@ -24,21 +25,26 @@ pub fn trace_to_web_json(trace: &TransactionTrace) -> SoldbResult<String> {
         })
         .collect::<Vec<_>>();
 
-    let response = json!({
-        "status": if trace.success { "success" } else { "reverted" },
-        "traceCall": {
-            "type": if trace.contract_address.is_some() { "CREATE" } else { "CALL" },
-            "from": trace.from_addr,
-            "to": trace.to_addr,
-            "value": trace.value,
-            "gas": trace.steps.first().map_or(0, |step| step.gas),
-            "gasUsed": trace.gas_used,
-            "input": trace.input_data,
-            "output": trace.output,
+    let response = TraceWebResponse {
+        status: if trace.success { "success" } else { "reverted" },
+        trace_call: TraceCallWeb {
+            ty: if trace.contract_address.is_some() {
+                "CREATE"
+            } else {
+                "CALL"
+            },
+            from: &trace.from_addr,
+            to: trace.to_addr.as_deref(),
+            value: &trace.value,
+            gas: trace.steps.first().map_or(0, |step| step.gas),
+            gas_used: trace.gas_used,
+            input: &trace.input_data,
+            output: &trace.output,
+            call_id: None,
         },
-        "steps": steps,
-        "contracts": {},
-    });
+        steps,
+        contracts: json!({}),
+    };
 
     serde_json::to_string_pretty(&response)
         .map_err(|err| soldb_core::SoldbError::Message(err.to_string()))
@@ -62,26 +68,63 @@ pub fn simulate_to_web_json(trace: &TransactionTrace, function_name: &str) -> So
         })
         .collect::<Vec<_>>();
 
-    let response = json!({
-        "status": if trace.success { "success" } else { "reverted" },
-        "traceCall": {
-            "type": "ENTRY",
-            "from": trace.from_addr,
-            "to": trace.to_addr,
-            "value": trace.value,
-            "gas": trace.steps.first().map_or(0, |step| step.gas),
-            "gasUsed": trace.gas_used,
-            "input": trace.input_data,
-            "output": trace.output,
-            "callId": 0,
+    let response = SimulateWebResponse {
+        status: if trace.success { "success" } else { "reverted" },
+        trace_call: TraceCallWeb {
+            ty: "ENTRY",
+            from: &trace.from_addr,
+            to: trace.to_addr.as_deref(),
+            value: &trace.value,
+            gas: trace.steps.first().map_or(0, |step| step.gas),
+            gas_used: trace.gas_used,
+            input: &trace.input_data,
+            output: &trace.output,
+            call_id: Some(0),
         },
-        "steps": steps,
-        "function_name": function_name,
-        "isVerified": false,
-    });
+        steps,
+        function_name,
+        is_verified: false,
+    };
 
     serde_json::to_string_pretty(&response)
         .map_err(|err| soldb_core::SoldbError::Message(err.to_string()))
+}
+
+#[derive(Debug, Serialize)]
+struct TraceCallWeb<'a> {
+    #[serde(rename = "type")]
+    ty: &'a str,
+    from: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<&'a str>,
+    value: &'a str,
+    gas: u64,
+    #[serde(rename = "gasUsed")]
+    gas_used: u64,
+    input: &'a str,
+    output: &'a str,
+    #[serde(rename = "callId", skip_serializing_if = "Option::is_none")]
+    call_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceWebResponse<'a> {
+    status: &'static str,
+    #[serde(rename = "traceCall")]
+    trace_call: TraceCallWeb<'a>,
+    steps: Vec<serde_json::Value>,
+    contracts: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct SimulateWebResponse<'a> {
+    status: &'static str,
+    #[serde(rename = "traceCall")]
+    trace_call: TraceCallWeb<'a>,
+    steps: Vec<serde_json::Value>,
+    function_name: &'a str,
+    #[serde(rename = "isVerified")]
+    is_verified: bool,
 }
 
 #[cfg(test)]

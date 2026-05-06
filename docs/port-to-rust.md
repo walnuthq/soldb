@@ -2,13 +2,13 @@
 
 This branch ports SolDB incrementally. Rust now owns the CLI, compiler,
 auto-deploy, RPC transport, ABI/event decoding, DAP entrypoint, bridge protocol,
-and lit command execution. Python remains only for still-unported debugger,
-parser, serializer, bridge-server/client, and utility internals.
+parser/serializer/debugger internals, and lit command execution. Python remains
+only as a thin packaging shim for console-script entrypoints.
 
 ## Invariants
 
 - Keep existing behavior covered by parity tests before removing Python modules.
-- Keep Python coverage at the configured gate while Python code remains in use.
+- Keep Python coverage at the configured gate while Python shims remain in use.
 - Add Rust coverage as soon as Rust behavior exists; do not use Python coverage to
   hide untested Rust code.
 - Run lit tests through the Rust `soldb` binary by default; `SOLDB_BIN` remains
@@ -43,5 +43,11 @@ parser, serializer, bridge-server/client, and utility internals.
 - `src/soldb/cli/*`
 - `src/soldb/compiler/*`
 - `src/soldb/core/auto_deploy.py`
+- `src/soldb/core/evm_repl.py`
+- `src/soldb/core/serializer.py`
+- `src/soldb/core/transaction_tracer.py`
+- `src/soldb/cross_env/*`
+- `src/soldb/parsers/*`
+- `src/soldb/utils/*`
 - `src/tools/dap_server.py`
 - `src/tools/dap_utils.py`

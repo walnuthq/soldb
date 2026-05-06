@@ -1,9 +1,8 @@
 """
 Python console-script shim for the Rust soldb binary.
 
-The Python package still exposes importable compatibility modules while the
-user-facing CLI migrates to Rust. This module keeps `pip install -e .`
-workflows usable by dispatching `soldb` to the Rust binary.
+The Python package only keeps the installed `soldb` entrypoint; all runtime
+debugger behavior lives in the Rust binary.
 """
 
 from __future__ import annotations
