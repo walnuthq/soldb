@@ -17,9 +17,14 @@ SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
 
 ## Quick Start
 
-Install the Rust CLI:
+Install SolDB:
 ```bash
 cargo install --git https://github.com/walnuthq/soldb.git soldb-cli
+```
+
+Optional debug-adapter binary:
+```bash
+cargo install --git https://github.com/walnuthq/soldb.git soldb-dap
 ```
 
 Run against a local node (Anvil):
@@ -212,13 +217,14 @@ Call Stack:
 
 ---
 
-## Advanced
+## Development
 
 ### Install From Source
 
 ```bash
 git clone https://github.com/walnuthq/soldb.git
 cd soldb
+cargo build --workspace --all-targets
 cargo install --path crates/soldb-cli
 cargo install --path crates/soldb-dap
 ```
@@ -226,11 +232,15 @@ cargo install --path crates/soldb-dap
 ### Run Automated Tests
 
 **Prerequisites**  
+- Rust stable toolchain
 - RPC at `http://localhost:8545` (Anvil default)  
 - Anvil running with tracing enabled:  
   ```bash
   anvil --steps-tracing
   ```
+- Solidity compiler:
+  - `solc` 0.8.29+ for ETHDebug tests
+  - `solc` 0.8.16 for legacy source-map tests
 - LLVM tools (`lit`, `FileCheck`)  
   ```bash
     # Install LLVM
@@ -240,10 +250,28 @@ cargo install --path crates/soldb-dap
     sudo apt-get install llvm-dev
   ```
 
-Run tests:
+Run unit tests:
 ```bash
-cd test
-./run-tests.sh SOLC_PATH=/path/to/solc
+cargo test --workspace --all-targets
+```
+
+Run lit end-to-end CLI tests:
+```bash
+./test/run-tests.sh SOLC_PATH=/path/to/solc
+```
+
+Run the full local test target:
+```bash
+make test
+```
+
+### Coverage
+
+Line coverage is enforced at 80% in CI.
+
+```bash
+cargo llvm-cov --workspace --all-targets --fail-under-lines 80
+make coverage
 ```
 
 ---
