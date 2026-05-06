@@ -275,6 +275,108 @@ fn simulate_json_encodes_dynamic_array_abi_call() {
 }
 
 #[test]
+#[cfg(unix)]
+fn compile_verify_version_json_uses_rust_compiler_path() {
+    let temp = temp_dir("compile-version");
+    let solc = fake_solc(&temp);
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "compile",
+            "--verify-version",
+            "--solc-path",
+            &solc.to_string_lossy(),
+            "--json",
+        ])
+        .output()
+        .expect("run soldb");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"supported\": true"));
+    assert!(stdout.contains("\"version\": \"0.8.31\""));
+}
+
+#[test]
+#[cfg(unix)]
+fn compile_solidity_contract_writes_ethdebug_outputs() {
+    let temp = temp_dir("compile-contract");
+    let solc = fake_solc(&temp);
+    let contract = temp.join("Counter.sol");
+    fs::write(&contract, "contract Counter {}").expect("write contract");
+    let out = temp.join("out");
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "compile",
+            &contract.to_string_lossy(),
+            "--solc-path",
+            &solc.to_string_lossy(),
+            "--output-dir",
+            &out.to_string_lossy(),
+        ])
+        .output()
+        .expect("run soldb");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("ETHDebug compilation successful"));
+    assert!(out.join("Counter.abi").exists());
+    assert!(out.join("Counter.bin").exists());
+    assert!(out.join("Counter_ethdebug.json").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn simulate_auto_deploys_solidity_file_before_trace_call() {
+    let temp = temp_dir("simulate-auto-deploy");
+    let solc = fake_solc(&temp);
+    let contract = temp.join("Counter.sol");
+    fs::write(
+        &contract,
+        "contract Counter { function set(uint256 n) public {} }",
+    )
+    .expect("write contract");
+    let out = temp.join("out");
+    let rpc_url = start_auto_deploy_rpc_server();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "simulate",
+            "--from",
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            &contract.to_string_lossy(),
+            "set(uint256)",
+            "7",
+            "--rpc-url",
+            &rpc_url,
+            "--solc-path",
+            &solc.to_string_lossy(),
+            "--output-dir",
+            &out.to_string_lossy(),
+        ])
+        .output()
+        .expect("run soldb");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("Deployed Counter at 0x5fbdb2315678afecb367f032d93f642f64180aa3"));
+    assert!(stdout.contains("Contract: Counter"));
+    assert!(stdout.contains("Function Call Trace:"));
+    assert!(out.join("deployment.json").exists());
+}
+
+#[test]
 fn simulate_raw_data_prints_call_summary() {
     let rpc_url = start_rpc_server(1);
     let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
@@ -619,6 +721,19 @@ fn start_rpc_server(request_count: usize) -> String {
     format!("http://{address}")
 }
 
+#[cfg(unix)]
+fn start_auto_deploy_rpc_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc server");
+    let address = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        for _ in 0..4 {
+            let (stream, _) = listener.accept().expect("accept rpc request");
+            respond_to_auto_deploy_rpc_request(stream);
+        }
+    });
+    format!("http://{address}")
+}
+
 fn respond_to_rpc_request(mut stream: TcpStream) {
     let request = read_http_request(&mut stream);
     let response = if request.contains("\"eth_getTransactionByHash\"") {
@@ -674,6 +789,66 @@ fn respond_to_rpc_request(mut stream: TcpStream) {
                     {"pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3, "depth": 0, "stack": []},
                     {"pc": 1, "op": "CALLDATASIZE", "gas": 97, "gasCost": 2, "depth": 0, "stack": ["0x01"]},
                     {"pc": 2, "op": "STOP", "gas": 95, "gasCost": 0, "depth": 0}
+                ]
+            }
+        })
+    } else {
+        json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "unknown method"}})
+    };
+
+    let body = response.to_string();
+    let http_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(http_response.as_bytes())
+        .expect("write response");
+}
+
+#[cfg(unix)]
+fn respond_to_auto_deploy_rpc_request(mut stream: TcpStream) {
+    let request = read_http_request(&mut stream);
+    let response = if request.contains("\"eth_accounts\"") {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"]
+        })
+    } else if request.contains("\"eth_sendTransaction\"") {
+        assert!(request.contains("6001600055"));
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": "0x85368076afa1f63460e6f98fe3f2a85d121c4b9c0086ed37fc20022ebea4964c"
+        })
+    } else if request.contains("\"eth_getTransactionReceipt\"") {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "gasUsed": "0x5208",
+                "status": "0x1",
+                "contractAddress": "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+                "logs": []
+            }
+        })
+    } else if request.contains("\"debug_traceCall\"") {
+        let expected_input =
+            encode_function_call("set(uint256)", &["7".to_owned()]).expect("calldata");
+        assert!(request.contains("0x5fbdb2315678afecb367f032d93f642f64180aa3"));
+        assert!(request.contains(&expected_input));
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "gas": 42000,
+                "returnValue": "",
+                "failed": false,
+                "structLogs": [
+                    {"pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3, "depth": 0, "stack": []},
+                    {"pc": 1, "op": "STOP", "gas": 97, "gasCost": 0, "depth": 0}
                 ]
             }
         })
@@ -819,6 +994,59 @@ fn balance_updated_topic() -> String {
         .expect("parse abi")
         .remove(0);
     event_topic(&event)
+}
+
+#[cfg(unix)]
+fn fake_solc(root: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = root.join("solc");
+    let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "solc, the solidity compiler"
+  echo "Version: 0.8.31+commit.test"
+  exit 0
+fi
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    out="$arg"
+  fi
+  prev="$arg"
+done
+mkdir -p "$out"
+cat > "$out/ethdebug.json" <<'EOF'
+{"version":1}
+EOF
+cat > "$out/Counter.abi" <<'EOF'
+[{"type":"function","name":"set","inputs":[{"name":"n","type":"uint256"}]}]
+EOF
+cat > "$out/Counter.bin" <<'EOF'
+6001600055
+EOF
+cat > "$out/Counter_ethdebug.json" <<'EOF'
+{"contract":"Counter"}
+EOF
+cat > "$out/Counter_ethdebug-runtime.json" <<'EOF'
+{"contract":"Counter"}
+EOF
+"#;
+    fs::write(&path, script).expect("write fake solc");
+    let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("chmod");
+    path
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("soldb-cli-{label}-{unique}"));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {

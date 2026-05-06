@@ -204,13 +204,26 @@ name = "soldb-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde",
  "serde_json",
  "soldb-bridge",
+ "soldb-compiler",
  "soldb-core",
  "soldb-ethdebug",
  "soldb-repl",
  "soldb-rpc",
  "soldb-serializer",
+]
+
+[[package]]
+name = "soldb-compiler"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "soldb-core",
+ "soldb-ethdebug",
+ "soldb-rpc",
 ]
 
 [[package]]

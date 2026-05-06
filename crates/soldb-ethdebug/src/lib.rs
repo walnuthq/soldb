@@ -4,8 +4,9 @@ pub mod metadata;
 pub mod source_map;
 
 pub use abi::{
-    encode_function_call, function_selector, keccak256, match_abi_types, match_single_type,
-    parse_signature, parse_tuple_arg, AbiInput, FunctionSignature,
+    canonical_abi_input_type, encode_abi_arguments, encode_function_call, function_selector,
+    keccak256, match_abi_types, match_single_type, parse_signature, parse_tuple_arg, AbiInput,
+    FunctionSignature,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,

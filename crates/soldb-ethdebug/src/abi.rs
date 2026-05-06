@@ -96,25 +96,46 @@ pub fn parse_tuple_arg(value: &Value, abi_input: &AbiInput) -> SoldbResult<Value
     Ok(Value::Array(parsed))
 }
 
-pub fn encode_function_call(signature: &str, args: &[String]) -> SoldbResult<String> {
-    let parsed = parse_signature(signature)
-        .ok_or_else(|| SoldbError::Message(format!("Invalid function signature: {signature}")))?;
-    if parsed.arg_types.len() != args.len() {
+pub fn canonical_abi_input_type(input: &AbiInput) -> String {
+    if let Some(suffix) = input.ty.strip_prefix("tuple") {
+        let components = input
+            .components
+            .iter()
+            .map(canonical_abi_input_type)
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!("({components}){suffix}");
+    }
+    input.ty.clone()
+}
+
+pub fn encode_abi_arguments(arg_types: &[String], args: &[String]) -> SoldbResult<String> {
+    if arg_types.len() != args.len() {
         return Err(SoldbError::Message(format!(
-            "Wrong argument count for {signature}: expected {}, got {}",
-            parsed.arg_types.len(),
+            "Wrong argument count: expected {}, got {}",
+            arg_types.len(),
             args.len()
         )));
     }
 
-    let selector = function_selector(signature)?;
-    let encoded_args = parsed
-        .arg_types
+    let encoded_args = arg_types
         .iter()
         .zip(args)
         .map(|(arg_type, arg_value)| encode_arg(arg_type, arg_value))
         .collect::<SoldbResult<Vec<_>>>()?;
-    let payload = encode_tuple_payload(encoded_args);
+    Ok(encode_tuple_payload(encoded_args))
+}
+
+pub fn encode_function_call(signature: &str, args: &[String]) -> SoldbResult<String> {
+    let parsed = parse_signature(signature)
+        .ok_or_else(|| SoldbError::Message(format!("Invalid function signature: {signature}")))?;
+
+    let selector = function_selector(signature)?;
+    let payload = encode_abi_arguments(&parsed.arg_types, args).map_err(|error| {
+        SoldbError::Message(format!(
+            "Failed to encode arguments for {signature}: {error}"
+        ))
+    })?;
 
     let mut encoded = String::with_capacity(2 + 8 + payload.len());
     encoded.push_str("0x");
@@ -648,8 +669,8 @@ fn keccak_f1600(state: &mut [u64; 25]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_function_call, function_selector, keccak256, match_abi_types, match_single_type,
-        parse_signature, parse_tuple_arg, AbiInput,
+        canonical_abi_input_type, encode_abi_arguments, encode_function_call, function_selector,
+        keccak256, match_abi_types, match_single_type, parse_signature, parse_tuple_arg, AbiInput,
     };
     use serde_json::json;
 
@@ -703,6 +724,23 @@ mod tests {
         assert_eq!(parsed, json!([1, ["0xabc"], [[2], [3]]]));
 
         assert!(parse_tuple_arg(&json!("bad"), &abi_input).is_err());
+    }
+
+    #[test]
+    fn canonicalizes_tuple_abi_input_types() {
+        let abi_input: AbiInput = serde_json::from_value(json!({
+            "type": "tuple[]",
+            "components": [
+                {"type": "uint256"},
+                {"type": "tuple", "components": [{"type": "address"}]}
+            ]
+        }))
+        .expect("abi input");
+
+        assert_eq!(
+            canonical_abi_input_type(&abi_input),
+            "(uint256,(address))[]"
+        );
     }
 
     #[test]
@@ -812,6 +850,24 @@ mod tests {
         assert_eq!(
             encode_function_call("set(bytes2)", &["0xabcd".to_owned()]).expect("calldata"),
             format!("0x{selector}abcd{}", "0".repeat(60))
+        );
+    }
+
+    #[test]
+    fn encodes_abi_argument_payload_without_selector() {
+        let arg_types = vec!["uint256".to_owned(), "string".to_owned()];
+        let args = vec!["7".to_owned(), "hi".to_owned()];
+
+        assert_eq!(
+            encode_abi_arguments(&arg_types, &args).expect("payload"),
+            format!(
+                "\
+                0000000000000000000000000000000000000000000000000000000000000007\
+                0000000000000000000000000000000000000000000000000000000000000040\
+                0000000000000000000000000000000000000000000000000000000000000002\
+                6869{}",
+                "0".repeat(60)
+            )
         );
     }
 

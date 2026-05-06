@@ -2,6 +2,7 @@
 members = [
     "crates/soldb-bridge",
     "crates/soldb-cli",
+    "crates/soldb-compiler",
     "crates/soldb-core",
     "crates/soldb-dap",
     "crates/soldb-ethdebug",

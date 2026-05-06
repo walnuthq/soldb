@@ -33,6 +33,8 @@ struct Cli {
 enum Command {
     #[command(about = "Run the cross-environment (Stylus) debug bridge server")]
     Bridge(BridgeArgs),
+    #[command(about = "Compile Solidity contracts with ETHDebug artifacts")]
+    Compile(CompileArgs),
     #[command(name = "list-contracts", about = "List all contracts in the project")]
     ListContracts(ListContractsArgs),
     #[command(
@@ -56,6 +58,30 @@ struct BridgeArgs {
     config_file: Option<String>,
     #[arg(long)]
     quiet: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CompileArgs {
+    contract_file: Option<String>,
+    #[arg(
+        long = "solc",
+        alias = "solc-path",
+        short = 's',
+        default_value = "solc"
+    )]
+    solc_path: String,
+    #[arg(long = "output-dir", short = 'o', default_value = "./out")]
+    output_dir: String,
+    #[arg(long)]
+    dual_compile: bool,
+    #[arg(long, default_value = "./build/contracts")]
+    production_dir: String,
+    #[arg(long)]
+    verify_version: bool,
+    #[arg(long)]
+    save_config: bool,
     #[arg(long)]
     json: bool,
 }
@@ -204,6 +230,7 @@ fn main() -> ExitCode {
         Command::ListEvents(args) => list_events_command(&args),
         Command::ListContracts(args) => list_contracts_command(&args),
         Command::Bridge(args) => bridge_command(&args),
+        Command::Compile(args) => compile_command(&args),
     };
 
     match result {
@@ -212,6 +239,117 @@ fn main() -> ExitCode {
             eprintln!("{error}");
             ExitCode::from(2)
         }
+    }
+}
+
+fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
+    let config = soldb_compiler::CompilerConfig::with_paths(
+        args.solc_path.clone(),
+        &args.output_dir,
+        &args.production_dir,
+    );
+
+    if args.verify_version {
+        let info = config.verify_solc_version();
+        if args.json {
+            print_json(&info)?;
+        } else if info.supported {
+            println!(
+                "Solidity {} supports ETHDebug",
+                info.version.as_deref().unwrap_or("<unknown>")
+            );
+        } else {
+            println!(
+                "{}",
+                info.error
+                    .as_deref()
+                    .unwrap_or("Solidity compiler does not support ETHDebug")
+            );
+        }
+        if !info.supported {
+            return Err(soldb_core::SoldbError::Message(
+                info.error
+                    .unwrap_or_else(|| "Unsupported solc version".to_owned()),
+            ));
+        }
+        return Ok(());
+    }
+
+    if args.save_config {
+        config.save_to_soldb_config("soldb.config.yaml")?;
+        if !args.json {
+            println!("Configuration saved to soldb.config.yaml");
+        }
+    }
+
+    let contract_file = args
+        .contract_file
+        .as_deref()
+        .ok_or_else(|| soldb_core::SoldbError::Message("Contract file is required".to_owned()))?;
+    if !Path::new(contract_file).exists() {
+        return Err(soldb_core::SoldbError::Message(format!(
+            "Contract file '{contract_file}' not found"
+        )));
+    }
+
+    if args.dual_compile {
+        let result = soldb_compiler::dual_compile(contract_file, &config);
+        if args.json {
+            print_json(&result)?;
+        } else {
+            match &result.production {
+                Ok(production) => {
+                    println!(
+                        "Production build created in {}",
+                        production.output_dir.display()
+                    )
+                }
+                Err(error) => println!("Production build failed: {error}"),
+            }
+            match &result.debug {
+                Ok(debug) => print_compile_result(debug),
+                Err(error) => {
+                    println!("ETHDebug build failed: {error}");
+                    return Err(soldb_core::SoldbError::Message(error.clone()));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let result = config.compile_with_ethdebug(contract_file, None)?;
+    if args.json {
+        print_json(&result)?;
+    } else {
+        print_compile_result(&result);
+    }
+    Ok(())
+}
+
+fn print_compile_result(result: &soldb_compiler::CompilationResult) {
+    println!("ETHDebug compilation successful");
+    println!("Output directory: {}", result.output_dir.display());
+    if result.files.ethdebug.is_some() {
+        println!("  - ethdebug.json");
+    }
+    for (contract_name, files) in &result.files.contracts {
+        println!("Contract: {contract_name}");
+        if let Some(path) = &files.bytecode {
+            println!("  - {}", path.display());
+        }
+        if let Some(path) = &files.abi {
+            println!("  - {}", path.display());
+        }
+        if let Some(path) = &files.ethdebug {
+            println!("  - {}", path.display());
+        }
+        if let Some(path) = &files.ethdebug_runtime {
+            println!("  - {}", path.display());
+        }
+    }
+    if !result.stderr.trim().is_empty() {
+        println!("Compiler warnings:");
+        println!("{}", result.stderr.trim());
     }
 }
 
@@ -246,11 +384,19 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
 }
 
 fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
+    let auto_deploy = maybe_auto_deploy(args)?;
+    let contract_address = auto_deploy.as_ref().map_or_else(
+        || args.contract_address.clone(),
+        |deploy| deploy.contract_address.clone(),
+    );
+    let contract_name = auto_deploy
+        .as_ref()
+        .map(|deploy| deploy.contract_name.clone());
     let calldata = simulate_calldata(args)?;
 
     let request = soldb_rpc::SimulateCallRequest {
         from_addr: args.from_addr.clone(),
-        to_addr: args.contract_address.clone(),
+        to_addr: contract_address.clone(),
         calldata: calldata.clone(),
         value: args.value.clone(),
         block: args.block,
@@ -268,12 +414,45 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
             soldb_serializer::simulate_to_web_json(&trace, &json_function_name)?
         );
     } else if args.raw {
-        print_raw_simulation(&trace, args);
+        print_raw_simulation(&trace, args, &contract_address);
     } else {
-        print_simulation_summary(&trace, args, &calldata, &display_function_name);
+        print_simulation_summary(
+            &trace,
+            args,
+            &contract_address,
+            contract_name.as_deref(),
+            &calldata,
+            &display_function_name,
+        );
     }
 
     Ok(())
+}
+
+fn maybe_auto_deploy(args: &SimulateArgs) -> SoldbResult<Option<soldb_compiler::AutoDeployResult>> {
+    let path = Path::new(&args.contract_address);
+    if path.extension().and_then(|extension| extension.to_str()) != Some("sol") || !path.exists() {
+        return Ok(None);
+    }
+
+    let mut config = soldb_compiler::AutoDeployConfig::new(path, args.rpc_url.clone());
+    config.compiler = soldb_compiler::CompilerConfig::with_paths(
+        args.solc_path.clone(),
+        &args.output_dir,
+        &args.production_dir,
+    );
+    config.dual_compile = args.dual_compile;
+    config.verify_version = args.verify_version;
+    config.save_config = args.save_config;
+    config.constructor_args = args.constructor_args.clone();
+
+    let result = soldb_compiler::auto_deploy(&config)?;
+    println!(
+        "Deployed {} at {}",
+        result.contract_name, result.contract_address
+    );
+    println!("Deployment transaction: {}", result.transaction_hash);
+    Ok(Some(result))
 }
 
 fn run_interactive_debugger(trace: TransactionTrace, title: &str) -> SoldbResult<()> {
@@ -468,8 +647,8 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
     }
 }
 
-fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs) {
-    println!("Simulating call to {}", args.contract_address);
+fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_address: &str) {
+    println!("Simulating call to {contract_address}");
     if let Some(contract_name) = simulate_contract_name(args) {
         println!("Contract: {contract_name}");
     }
@@ -496,11 +675,15 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs) {
 fn print_simulation_summary(
     trace: &TransactionTrace,
     args: &SimulateArgs,
+    contract_address: &str,
+    auto_contract_name: Option<&str>,
     raw_data: &str,
     function_name: &str,
 ) {
-    let contract_name =
-        simulate_contract_name(args).unwrap_or_else(|| args.contract_address.clone());
+    let contract_name = auto_contract_name
+        .map(str::to_owned)
+        .or_else(|| simulate_contract_name(args))
+        .unwrap_or_else(|| contract_address.to_owned());
     println!("Contract: {contract_name}");
     println!("Function Call Trace:");
     println!("Gas used: {}", trace.gas_used);
@@ -738,6 +921,13 @@ fn display_json_value(value: &serde_json::Value) -> String {
         serde_json::Value::String(value) => value.clone(),
         other => other.to_string(),
     }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> SoldbResult<()> {
+    let output = serde_json::to_string_pretty(value)
+        .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?;
+    println!("{output}");
+    Ok(())
 }
 
 fn call_target_stack_word(stack: &[String]) -> Option<&str> {
