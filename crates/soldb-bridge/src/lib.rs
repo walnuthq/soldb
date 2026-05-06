@@ -3,9 +3,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use soldb_core::TransactionTrace;
 
 pub const PROTOCOL_VERSION: &str = "1.0";
 
@@ -220,6 +222,7 @@ impl ContractInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceRequest {
+    #[serde(default)]
     pub request_id: String,
     pub transaction_hash: Option<String>,
     pub block_number: Option<u64>,
@@ -357,6 +360,41 @@ pub struct ContractRegistry {
     evm_addresses: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceStore {
+    traces: BTreeMap<String, CrossEnvTrace>,
+    pending_requests: BTreeMap<String, TraceRequest>,
+}
+
+impl TraceStore {
+    pub fn store_trace(&mut self, trace: CrossEnvTrace) {
+        self.traces.insert(trace.trace_id.clone(), trace);
+    }
+
+    pub fn get_trace(&self, trace_id: &str) -> Option<&CrossEnvTrace> {
+        self.traces.get(trace_id)
+    }
+
+    pub fn add_pending_request(&mut self, request: TraceRequest) {
+        self.pending_requests
+            .insert(request.request_id.clone(), request);
+    }
+
+    pub fn complete_request(&mut self, response: &TraceResponse) -> bool {
+        if self.pending_requests.remove(&response.request_id).is_none() {
+            return false;
+        }
+        if let Some(trace) = &response.trace {
+            self.store_trace(trace.clone());
+        }
+        true
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending_requests.len()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpResponse {
     pub status_code: u16,
@@ -405,11 +443,15 @@ impl HttpResponse {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BridgeHttpHandler {
     pub registry: ContractRegistry,
+    pub trace_store: TraceStore,
 }
 
 impl BridgeHttpHandler {
     pub fn new(registry: ContractRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            trace_store: TraceStore::default(),
+        }
     }
 
     pub fn handle_request(&mut self, method: &str, path: &str, body: Option<&str>) -> HttpResponse {
@@ -419,14 +461,17 @@ impl BridgeHttpHandler {
             ("GET", "/health") => self.handle_health(),
             ("GET", "/contracts") => self.handle_list_contracts(),
             ("POST", "/register") => self.handle_register_contract(body),
+            ("POST", "/request-trace") => self.handle_trace_request(body),
+            ("POST", "/submit-trace") => self.handle_submit_trace(body),
+            ("POST", "/respond-trace") => self.handle_trace_response(body),
             _ if method == "GET" && path.starts_with("/contract/") => {
                 self.handle_get_contract(path.trim_start_matches("/contract/"))
             }
+            _ if method == "GET" && path.starts_with("/trace/") => {
+                self.handle_get_trace(path.trim_start_matches("/trace/"))
+            }
             _ if method == "DELETE" && path.starts_with("/contract/") => {
                 self.handle_unregister_contract(path.trim_start_matches("/contract/"))
-            }
-            ("POST", "/request-trace" | "/submit-trace" | "/respond-trace") => {
-                HttpResponse::error("Trace bridge execution is not ported to Rust yet", 501)
             }
             _ => HttpResponse::error("Not found", 404),
         }
@@ -440,6 +485,7 @@ impl BridgeHttpHandler {
                 "GET /health",
                 "GET /contracts",
                 "GET /contract/{address}",
+                "GET /trace/{trace_id}",
                 "POST /register",
                 "POST /request-trace",
                 "POST /submit-trace",
@@ -454,6 +500,7 @@ impl BridgeHttpHandler {
             "status": "healthy",
             "protocol_version": PROTOCOL_VERSION,
             "contracts_registered": self.registry.get_all_contracts().len(),
+            "pending_trace_requests": self.trace_store.pending_count(),
         }))
     }
 
@@ -508,6 +555,211 @@ impl BridgeHttpHandler {
             HttpResponse::error(format!("Contract not found: {address}"), 404)
         }
     }
+
+    fn handle_trace_request(&mut self, body: Option<&str>) -> HttpResponse {
+        let Some(body) = body else {
+            return HttpResponse::error("Invalid JSON body", 400);
+        };
+        let mut request = match serde_json::from_str::<TraceRequest>(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return HttpResponse::error(
+                    format!("Failed to process trace request: {error}"),
+                    400,
+                )
+            }
+        };
+        if request.request_id.is_empty() {
+            request.request_id = generated_id("trace-request");
+        }
+
+        let Some(target_contract) = self.registry.get(&request.target_address).cloned() else {
+            return HttpResponse {
+                status_code: 404,
+                body: json!({
+                    "status": "error",
+                    "error_message": format!("Contract not registered: {}", request.target_address),
+                }),
+            };
+        };
+
+        if target_contract
+            .environment
+            .eq_ignore_ascii_case(Environment::Evm.as_str())
+        {
+            return match invoke_evm_trace(&request, &target_contract) {
+                Ok(trace) => {
+                    self.trace_store.store_trace(trace.clone());
+                    let status = if trace.success { "success" } else { "error" };
+                    HttpResponse::ok(json!(TraceResponse {
+                        request_id: request.request_id,
+                        status: status.to_owned(),
+                        trace: Some(trace),
+                        error_message: None,
+                        error_code: None,
+                    }))
+                }
+                Err(error) => {
+                    self.trace_store.add_pending_request(request.clone());
+                    HttpResponse::ok(json!({
+                        "request_id": request.request_id,
+                        "status": "pending",
+                        "message": format!("Request queued for evm environment (EVM trace generation failed: {error})"),
+                        "target_environment": target_contract.environment,
+                    }))
+                }
+            };
+        }
+
+        self.trace_store.add_pending_request(request.clone());
+        HttpResponse::ok(json!({
+            "request_id": request.request_id,
+            "status": "pending",
+            "message": format!("Request queued for {} environment", target_contract.environment),
+            "target_environment": target_contract.environment,
+        }))
+    }
+
+    fn handle_submit_trace(&mut self, body: Option<&str>) -> HttpResponse {
+        let Some(body) = body else {
+            return HttpResponse::error("Invalid JSON body", 400);
+        };
+        let mut trace = match serde_json::from_str::<CrossEnvTrace>(body) {
+            Ok(trace) => trace,
+            Err(error) => {
+                return HttpResponse::error(format!("Failed to store trace: {error}"), 400)
+            }
+        };
+        if trace.trace_id.is_empty() {
+            trace.trace_id = generated_id("trace");
+        }
+        let trace_id = trace.trace_id.clone();
+        self.trace_store.store_trace(trace);
+        HttpResponse::ok(json!({
+            "status": "stored",
+            "trace_id": trace_id,
+        }))
+    }
+
+    fn handle_trace_response(&mut self, body: Option<&str>) -> HttpResponse {
+        let Some(body) = body else {
+            return HttpResponse::error("Invalid JSON body", 400);
+        };
+        let response = match serde_json::from_str::<TraceResponse>(body) {
+            Ok(response) => response,
+            Err(error) => {
+                return HttpResponse::error(
+                    format!("Failed to process trace response: {error}"),
+                    400,
+                )
+            }
+        };
+
+        if self.trace_store.complete_request(&response) {
+            HttpResponse::ok(json!({
+                "status": "completed",
+                "request_id": response.request_id,
+            }))
+        } else {
+            HttpResponse::ok(json!({
+                "status": "not_found",
+                "message": format!("No pending request found: {}", response.request_id),
+            }))
+        }
+    }
+
+    fn handle_get_trace(&self, trace_id: &str) -> HttpResponse {
+        match self.trace_store.get_trace(trace_id) {
+            Some(trace) => HttpResponse::ok(json!(trace)),
+            None => HttpResponse {
+                status_code: 404,
+                body: json!({
+                    "status": "error",
+                    "error_message": format!("Trace not found: {trace_id}"),
+                }),
+            },
+        }
+    }
+}
+
+fn invoke_evm_trace(
+    request: &TraceRequest,
+    contract: &ContractInfo,
+) -> Result<CrossEnvTrace, String> {
+    let rpc_endpoint = request
+        .rpc_endpoint
+        .as_deref()
+        .unwrap_or("http://localhost:8545");
+    let simulate_request = soldb_rpc::SimulateCallRequest {
+        from_addr: request.caller_address.clone().unwrap_or_else(zero_address),
+        to_addr: contract.address.clone(),
+        calldata: if request.calldata.is_empty() {
+            "0x".to_owned()
+        } else {
+            request.calldata.clone()
+        },
+        value: request.value.to_string(),
+        block: request.block_number,
+        tx_index: None,
+    };
+    let trace = soldb_rpc::simulate_call(rpc_endpoint, &simulate_request)
+        .map_err(|error| error.to_string())?;
+    Ok(transaction_trace_to_cross_env(trace, request, contract))
+}
+
+fn transaction_trace_to_cross_env(
+    trace: TransactionTrace,
+    request: &TraceRequest,
+    contract: &ContractInfo,
+) -> CrossEnvTrace {
+    let selector = trace
+        .input_data
+        .trim_start_matches("0x")
+        .get(..8)
+        .filter(|selector| !selector.is_empty())
+        .map(|selector| format!("0x{}", selector.to_ascii_lowercase()));
+    let function_name = selector.as_deref().map_or_else(
+        || "runtime_dispatcher".to_owned(),
+        |selector| format!("function_{selector}"),
+    );
+
+    let mut root_call = CrossEnvCall::new(
+        0,
+        Environment::Evm.as_str(),
+        contract.address.clone(),
+        function_name,
+    );
+    root_call.function_selector = selector;
+    root_call.call_type = "entry".to_owned();
+    root_call.gas_used = Some(trace.gas_used);
+    root_call.return_data = Some(trace.output.clone());
+    root_call.success = trace.success;
+    root_call.error = trace.error.clone();
+    root_call.value = Some(request.value);
+
+    let mut cross_trace = CrossEnvTrace::new(request.request_id.clone());
+    cross_trace.transaction_hash = request.transaction_hash.clone();
+    cross_trace.root_call = Some(root_call.clone());
+    cross_trace.calls = vec![root_call];
+    cross_trace.from_address = Some(trace.from_addr);
+    cross_trace.to_address = trace.to_addr.or_else(|| Some(contract.address.clone()));
+    cross_trace.value = Some(request.value);
+    cross_trace.gas_used = Some(trace.gas_used);
+    cross_trace.success = trace.success;
+    cross_trace.error = trace.error;
+    cross_trace
+}
+
+fn generated_id(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
+fn zero_address() -> String {
+    "0x0000000000000000000000000000000000000000".to_owned()
 }
 
 pub fn run_bridge_server(
@@ -1052,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_http_handler_reports_bad_json_and_unported_trace_endpoints() {
+    fn bridge_http_handler_reports_bad_json_and_missing_trace_targets() {
         let mut handler = BridgeHttpHandler::default();
 
         let bad = handler.handle_request("POST", "/register", Some("{"));
@@ -1062,12 +1314,17 @@ mod tests {
             .expect("error")
             .contains("Failed to register contract"));
 
-        let trace = handler.handle_request("POST", "/request-trace", Some("{}"));
-        assert_eq!(trace.status_code, 501);
-        assert!(trace.body["error"]
+        let trace = handler.handle_request(
+            "POST",
+            "/request-trace",
+            Some(r#"{"request_id":"req-1","target_address":"0xdead"}"#),
+        );
+        assert_eq!(trace.status_code, 404);
+        assert_eq!(trace.body["status"], "error");
+        assert!(trace.body["error_message"]
             .as_str()
             .expect("error")
-            .contains("not ported"));
+            .contains("Contract not registered"));
 
         let missing_address = handler.handle_request("POST", "/register", Some("{}"));
         assert_eq!(missing_address.status_code, 400);
@@ -1075,6 +1332,115 @@ mod tests {
 
         let unknown = handler.handle_request("GET", "/unknown", None);
         assert_eq!(unknown.status_code, 404);
+    }
+
+    #[test]
+    fn bridge_http_handler_stores_pending_and_completed_traces() {
+        let mut handler = BridgeHttpHandler::default();
+        handler.registry.register(ContractInfo::new(
+            "0xabc",
+            Environment::Stylus.as_str(),
+            "Stylus",
+        ));
+
+        let request = json!({
+            "request_id": "req-1",
+            "target_address": "0xabc",
+            "caller_address": "0x1",
+            "calldata": "0x1234",
+        })
+        .to_string();
+        let queued = handler.handle_request("POST", "/request-trace", Some(&request));
+        assert_eq!(queued.status_code, 200);
+        assert_eq!(queued.body["status"], "pending");
+        assert_eq!(queued.body["target_environment"], "stylus");
+        assert_eq!(handler.trace_store.pending_count(), 1);
+
+        let trace = sample_cross_env_trace("trace-1");
+        let response = TraceResponse::success("req-1", trace.clone());
+        let completed = handler.handle_request(
+            "POST",
+            "/respond-trace",
+            Some(&serde_json::to_string(&response).expect("response json")),
+        );
+        assert_eq!(completed.status_code, 200);
+        assert_eq!(completed.body["status"], "completed");
+        assert_eq!(handler.trace_store.pending_count(), 0);
+
+        let fetched = handler.handle_request("GET", "/trace/trace-1", None);
+        assert_eq!(fetched.status_code, 200);
+        assert_eq!(fetched.body["trace_id"], "trace-1");
+
+        let not_found = handler.handle_request(
+            "POST",
+            "/respond-trace",
+            Some(r#"{"request_id":"missing","status":"success"}"#),
+        );
+        assert_eq!(not_found.status_code, 200);
+        assert_eq!(not_found.body["status"], "not_found");
+    }
+
+    #[test]
+    fn bridge_http_handler_submits_and_fetches_traces() {
+        let mut handler = BridgeHttpHandler::default();
+        let trace = sample_cross_env_trace("submitted-trace");
+        let submitted = handler.handle_request(
+            "POST",
+            "/submit-trace",
+            Some(&trace.to_json().expect("trace json")),
+        );
+        assert_eq!(submitted.status_code, 200);
+        assert_eq!(submitted.body["status"], "stored");
+        assert_eq!(submitted.body["trace_id"], "submitted-trace");
+
+        let fetched = handler.handle_request("GET", "/trace/submitted-trace", None);
+        assert_eq!(fetched.status_code, 200);
+        assert_eq!(fetched.body["calls"][0]["function_name"], "run");
+
+        let missing = handler.handle_request("GET", "/trace/missing", None);
+        assert_eq!(missing.status_code, 404);
+        assert_eq!(missing.body["status"], "error");
+    }
+
+    #[test]
+    fn bridge_http_handler_invokes_evm_trace_from_rpc() {
+        let rpc_url = start_bridge_rpc_server();
+        let mut handler = BridgeHttpHandler::default();
+        handler.registry.register(ContractInfo::new(
+            "0x0000000000000000000000000000000000000002",
+            Environment::Evm.as_str(),
+            "EvmContract",
+        ));
+
+        let request = json!({
+            "request_id": "req-evm",
+            "target_address": "0x0000000000000000000000000000000000000002",
+            "caller_address": "0x0000000000000000000000000000000000000001",
+            "calldata": "0x12345678",
+            "rpc_endpoint": rpc_url,
+            "value": 7
+        })
+        .to_string();
+        let response = handler.handle_request("POST", "/request-trace", Some(&request));
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.body["request_id"], "req-evm");
+        assert_eq!(response.body["status"], "success");
+        assert_eq!(response.body["trace"]["trace_id"], "req-evm");
+        assert_eq!(
+            response.body["trace"]["from_address"],
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert_eq!(response.body["trace"]["root_call"]["environment"], "evm");
+        assert_eq!(
+            response.body["trace"]["root_call"]["function_selector"],
+            "0x12345678"
+        );
+        assert_eq!(response.body["trace"]["root_call"]["gas_used"], 42_000);
+
+        let fetched = handler.handle_request("GET", "/trace/req-evm", None);
+        assert_eq!(fetched.status_code, 200);
+        assert_eq!(fetched.body["trace_id"], "req-evm");
     }
 
     #[test]
@@ -1113,5 +1479,79 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"status\":\"healthy\""));
+    }
+
+    fn sample_cross_env_trace(trace_id: &str) -> CrossEnvTrace {
+        let root = CrossEnvCall::new(0, Environment::Stylus.as_str(), "0xabc", "run");
+        let mut trace = CrossEnvTrace::new(trace_id);
+        trace.root_call = Some(root.clone());
+        trace.calls = vec![root];
+        trace
+    }
+
+    fn start_bridge_rpc_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc server");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept rpc request");
+            respond_to_bridge_rpc_request(stream);
+        });
+        format!("http://{address}")
+    }
+
+    fn respond_to_bridge_rpc_request(mut stream: TcpStream) {
+        let request = read_test_http_request(&mut stream);
+        let response = if request.contains("\"debug_traceCall\"") {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "gas": 42000,
+                    "returnValue": "2a",
+                    "failed": false,
+                    "structLogs": [
+                        {"pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3, "depth": 0, "stack": []},
+                        {"pc": 1, "op": "STOP", "gas": 97, "gasCost": 0, "depth": 0, "stack": ["0x01"]}
+                    ]
+                }
+            })
+        } else {
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "unknown method"}})
+        };
+        let body = response.to_string();
+        let http_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(http_response.as_bytes())
+            .expect("write response");
+    }
+
+    fn read_test_http_request(stream: &mut TcpStream) -> String {
+        let mut data = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).expect("read request");
+            if read == 0 {
+                break;
+            }
+            data.extend_from_slice(&buffer[..read]);
+
+            if let Some(header_end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&data[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let body_len = data.len().saturating_sub(header_end + 4);
+                if body_len >= content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8(data).expect("utf8 request")
     }
 }
