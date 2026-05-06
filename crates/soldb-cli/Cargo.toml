@@ -15,6 +15,7 @@ serde_json.workspace = true
 soldb-bridge = { path = "../soldb-bridge" }
 soldb-core = { path = "../soldb-core" }
 soldb-ethdebug = { path = "../soldb-ethdebug" }
+soldb-repl = { path = "../soldb-repl" }
 soldb-rpc = { path = "../soldb-rpc" }
 soldb-serializer = { path = "../soldb-serializer" }
 

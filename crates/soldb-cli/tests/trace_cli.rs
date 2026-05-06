@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -119,6 +119,34 @@ fn trace_summary_prints_status_and_step_count() {
 }
 
 #[test]
+fn trace_interactive_accepts_repl_commands() {
+    let rpc_url = start_rpc_server(3);
+    let output = run_with_stdin(
+        Command::new(env!("CARGO_BIN_EXE_soldb")).args([
+            "trace",
+            "0xabc",
+            "--rpc",
+            &rpc_url,
+            "--interactive",
+        ]),
+        "nexti\nbreak 3\ncontinue\nq\n",
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("Transaction trace debugger"));
+    assert!(stdout.contains("Loaded trace with 4 steps"));
+    assert!(stdout.contains("Step 1/3 | PC 2 | MSTORE | gas 97"));
+    assert!(stdout.contains("Breakpoint set at PC 3"));
+    assert!(stdout.contains("Breakpoint hit at step 2, PC 3"));
+    assert!(stdout.contains("Exiting debugger."));
+}
+
+#[test]
 fn simulate_json_uses_debug_trace_call() {
     let rpc_url = start_rpc_server(1);
     let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
@@ -149,6 +177,37 @@ fn simulate_json_uses_debug_trace_call() {
     assert!(stdout.contains("\"callId\": 0"));
     assert!(stdout.contains("\"function_name\": \"increment\""));
     assert!(stdout.contains("\"isVerified\": false"));
+}
+
+#[test]
+fn simulate_interactive_accepts_repl_commands() {
+    let rpc_url = start_rpc_server(1);
+    let output = run_with_stdin(
+        Command::new(env!("CARGO_BIN_EXE_soldb")).args([
+            "simulate",
+            "0x2",
+            "--from",
+            "0x1",
+            "--rpc",
+            &rpc_url,
+            "--raw-data",
+            "0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004",
+            "--interactive",
+        ]),
+        "nexti\nmode asm\nq\n",
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("Simulation debugger"));
+    assert!(stdout.contains("Loaded trace with 3 steps"));
+    assert!(stdout.contains("Step 1/2 | PC 1 | CALLDATASIZE | gas 97"));
+    assert!(stdout.contains("Mode: asm"));
+    assert!(stdout.contains("Exiting debugger."));
 }
 
 #[test]
@@ -488,6 +547,22 @@ fn start_contract_call_rpc_server() -> String {
         }
     });
     format!("http://{address}")
+}
+
+fn run_with_stdin(command: &mut Command, input: &str) -> std::process::Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn soldb");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for soldb")
 }
 
 fn start_decoded_event_rpc_server() -> String {

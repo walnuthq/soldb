@@ -5,8 +5,10 @@ use soldb_ethdebug::{
     encode_function_call, parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent,
     EventRegistry,
 };
+use soldb_repl::{DebuggerCommand, DebuggerState, StepOutcome};
 use soldb_rpc::RpcLog;
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -229,14 +231,10 @@ fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
-    if args.interactive {
-        return Err(soldb_core::SoldbError::Message(
-            "interactive trace mode is not ported to Rust yet".to_owned(),
-        ));
-    }
-
     let trace = soldb_rpc::trace_transaction(&args.rpc, &args.tx_hash)?;
-    if args.json {
+    if args.interactive {
+        run_interactive_debugger(trace, "Transaction trace debugger")?;
+    } else if args.json {
         println!("{}", soldb_serializer::trace_to_web_json(&trace)?);
     } else if args.raw {
         print_raw_trace(&trace, args);
@@ -248,12 +246,6 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
 }
 
 fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
-    if args.interactive {
-        return Err(soldb_core::SoldbError::Message(
-            "interactive simulate mode is not ported to Rust yet".to_owned(),
-        ));
-    }
-
     let calldata = simulate_calldata(args)?;
 
     let request = soldb_rpc::SimulateCallRequest {
@@ -268,7 +260,9 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     let json_function_name = simulate_json_function_name(args, &calldata);
     let display_function_name = simulate_display_function_name(args, &calldata);
 
-    if args.json {
+    if args.interactive {
+        run_interactive_debugger(trace, "Simulation debugger")?;
+    } else if args.json {
         println!(
             "{}",
             soldb_serializer::simulate_to_web_json(&trace, &json_function_name)?
@@ -280,6 +274,108 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     }
 
     Ok(())
+}
+
+fn run_interactive_debugger(trace: TransactionTrace, title: &str) -> SoldbResult<()> {
+    let mut state = DebuggerState::new();
+    state.load_trace(trace);
+
+    println!("{title}");
+    println!("Loaded trace with {} steps", state.step_count());
+    print_current_debugger_step(&state);
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("soldb> ");
+        io::stdout()
+            .flush()
+            .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?;
+
+        line.clear();
+        let bytes_read = stdin
+            .read_line(&mut line)
+            .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?;
+        if bytes_read == 0 {
+            println!();
+            break;
+        }
+
+        let command = DebuggerCommand::parse(&line);
+        match command {
+            DebuggerCommand::Empty => {}
+            DebuggerCommand::Quit => {
+                println!("Exiting debugger.");
+                break;
+            }
+            DebuggerCommand::Help(topic) => print_debugger_help(topic.as_deref()),
+            DebuggerCommand::Mode(None) => {
+                println!("Mode: {}", state.display_mode.as_str());
+            }
+            DebuggerCommand::Unknown(command) => {
+                println!("Unknown command: {command}");
+            }
+            command => {
+                if let Some(outcome) = state.apply_command(command) {
+                    print_step_outcome(&state, &outcome);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_current_debugger_step(state: &DebuggerState) {
+    let Some(step) = state.current_step_data() else {
+        println!("No trace loaded.");
+        return;
+    };
+    let max_step = state.step_count().saturating_sub(1);
+    println!(
+        "Step {}/{} | PC {} | {} | gas {}",
+        state.current_step, max_step, step.pc, step.op, step.gas
+    );
+    if !step.stack.is_empty() {
+        println!("Stack: {}", format_stack(&step.stack));
+    }
+}
+
+fn print_step_outcome(state: &DebuggerState, outcome: &StepOutcome) {
+    match outcome {
+        StepOutcome::NoTrace => println!("No trace loaded."),
+        StepOutcome::Moved { .. } => print_current_debugger_step(state),
+        StepOutcome::BreakpointHit { step, pc } => {
+            println!("Breakpoint hit at step {step}, PC {pc}");
+            print_current_debugger_step(state);
+        }
+        StepOutcome::AtEnd { step } => {
+            println!("End of trace at step {step}");
+            print_current_debugger_step(state);
+        }
+        StepOutcome::InvalidStep {
+            requested,
+            max_step,
+        } => match max_step {
+            Some(max_step) => println!("Invalid step {requested}; max step is {max_step}"),
+            None => println!("Invalid step {requested}; trace is empty"),
+        },
+        StepOutcome::ModeChanged(mode) => println!("Mode: {}", mode.as_str()),
+        StepOutcome::BreakpointSet(pc) => println!("Breakpoint set at PC {pc}"),
+        StepOutcome::BreakpointCleared(pc) => println!("Breakpoint cleared at PC {pc}"),
+        StepOutcome::BreakpointMissing(pc) => println!("No breakpoint set at PC {pc}"),
+    }
+}
+
+fn print_debugger_help(topic: Option<&str>) {
+    match topic {
+        Some("mode") => println!("mode source|asm - switch display mode"),
+        Some(topic) => println!("No help for {topic}"),
+        None => {
+            println!("Commands: next, nexti, step, continue, goto <step>");
+            println!("          break <pc>, clear <pc>, mode source|asm, help, quit");
+        }
+    }
 }
 
 fn list_events_command(args: &ListEventsArgs) -> SoldbResult<()> {

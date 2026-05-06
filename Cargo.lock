@@ -206,6 +206,7 @@ dependencies = [
  "soldb-bridge",
  "soldb-core",
  "soldb-ethdebug",
+ "soldb-repl",
  "soldb-rpc",
  "soldb-serializer",
 ]
