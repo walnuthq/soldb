@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub mod server;
+
+pub use server::{run_stdio_server, DapServer};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DapServerConfig {
     pub adapter_id: String,

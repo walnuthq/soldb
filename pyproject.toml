@@ -52,7 +52,7 @@ Issues = "https://github.com/walnuthq/soldb/issues"
 
 [project.scripts]
 soldb = "soldb.rust_cli:main"
-soldb-dap-server = "tools.dap_server:main"
+soldb-dap-server = "tools.rust_dap_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
