@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -179,9 +181,11 @@ impl CrossEnvTrace {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractInfo {
+    #[serde(default)]
     pub address: String,
     #[serde(default = "default_environment")]
     pub environment: String,
+    #[serde(default)]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_dir: Option<String>,
@@ -351,6 +355,262 @@ pub struct ContractRegistry {
     contracts: BTreeMap<String, ContractInfo>,
     stylus_addresses: BTreeSet<String>,
     evm_addresses: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HttpResponse {
+    pub status_code: u16,
+    pub body: Value,
+}
+
+impl HttpResponse {
+    pub fn ok(body: Value) -> Self {
+        Self {
+            status_code: 200,
+            body,
+        }
+    }
+
+    pub fn error(message: impl Into<String>, status_code: u16) -> Self {
+        Self {
+            status_code,
+            body: json!({"error": message.into()}),
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self.status_code {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            _ => "Internal Server Error",
+        }
+    }
+
+    fn to_http_response(&self) -> String {
+        let body = serde_json::to_string(&self.body).unwrap_or_else(|error| {
+            json!({"error": format!("Failed to encode response: {error}")}).to_string()
+        });
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            self.status_code,
+            self.reason(),
+            body.len(),
+            body
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BridgeHttpHandler {
+    pub registry: ContractRegistry,
+}
+
+impl BridgeHttpHandler {
+    pub fn new(registry: ContractRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub fn handle_request(&mut self, method: &str, path: &str, body: Option<&str>) -> HttpResponse {
+        let path = path.split('?').next().unwrap_or(path);
+        match (method, path) {
+            ("GET", "/") => self.handle_info(),
+            ("GET", "/health") => self.handle_health(),
+            ("GET", "/contracts") => self.handle_list_contracts(),
+            ("POST", "/register") => self.handle_register_contract(body),
+            _ if method == "GET" && path.starts_with("/contract/") => {
+                self.handle_get_contract(path.trim_start_matches("/contract/"))
+            }
+            _ if method == "DELETE" && path.starts_with("/contract/") => {
+                self.handle_unregister_contract(path.trim_start_matches("/contract/"))
+            }
+            ("POST", "/request-trace" | "/submit-trace" | "/respond-trace") => {
+                HttpResponse::error("Trace bridge execution is not ported to Rust yet", 501)
+            }
+            _ => HttpResponse::error("Not found", 404),
+        }
+    }
+
+    fn handle_info(&self) -> HttpResponse {
+        HttpResponse::ok(json!({
+            "name": "Cross-Environment Debug Bridge",
+            "protocol_version": PROTOCOL_VERSION,
+            "endpoints": [
+                "GET /health",
+                "GET /contracts",
+                "GET /contract/{address}",
+                "POST /register",
+                "POST /request-trace",
+                "POST /submit-trace",
+                "POST /respond-trace",
+                "DELETE /contract/{address}"
+            ]
+        }))
+    }
+
+    fn handle_health(&self) -> HttpResponse {
+        HttpResponse::ok(json!({
+            "status": "healthy",
+            "protocol_version": PROTOCOL_VERSION,
+            "contracts_registered": self.registry.get_all_contracts().len(),
+        }))
+    }
+
+    fn handle_list_contracts(&self) -> HttpResponse {
+        HttpResponse::ok(json!({
+            "contracts": self.registry.get_all_contracts(),
+            "count": self.registry.get_all_contracts().len(),
+        }))
+    }
+
+    fn handle_get_contract(&self, address: &str) -> HttpResponse {
+        match self.registry.get(address) {
+            Some(contract) => HttpResponse::ok(json!(contract)),
+            None => HttpResponse::error(format!("Contract not found: {address}"), 404),
+        }
+    }
+
+    fn handle_register_contract(&mut self, body: Option<&str>) -> HttpResponse {
+        let Some(body) = body else {
+            return HttpResponse::error("Invalid JSON body", 400);
+        };
+        let contract = match serde_json::from_str::<ContractInfo>(body) {
+            Ok(contract) => contract,
+            Err(error) => {
+                return HttpResponse::error(format!("Failed to register contract: {error}"), 400)
+            }
+        };
+        if contract.address.is_empty() {
+            return HttpResponse::error("Address is required", 400);
+        }
+        if contract.environment.is_empty() {
+            return HttpResponse::error("Environment is required (evm or stylus)", 400);
+        }
+
+        let mut registered_contract = contract.clone();
+        registered_contract.address =
+            ContractRegistry::format_address(&registered_contract.address);
+        self.registry.register(contract);
+        HttpResponse::ok(json!({
+            "status": "registered",
+            "contract": registered_contract,
+        }))
+    }
+
+    fn handle_unregister_contract(&mut self, address: &str) -> HttpResponse {
+        if self.registry.unregister(address).is_some() {
+            HttpResponse::ok(json!({
+                "status": "unregistered",
+                "address": address,
+            }))
+        } else {
+            HttpResponse::error(format!("Contract not found: {address}"), 404)
+        }
+    }
+}
+
+pub fn run_bridge_server(
+    host: &str,
+    port: u16,
+    verbose: bool,
+    config_file: Option<&str>,
+) -> std::io::Result<()> {
+    let mut registry = ContractRegistry::new();
+    if let Some(config_file) = config_file {
+        match registry.load_from_file(config_file) {
+            Ok(count) if verbose => {
+                eprintln!("[Bridge] Loaded {count} contracts from {config_file}")
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("[Bridge] Warning: Failed to load config: {error}"),
+        }
+    }
+
+    if verbose {
+        print_bridge_banner(host, port);
+    }
+
+    let listener = TcpListener::bind(format!("{host}:{port}"))?;
+    let mut handler = BridgeHttpHandler::new(registry);
+    for stream in listener.incoming() {
+        handle_tcp_connection(&mut handler, stream?)?;
+    }
+    Ok(())
+}
+
+fn print_bridge_banner(host: &str, port: u16) {
+    println!("Cross-Environment Debug Bridge");
+    println!("{}", "=".repeat(40));
+    println!("URL: http://{host}:{port}");
+    println!("Protocol: {PROTOCOL_VERSION}");
+    println!();
+    println!("Endpoints:");
+    println!("  GET  /health           - Health check");
+    println!("  GET  /contracts        - List registered contracts");
+    println!("  POST /register         - Register a contract");
+    println!("  POST /request-trace    - Request trace from environment");
+    println!("  POST /submit-trace     - Submit completed trace");
+    println!();
+    println!("Press Ctrl+C to stop");
+    println!("{}", "=".repeat(40));
+}
+
+fn handle_tcp_connection(
+    handler: &mut BridgeHttpHandler,
+    mut stream: TcpStream,
+) -> std::io::Result<()> {
+    let request = read_http_request(&mut stream)?;
+    let response = match parse_http_request(&request) {
+        Some((method, path, body)) => handler.handle_request(method, path, body),
+        None => HttpResponse::error("Invalid HTTP request", 400),
+    };
+    stream.write_all(response.to_http_response().as_bytes())
+}
+
+fn read_http_request(stream: &mut TcpStream) -> std::io::Result<String> {
+    let mut data = Vec::new();
+    let mut buffer = [0_u8; 512];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        data.extend_from_slice(&buffer[..read]);
+
+        if let Some(header_end) = find_header_end(&data) {
+            let headers = String::from_utf8_lossy(&data[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim())
+                    })
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_len = data.len().saturating_sub(header_end + 4);
+            if body_len >= content_length {
+                break;
+            }
+        }
+    }
+    String::from_utf8(data)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn parse_http_request(request: &str) -> Option<(&str, &str, Option<&str>)> {
+    let (head, body) = request.split_once("\r\n\r\n")?;
+    let request_line = head.lines().next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method, path, (!body.is_empty()).then_some(body)))
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 impl ContractRegistry {
@@ -528,12 +788,16 @@ fn default_success() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
     use serde_json::json;
 
     use super::{
-        detect_stylus_bytecode, BridgeMessage, CallArgument, ContractInfo, ContractRegistry,
-        CrossEnvCall, CrossEnvTrace, Environment, MessageType, SourceLocation, TraceRequest,
-        TraceResponse, PROTOCOL_VERSION,
+        detect_stylus_bytecode, handle_tcp_connection, parse_http_request, BridgeHttpHandler,
+        BridgeMessage, CallArgument, ContractInfo, ContractRegistry, CrossEnvCall, CrossEnvTrace,
+        Environment, MessageType, SourceLocation, TraceRequest, TraceResponse, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -735,5 +999,119 @@ mod tests {
         assert!(detect_stylus_bytecode(&[0xef, 0x00, 0x01, 0x00]));
         assert!(detect_stylus_bytecode(b"\x00asm\x00\x00\x00\x00"));
         assert!(!detect_stylus_bytecode(&[0x60, 0x80, 0x60, 0x40]));
+    }
+
+    #[test]
+    fn bridge_http_handler_serves_health_and_info() {
+        let mut handler = BridgeHttpHandler::default();
+
+        let info = handler.handle_request("GET", "/", None);
+        assert_eq!(info.status_code, 200);
+        assert_eq!(info.body["protocol_version"], PROTOCOL_VERSION);
+        assert!(info.body["endpoints"]
+            .as_array()
+            .expect("endpoints")
+            .contains(&json!("GET /health")));
+
+        let health = handler.handle_request("GET", "/health", None);
+        assert_eq!(health.status_code, 200);
+        assert_eq!(health.body["status"], "healthy");
+        assert_eq!(health.body["contracts_registered"], 0);
+    }
+
+    #[test]
+    fn bridge_http_handler_registers_lists_gets_and_deletes_contracts() {
+        let mut handler = BridgeHttpHandler::default();
+        let body = json!({
+            "address": "ABCDEF",
+            "environment": "stylus",
+            "name": "Stylus",
+            "project_path": "proj"
+        })
+        .to_string();
+
+        let registered = handler.handle_request("POST", "/register", Some(&body));
+        assert_eq!(registered.status_code, 200);
+        assert_eq!(registered.body["status"], "registered");
+        assert_eq!(registered.body["contract"]["address"], "0xabcdef");
+
+        let listed = handler.handle_request("GET", "/contracts", None);
+        assert_eq!(listed.body["count"], 1);
+        assert_eq!(listed.body["contracts"][0]["environment"], "stylus");
+
+        let fetched = handler.handle_request("GET", "/contract/0xabcdef", None);
+        assert_eq!(fetched.status_code, 200);
+        assert_eq!(fetched.body["name"], "Stylus");
+
+        let deleted = handler.handle_request("DELETE", "/contract/abcdef", None);
+        assert_eq!(deleted.status_code, 200);
+        assert_eq!(deleted.body["status"], "unregistered");
+
+        let missing = handler.handle_request("GET", "/contract/abcdef", None);
+        assert_eq!(missing.status_code, 404);
+    }
+
+    #[test]
+    fn bridge_http_handler_reports_bad_json_and_unported_trace_endpoints() {
+        let mut handler = BridgeHttpHandler::default();
+
+        let bad = handler.handle_request("POST", "/register", Some("{"));
+        assert_eq!(bad.status_code, 400);
+        assert!(bad.body["error"]
+            .as_str()
+            .expect("error")
+            .contains("Failed to register contract"));
+
+        let trace = handler.handle_request("POST", "/request-trace", Some("{}"));
+        assert_eq!(trace.status_code, 501);
+        assert!(trace.body["error"]
+            .as_str()
+            .expect("error")
+            .contains("not ported"));
+
+        let missing_address = handler.handle_request("POST", "/register", Some("{}"));
+        assert_eq!(missing_address.status_code, 400);
+        assert_eq!(missing_address.body["error"], "Address is required");
+
+        let unknown = handler.handle_request("GET", "/unknown", None);
+        assert_eq!(unknown.status_code, 404);
+    }
+
+    #[test]
+    fn parses_http_request_line_and_body() {
+        let request = concat!(
+            "POST /register HTTP/1.1\r\n",
+            "Host: localhost\r\n",
+            "Content-Length: 13\r\n",
+            "\r\n",
+            "{\"name\":\"C\"}"
+        );
+        let (method, path, body) = parse_http_request(request).expect("parse request");
+
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/register");
+        assert_eq!(body, Some("{\"name\":\"C\"}"));
+    }
+
+    #[test]
+    fn bridge_tcp_connection_returns_json_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind bridge test server");
+        let address = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client");
+            let mut handler = BridgeHttpHandler::default();
+            handle_tcp_connection(&mut handler, stream).expect("handle request");
+        });
+
+        let mut client = TcpStream::connect(address).expect("connect client");
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write request");
+        let mut response = String::new();
+        client.read_to_string(&mut response).expect("read response");
+        server.join().expect("join server");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"status\":\"healthy\""));
     }
 }

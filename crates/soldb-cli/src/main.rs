@@ -201,9 +201,7 @@ fn main() -> ExitCode {
         Command::Simulate(args) => simulate_command(&args),
         Command::ListEvents(args) => list_events_command(&args),
         Command::ListContracts(args) => list_contracts_command(&args),
-        Command::Bridge(_) => Err(soldb_core::SoldbError::Message(
-            "soldb Rust CLI skeleton: command implementation is not ported yet".to_owned(),
-        )),
+        Command::Bridge(args) => bridge_command(&args),
     };
 
     match result {
@@ -213,6 +211,21 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
+    let verbose = !args.quiet && !args.json;
+    if verbose {
+        println!(
+            "Starting SolDB Cross-Environment Bridge on {}:{}...",
+            args.host, args.port
+        );
+    }
+
+    soldb_bridge::run_bridge_server(&args.host, args.port, verbose, args.config_file.as_deref())
+        .map_err(|error| {
+            soldb_core::SoldbError::Message(format!("Error starting bridge server: {error}"))
+        })
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {

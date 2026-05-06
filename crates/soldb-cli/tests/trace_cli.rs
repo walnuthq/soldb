@@ -21,6 +21,25 @@ const BALANCE_UPDATED_ABI: &str = r#"[
 ]"#;
 
 #[test]
+fn bridge_invalid_host_reports_start_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "bridge",
+            "--host",
+            "999.999.999.999",
+            "--port",
+            "8765",
+            "--json",
+        ])
+        .output()
+        .expect("run soldb");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("Error starting bridge server:"));
+}
+
+#[test]
 fn trace_json_uses_rpc_trace_data() {
     let rpc_url = start_rpc_server(3);
     let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
