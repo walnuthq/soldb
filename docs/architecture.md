@@ -23,22 +23,23 @@ Returns step-by-step execution trace
 ```
 
 **Key Files:**
-- `src/soldb/transaction_tracer.py` - Handles RPC communication and trace retrieval
+- `crates/soldb-rpc/src/lib.rs` - Handles JSON-RPC communication and trace retrieval
+- `crates/soldb-cli/src/main.rs` - Wires trace data into user-facing commands
 
 ### 2. Execution Trace Structure
 
 The node returns a detailed trace for every EVM instruction executed:
 
-```python
+```json
 {
-    "pc": 123,           # Program Counter
-    "op": "PUSH1",       # Opcode
-    "gas": 100000,       # Remaining gas
-    "gasCost": 3,        # Cost of this operation
-    "depth": 1,          # Call stack depth
-    "stack": ["0x4"],    # Stack state
-    "memory": "0x...",   # Memory state
-    "storage": {...}     # Storage state
+    "pc": 123,
+    "op": "PUSH1",
+    "gas": 100000,
+    "gasCost": 3,
+    "depth": 1,
+    "stack": ["0x4"],
+    "memory": "0x...",
+    "storage": {}
 }
 ```
 
@@ -132,69 +133,54 @@ The system analyzes the execution trace to reconstruct function calls:
 
 ## Key Implementation Details
 
-### Transaction Loading (`transaction_tracer.py`)
+### Transaction Loading (`soldb-rpc`)
 
-```python
-def trace_transaction(tx_hash, rpc_url, ethdebug_dir):
-    # 1. Connect to node
-    w3 = Web3(HTTPProvider(rpc_url))
-    
-    # 2. Fetch transaction
-    tx = w3.eth.get_transaction(tx_hash)
-    receipt = w3.eth.get_transaction_receipt(tx_hash)
-    
-    # 3. Get execution trace
-    trace = w3.manager.request_blocking("debug_traceTransaction", 
-        [tx_hash, {"tracer": "callTracer", "tracerConfig": {...}}])
-    
-    # 4. Load ETHDebug mappings
-    ethdebug = load_ethdebug_files(ethdebug_dir, receipt.contractAddress)
-    
-    # 5. Correlate and analyze
-    return analyze_trace(trace, ethdebug)
+```rust
+pub fn trace_transaction(rpc_url: &str, tx_hash: &str) -> SoldbResult<TransactionTrace> {
+    let transaction = rpc_request(rpc_url, "eth_getTransactionByHash", json!([tx_hash]))?;
+    let receipt = rpc_request(rpc_url, "eth_getTransactionReceipt", json!([tx_hash]))?;
+    let debug = rpc_request(
+        rpc_url,
+        "debug_traceTransaction",
+        json!([tx_hash, {"enableMemory": true, "disableStack": false}]),
+    )?;
+
+    build_transaction_trace(tx_hash, transaction, receipt, debug)
+}
 ```
 
 ### PC to Source Mapping
 
-```python
-def map_pc_to_source(pc, ethdebug_data):
-    # Find instruction at PC
-    instruction = ethdebug_data.instructions.get(pc)
-    if instruction and instruction.context:
-        source_id = instruction.context.source.id
-        offset = instruction.context.source.offset
-        length = instruction.context.source.length
-        
-        # Convert byte offset to line:column
-        source_file = ethdebug_data.sources[source_id]
-        line, column = byte_offset_to_position(source_file.content, offset)
-        
-        return SourceLocation(file=source_file.path, line=line, column=column)
+```rust
+pub fn source_info_for_pc(&self, pc: u64) -> Option<SourceInfo> {
+    let instruction = self.instruction_for_pc(pc)?;
+    let source = instruction.source.as_ref()?;
+    let source_file = self.sources.get(&source.id)?;
+    let (line, column) = byte_offset_to_position(&source_file.content, source.offset);
+
+    Some(SourceInfo {
+        path: source_file.path.clone(),
+        line,
+        column,
+    })
+}
 ```
 
 ### Function Call Detection
 
-```python
-def analyze_function_calls(trace, ethdebug):
-    call_stack = []
-    current_calls = []
-    
-    for step in trace:
-        if step.op == "JUMPDEST":
-            # Check if this is a function entry
-            source = map_pc_to_source(step.pc, ethdebug)
-            if is_function_declaration(source):
-                function = extract_function_info(source, step)
-                current_calls.append(function)
-                
-        elif step.op in ["RETURN", "STOP", "REVERT"]:
-            # Function exit
-            if current_calls:
-                completed_call = current_calls.pop()
-                completed_call.gas_used = calculate_gas_used(completed_call, step)
-                call_stack.append(completed_call)
-    
-    return build_call_tree(call_stack)
+```rust
+pub fn summarize_calls(trace: &TransactionTrace, metadata: &ContractMetadata) -> Vec<FunctionCall> {
+    trace
+        .steps
+        .iter()
+        .filter_map(|step| metadata.function_at_pc(step.pc))
+        .map(|function| FunctionCall {
+            name: function.name,
+            source: function.source,
+            gas_used: trace.gas_used,
+        })
+        .collect()
+}
 ```
 
 ## Why This Architecture Works

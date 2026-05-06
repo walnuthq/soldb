@@ -19,7 +19,6 @@ RUN_SIMULATE_TESTS=true
 RUN_EVENTS_TESTS=true
 RUN_CLI_TESTS=true
 VERBOSE=false
-RUN_COVERAGE=false
 SEPOLIA_KEY=""
 
 for arg in "$@"; do
@@ -61,7 +60,8 @@ for arg in "$@"; do
             shift
             ;;
         --coverage)
-            RUN_COVERAGE=true
+            # Backward-compatible no-op. Implementation coverage is handled by
+            # cargo llvm-cov; this script always runs the Rust soldb binary.
             shift
             ;;
         -h|--help)
@@ -73,7 +73,7 @@ for arg in "$@"; do
             echo "  --events-only      Run only events tests (from test/events/)"
             echo "  --cli-only         Run only CLI tests (from test/cli/)"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
-            echo "  --coverage         Join coverage runs; uses Rust soldb for LIT invocations"
+            echo "  --coverage         Accepted for compatibility; use cargo llvm-cov for coverage"
             echo "  -v, --verbose      Run tests with verbose output"
             echo "  -h, --help         Show this help message"
             echo ""
@@ -89,7 +89,6 @@ for arg in "$@"; do
             echo "  SOLDB_BIN          Path to soldb executable override"
             echo "  TEST_TX            Specific transaction hash to test"
             echo "  SEPOLIA_KEY        Optimism Sepolia API key (can also use --sepolia-key)"
-            echo "  COVERAGE_FILE      Coverage data file base path (default: .coverage in project root)"
             echo ""
             echo "Examples:"
             echo "  $0                           # Run all tests"
@@ -334,12 +333,9 @@ elif [ -f "${PROJECT_DIR}/MyEnv/bin/soldb" ]; then
     echo -e "${GREEN}Using venv soldb${NC}"
 else
     echo -e "${RED}Error: soldb not found${NC}"
-    echo "Install with: pip install -e ${PROJECT_DIR}"
+    echo "Build it with: cargo build --bin soldb"
+    echo "Or install it with: cargo install --path ${PROJECT_DIR}/crates/soldb-cli"
     exit 1
-fi
-
-if [ "$RUN_COVERAGE" = true ]; then
-    echo -e "${GREEN}Using Rust soldb for LIT coverage run${NC}"
 fi
 
 # Create lit config with relative paths

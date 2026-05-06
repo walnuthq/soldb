@@ -1090,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_defaults_match_python_bridge_contract() {
+    fn protocol_defaults_match_bridge_contract() {
         let request = serde_json::from_value::<TraceRequest>(json!({
             "request_id": "req-1"
         }))

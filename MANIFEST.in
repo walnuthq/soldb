@@ -1,8 +1,0 @@
-include README.md
-include LICENSE.md
-recursive-include scripts *.sh
-recursive-include examples *.sol
-exclude soldb.py
-global-exclude *.pyc
-global-exclude __pycache__
-global-exclude .DS_Store

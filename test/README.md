@@ -6,13 +6,11 @@ This directory contains the test infrastructure for SolDB.
 
 ```
 test/
-├── unit/            # Pytest tests for Python entrypoint shims
 ├── trace/           # Trace command tests (lit + FileCheck)
 ├── simulate/        # Simulate command tests (lit + FileCheck)
 ├── events/          # Events command tests (lit + FileCheck)
 ├── cli/             # CLI command and validation tests (lit + FileCheck)
 ├── stylus/          # Stylus interop test contracts and scripts
-├── conftest.py      # Shared pytest constants
 ├── run-tests.sh     # Main test runner script
 ├── lit.cfg.py       # Test framework configuration
 ├── lit.site.cfg.py  # Generated site-specific configuration (gitignored)
@@ -63,12 +61,6 @@ Tests for command-line parsing and shared command behavior:
 - **list-contracts-basic.test**: Contract listing for a local transaction
 - **bridge-invalid-host.test**: Bridge command startup error handling
 
-### Unit Tests (`test/unit/`)
-
-Pytest now covers the Python console-script shims that dispatch installed
-entrypoints to the Rust binaries. Runtime behavior is covered by Rust tests and
-lit tests.
-
 ### Stylus Interop Tests (`test/stylus/`)
 
 Tests for Solidity <> Stylus cross-environment tracing:
@@ -108,30 +100,16 @@ cd test
 ./run-tests.sh -v
 ```
 
-### Run Python Shim Tests
-
-```bash
-pytest test/unit
-```
-
 ### Run with Coverage
 
 ```bash
-coverage erase
-coverage run --parallel-mode -m pytest test/unit
-./run-tests.sh --coverage
-coverage combine
-coverage report
-coverage html
-coverage xml
+cargo llvm-cov --workspace --all-targets --fail-under-lines 80
+./run-tests.sh
 ```
 
-This records pytest coverage for Python entrypoint shims, then runs the Rust
-`soldb` binary through lit. Rust coverage is generated separately with
-`cargo llvm-cov`.
-CI enforces a 70% total coverage gate for the remaining Python shim scope
-configured in `pyproject.toml`, plus at least 80% coverage on Python lines
-changed in each pull request.
+This records implementation coverage for the Rust workspace and then runs the
+Rust `soldb` binary through lit as an end-to-end command test. CI enforces at
+least 80% Rust line coverage.
 
 ### Run Remote Tests with Sepolia API Key
 

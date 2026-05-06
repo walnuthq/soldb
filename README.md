@@ -17,9 +17,9 @@ SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
 
 ## Quick Start
 
-Install via pip:
+Install the Rust CLI:
 ```bash
-pip install git+https://github.com/walnuthq/soldb.git
+cargo install --git https://github.com/walnuthq/soldb.git soldb-cli
 ```
 
 Run against a local node (Anvil):
@@ -219,10 +219,8 @@ Call Stack:
 ```bash
 git clone https://github.com/walnuthq/soldb.git
 cd soldb
-python3 -m venv venv
-source venv/bin/activate
-cargo build --bin soldb --bin soldb-dap-server
-pip install -e .
+cargo install --path crates/soldb-cli
+cargo install --path crates/soldb-dap
 ```
 
 ### Run Automated Tests
