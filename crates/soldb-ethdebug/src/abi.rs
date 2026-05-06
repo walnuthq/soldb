@@ -114,32 +114,12 @@ pub fn encode_function_call(signature: &str, args: &[String]) -> SoldbResult<Str
         .zip(args)
         .map(|(arg_type, arg_value)| encode_arg(arg_type, arg_value))
         .collect::<SoldbResult<Vec<_>>>()?;
-    let head_size_bytes = encoded_args.len() * 32;
-    let tail_size = encoded_args
-        .iter()
-        .filter_map(|arg| match arg {
-            EncodedArg::Static(_) => None,
-            EncodedArg::Dynamic(tail) => Some(tail.len()),
-        })
-        .sum::<usize>();
+    let payload = encode_tuple_payload(encoded_args);
 
-    let mut encoded = String::with_capacity(2 + 8 + args.len() * 64 + tail_size);
+    let mut encoded = String::with_capacity(2 + 8 + payload.len());
     encoded.push_str("0x");
     encoded.push_str(&bytes_to_hex(&selector));
-
-    let mut tails = String::with_capacity(tail_size);
-    let mut dynamic_offset = head_size_bytes;
-    for arg in encoded_args {
-        match arg {
-            EncodedArg::Static(word) => encoded.push_str(&word),
-            EncodedArg::Dynamic(tail) => {
-                encoded.push_str(&format!("{dynamic_offset:064x}"));
-                dynamic_offset += tail.len() / 2;
-                tails.push_str(&tail);
-            }
-        }
-    }
-    encoded.push_str(&tails);
+    encoded.push_str(&payload);
     Ok(encoded)
 }
 
@@ -228,6 +208,12 @@ enum EncodedArg {
 
 fn encode_arg(arg_type: &str, value: &str) -> SoldbResult<EncodedArg> {
     let arg_type = arg_type.trim();
+    if let Some(base_type) = arg_type.strip_suffix("[]") {
+        return Ok(EncodedArg::Dynamic(encode_dynamic_array(
+            base_type.trim(),
+            value,
+        )?));
+    }
     if arg_type == "string" {
         return Ok(EncodedArg::Dynamic(encode_dynamic_bytes(value.as_bytes())));
     }
@@ -238,6 +224,71 @@ fn encode_arg(arg_type: &str, value: &str) -> SoldbResult<EncodedArg> {
     }
 
     encode_static_arg(arg_type, value).map(EncodedArg::Static)
+}
+
+fn encode_tuple_payload(encoded_args: Vec<EncodedArg>) -> String {
+    let head_size_bytes = encoded_args.len() * 32;
+    let tail_size = encoded_args
+        .iter()
+        .filter_map(|arg| match arg {
+            EncodedArg::Static(_) => None,
+            EncodedArg::Dynamic(tail) => Some(tail.len()),
+        })
+        .sum::<usize>();
+
+    let mut encoded = String::with_capacity(encoded_args.len() * 64 + tail_size);
+    let mut tails = String::with_capacity(tail_size);
+    let mut dynamic_offset = head_size_bytes;
+    for arg in encoded_args {
+        match arg {
+            EncodedArg::Static(word) => encoded.push_str(&word),
+            EncodedArg::Dynamic(tail) => {
+                encoded.push_str(&format!("{dynamic_offset:064x}"));
+                dynamic_offset += tail.len() / 2;
+                tails.push_str(&tail);
+            }
+        }
+    }
+    encoded.push_str(&tails);
+    encoded
+}
+
+fn encode_dynamic_array(base_type: &str, value: &str) -> SoldbResult<String> {
+    let values = serde_json::from_str::<Value>(value).map_err(|error| {
+        SoldbError::Message(format!(
+            "Array argument for type '{base_type}[]' must be JSON: {error}"
+        ))
+    })?;
+    let values = values.as_array().ok_or_else(|| {
+        SoldbError::Message(format!(
+            "Array argument for type '{base_type}[]' must be a JSON array"
+        ))
+    })?;
+
+    let encoded_elements = values
+        .iter()
+        .map(|item| encode_arg(base_type, &json_value_to_arg_string(item)?))
+        .collect::<SoldbResult<Vec<_>>>()?;
+
+    let mut encoded = format!("{:064x}", values.len());
+    encoded.push_str(&encode_tuple_payload(encoded_elements));
+    Ok(encoded)
+}
+
+fn json_value_to_arg_string(value: &Value) -> SoldbResult<String> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Array(_) => serde_json::to_string(value)
+            .map_err(|error| SoldbError::Message(format!("Invalid array argument: {error}"))),
+        Value::Null => Err(SoldbError::Message(
+            "Null ABI array values are not supported".to_owned(),
+        )),
+        Value::Object(_) => Err(SoldbError::Message(
+            "Object ABI array values are not supported".to_owned(),
+        )),
+    }
 }
 
 fn encode_static_arg(arg_type: &str, value: &str) -> SoldbResult<String> {
@@ -267,9 +318,10 @@ fn encode_static_arg(arg_type: &str, value: &str) -> SoldbResult<String> {
 }
 
 fn encode_uint_arg(arg_type: &str, value: &str) -> SoldbResult<String> {
-    validate_uint_type(arg_type)?;
-    let parsed = parse_u128_value(value)?;
-    Ok(format!("{parsed:064x}"))
+    let bits = validate_uint_type(arg_type)?;
+    let encoded = parse_uint_word(value)?;
+    validate_uint_fits_bits(&encoded, bits, value)?;
+    Ok(encoded)
 }
 
 fn encode_int_arg(arg_type: &str, value: &str) -> SoldbResult<String> {
@@ -349,17 +401,18 @@ fn parse_hex_bytes(value: &str) -> SoldbResult<Vec<u8>> {
         .collect()
 }
 
-fn validate_uint_type(arg_type: &str) -> SoldbResult<()> {
+fn validate_uint_type(arg_type: &str) -> SoldbResult<u16> {
     validate_int_bit_width(arg_type.strip_prefix("uint").unwrap_or_default(), "uint")
 }
 
 fn validate_int_type(arg_type: &str) -> SoldbResult<()> {
-    validate_int_bit_width(arg_type.strip_prefix("int").unwrap_or_default(), "int")
+    validate_int_bit_width(arg_type.strip_prefix("int").unwrap_or_default(), "int")?;
+    Ok(())
 }
 
-fn validate_int_bit_width(width: &str, label: &str) -> SoldbResult<()> {
+fn validate_int_bit_width(width: &str, label: &str) -> SoldbResult<u16> {
     if width.is_empty() {
-        return Ok(());
+        return Ok(256);
     }
 
     let bits = width.parse::<u16>().map_err(|error| {
@@ -370,18 +423,54 @@ fn validate_int_bit_width(width: &str, label: &str) -> SoldbResult<()> {
             "Invalid {label} bit width: {bits}"
         )));
     }
-    Ok(())
+    Ok(bits)
 }
 
-fn parse_u128_value(value: &str) -> SoldbResult<u128> {
-    if let Some(hex) = value.strip_prefix("0x") {
-        u128::from_str_radix(hex, 16)
-            .map_err(|error| SoldbError::Message(format!("Invalid uint value '{value}': {error}")))
-    } else {
-        value
-            .parse::<u128>()
-            .map_err(|error| SoldbError::Message(format!("Invalid uint value '{value}': {error}")))
+fn parse_uint_word(value: &str) -> SoldbResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(SoldbError::Message("Invalid uint value: empty".to_owned()));
     }
+
+    if let Some(hex) = value.strip_prefix("0x") {
+        if hex.is_empty() || hex.len() > 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SoldbError::Message(format!("Invalid uint value: {value}")));
+        }
+        return Ok(format!("{:0>64}", hex.to_ascii_lowercase()));
+    }
+
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SoldbError::Message(format!("Invalid uint value: {value}")));
+    }
+
+    let mut bytes = [0_u8; 32];
+    for digit in value.bytes().map(|byte| byte - b'0') {
+        let mut carry = u16::from(digit);
+        for byte in bytes.iter_mut().rev() {
+            let next = u16::from(*byte) * 10 + carry;
+            *byte = (next & 0xff) as u8;
+            carry = next >> 8;
+        }
+        if carry != 0 {
+            return Err(SoldbError::Message(format!(
+                "Uint value exceeds 256 bits: {value}"
+            )));
+        }
+    }
+    Ok(bytes_to_hex(&bytes))
+}
+
+fn validate_uint_fits_bits(encoded_word: &str, bits: u16, value: &str) -> SoldbResult<()> {
+    let unused_hex_digits = usize::from(256 - bits) / 4;
+    if encoded_word[..unused_hex_digits]
+        .bytes()
+        .any(|byte| byte != b'0')
+    {
+        return Err(SoldbError::Message(format!(
+            "Uint value does not fit uint{bits}: {value}"
+        )));
+    }
+    Ok(())
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -558,6 +647,14 @@ mod tests {
             .expect("calldata"),
             "0xa9059cbb0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000002a"
         );
+        assert_eq!(
+            encode_function_call(
+                "set(uint256)",
+                &["1606938044258990275541962092341162602522202993782792835301376".to_owned()],
+            )
+            .expect("calldata"),
+            "0x60fe47b10000000000000100000000000000000000000000000000000000000000000000"
+        );
     }
 
     #[test]
@@ -624,14 +721,40 @@ mod tests {
     }
 
     #[test]
+    fn encodes_dynamic_array_function_calls() {
+        assert_eq!(
+            encode_function_call("set(uint256[])", &["[1,2,3]".to_owned()]).expect("calldata"),
+            "0x6ea9bfc500000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000003"
+        );
+
+        assert_eq!(
+            encode_function_call("set(string[])", &["[\"a\",\"bb\"]".to_owned()])
+                .expect("calldata"),
+            "0x52e66db800000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000001610000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000026262000000000000000000000000000000000000000000000000000000000000"
+        );
+
+        assert_eq!(
+            encode_function_call(
+                "mix(uint256[],string)",
+                &["[1,2]".to_owned(), "ok".to_owned()],
+            )
+            .expect("calldata"),
+            "0xb613ef8d000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000026f6b000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_or_invalid_encoding() {
         assert!(encode_function_call("set(uint256)", &[]).is_err());
+        assert!(encode_function_call("set(uint8)", &["256".to_owned()]).is_err());
         assert!(encode_function_call("set(address)", &["0x1".to_owned()]).is_err());
         assert!(encode_function_call("set(bool)", &["maybe".to_owned()]).is_err());
         assert!(encode_function_call("set(bytes)", &["0xabc".to_owned()]).is_err());
         assert!(encode_function_call("set(bytes)", &["0xzz".to_owned()]).is_err());
         assert!(encode_function_call("set(bytes2)", &["0xab".to_owned()]).is_err());
         assert!(encode_function_call("set(bytes33)", &["0xab".to_owned()]).is_err());
+        assert!(encode_function_call("set(uint256[])", &["1,2".to_owned()]).is_err());
+        assert!(encode_function_call("set(address[])", &["[\"0x1\"]".to_owned()]).is_err());
     }
 
     fn hex(bytes: &[u8]) -> String {

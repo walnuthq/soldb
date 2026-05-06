@@ -243,6 +243,38 @@ fn simulate_json_encodes_static_abi_call() {
 }
 
 #[test]
+fn simulate_json_encodes_dynamic_array_abi_call() {
+    let rpc_url = start_rpc_server(1);
+    let expected_input =
+        encode_function_call("set(uint256[])", &["[1,2,3]".to_owned()]).expect("calldata");
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "simulate",
+            "0x2",
+            "set(uint256[])",
+            "[1,2,3]",
+            "--from",
+            "0x1",
+            "--rpc",
+            &rpc_url,
+            "--ethdebug-dir",
+            "0x2:TestContract:out",
+            "--json",
+        ])
+        .output()
+        .expect("run soldb");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains(&format!("\"input\": \"{expected_input}\"")));
+    assert!(stdout.contains("\"function_name\": \"set(uint256[])\""));
+}
+
+#[test]
 fn simulate_raw_data_prints_call_summary() {
     let rpc_url = start_rpc_server(1);
     let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
