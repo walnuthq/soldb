@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::process::Command;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -49,6 +50,14 @@ impl HttpJsonRpcClient {
             "params": params,
         });
         let body = payload.to_string();
+        if self.endpoint.scheme == HttpScheme::Https {
+            return self.request_value_with_curl(method, &body);
+        }
+
+        self.request_value_with_tcp(method, &body)
+    }
+
+    fn request_value_with_tcp(&self, method: &str, body: &str) -> SoldbResult<Value> {
         let mut stream = TcpStream::connect(self.endpoint.socket_addr()).map_err(|error| {
             SoldbError::Message(format!(
                 "Failed to connect to {}: {error}",
@@ -81,10 +90,72 @@ impl HttpJsonRpcClient {
         })?;
         parse_http_json_response(method, &response)
     }
+
+    fn request_value_with_curl(&self, method: &str, body: &str) -> SoldbResult<Value> {
+        let output = Command::new("curl")
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                &self.timeout.as_secs().to_string(),
+                "--header",
+                "Content-Type: application/json",
+                "--data",
+                body,
+                &self.endpoint.url(),
+            ])
+            .output()
+            .map_err(|error| {
+                SoldbError::Message(format!(
+                    "Failed to start curl for HTTPS RPC {}: {error}",
+                    self.endpoint.url()
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SoldbError::Message(format!(
+                "HTTPS RPC request {method} failed for {}: {}",
+                self.endpoint.url(),
+                stderr.trim()
+            )));
+        }
+
+        let body = String::from_utf8(output.stdout).map_err(|error| {
+            SoldbError::Message(format!(
+                "Invalid UTF-8 HTTPS RPC response for {method}: {error}"
+            ))
+        })?;
+        parse_json_rpc_body(method, &body)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpScheme {
+    Http,
+    Https,
+}
+
+impl HttpScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+
+    fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HttpEndpoint {
+    scheme: HttpScheme,
     host: String,
     port: u16,
     path: String,
@@ -92,9 +163,13 @@ struct HttpEndpoint {
 
 impl HttpEndpoint {
     fn parse(url: &str) -> SoldbResult<Self> {
-        let Some(rest) = url.strip_prefix("http://") else {
+        let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
+            (HttpScheme::Http, rest)
+        } else if let Some(rest) = url.strip_prefix("https://") {
+            (HttpScheme::Https, rest)
+        } else {
             return Err(SoldbError::Message(format!(
-                "Only http:// RPC URLs are supported by the Rust client for now: {url}"
+                "Only http:// and https:// RPC URLs are supported by the Rust client: {url}"
             )));
         };
 
@@ -107,19 +182,26 @@ impl HttpEndpoint {
             return Err(SoldbError::Message(format!("Invalid RPC URL: {url}")));
         }
 
-        let (host, port) =
-            authority
-                .rsplit_once(':')
-                .map_or((authority.to_owned(), 80), |(host, port)| {
-                    let parsed_port = port.parse::<u16>().unwrap_or(80);
-                    (host.to_owned(), parsed_port)
-                });
+        let (host, port) = authority.rsplit_once(':').map_or(
+            (authority.to_owned(), scheme.default_port()),
+            |(host, port)| {
+                let parsed_port = port
+                    .parse::<u16>()
+                    .unwrap_or_else(|_| scheme.default_port());
+                (host.to_owned(), parsed_port)
+            },
+        );
 
         if host.is_empty() {
             return Err(SoldbError::Message(format!("Invalid RPC URL: {url}")));
         }
 
-        Ok(Self { host, port, path })
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            path,
+        })
     }
 
     fn socket_addr(&self) -> String {
@@ -127,7 +209,7 @@ impl HttpEndpoint {
     }
 
     fn host_header(&self) -> String {
-        if self.port == 80 {
+        if self.port == self.scheme.default_port() {
             self.host.clone()
         } else {
             self.socket_addr()
@@ -135,7 +217,12 @@ impl HttpEndpoint {
     }
 
     fn url(&self) -> String {
-        format!("http://{}{}", self.host_header(), self.path)
+        format!(
+            "{}://{}{}",
+            self.scheme.as_str(),
+            self.host_header(),
+            self.path
+        )
     }
 }
 
@@ -152,7 +239,11 @@ fn parse_http_json_response(method: &str, response: &str) -> SoldbResult<Value> 
         )));
     }
 
-    let value = serde_json::from_str::<Value>(body).map_err(|error| {
+    parse_json_rpc_body(method, body)
+}
+
+fn parse_json_rpc_body(method: &str, body: &str) -> SoldbResult<Value> {
+    let value = serde_json::from_str::<Value>(body.trim()).map_err(|error| {
         SoldbError::Message(format!("Invalid JSON response for {method}: {error}"))
     })?;
     if let Some(error) = value.get("error") {
@@ -510,7 +601,8 @@ mod tests {
 
     use super::{
         build_transaction_trace, decode_revert_reason, simulate_call, trace_transaction,
-        transaction_logs, DebugTraceResult, SimulateCallRequest, StructLog, TraceEnvelope,
+        transaction_logs, DebugTraceResult, HttpEndpoint, HttpScheme, SimulateCallRequest,
+        StructLog, TraceEnvelope,
     };
     use serde_json::json;
 
@@ -634,6 +726,42 @@ mod tests {
             result.failure_message().as_deref(),
             Some("Reverted with data: 0xdeadbeef")
         );
+    }
+
+    #[test]
+    fn parses_http_and_https_rpc_endpoints() {
+        let http = HttpEndpoint::parse("http://localhost:8545").expect("http endpoint");
+        assert_eq!(http.scheme, HttpScheme::Http);
+        assert_eq!(http.host_header(), "localhost:8545");
+        assert_eq!(http.url(), "http://localhost:8545/");
+
+        let https = HttpEndpoint::parse("https://rpc.example.com/v1/key").expect("https endpoint");
+        assert_eq!(https.scheme, HttpScheme::Https);
+        assert_eq!(https.host_header(), "rpc.example.com");
+        assert_eq!(https.socket_addr(), "rpc.example.com:443");
+        assert_eq!(https.url(), "https://rpc.example.com/v1/key");
+
+        let https_with_port =
+            HttpEndpoint::parse("https://127.0.0.1:9443/rpc").expect("https port endpoint");
+        assert_eq!(https_with_port.host_header(), "127.0.0.1:9443");
+        assert_eq!(https_with_port.url(), "https://127.0.0.1:9443/rpc");
+    }
+
+    #[test]
+    fn parses_direct_json_rpc_bodies_for_https_transport() {
+        let result = super::parse_json_rpc_body(
+            "web3_clientVersion",
+            r#"{"jsonrpc":"2.0","id":1,"result":"anvil"}"#,
+        )
+        .expect("result");
+        assert_eq!(result, json!("anvil"));
+
+        let error = super::parse_json_rpc_body(
+            "web3_clientVersion",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"message":"boom"}}"#,
+        )
+        .expect_err("rpc error");
+        assert!(error.to_string().contains("returned error"));
     }
 
     #[test]
