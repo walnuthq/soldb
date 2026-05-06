@@ -7,7 +7,7 @@ help:
 	@echo "  make install         Install package locally"
 	@echo "  make dev            Install in development mode"
 	@echo "  make test           Run tests"
-	@echo "  make coverage       Run tests with Python coverage"
+	@echo "  make coverage       Run Python coverage and Rust-backed LIT tests"
 	@echo "  make rust-test      Run Rust workspace tests"
 	@echo "  make test-setup     Setup and verify test environment"
 	@echo "  make test-deploy    Deploy test contracts"

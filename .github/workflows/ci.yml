@@ -80,6 +80,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]'
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build Rust CLI
+        run: cargo build --bin soldb
+
       - name: Syntax check
         run: python -m compileall src/
 
@@ -169,6 +177,9 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - name: Build Rust CLI
+        run: cargo build --bin soldb
 
       - name: Install Rust coverage tool
         run: cargo install cargo-llvm-cov --locked

@@ -73,7 +73,7 @@ for arg in "$@"; do
             echo "  --events-only      Run only events tests (from test/events/)"
             echo "  --cli-only         Run only CLI tests (from test/cli/)"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
-            echo "  --coverage         Run soldb CLI invocations under coverage.py"
+            echo "  --coverage         Join coverage runs; uses Rust soldb unless SOLDB_COVERAGE_PYTHON_CLI=1"
             echo "  -v, --verbose      Run tests with verbose output"
             echo "  -h, --help         Show this help message"
             echo ""
@@ -90,6 +90,7 @@ for arg in "$@"; do
             echo "  TEST_TX            Specific transaction hash to test"
             echo "  SEPOLIA_KEY        Optimism Sepolia API key (can also use --sepolia-key)"
             echo "  COVERAGE_FILE      Coverage data file base path (default: .coverage in project root)"
+            echo "  SOLDB_COVERAGE_PYTHON_CLI=1  Run legacy Python CLI invocations under coverage.py"
             echo ""
             echo "Examples:"
             echo "  $0                           # Run all tests"
@@ -302,13 +303,21 @@ if [ -n "$TEST_TX_NO_EVENTS" ]; then
 fi
 echo ""
 
-# Find soldb - prefer system-wide installation
+# Find soldb - prefer the Rust binary during the migration.
 SOLDB_CMD=""
 SOLDB_TYPE=""
 if [ -n "${SOLDB_BIN:-}" ]; then
     SOLDB_CMD="${SOLDB_BIN}"
     SOLDB_TYPE="override"
     echo -e "${GREEN}Using SOLDB_BIN override: ${SOLDB_CMD}${NC}"
+elif [ -x "${PROJECT_DIR}/target/debug/soldb" ]; then
+    SOLDB_CMD="${PROJECT_DIR}/target/debug/soldb"
+    SOLDB_TYPE="rust"
+    echo -e "${GREEN}Using Rust soldb binary${NC}"
+elif [ -x "${PROJECT_DIR}/target/release/soldb" ]; then
+    SOLDB_CMD="${PROJECT_DIR}/target/release/soldb"
+    SOLDB_TYPE="rust"
+    echo -e "${GREEN}Using release Rust soldb binary${NC}"
 elif command -v soldb &> /dev/null; then
     # Use the soldb executable already selected by PATH.
     SOLDB_CMD="soldb"
@@ -331,24 +340,28 @@ else
 fi
 
 if [ "$RUN_COVERAGE" = true ]; then
-    PYTHON_CMD="${PYTHON:-python}"
-    if [[ "$PYTHON_CMD" != /* && -x "${PROJECT_DIR}/${PYTHON_CMD}" ]]; then
-        PYTHON_CMD="${PROJECT_DIR}/${PYTHON_CMD}"
-    elif [[ "$PYTHON_CMD" != */* ]]; then
-        PYTHON_CMD="$(command -v "$PYTHON_CMD" || echo "$PYTHON_CMD")"
+    if [ "${SOLDB_COVERAGE_PYTHON_CLI:-0}" = "1" ]; then
+        PYTHON_CMD="${PYTHON:-python}"
+        if [[ "$PYTHON_CMD" != /* && -x "${PROJECT_DIR}/${PYTHON_CMD}" ]]; then
+            PYTHON_CMD="${PROJECT_DIR}/${PYTHON_CMD}"
+        elif [[ "$PYTHON_CMD" != */* ]]; then
+            PYTHON_CMD="$(command -v "$PYTHON_CMD" || echo "$PYTHON_CMD")"
+        fi
+        if ! "$PYTHON_CMD" -m coverage --version >/dev/null 2>&1; then
+            echo -e "${RED}Error: coverage.py not found${NC}"
+            echo "Install with: pip install -e '${PROJECT_DIR}[dev]'"
+            exit 1
+        fi
+        COVERAGE_FILE="${COVERAGE_FILE:-${PROJECT_DIR}/.coverage}"
+        COVERAGE_RCFILE="${COVERAGE_RCFILE:-${PROJECT_DIR}/pyproject.toml}"
+        export COVERAGE_FILE
+        export COVERAGE_RCFILE
+        SOLDB_CMD="$PYTHON_CMD -m coverage run --parallel-mode -m soldb.cli.main"
+        SOLDB_TYPE="coverage"
+        echo -e "${GREEN}Using coverage-wrapped Python soldb (${COVERAGE_FILE}.*)${NC}"
+    else
+        echo -e "${GREEN}Using Rust soldb for LIT coverage run${NC}"
     fi
-    if ! "$PYTHON_CMD" -m coverage --version >/dev/null 2>&1; then
-        echo -e "${RED}Error: coverage.py not found${NC}"
-        echo "Install with: pip install -e '${PROJECT_DIR}[dev]'"
-        exit 1
-    fi
-    COVERAGE_FILE="${COVERAGE_FILE:-${PROJECT_DIR}/.coverage}"
-    COVERAGE_RCFILE="${COVERAGE_RCFILE:-${PROJECT_DIR}/pyproject.toml}"
-    export COVERAGE_FILE
-    export COVERAGE_RCFILE
-    SOLDB_CMD="$PYTHON_CMD -m coverage run --parallel-mode -m soldb.cli.main"
-    SOLDB_TYPE="coverage"
-    echo -e "${GREEN}Using coverage-wrapped soldb (${COVERAGE_FILE}.*)${NC}"
 fi
 
 # Create lit config with relative paths

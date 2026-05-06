@@ -5,7 +5,7 @@ SolDB - Ethereum Transaction Debugger
 __version__ = "0.1.0"
 
 # Main entry point
-from .cli.main import main
+from .rust_cli import main
 
 # Core components
 from .core import (

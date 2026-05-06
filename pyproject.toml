@@ -51,7 +51,7 @@ Repository = "https://github.com/walnuthq/soldb.git"
 Issues = "https://github.com/walnuthq/soldb/issues"
 
 [project.scripts]
-soldb = "soldb.cli.main:main"
+soldb = "soldb.rust_cli:main"
 soldb-dap-server = "tools.dap_server:main"
 
 [tool.setuptools]
