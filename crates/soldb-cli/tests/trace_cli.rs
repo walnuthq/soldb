@@ -21,6 +21,40 @@ const BALANCE_UPDATED_ABI: &str = r#"[
 ]"#;
 
 #[test]
+fn help_and_version_are_served_by_rust_cli() {
+    let help = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .arg("--help")
+        .output()
+        .expect("run soldb help");
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout).expect("utf8 help");
+    assert!(stdout.contains("SolDB - Ethereum transaction analysis tool"));
+    assert!(stdout.contains("trace"));
+    assert!(stdout.contains("simulate"));
+    assert!(stdout.contains("list-events"));
+
+    let version = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .arg("--version")
+        .output()
+        .expect("run soldb version");
+    assert!(version.status.success());
+    let stdout = String::from_utf8(version.stdout).expect("utf8 version");
+    assert!(stdout.contains("soldb 0.1.0"));
+}
+
+#[test]
+fn missing_command_reports_clap_usage_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .output()
+        .expect("run soldb without command");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("Usage:"));
+    assert!(stderr.contains("<COMMAND>"));
+}
+
+#[test]
 fn bridge_invalid_host_reports_start_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
         .args([

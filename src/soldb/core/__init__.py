@@ -5,7 +5,6 @@ This module contains the main business logic for transaction tracing and debuggi
 - TransactionTracer: Traces EVM transactions
 - EVMDebugger: Interactive debugger REPL
 - TraceSerializer: Serializes traces to JSON format
-- AutoDeployDebugger: Automated deployment and debugging
 """
 
 from .transaction_tracer import (
@@ -17,7 +16,6 @@ from .transaction_tracer import (
 )
 from .serializer import TraceSerializer
 from .evm_repl import EVMDebugger
-from .auto_deploy import AutoDeployDebugger
 
 __all__ = [
     'TransactionTracer',
@@ -27,5 +25,4 @@ __all__ = [
     'StackVariable',
     'TraceSerializer',
     'EVMDebugger',
-    'AutoDeployDebugger',
 ]

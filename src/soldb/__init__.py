@@ -25,13 +25,6 @@ from .parsers import (
     SourceMapInfo,
 )
 
-# Compiler
-from .compiler import (
-    CompilerConfig,
-    CompilationError,
-    dual_compile,
-)
-
 # Utilities
 from .utils import (
     Colors,
@@ -57,10 +50,6 @@ __all__ = [
     'MultiContractETHDebugParser',
     'SourceMapParser',
     'SourceMapInfo',
-    # Compiler
-    'CompilerConfig',
-    'CompilationError',
-    'dual_compile',
     # Utils
     'Colors',
     'error', 'warning', 'info', 'success',

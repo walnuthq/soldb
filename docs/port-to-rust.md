@@ -1,17 +1,18 @@
 # Port To Rust Plan
 
-This branch ports SolDB incrementally. Python remains the behavior reference until
-the Rust binary passes the same lit and integration tests for a migrated surface.
+This branch ports SolDB incrementally. Rust now owns the CLI, compiler,
+auto-deploy, RPC transport, ABI/event decoding, DAP entrypoint, bridge protocol,
+and lit command execution. Python remains only for still-unported debugger,
+parser, serializer, bridge-server/client, and utility internals.
 
 ## Invariants
 
-- Keep the existing Python `soldb` CLI working until an equivalent Rust command is
-  covered by parity tests.
+- Keep existing behavior covered by parity tests before removing Python modules.
 - Keep Python coverage at the configured gate while Python code remains in use.
 - Add Rust coverage as soon as Rust behavior exists; do not use Python coverage to
   hide untested Rust code.
-- Run lit tests through a configurable `SOLDB_BIN` so the same tests can exercise
-  Python or Rust.
+- Run lit tests through the Rust `soldb` binary by default; `SOLDB_BIN` remains
+  configurable for local experiments.
 
 ## Target Workspace
 
@@ -36,3 +37,11 @@ the Rust binary passes the same lit and integration tests for a migrated surface
 7. Port Stylus bridge and DAP after trace/simulate behavior is stable.
 8. Switch lit defaults to Rust command by command, then remove Python modules only
    after parity and coverage are in place.
+
+## Removed Python Surfaces
+
+- `src/soldb/cli/*`
+- `src/soldb/compiler/*`
+- `src/soldb/core/auto_deploy.py`
+- `src/tools/dap_server.py`
+- `src/tools/dap_utils.py`
