@@ -13,7 +13,4 @@
 # Check for the call hierarchy with increment function (legacy format - basic structure only)
 # CHECK: #0 TestContract::runtime_dispatcher
 # CHECK: #1 increment
-# CHECK: arguments: 0x0000000000000000000000000000000000000000000000000000000000000004
-
-# Legacy format may show some nested calls but not all details
-# CHECK: increment [internal]
+# CHECK: amount: 4

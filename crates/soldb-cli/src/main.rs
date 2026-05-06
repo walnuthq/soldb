@@ -2,17 +2,88 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use soldb_core::{SoldbResult, TransactionTrace};
 use soldb_ethdebug::{
-    encode_function_call, parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent,
-    EventRegistry,
+    encode_function_call, function_selector, parse_ethdebug_spec, parse_event_abis,
+    parse_signature, parse_variable_locations, DecodedEvent, EthdebugInfo, EventRegistry,
+    Instruction,
 };
 use soldb_repl::{DebuggerCommand, DebuggerState, StepOutcome};
 use soldb_rpc::RpcLog;
+use std::collections::BTreeMap;
+use std::env;
+use std::fmt::Display;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn colors_enabled() -> bool {
+    *COLORS_ENABLED.get_or_init(|| {
+        if let Some(force) = env::var_os("CLICOLOR_FORCE") {
+            return force.to_string_lossy() != "0";
+        }
+        if env::var_os("NO_COLOR").is_some() {
+            return false;
+        }
+        io::stdout().is_terminal() && env::var("TERM").map_or(true, |term| term != "dumb")
+    })
+}
+
+fn paint(value: impl Display, code: &str) -> String {
+    let text = value.to_string();
+    if colors_enabled() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text
+    }
+}
+
+fn bold(value: impl Display) -> String {
+    paint(value, "1")
+}
+
+fn dim(value: impl Display) -> String {
+    paint(value, "2")
+}
+
+fn info(value: impl Display) -> String {
+    paint(value, "96")
+}
+
+fn success(value: impl Display) -> String {
+    paint(value, "92")
+}
+
+fn warning(value: impl Display) -> String {
+    paint(value, "93")
+}
+
+fn error_color(value: impl Display) -> String {
+    paint(value, "91")
+}
+
+fn opcode_color(value: impl Display) -> String {
+    paint(value, "94")
+}
+
+fn address_color(value: impl Display) -> String {
+    paint(value, "95")
+}
+
+fn number_color(value: impl Display) -> String {
+    paint(value, "93")
+}
+
+fn function_color(value: impl Display) -> String {
+    paint(value, "95")
+}
+
+fn separator(width: usize) -> String {
+    dim("-".repeat(width))
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -444,6 +515,7 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
             args,
             &contract_address,
             contract_name.as_deref(),
+            &calldata,
             &display_function_name,
         );
         run_interactive_debugger(trace, "Simulation debugger")?;
@@ -498,21 +570,51 @@ fn print_simulation_interactive_prelude(
     args: &SimulateArgs,
     contract_address: &str,
     auto_contract_name: Option<&str>,
+    calldata: &str,
     function_name: &str,
 ) {
     let contract_name = auto_contract_name
         .map(str::to_owned)
         .or_else(|| simulate_contract_name(args))
         .unwrap_or_else(|| contract_address.to_owned());
-    println!("Contract: {contract_name}");
-    println!("Simulating {}", format_simulated_call(args, function_name));
+    println!("{} {}", info("Contract:"), function_color(&contract_name));
+    println!(
+        "{} {}",
+        info("Simulating"),
+        function_color(format_simulated_call(args, function_name))
+    );
     if let Some(source_file) = simulation_source_file(args, &contract_name) {
-        println!("{source_file}");
+        println!("{}", dim(source_file));
     }
-    println!("=> contract {contract_name}");
-    if let Some(amount) = args.function_args.first() {
-        println!("Parameters:");
-        println!("amount: {amount}");
+    println!("{} {}", dim("=> contract"), function_color(&contract_name));
+    if !args.function_args.is_empty() {
+        println!("{}", info("Parameters:"));
+        let params = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+            .ok()
+            .and_then(|specs| {
+                specs
+                    .into_iter()
+                    .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
+            })
+            .map(|descriptor| descriptor.params)
+            .unwrap_or_else(|| {
+                args.function_args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| DecodedCallParam {
+                        name: format!("arg{index}"),
+                        value: value.clone(),
+                        raw: false,
+                    })
+                    .collect()
+            });
+        for param in params {
+            println!(
+                "{} {}",
+                info(format!("{}:", param.name)),
+                number_color(param.value)
+            );
+        }
     }
 }
 
@@ -521,13 +623,19 @@ fn run_interactive_debugger(trace: TransactionTrace, title: &str) -> SoldbResult
     let mut state = DebuggerState::new();
     state.load_trace(trace);
 
-    println!("Starting interactive debugger...");
+    println!("{}", bold(info("Starting interactive debugger...")));
     if let Some(address) = contract_address {
-        println!("Contract found: {address}");
+        println!("{} {}", info("Contract found:"), address_color(address));
     }
-    println!("Transaction loaded. {} steps.", state.step_count());
-    println!("Loaded trace with {} steps", state.step_count());
-    println!("{title}");
+    println!(
+        "Transaction loaded. {} steps.",
+        number_color(state.step_count())
+    );
+    println!(
+        "Loaded trace with {} steps",
+        number_color(state.step_count())
+    );
+    println!("{}", bold(info(title)));
     print_current_debugger_step(&state);
 
     let stdin = io::stdin();
@@ -551,15 +659,15 @@ fn run_interactive_debugger(trace: TransactionTrace, title: &str) -> SoldbResult
         match command {
             DebuggerCommand::Empty => {}
             DebuggerCommand::Quit => {
-                println!("Exiting debugger.");
+                println!("{}", info("Exiting debugger."));
                 break;
             }
             DebuggerCommand::Help(topic) => print_debugger_help(topic.as_deref()),
             DebuggerCommand::Mode(None) => {
-                println!("Mode: {}", state.display_mode.as_str());
+                println!("{} {}", info("Mode:"), bold(state.display_mode.as_str()));
             }
             DebuggerCommand::Unknown(command) => {
-                println!("Unknown command: {command}");
+                println!("{} {}", warning("Unknown command:"), command);
             }
             command => {
                 if let Some(outcome) = state.apply_command(command) {
@@ -574,48 +682,88 @@ fn run_interactive_debugger(trace: TransactionTrace, title: &str) -> SoldbResult
 
 fn print_current_debugger_step(state: &DebuggerState) {
     let Some(step) = state.current_step_data() else {
-        println!("No trace loaded.");
+        println!("{}", warning("No trace loaded."));
         return;
     };
     let max_step = state.step_count().saturating_sub(1);
     println!(
         "Step {}/{} | PC {} | {} | gas {}",
-        state.current_step, max_step, step.pc, step.op, step.gas
+        number_color(state.current_step),
+        number_color(max_step),
+        number_color(step.pc),
+        opcode_color(&step.op),
+        success(step.gas)
     );
-    println!("Step {}/{}", state.current_step, max_step,);
-    println!("PC: {} | {} | Gas: {} |", step.pc, step.op, step.gas);
+    println!(
+        "Step {}/{}",
+        number_color(state.current_step),
+        number_color(max_step)
+    );
+    println!(
+        "PC: {} | {} | Gas: {} |",
+        number_color(step.pc),
+        opcode_color(&step.op),
+        success(step.gas)
+    );
     println!(
         "[ Step {} | Gas: {} | PC: {} | {} ]",
-        state.current_step, step.gas, step.pc, step.op
+        number_color(state.current_step),
+        success(step.gas),
+        number_color(step.pc),
+        opcode_color(&step.op)
     );
     if !step.stack.is_empty() {
-        println!("Stack: {}", format_stack(&step.stack));
+        println!("{} {}", info("Stack:"), format_stack(&step.stack));
     }
 }
 
 fn print_step_outcome(state: &DebuggerState, outcome: &StepOutcome) {
     match outcome {
-        StepOutcome::NoTrace => println!("No trace loaded."),
+        StepOutcome::NoTrace => println!("{}", warning("No trace loaded.")),
         StepOutcome::Moved { .. } => print_current_debugger_step(state),
         StepOutcome::BreakpointHit { step, pc } => {
-            println!("Breakpoint hit at step {step}, PC {pc}");
+            println!(
+                "{} step {}, PC {}",
+                success("Breakpoint hit at"),
+                number_color(step),
+                number_color(pc)
+            );
             print_current_debugger_step(state);
         }
         StepOutcome::AtEnd { step } => {
-            println!("End of trace at step {step}");
+            println!("{} {}", info("End of trace at step"), number_color(step));
             print_current_debugger_step(state);
         }
         StepOutcome::InvalidStep {
             requested,
             max_step,
         } => match max_step {
-            Some(max_step) => println!("Invalid step {requested}; max step is {max_step}"),
-            None => println!("Invalid step {requested}; trace is empty"),
+            Some(max_step) => println!(
+                "{} {}; max step is {}",
+                warning("Invalid step"),
+                number_color(requested),
+                number_color(max_step)
+            ),
+            None => println!(
+                "{} {}; trace is empty",
+                warning("Invalid step"),
+                number_color(requested)
+            ),
         },
-        StepOutcome::ModeChanged(mode) => println!("Mode: {}", mode.as_str()),
-        StepOutcome::BreakpointSet(pc) => println!("Breakpoint set at PC {pc}"),
-        StepOutcome::BreakpointCleared(pc) => println!("Breakpoint cleared at PC {pc}"),
-        StepOutcome::BreakpointMissing(pc) => println!("No breakpoint set at PC {pc}"),
+        StepOutcome::ModeChanged(mode) => println!("{} {}", info("Mode:"), bold(mode.as_str())),
+        StepOutcome::BreakpointSet(pc) => {
+            println!("{} PC {}", success("Breakpoint set at"), number_color(pc));
+        }
+        StepOutcome::BreakpointCleared(pc) => {
+            println!("{} PC {}", info("Breakpoint cleared at"), number_color(pc));
+        }
+        StepOutcome::BreakpointMissing(pc) => {
+            println!(
+                "{} PC {}",
+                warning("No breakpoint set at"),
+                number_color(pc)
+            );
+        }
     }
 }
 
@@ -692,74 +840,77 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
         return;
     };
     let metadata = trace_debug_metadata(&spec);
-    let function_name = trace_display_function_name(&trace.input_data);
 
     println!(
-        "Loading transaction {}",
-        trace.tx_hash.as_deref().unwrap_or("<simulated>")
+        "{} {}",
+        info("Loading transaction"),
+        address_color(trace.tx_hash.as_deref().unwrap_or("<simulated>"))
     );
     if metadata.is_legacy {
-        println!("Debug format: srcmap-runtime");
+        println!("{} {}", info("Debug format:"), bold("srcmap-runtime"));
     }
-    println!("Contract: {}", spec.name);
+    println!("{} {}", info("Contract:"), function_color(&spec.name));
     if let Some(compiler) = metadata.compiler_version {
-        println!("Compiler: solc {compiler}");
+        println!("{} solc {}", info("Compiler:"), number_color(compiler));
     }
-    println!("Function Call Trace:");
-    println!("Gas used: {}", trace.gas_used);
+    println!("{}", bold(info("Function Call Trace:")));
+    println!("{} {}", info("Gas used:"), success(trace.gas_used));
     if let Some(error) = &trace.error {
-        println!("Error: {error}");
+        println!("{} {}", error_color("Error:"), error_color(error));
     }
     println!();
-    println!("Call Stack:");
-    println!("------------------------------------------------------------");
-    println!("#0 {}::runtime_dispatcher", spec.name);
-    if function_name != "raw_data" {
-        println!("#1 {function_name}");
-        if let Some(argument_word) = first_uint256_arg_word(&trace.input_data) {
-            if metadata.is_legacy {
-                println!("  arguments: {argument_word}");
-            } else {
-                let amount = decode_single_uint256_arg(&trace.input_data).unwrap_or_default();
-                println!("  amount: {amount}");
-            }
-        }
-        if function_name == "increment" {
-            if metadata.is_legacy {
-                println!("  increment [internal]");
-            } else {
-                println!("  increment2 [internal]");
-                println!("  increment3 [internal]");
-            }
-        }
-    }
-    println!("------------------------------------------------------------");
-    println!("Use --raw flag to see detailed instruction trace");
+    println!("{}", bold(info("Call Stack:")));
+    println!("{}", separator(60));
+    println!(
+        "{} {}",
+        dim("#0"),
+        function_color(format!("{}::runtime_dispatcher", spec.name))
+    );
+    print_call_frames(&build_trace_call_frames(trace, &spec, None));
+    println!("{}", separator(60));
+    println!(
+        "{}",
+        dim("Use --raw flag to see detailed instruction trace")
+    );
 }
 
 fn print_plain_trace_summary(trace: &TransactionTrace) {
     println!(
-        "Transaction {}",
-        trace.tx_hash.as_deref().unwrap_or("<simulated>")
+        "{} {}",
+        info("Transaction"),
+        address_color(trace.tx_hash.as_deref().unwrap_or("<simulated>"))
     );
-    println!(
-        "Status: {}",
-        if trace.success { "SUCCESS" } else { "REVERTED" }
-    );
-    println!("Gas used: {}", trace.gas_used);
-    println!("Steps: {}", trace.steps.len());
+    let status = if trace.success {
+        success("SUCCESS")
+    } else {
+        error_color("REVERTED")
+    };
+    println!("{} {}", info("Status:"), status);
+    println!("{} {}", info("Gas used:"), success(trace.gas_used));
+    println!("{} {}", info("Steps:"), number_color(trace.steps.len()));
     if let Some(error) = &trace.error {
-        println!("Error: {error}");
+        println!("{} {}", error_color("Error:"), error_color(error));
     }
 }
 
 fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
-    println!("Loading transaction {}", args.tx_hash);
+    println!(
+        "{} {}",
+        info("Loading transaction"),
+        address_color(&args.tx_hash)
+    );
     if let Some(contract_name) = trace_contract_name(args) {
-        println!("Contract: {contract_name}");
+        println!("{} {}", info("Contract:"), function_color(contract_name));
     }
-    println!("Execution trace");
-    println!("Step | PC | Op | Gas | Stack");
+    println!("{}", bold(info("Execution trace")));
+    println!(
+        "{} | {} | {} | {} | {}",
+        bold("Step"),
+        bold("PC"),
+        bold("Op"),
+        bold("Gas"),
+        bold("Stack")
+    );
 
     let max_steps = if args.max_steps < 0 {
         trace.steps.len()
@@ -769,22 +920,34 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
         println!(
-            "{index:>4} | {:>4} | {:<14} | {:>8} | {}",
-            step.pc,
-            step.op,
-            step.gas,
+            "{} | {} | {} | {} | {}",
+            number_color(format!("{index:>4}")),
+            number_color(format!("{:>4}", step.pc)),
+            opcode_color(format!("{:<14}", step.op)),
+            success(format!("{:>8}", step.gas)),
             format_stack(&step.stack)
         );
     }
 }
 
 fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_address: &str) {
-    println!("Simulating call to {contract_address}");
+    println!(
+        "{} {}",
+        info("Simulating call to"),
+        address_color(contract_address)
+    );
     if let Some(contract_name) = simulate_contract_name(args) {
-        println!("Contract: {contract_name}");
+        println!("{} {}", info("Contract:"), function_color(contract_name));
     }
-    println!("Execution trace");
-    println!("Step | PC | Op | Gas | Stack");
+    println!("{}", bold(info("Execution trace")));
+    println!(
+        "{} | {} | {} | {} | {}",
+        bold("Step"),
+        bold("PC"),
+        bold("Op"),
+        bold("Gas"),
+        bold("Stack")
+    );
 
     let max_steps = if args.max_steps < 0 {
         trace.steps.len()
@@ -794,10 +957,11 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
         println!(
-            "{index:>4} | {:>4} | {:<14} | {:>8} | {}",
-            step.pc,
-            step.op,
-            step.gas,
+            "{} | {} | {} | {} | {}",
+            number_color(format!("{index:>4}")),
+            number_color(format!("{:>4}", step.pc)),
+            opcode_color(format!("{:<14}", step.op)),
+            success(format!("{:>8}", step.gas)),
             format_stack(&step.stack)
         );
     }
@@ -817,46 +981,778 @@ fn print_simulation_summary(
         .unwrap_or_else(|| contract_address.to_owned());
     let has_debug_info = !args.ethdebug_dir.is_empty() || args.contracts.is_some();
     if !has_debug_info {
-        println!("Connecting to RPC: {}", args.rpc_url);
+        println!(
+            "{} {}",
+            info("Connecting to RPC:"),
+            address_color(&args.rpc_url)
+        );
         if let Some(signature) = &args.function_signature {
-            println!("No ABI files found. Proceeding with function signature: {signature}");
+            println!(
+                "{} {}",
+                warning("No ABI files found. Proceeding with function signature:"),
+                function_color(signature)
+            );
         }
     }
-    println!("Contract: {contract_name}");
-    println!("Function Call Trace:");
-    println!("Gas used: {}", trace.gas_used);
-    println!(
-        "Status: {}",
-        if trace.success { "SUCCESS" } else { "REVERTED" }
-    );
+    println!("{} {}", info("Contract:"), function_color(&contract_name));
+    println!("{}", bold(info("Function Call Trace:")));
+    println!("{} {}", info("Gas used:"), success(trace.gas_used));
+    let status = if trace.success {
+        success("SUCCESS")
+    } else {
+        error_color("REVERTED")
+    };
+    println!("{} {}", info("Status:"), status);
     if let Some(error) = &trace.error {
-        println!("Error: {error}");
+        println!("{} {}", error_color("Error:"), error_color(error));
     }
     println!();
-    println!("Call Stack:");
-    println!("------------------------------------------------------------");
-    println!("#0 {contract_name}::runtime_dispatcher");
-    let function_label = if !has_debug_info {
-        args.function_signature.as_deref().unwrap_or(function_name)
+    println!("{}", bold(info("Call Stack:")));
+    println!("{}", separator(60));
+    println!(
+        "{} {}",
+        dim("#0"),
+        function_color(format!("{contract_name}::runtime_dispatcher"))
+    );
+    let fallback = simulated_call_descriptor(args, raw_data, function_name);
+    print_call_frames(&build_simulation_call_frames(
+        trace, args, raw_data, fallback,
+    ));
+    println!("{}", separator(60));
+    println!(
+        "{}",
+        dim("Use --raw flag to see detailed instruction trace")
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallFrame {
+    name: String,
+    params: Vec<DecodedCallParam>,
+    source_params: Vec<SourceParam>,
+    raw_stack: Vec<String>,
+    internal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallDescriptor {
+    name: String,
+    params: Vec<DecodedCallParam>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedCallParam {
+    name: String,
+    value: String,
+    raw: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceFunction {
+    source_id: u64,
+    name: String,
+    params: Vec<SourceParam>,
+    declaration_start: u64,
+    body_end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceParam {
+    name: String,
+    ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceSourceIndex {
+    info: EthdebugInfo,
+    functions: Vec<SourceFunction>,
+}
+
+impl TraceSourceIndex {
+    fn load(spec: &ResolvedContractSpec) -> SoldbResult<Self> {
+        let metadata_path = spec.debug_dir.join("ethdebug.json");
+        let runtime_path = find_runtime_ethdebug(&spec.debug_dir, &spec.name).ok_or_else(|| {
+            soldb_core::SoldbError::Message(format!(
+                "No ETHDebug runtime file found in {}",
+                spec.debug_dir.display()
+            ))
+        })?;
+
+        let metadata = read_json_file(&metadata_path)?;
+        let runtime = read_json_file(&runtime_path)?;
+        let instructions = runtime
+            .get("instructions")
+            .cloned()
+            .map(serde_json::from_value::<Vec<Instruction>>)
+            .transpose()
+            .map_err(|error| {
+                soldb_core::SoldbError::Message(format!(
+                    "Invalid instructions in {}: {error}",
+                    runtime_path.display()
+                ))
+            })?
+            .unwrap_or_default();
+        let compilation = metadata
+            .get("compilation")
+            .cloned()
+            .unwrap_or_else(|| metadata.clone());
+        let sources = parse_compilation_sources(&compilation);
+        let variable_locations = parse_variable_locations(&runtime)?;
+        let info = EthdebugInfo {
+            compilation,
+            contract_name: spec.name.clone(),
+            environment: "runtime".to_owned(),
+            instructions,
+            sources,
+            variable_locations,
+        };
+
+        let mut functions = Vec::new();
+        for (source_id, source_path) in &info.sources {
+            if let Some(source) = read_debug_source(&spec.debug_dir, source_path) {
+                functions.extend(parse_source_functions(*source_id, &source));
+            }
+        }
+
+        Ok(Self { info, functions })
+    }
+
+    fn function_at_pc(&self, pc: u64) -> Option<&SourceFunction> {
+        let location = self.info.instruction_at_pc(pc)?.source_location()?;
+        self.functions
+            .iter()
+            .filter(|function| {
+                function.source_id == location.source_id
+                    && function.declaration_start <= location.offset
+                    && location.offset <= function.body_end
+            })
+            .min_by_key(|function| function.body_end - function.declaration_start)
+    }
+
+    fn descriptor_for_calldata(&self, calldata: &str) -> Option<CallDescriptor> {
+        let selector = selector_from_calldata(calldata)?;
+        self.functions.iter().find_map(|function| {
+            let signature = source_function_signature(function);
+            let function_selector = selector_hex(function_selector(&signature).ok()?);
+            (function_selector == selector)
+                .then(|| descriptor_from_source_function(function, calldata))
+        })
+    }
+}
+
+fn print_call_frames(frames: &[CallFrame]) {
+    for (index, frame) in frames.iter().enumerate() {
+        if frame.internal {
+            println!(
+                "{} {} {}",
+                dim(format!("#{}", index + 1)),
+                function_color(&frame.name),
+                dim("[internal]")
+            );
+        } else {
+            println!(
+                "{} {}",
+                dim(format!("#{}", index + 1)),
+                function_color(&frame.name)
+            );
+        }
+        for param in &frame.params {
+            let label = if param.raw {
+                format!("{} raw:", param.name)
+            } else {
+                format!("{}:", param.name)
+            };
+            println!("  {} {}", info(label), number_color(&param.value));
+        }
+        if frame.internal && !frame.source_params.is_empty() && frame.params.is_empty() {
+            let signature = frame
+                .source_params
+                .iter()
+                .map(|param| format!("{}:{}", param.name, param.ty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  {} {}", info("args:"), dim(signature));
+            if !frame.raw_stack.is_empty() {
+                println!(
+                    "  {} {}",
+                    info("raw stack:"),
+                    number_color(format_raw_stack(&frame.raw_stack))
+                );
+            }
+        }
+    }
+}
+
+fn build_trace_call_frames(
+    trace: &TransactionTrace,
+    spec: &ResolvedContractSpec,
+    fallback: Option<CallDescriptor>,
+) -> Vec<CallFrame> {
+    let source_index = TraceSourceIndex::load(spec).ok();
+    let descriptor = source_index
+        .as_ref()
+        .and_then(|index| index.descriptor_for_calldata(&trace.input_data))
+        .or_else(|| abi_descriptor_for_calldata(spec, &trace.input_data))
+        .or(fallback);
+    build_call_frames(trace, source_index.as_ref(), descriptor)
+}
+
+fn build_simulation_call_frames(
+    trace: &TransactionTrace,
+    args: &SimulateArgs,
+    raw_data: &str,
+    fallback: Option<CallDescriptor>,
+) -> Vec<CallFrame> {
+    let source_index = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .ok()
+        .and_then(|specs| {
+            specs
+                .into_iter()
+                .find_map(|spec| TraceSourceIndex::load(&spec).ok())
+        });
+    let descriptor = source_index
+        .as_ref()
+        .and_then(|index| index.descriptor_for_calldata(raw_data))
+        .or_else(|| {
+            resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+                .ok()
+                .and_then(|specs| {
+                    specs
+                        .into_iter()
+                        .find_map(|spec| abi_descriptor_for_calldata(&spec, raw_data))
+                })
+        })
+        .or(fallback);
+    build_call_frames(trace, source_index.as_ref(), descriptor)
+}
+
+fn build_call_frames(
+    trace: &TransactionTrace,
+    source_index: Option<&TraceSourceIndex>,
+    descriptor: Option<CallDescriptor>,
+) -> Vec<CallFrame> {
+    let mut frames = Vec::<CallFrame>::new();
+
+    if let Some(index) = source_index {
+        for step in &trace.steps {
+            let Some(function) = index.function_at_pc(step.pc) else {
+                continue;
+            };
+            if frames.iter().any(|frame| frame.name == function.name) {
+                continue;
+            }
+            frames.push(CallFrame {
+                name: function.name.clone(),
+                params: Vec::new(),
+                source_params: function.params.clone(),
+                raw_stack: step.stack.clone(),
+                internal: false,
+            });
+        }
+    }
+
+    if let Some(descriptor) = descriptor {
+        if let Some(frame) = frames
+            .iter_mut()
+            .find(|frame| frame.name == descriptor.name)
+        {
+            frame.params = descriptor.params;
+        } else {
+            frames.insert(
+                0,
+                CallFrame {
+                    name: descriptor.name,
+                    params: descriptor.params,
+                    source_params: Vec::new(),
+                    raw_stack: Vec::new(),
+                    internal: false,
+                },
+            );
+        }
+    }
+
+    for (index, frame) in frames.iter_mut().enumerate() {
+        frame.internal = index > 0;
+    }
+
+    frames
+}
+
+fn call_descriptor_for_calldata(
+    spec: &ResolvedContractSpec,
+    calldata: &str,
+) -> Option<CallDescriptor> {
+    TraceSourceIndex::load(spec)
+        .ok()
+        .and_then(|index| index.descriptor_for_calldata(calldata))
+        .or_else(|| abi_descriptor_for_calldata(spec, calldata))
+}
+
+fn simulated_call_descriptor(
+    args: &SimulateArgs,
+    raw_data: &str,
+    function_name: &str,
+) -> Option<CallDescriptor> {
+    if let Some(signature) = &args.function_signature {
+        let parsed = parse_signature(signature)?;
+        let has_debug_info = !args.ethdebug_dir.is_empty() || args.contracts.is_some();
+        let params = parsed
+            .arg_types
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                args.function_args.get(index).map(|value| DecodedCallParam {
+                    name: format!("arg{index}"),
+                    value: value.clone(),
+                    raw: false,
+                })
+            })
+            .collect();
+        return Some(CallDescriptor {
+            name: if has_debug_info {
+                parsed.name
+            } else {
+                signature.clone()
+            },
+            params,
+        });
+    }
+
+    if function_name != "raw_data" {
+        return Some(CallDescriptor {
+            name: function_name.to_owned(),
+            params: Vec::new(),
+        });
+    }
+
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .ok()
+        .and_then(|specs| {
+            specs
+                .into_iter()
+                .find_map(|spec| call_descriptor_for_calldata(&spec, raw_data))
+        })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FunctionAbiEntry {
+    #[serde(rename = "type")]
+    item_type: String,
+    name: Option<String>,
+    #[serde(default)]
+    inputs: Vec<FunctionAbiInput>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FunctionAbiInput {
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "type")]
+    ty: String,
+}
+
+fn abi_descriptor_for_calldata(
+    spec: &ResolvedContractSpec,
+    calldata: &str,
+) -> Option<CallDescriptor> {
+    let selector = selector_from_calldata(calldata)?;
+    let entries = abi_entries_for_spec(spec)?;
+    entries
+        .into_iter()
+        .filter(|entry| entry.item_type == "function")
+        .find_map(|entry| {
+            let name = entry.name?;
+            let signature = format!(
+                "{}({})",
+                name,
+                entry
+                    .inputs
+                    .iter()
+                    .map(|input| input.ty.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let function_selector = selector_hex(function_selector(&signature).ok()?);
+            if function_selector != selector {
+                return None;
+            }
+            let params = entry
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, input)| {
+                    let name = if input.name.is_empty() {
+                        format!("arg{index}")
+                    } else {
+                        input.name.clone()
+                    };
+                    decode_calldata_word(calldata, index, &input.ty).map(|word| DecodedCallParam {
+                        name,
+                        value: word.value,
+                        raw: word.raw,
+                    })
+                })
+                .collect();
+            Some(CallDescriptor { name, params })
+        })
+}
+
+fn abi_entries_for_spec(spec: &ResolvedContractSpec) -> Option<Vec<FunctionAbiEntry>> {
+    if let Some(abi_path) = abi_path_for_contract(&spec.debug_dir, &spec.name) {
+        let content = fs::read_to_string(abi_path).ok()?;
+        return serde_json::from_str::<Vec<FunctionAbiEntry>>(&content).ok();
+    }
+
+    let combined = read_json_file(&spec.debug_dir.join("combined.json")).ok()?;
+    let contracts = combined.get("contracts")?.as_object()?;
+    contracts
+        .iter()
+        .find(|(key, _)| {
+            key.rsplit_once(':')
+                .map_or(*key == &spec.name, |(_, name)| name == spec.name)
+        })
+        .and_then(|(_, contract)| contract.get("abi").cloned())
+        .and_then(|abi| serde_json::from_value::<Vec<FunctionAbiEntry>>(abi).ok())
+}
+
+fn descriptor_from_source_function(function: &SourceFunction, calldata: &str) -> CallDescriptor {
+    let params = function
+        .params
+        .iter()
+        .enumerate()
+        .filter_map(|(index, param)| {
+            decode_calldata_word(calldata, index, &param.ty).map(|word| DecodedCallParam {
+                name: param.name.clone(),
+                value: word.value,
+                raw: word.raw,
+            })
+        })
+        .collect();
+    CallDescriptor {
+        name: function.name.clone(),
+        params,
+    }
+}
+
+fn source_function_signature(function: &SourceFunction) -> String {
+    format!(
+        "{}({})",
+        function.name,
+        function
+            .params
+            .iter()
+            .map(|param| param.ty.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn selector_from_calldata(calldata: &str) -> Option<String> {
+    let data = calldata.trim_start_matches("0x");
+    let selector = data.get(..8)?;
+    selector
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit())
+        .then(|| selector.to_ascii_lowercase())
+}
+
+fn selector_hex(selector: [u8; 4]) -> String {
+    selector
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedWord {
+    value: String,
+    raw: bool,
+}
+
+fn decode_calldata_word(calldata: &str, index: usize, ty: &str) -> Option<DecodedWord> {
+    let data = calldata.trim_start_matches("0x");
+    let start = 8 + index * 64;
+    let word = data.get(start..start + 64)?;
+    decode_static_word(word, ty).map_or_else(
+        || {
+            Some(DecodedWord {
+                value: format!("0x{}", word.to_ascii_lowercase()),
+                raw: true,
+            })
+        },
+        |value| Some(DecodedWord { value, raw: false }),
+    )
+}
+
+fn decode_static_word(word: &str, ty: &str) -> Option<String> {
+    let ty = ty.trim();
+    if ty.starts_with("uint") {
+        return Some(format_uint_word(word));
+    }
+    if ty == "address" {
+        return Some(format!("0x{}", &word[word.len().saturating_sub(40)..]).to_ascii_lowercase());
+    }
+    if ty == "bool" {
+        return Some((word.trim_start_matches('0') == "1").to_string());
+    }
+    if ty == "bytes32" {
+        return Some(format!("0x{}", word.to_ascii_lowercase()));
+    }
+    None
+}
+
+fn format_uint_word(word: &str) -> String {
+    let trimmed = word.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return "0".to_owned();
+    }
+    if trimmed.len() <= 32 {
+        return u128::from_str_radix(trimmed, 16)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| format!("0x{}", trimmed.to_ascii_lowercase()));
+    }
+    format!("0x{}", trimmed.to_ascii_lowercase())
+}
+
+fn format_raw_stack(stack: &[String]) -> String {
+    if stack.is_empty() {
+        return "[empty]".to_owned();
+    }
+    stack
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("[{index}] {}", normalize_hex(value)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn find_runtime_ethdebug(root: &Path, contract_name: &str) -> Option<PathBuf> {
+    let named = root.join(format!("{contract_name}_ethdebug-runtime.json"));
+    if named.exists() {
+        return Some(named);
+    }
+
+    fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_ethdebug-runtime.json"))
+        })
+}
+
+fn parse_compilation_sources(compilation: &serde_json::Value) -> BTreeMap<u64, String> {
+    compilation
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|source| {
+            Some((
+                source.get("id")?.as_u64()?,
+                source.get("path")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+fn read_debug_source(root: &Path, source_path: &str) -> Option<String> {
+    let source = Path::new(source_path);
+    let mut candidates = Vec::new();
+    if source.is_absolute() {
+        candidates.push(source.to_path_buf());
     } else {
-        function_name
+        candidates.push(root.join(source));
+        if let Some(parent) = root.parent() {
+            candidates.push(parent.join(source));
+        }
+        candidates.push(source.to_path_buf());
+    }
+
+    candidates
+        .into_iter()
+        .find_map(|candidate| fs::read_to_string(candidate).ok())
+}
+
+fn parse_source_functions(source_id: u64, source: &str) -> Vec<SourceFunction> {
+    let mut functions = Vec::new();
+    let mut cursor = 0;
+    while let Some(keyword_start) = find_solidity_keyword(source, "function", cursor) {
+        let mut index = keyword_start + "function".len();
+        index = skip_ascii_whitespace(source, index);
+        let Some((name, name_end)) = parse_identifier(source, index) else {
+            cursor = index;
+            continue;
+        };
+        index = skip_ascii_whitespace(source, name_end);
+        let Some(params_start) = source.as_bytes().get(index).filter(|byte| **byte == b'(') else {
+            cursor = index;
+            continue;
+        };
+        let _ = params_start;
+        let Some(params_end) = find_matching_delimiter(source, index, b'(', b')') else {
+            cursor = index + 1;
+            continue;
+        };
+        let params = parse_source_params(&source[index + 1..params_end]);
+        let Some(body_start) = find_next_byte(source, params_end + 1, b'{') else {
+            cursor = params_end + 1;
+            continue;
+        };
+        let Some(body_end) = find_matching_delimiter(source, body_start, b'{', b'}') else {
+            cursor = body_start + 1;
+            continue;
+        };
+
+        functions.push(SourceFunction {
+            source_id,
+            name: name.to_owned(),
+            params,
+            declaration_start: keyword_start as u64,
+            body_end: body_end as u64,
+        });
+        cursor = body_end + 1;
+    }
+    functions
+}
+
+fn parse_source_params(params: &str) -> Vec<SourceParam> {
+    split_top_level_commas(params)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, param)| {
+            let param = param.trim();
+            if param.is_empty() {
+                return None;
+            }
+            let mut tokens = param.split_whitespace().collect::<Vec<_>>();
+            let name = tokens
+                .last()
+                .copied()
+                .filter(|token| is_identifier(token))
+                .map_or_else(|| format!("arg{index}"), str::to_owned);
+            if tokens.last().copied() == Some(name.as_str()) && tokens.len() > 1 {
+                tokens.pop();
+            }
+            let ty = tokens
+                .into_iter()
+                .filter(|token| !matches!(*token, "memory" | "calldata" | "storage" | "payable"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!ty.is_empty()).then_some(SourceParam { name, ty })
+        })
+        .collect()
+}
+
+fn split_top_level_commas(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    for (index, byte) in input.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&input[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+fn find_solidity_keyword(source: &str, keyword: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    while let Some(relative) = source[cursor..].find(keyword) {
+        let absolute = cursor + relative;
+        let before = absolute
+            .checked_sub(1)
+            .and_then(|index| source.as_bytes().get(index))
+            .copied();
+        let after = source.as_bytes().get(absolute + keyword.len()).copied();
+        if before.is_none_or(|byte| !is_identifier_byte(byte))
+            && after.is_none_or(|byte| !is_identifier_byte(byte))
+        {
+            return Some(absolute);
+        }
+        cursor = absolute + keyword.len();
+    }
+    None
+}
+
+fn parse_identifier(source: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = source.as_bytes();
+    let first = *bytes.get(start)?;
+    if !is_identifier_start_byte(first) {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes.get(end).is_some_and(|byte| is_identifier_byte(*byte)) {
+        end += 1;
+    }
+    Some((&source[start..end], end))
+}
+
+fn is_identifier(input: &str) -> bool {
+    let mut bytes = input.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
     };
-    println!("#1 {function_label}");
-    if let Some(amount) = decode_single_uint256_arg(raw_data) {
-        println!("  amount: {amount}");
+    is_identifier_start_byte(first) && bytes.all(is_identifier_byte)
+}
+
+fn is_identifier_start_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    is_identifier_start_byte(byte) || byte.is_ascii_digit()
+}
+
+fn skip_ascii_whitespace(source: &str, mut index: usize) -> usize {
+    while source
+        .as_bytes()
+        .get(index)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        index += 1;
     }
-    if function_name == "increment" {
-        println!("  increment2 [internal]");
-        println!("  increment3 [internal]");
+    index
+}
+
+fn find_next_byte(source: &str, start: usize, needle: u8) -> Option<usize> {
+    source
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, byte)| (*byte == needle).then_some(index))
+}
+
+fn find_matching_delimiter(source: &str, open_index: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 0_i32;
+    for (index, byte) in source.bytes().enumerate().skip(open_index) {
+        if byte == open {
+            depth += 1;
+        } else if byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
     }
-    println!("------------------------------------------------------------");
-    println!("Use --raw flag to see detailed instruction trace");
+    None
 }
 
 fn print_events(logs: &[RpcLog], events: &EventRegistry) {
-    println!("Events emitted in Transaction:");
+    println!("{}", bold(info("Events emitted in Transaction:")));
     if logs.is_empty() {
-        println!("No events emitted");
+        println!("{}", warning("No events emitted"));
         return;
     }
 
@@ -867,27 +1763,41 @@ fn print_events(logs: &[RpcLog], events: &EventRegistry) {
         }
 
         println!();
-        println!("Event #{}: Contract Address: {}", index + 1, log.address);
+        println!(
+            "{} {}: {} {}",
+            info("Event"),
+            number_color(format!("#{}", index + 1)),
+            info("Contract Address:"),
+            address_color(&log.address)
+        );
         for topic in &log.topics {
-            println!("    topic: {topic}");
+            println!("    {} {}", info("topic:"), number_color(topic));
         }
-        println!("    data: {}", normalize_hex(&log.data));
+        println!(
+            "    {} {}",
+            info("data:"),
+            number_color(normalize_hex(&log.data))
+        );
     }
 }
 
 fn print_decoded_event(index: usize, decoded: &DecodedEvent) {
     println!();
-    print!("Event #{}: ", index + 1);
+    print!(
+        "{} {}: ",
+        info("Event"),
+        number_color(format!("#{}", index + 1))
+    );
     if let Some(contract_name) = &decoded.contract_name {
-        print!("{contract_name}::");
+        print!("{}::", function_color(contract_name));
     }
-    println!("{}", decoded.signature);
+    println!("{}", function_color(&decoded.signature));
     for arg in &decoded.args {
         println!(
-            "    {}: {} ({})",
-            arg.name,
-            display_json_value(&arg.value),
-            arg.ty
+            "    {} {} {}",
+            info(format!("{}:", arg.name)),
+            number_color(display_json_value(&arg.value)),
+            dim(format!("({})", arg.ty))
         );
     }
 }
@@ -1429,40 +2339,14 @@ fn simulate_display_function_name(args: &SimulateArgs, calldata: &str) -> String
         return signature.clone();
     }
 
-    match calldata
-        .trim_start_matches("0x")
-        .get(..8)
-        .map(|selector| selector.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("7cf5dab0") => "increment".to_owned(),
-        _ => "raw_data".to_owned(),
-    }
-}
-
-fn trace_display_function_name(calldata: &str) -> String {
-    match calldata
-        .trim_start_matches("0x")
-        .get(..8)
-        .map(|selector| selector.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("7cf5dab0") => "increment".to_owned(),
-        Some("e0b1cccb") => "updateBalance".to_owned(),
-        Some("dfccea7d") => "complexCalculation".to_owned(),
-        _ => "raw_data".to_owned(),
-    }
-}
-
-fn first_uint256_arg_word(raw_data: &str) -> Option<String> {
-    let data = raw_data.trim_start_matches("0x");
-    data.get(8..72).map(|argument| format!("0x{argument}"))
-}
-
-fn decode_single_uint256_arg(raw_data: &str) -> Option<u128> {
-    let data = raw_data.trim_start_matches("0x");
-    let arg = data.get(8..72)?;
-    u128::from_str_radix(arg, 16).ok()
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .ok()
+        .and_then(|specs| {
+            specs
+                .into_iter()
+                .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
+        })
+        .map_or_else(|| "raw_data".to_owned(), |descriptor| descriptor.name)
 }
 
 fn normalize_hex(value: &str) -> String {
@@ -1510,17 +2394,23 @@ fn extract_address_from_stack_word(word: &str) -> Option<String> {
 
 fn format_stack(stack: &[String]) -> String {
     if stack.is_empty() {
-        return "[empty]".to_owned();
+        return dim("[empty]");
     }
 
     let mut items = stack
         .iter()
         .take(3)
         .enumerate()
-        .map(|(index, value)| format!("[{index}] {}", shorten_hex(value)))
+        .map(|(index, value)| {
+            format!(
+                "{} {}",
+                dim(format!("[{index}]")),
+                number_color(shorten_hex(value))
+            )
+        })
         .collect::<Vec<_>>();
     if stack.len() > 3 {
-        items.push(format!("... +{} more", stack.len() - 3));
+        items.push(dim(format!("... +{} more", stack.len() - 3)));
     }
     items.join(" ")
 }
