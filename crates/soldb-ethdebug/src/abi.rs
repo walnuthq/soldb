@@ -206,13 +206,26 @@ enum EncodedArg {
     Dynamic(String),
 }
 
+impl EncodedArg {
+    fn head_size_bytes(&self) -> usize {
+        match self {
+            Self::Static(words) => words.len() / 2,
+            Self::Dynamic(_) => 32,
+        }
+    }
+
+    fn is_dynamic(&self) -> bool {
+        matches!(self, Self::Dynamic(_))
+    }
+}
+
 fn encode_arg(arg_type: &str, value: &str) -> SoldbResult<EncodedArg> {
     let arg_type = arg_type.trim();
-    if let Some(base_type) = arg_type.strip_suffix("[]") {
-        return Ok(EncodedArg::Dynamic(encode_dynamic_array(
-            base_type.trim(),
-            value,
-        )?));
+    if let Some((base_type, fixed_len)) = parse_array_type(arg_type)? {
+        return encode_array_arg(base_type, fixed_len, value);
+    }
+    if let Some(component_types) = parse_tuple_type(arg_type) {
+        return encode_tuple_arg(&component_types, value);
     }
     if arg_type == "string" {
         return Ok(EncodedArg::Dynamic(encode_dynamic_bytes(value.as_bytes())));
@@ -227,7 +240,10 @@ fn encode_arg(arg_type: &str, value: &str) -> SoldbResult<EncodedArg> {
 }
 
 fn encode_tuple_payload(encoded_args: Vec<EncodedArg>) -> String {
-    let head_size_bytes = encoded_args.len() * 32;
+    let head_size_bytes = encoded_args
+        .iter()
+        .map(EncodedArg::head_size_bytes)
+        .sum::<usize>();
     let tail_size = encoded_args
         .iter()
         .filter_map(|arg| match arg {
@@ -253,26 +269,105 @@ fn encode_tuple_payload(encoded_args: Vec<EncodedArg>) -> String {
     encoded
 }
 
-fn encode_dynamic_array(base_type: &str, value: &str) -> SoldbResult<String> {
-    let values = serde_json::from_str::<Value>(value).map_err(|error| {
-        SoldbError::Message(format!(
-            "Array argument for type '{base_type}[]' must be JSON: {error}"
-        ))
+fn parse_array_type(arg_type: &str) -> SoldbResult<Option<(&str, Option<usize>)>> {
+    if !arg_type.ends_with(']') {
+        return Ok(None);
+    }
+    let Some(open) = arg_type.rfind('[') else {
+        return Ok(None);
+    };
+    let base_type = arg_type[..open].trim();
+    if base_type.is_empty() {
+        return Err(SoldbError::Message(format!(
+            "Invalid array type: {arg_type}"
+        )));
+    }
+
+    let length = &arg_type[open + 1..arg_type.len() - 1];
+    if length.is_empty() {
+        return Ok(Some((base_type, None)));
+    }
+    let length = length.parse::<usize>().map_err(|error| {
+        SoldbError::Message(format!("Invalid fixed array length '{length}': {error}"))
     })?;
-    let values = values.as_array().ok_or_else(|| {
-        SoldbError::Message(format!(
-            "Array argument for type '{base_type}[]' must be a JSON array"
-        ))
-    })?;
+    Ok(Some((base_type, Some(length))))
+}
+
+fn parse_tuple_type(arg_type: &str) -> Option<Vec<String>> {
+    let inner = arg_type.strip_prefix('(')?.strip_suffix(')')?;
+    split_args(inner)
+}
+
+fn encode_tuple_arg(component_types: &[String], value: &str) -> SoldbResult<EncodedArg> {
+    let values = parse_json_array_arg(value, "tuple")?;
+    if values.len() != component_types.len() {
+        return Err(SoldbError::Message(format!(
+            "Tuple argument expects {} values, got {}",
+            component_types.len(),
+            values.len()
+        )));
+    }
+
+    let encoded_components = component_types
+        .iter()
+        .zip(&values)
+        .map(|(component_type, item)| encode_arg(component_type, &json_value_to_arg_string(item)?))
+        .collect::<SoldbResult<Vec<_>>>()?;
+    let is_dynamic = encoded_components.iter().any(EncodedArg::is_dynamic);
+    let encoded = encode_tuple_payload(encoded_components);
+    if is_dynamic {
+        Ok(EncodedArg::Dynamic(encoded))
+    } else {
+        Ok(EncodedArg::Static(encoded))
+    }
+}
+
+fn encode_array_arg(
+    base_type: &str,
+    fixed_len: Option<usize>,
+    value: &str,
+) -> SoldbResult<EncodedArg> {
+    let values = parse_json_array_arg(value, &format!("{base_type}[]"))?;
+    if let Some(expected) = fixed_len {
+        if values.len() != expected {
+            return Err(SoldbError::Message(format!(
+                "Fixed array argument expects {expected} values, got {}",
+                values.len()
+            )));
+        }
+    }
 
     let encoded_elements = values
         .iter()
         .map(|item| encode_arg(base_type, &json_value_to_arg_string(item)?))
         .collect::<SoldbResult<Vec<_>>>()?;
+    let has_dynamic_elements = encoded_elements.iter().any(EncodedArg::is_dynamic);
+    let payload = encode_tuple_payload(encoded_elements);
 
-    let mut encoded = format!("{:064x}", values.len());
-    encoded.push_str(&encode_tuple_payload(encoded_elements));
-    Ok(encoded)
+    if fixed_len.is_some() {
+        if has_dynamic_elements {
+            Ok(EncodedArg::Dynamic(payload))
+        } else {
+            Ok(EncodedArg::Static(payload))
+        }
+    } else {
+        let mut encoded = format!("{:064x}", values.len());
+        encoded.push_str(&payload);
+        Ok(EncodedArg::Dynamic(encoded))
+    }
+}
+
+fn parse_json_array_arg(value: &str, label: &str) -> SoldbResult<Vec<Value>> {
+    let values = serde_json::from_str::<Value>(value).map_err(|error| {
+        SoldbError::Message(format!(
+            "Array argument for type '{label}' must be JSON: {error}"
+        ))
+    })?;
+    values.as_array().cloned().ok_or_else(|| {
+        SoldbError::Message(format!(
+            "Array argument for type '{label}' must be a JSON array"
+        ))
+    })
 }
 
 fn json_value_to_arg_string(value: &Value) -> SoldbResult<String> {
@@ -744,6 +839,44 @@ mod tests {
     }
 
     #[test]
+    fn encodes_fixed_array_and_tuple_function_calls() {
+        assert_eq!(
+            encode_function_call("set(uint256[3])", &["[1,2,3]".to_owned()]).expect("calldata"),
+            "0xcf1d72d1000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000003"
+        );
+
+        assert_eq!(
+            encode_function_call(
+                "mix(uint256[2],string)",
+                &["[1,2]".to_owned(), "ok".to_owned()],
+            )
+            .expect("calldata"),
+            "0x48ec1f2c00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000026f6b000000000000000000000000000000000000000000000000000000000000"
+        );
+
+        assert_eq!(
+            encode_function_call(
+                "set((uint256,address))",
+                &["[5,\"0x0000000000000000000000000000000000000002\"]".to_owned()],
+            )
+            .expect("calldata"),
+            "0x0193c8b800000000000000000000000000000000000000000000000000000000000000050000000000000000000000000000000000000000000000000000000000000002"
+        );
+
+        assert_eq!(
+            encode_function_call("set((uint256,string))", &["[5,\"hi\"]".to_owned()])
+                .expect("calldata"),
+            "0xa16fc8d400000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000026869000000000000000000000000000000000000000000000000000000000000"
+        );
+
+        assert_eq!(
+            encode_function_call("set(string[2])", &["[\"a\",\"bb\"]".to_owned()])
+                .expect("calldata"),
+            "0x74d379540000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000001610000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000026262000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_or_invalid_encoding() {
         assert!(encode_function_call("set(uint256)", &[]).is_err());
         assert!(encode_function_call("set(uint8)", &["256".to_owned()]).is_err());
@@ -755,6 +888,8 @@ mod tests {
         assert!(encode_function_call("set(bytes33)", &["0xab".to_owned()]).is_err());
         assert!(encode_function_call("set(uint256[])", &["1,2".to_owned()]).is_err());
         assert!(encode_function_call("set(address[])", &["[\"0x1\"]".to_owned()]).is_err());
+        assert!(encode_function_call("set(uint256[2])", &["[1]".to_owned()]).is_err());
+        assert!(encode_function_call("set((uint256,bool))", &["[1]".to_owned()]).is_err());
     }
 
     fn hex(bytes: &[u8]) -> String {
