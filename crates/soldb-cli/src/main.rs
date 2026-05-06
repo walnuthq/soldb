@@ -9,7 +9,7 @@ use soldb_repl::{DebuggerCommand, DebuggerState, StepOutcome};
 use soldb_rpc::RpcLog;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -806,12 +806,8 @@ fn decoded_event_to_json(index: usize, log: &RpcLog, decoded: &DecodedEvent) -> 
 
 fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
     let mut registry = EventRegistry::default();
-    for spec_text in &args.ethdebug_dir {
-        let spec = parse_ethdebug_spec(spec_text);
-        let Some(contract_name) = spec.name else {
-            continue;
-        };
-        let Some(abi_path) = abi_path_for_contract(&spec.path, &contract_name) else {
+    for spec in resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())? {
+        let Some(abi_path) = abi_path_for_contract(&spec.debug_dir, &spec.name) else {
             continue;
         };
         let content = fs::read_to_string(&abi_path).map_err(|error| {
@@ -821,14 +817,227 @@ fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
             ))
         })?;
         for event in parse_event_abis(&content)? {
-            registry.insert(Some(contract_name.clone()), event)?;
+            registry.insert(Some(spec.name.clone()), event)?;
         }
     }
     Ok(registry)
 }
 
-fn abi_path_for_contract(debug_dir: &str, contract_name: &str) -> Option<std::path::PathBuf> {
-    let dir = Path::new(debug_dir);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedContractSpec {
+    address: Option<String>,
+    name: String,
+    debug_dir: PathBuf,
+}
+
+fn resolve_contract_specs(
+    ethdebug_dirs: &[String],
+    contracts_file: Option<&str>,
+) -> SoldbResult<Vec<ResolvedContractSpec>> {
+    let mut specs = Vec::new();
+    if let Some(contracts_file) = contracts_file {
+        specs.extend(load_contract_mapping_file(Path::new(contracts_file))?);
+    }
+
+    for spec_text in ethdebug_dirs {
+        specs.extend(resolve_ethdebug_spec(spec_text)?);
+    }
+    Ok(specs)
+}
+
+fn resolve_ethdebug_spec(spec_text: &str) -> SoldbResult<Vec<ResolvedContractSpec>> {
+    let spec = parse_ethdebug_spec(spec_text);
+    if let Some(name) = spec.name {
+        return Ok(vec![ResolvedContractSpec {
+            address: spec.address,
+            name,
+            debug_dir: PathBuf::from(spec.path),
+        }]);
+    }
+
+    let path = PathBuf::from(&spec.path);
+    let mut loaded = if path.is_file() {
+        load_contract_mapping_or_deployment(&path)?
+    } else if path.join("deployment.json").exists() {
+        load_deployment_file(&path.join("deployment.json"))?
+    } else {
+        infer_contract_specs_from_dir(&path)?
+    };
+
+    if let Some(address) = spec.address {
+        loaded.retain(|candidate| {
+            candidate
+                .address
+                .as_deref()
+                .is_some_and(|candidate_address| candidate_address.eq_ignore_ascii_case(&address))
+        });
+        if loaded.is_empty() {
+            return Ok(vec![ResolvedContractSpec {
+                address: Some(address),
+                name: infer_contract_name_from_dir(&path).unwrap_or_else(|| "Unknown".to_owned()),
+                debug_dir: path,
+            }]);
+        }
+    }
+
+    Ok(loaded)
+}
+
+fn load_contract_mapping_or_deployment(path: &Path) -> SoldbResult<Vec<ResolvedContractSpec>> {
+    let value = read_json_file(path)?;
+    if value
+        .get("contracts")
+        .and_then(serde_json::Value::as_array)
+        .is_some()
+    {
+        return parse_contract_mapping_array(path, &value);
+    }
+    parse_deployment_value(path, &value)
+}
+
+fn load_contract_mapping_file(path: &Path) -> SoldbResult<Vec<ResolvedContractSpec>> {
+    let value = read_json_file(path)?;
+    if value
+        .get("contracts")
+        .and_then(serde_json::Value::as_array)
+        .is_some()
+    {
+        return parse_contract_mapping_array(path, &value);
+    }
+    parse_deployment_value(path, &value)
+}
+
+fn load_deployment_file(path: &Path) -> SoldbResult<Vec<ResolvedContractSpec>> {
+    let value = read_json_file(path)?;
+    parse_deployment_value(path, &value)
+}
+
+fn parse_contract_mapping_array(
+    path: &Path,
+    value: &serde_json::Value,
+) -> SoldbResult<Vec<ResolvedContractSpec>> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let contracts = value
+        .get("contracts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            soldb_core::SoldbError::Message(format!(
+                "Contracts mapping {} must contain a contracts array",
+                path.display()
+            ))
+        })?;
+
+    Ok(contracts
+        .iter()
+        .filter_map(|contract| {
+            let address = contract.get("address")?.as_str()?.to_owned();
+            let name = contract
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Unknown")
+                .to_owned();
+            let debug_dir = contract
+                .get("debug_dir")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)?;
+            let debug_dir = if debug_dir.is_absolute() {
+                debug_dir
+            } else {
+                base_dir.join(debug_dir)
+            };
+            Some(ResolvedContractSpec {
+                address: Some(address),
+                name,
+                debug_dir,
+            })
+        })
+        .collect())
+}
+
+fn parse_deployment_value(
+    path: &Path,
+    value: &serde_json::Value,
+) -> SoldbResult<Vec<ResolvedContractSpec>> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if let (Some(address), Some(contract)) = (
+        value.get("address").and_then(serde_json::Value::as_str),
+        value.get("contract").and_then(serde_json::Value::as_str),
+    ) {
+        return Ok(vec![ResolvedContractSpec {
+            address: Some(address.to_owned()),
+            name: contract.to_owned(),
+            debug_dir: base_dir.to_path_buf(),
+        }]);
+    }
+
+    let Some(contracts) = value
+        .get("contracts")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(contracts
+        .iter()
+        .filter_map(|(name, contract)| {
+            let address = contract.get("address")?.as_str()?.to_owned();
+            Some(ResolvedContractSpec {
+                address: Some(address),
+                name: name.clone(),
+                debug_dir: find_debug_dir_for_contract(base_dir, name),
+            })
+        })
+        .collect())
+}
+
+fn find_debug_dir_for_contract(base_dir: &Path, contract_name: &str) -> PathBuf {
+    let candidates = [
+        base_dir.join(format!("debug_{}", contract_name.to_ascii_lowercase())),
+        base_dir.join("debug").join(contract_name),
+        base_dir.join(contract_name).join("debug"),
+        base_dir.to_path_buf(),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("ethdebug.json").exists())
+        .unwrap_or_else(|| base_dir.to_path_buf())
+}
+
+fn infer_contract_specs_from_dir(path: &Path) -> SoldbResult<Vec<ResolvedContractSpec>> {
+    let Some(name) = infer_contract_name_from_dir(path) else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![ResolvedContractSpec {
+        address: None,
+        name,
+        debug_dir: path.to_path_buf(),
+    }])
+}
+
+fn infer_contract_name_from_dir(path: &Path) -> Option<String> {
+    let entries = fs::read_dir(path).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("abi") {
+            return path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+fn read_json_file(path: &Path) -> SoldbResult<serde_json::Value> {
+    let content = fs::read_to_string(path).map_err(|error| {
+        soldb_core::SoldbError::Message(format!("Failed to read {}: {error}", path.display()))
+    })?;
+    serde_json::from_str(&content).map_err(|error| {
+        soldb_core::SoldbError::Message(format!("Invalid JSON {}: {error}", path.display()))
+    })
+}
+
+fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::path::PathBuf> {
+    let dir = debug_dir;
     [
         format!("{contract_name}.abi"),
         format!("{contract_name}.json"),
@@ -839,15 +1048,15 @@ fn abi_path_for_contract(debug_dir: &str, contract_name: &str) -> Option<std::pa
 }
 
 fn trace_contract_name(args: &TraceArgs) -> Option<String> {
-    args.ethdebug_dir
-        .first()
-        .and_then(|spec| parse_ethdebug_spec(spec).name)
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .ok()
+        .and_then(|specs| specs.into_iter().next().map(|spec| spec.name))
 }
 
 fn simulate_contract_name(args: &SimulateArgs) -> Option<String> {
-    args.ethdebug_dir
-        .first()
-        .and_then(|spec| parse_ethdebug_spec(spec).name)
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .ok()
+        .and_then(|specs| specs.into_iter().next().map(|spec| spec.name))
 }
 
 fn simulate_calldata(args: &SimulateArgs) -> SoldbResult<String> {
