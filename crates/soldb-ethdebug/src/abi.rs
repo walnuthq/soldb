@@ -108,12 +108,38 @@ pub fn encode_function_call(signature: &str, args: &[String]) -> SoldbResult<Str
     }
 
     let selector = function_selector(signature)?;
-    let mut encoded = String::with_capacity(2 + 8 + args.len() * 64);
+    let encoded_args = parsed
+        .arg_types
+        .iter()
+        .zip(args)
+        .map(|(arg_type, arg_value)| encode_arg(arg_type, arg_value))
+        .collect::<SoldbResult<Vec<_>>>()?;
+    let head_size_bytes = encoded_args.len() * 32;
+    let tail_size = encoded_args
+        .iter()
+        .filter_map(|arg| match arg {
+            EncodedArg::Static(_) => None,
+            EncodedArg::Dynamic(tail) => Some(tail.len()),
+        })
+        .sum::<usize>();
+
+    let mut encoded = String::with_capacity(2 + 8 + args.len() * 64 + tail_size);
     encoded.push_str("0x");
     encoded.push_str(&bytes_to_hex(&selector));
-    for (arg_type, arg_value) in parsed.arg_types.iter().zip(args) {
-        encoded.push_str(&encode_static_arg(arg_type, arg_value)?);
+
+    let mut tails = String::with_capacity(tail_size);
+    let mut dynamic_offset = head_size_bytes;
+    for arg in encoded_args {
+        match arg {
+            EncodedArg::Static(word) => encoded.push_str(&word),
+            EncodedArg::Dynamic(tail) => {
+                encoded.push_str(&format!("{dynamic_offset:064x}"));
+                dynamic_offset += tail.len() / 2;
+                tails.push_str(&tail);
+            }
+        }
     }
+    encoded.push_str(&tails);
     Ok(encoded)
 }
 
@@ -195,6 +221,25 @@ fn split_args(input: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
+enum EncodedArg {
+    Static(String),
+    Dynamic(String),
+}
+
+fn encode_arg(arg_type: &str, value: &str) -> SoldbResult<EncodedArg> {
+    let arg_type = arg_type.trim();
+    if arg_type == "string" {
+        return Ok(EncodedArg::Dynamic(encode_dynamic_bytes(value.as_bytes())));
+    }
+    if arg_type == "bytes" {
+        return Ok(EncodedArg::Dynamic(encode_dynamic_bytes(&parse_hex_bytes(
+            value,
+        )?)));
+    }
+
+    encode_static_arg(arg_type, value).map(EncodedArg::Static)
+}
+
 fn encode_static_arg(arg_type: &str, value: &str) -> SoldbResult<String> {
     let arg_type = arg_type.trim();
     if arg_type.starts_with("uint") {
@@ -211,6 +256,9 @@ fn encode_static_arg(arg_type: &str, value: &str) -> SoldbResult<String> {
     }
     if arg_type == "bytes32" {
         return encode_bytes32_arg(value);
+    }
+    if let Some(width) = arg_type.strip_prefix("bytes") {
+        return encode_fixed_bytes_arg(width, value);
     }
 
     Err(SoldbError::Message(format!(
@@ -251,13 +299,54 @@ fn encode_bool_arg(value: &str) -> SoldbResult<String> {
 }
 
 fn encode_bytes32_arg(value: &str) -> SoldbResult<String> {
-    let bytes = value.trim_start_matches("0x");
-    if bytes.len() != 64 || !bytes.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    encode_fixed_bytes_arg("32", value)
+}
+
+fn encode_fixed_bytes_arg(width: &str, value: &str) -> SoldbResult<String> {
+    let width = width.parse::<usize>().map_err(|error| {
+        SoldbError::Message(format!("Invalid fixed bytes width '{width}': {error}"))
+    })?;
+    if !(1..=32).contains(&width) {
         return Err(SoldbError::Message(format!(
-            "Invalid bytes32 value: {value}"
+            "Invalid fixed bytes width: {width}"
         )));
     }
-    Ok(bytes.to_ascii_lowercase())
+
+    let bytes = parse_hex_bytes(value)?;
+    if bytes.len() != width {
+        return Err(SoldbError::Message(format!(
+            "Invalid bytes{width} value: {value}"
+        )));
+    }
+    let mut encoded = bytes_to_hex(&bytes);
+    encoded.push_str(&"0".repeat((32 - width) * 2));
+    Ok(encoded)
+}
+
+fn encode_dynamic_bytes(bytes: &[u8]) -> String {
+    let mut encoded = format!("{:064x}", bytes.len());
+    encoded.push_str(&bytes_to_hex(bytes));
+    let padding_bytes = (32 - bytes.len() % 32) % 32;
+    encoded.push_str(&"0".repeat(padding_bytes * 2));
+    encoded
+}
+
+fn parse_hex_bytes(value: &str) -> SoldbResult<Vec<u8>> {
+    let bytes = value.trim_start_matches("0x");
+    if !bytes.len().is_multiple_of(2) || !bytes.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SoldbError::Message(format!("Invalid bytes value: {value}")));
+    }
+
+    bytes
+        .as_bytes()
+        .chunks(2)
+        .map(|chunk| {
+            let pair = std::str::from_utf8(chunk)
+                .map_err(|error| SoldbError::Message(format!("Invalid bytes value: {error}")))?;
+            u8::from_str_radix(pair, 16)
+                .map_err(|error| SoldbError::Message(format!("Invalid bytes value: {error}")))
+        })
+        .collect()
 }
 
 fn validate_uint_type(arg_type: &str) -> SoldbResult<()> {
@@ -472,11 +561,77 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_or_invalid_static_encoding() {
-        assert!(encode_function_call("set(string)", &["hi".to_owned()]).is_err());
+    fn encodes_dynamic_function_calls() {
+        let selector = hex(function_selector("set(string)").expect("selector").as_ref());
+        assert_eq!(
+            encode_function_call("set(string)", &["hi".to_owned()]).expect("calldata"),
+            format!(
+                "0x{selector}\
+                0000000000000000000000000000000000000000000000000000000000000020\
+                0000000000000000000000000000000000000000000000000000000000000002\
+                6869{}",
+                "0".repeat(60)
+            )
+        );
+
+        let selector = hex(function_selector("processOrder(uint256,string,string)")
+            .expect("selector")
+            .as_ref());
+        assert_eq!(
+            encode_function_call(
+                "processOrder(uint256,string,string)",
+                &[
+                    "10".to_owned(),
+                    "express".to_owned(),
+                    "electronic".to_owned()
+                ],
+            )
+            .expect("calldata"),
+            format!(
+                "0x{selector}\
+                000000000000000000000000000000000000000000000000000000000000000a\
+                0000000000000000000000000000000000000000000000000000000000000060\
+                00000000000000000000000000000000000000000000000000000000000000a0\
+                0000000000000000000000000000000000000000000000000000000000000007\
+                65787072657373{}\
+                000000000000000000000000000000000000000000000000000000000000000a\
+                656c656374726f6e6963{}",
+                "0".repeat(50),
+                "0".repeat(44)
+            )
+        );
+
+        let selector = hex(function_selector("set(bytes)").expect("selector").as_ref());
+        assert_eq!(
+            encode_function_call("set(bytes)", &["0xabcd".to_owned()]).expect("calldata"),
+            format!(
+                "0x{selector}\
+                0000000000000000000000000000000000000000000000000000000000000020\
+                0000000000000000000000000000000000000000000000000000000000000002\
+                abcd{}",
+                "0".repeat(60)
+            )
+        );
+    }
+
+    #[test]
+    fn encodes_fixed_bytes_function_calls() {
+        let selector = hex(function_selector("set(bytes2)").expect("selector").as_ref());
+        assert_eq!(
+            encode_function_call("set(bytes2)", &["0xabcd".to_owned()]).expect("calldata"),
+            format!("0x{selector}abcd{}", "0".repeat(60))
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_or_invalid_encoding() {
         assert!(encode_function_call("set(uint256)", &[]).is_err());
         assert!(encode_function_call("set(address)", &["0x1".to_owned()]).is_err());
         assert!(encode_function_call("set(bool)", &["maybe".to_owned()]).is_err());
+        assert!(encode_function_call("set(bytes)", &["0xabc".to_owned()]).is_err());
+        assert!(encode_function_call("set(bytes)", &["0xzz".to_owned()]).is_err());
+        assert!(encode_function_call("set(bytes2)", &["0xab".to_owned()]).is_err());
+        assert!(encode_function_call("set(bytes33)", &["0xab".to_owned()]).is_err());
     }
 
     fn hex(bytes: &[u8]) -> String {
