@@ -1,5 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: &str = "1.0";
 
@@ -342,6 +346,170 @@ impl BridgeMessage {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContractRegistry {
+    contracts: BTreeMap<String, ContractInfo>,
+    stylus_addresses: BTreeSet<String>,
+    evm_addresses: BTreeSet<String>,
+}
+
+impl ContractRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn normalize_address(address: &str) -> String {
+        let address = address.to_ascii_lowercase();
+        address.strip_prefix("0x").unwrap_or(&address).to_owned()
+    }
+
+    pub fn format_address(address: &str) -> String {
+        format!("0x{}", Self::normalize_address(address))
+    }
+
+    pub fn register(&mut self, mut contract: ContractInfo) {
+        let address = Self::normalize_address(&contract.address);
+        contract.address = Self::format_address(&contract.address);
+        let is_stylus = contract
+            .environment
+            .eq_ignore_ascii_case(Environment::Stylus.as_str());
+        self.contracts.insert(address.clone(), contract);
+        if is_stylus {
+            self.stylus_addresses.insert(address.clone());
+            self.evm_addresses.remove(&address);
+        } else {
+            self.evm_addresses.insert(address.clone());
+            self.stylus_addresses.remove(&address);
+        }
+    }
+
+    pub fn unregister(&mut self, address: &str) -> Option<ContractInfo> {
+        let address = Self::normalize_address(address);
+        self.stylus_addresses.remove(&address);
+        self.evm_addresses.remove(&address);
+        self.contracts.remove(&address)
+    }
+
+    pub fn get(&self, address: &str) -> Option<&ContractInfo> {
+        self.contracts.get(&Self::normalize_address(address))
+    }
+
+    pub fn is_registered(&self, address: &str) -> bool {
+        self.contracts
+            .contains_key(&Self::normalize_address(address))
+    }
+
+    pub fn is_stylus(&self, address: &str) -> bool {
+        self.stylus_addresses
+            .contains(&Self::normalize_address(address))
+    }
+
+    pub fn is_evm(&self, address: &str) -> bool {
+        self.evm_addresses
+            .contains(&Self::normalize_address(address))
+    }
+
+    pub fn get_environment(&self, address: &str) -> Option<&str> {
+        self.get(address)
+            .map(|contract| contract.environment.as_str())
+    }
+
+    pub fn get_all_contracts(&self) -> Vec<&ContractInfo> {
+        self.contracts.values().collect()
+    }
+
+    pub fn get_stylus_contracts(&self) -> Vec<&ContractInfo> {
+        self.contracts
+            .values()
+            .filter(|contract| contract.environment.eq_ignore_ascii_case("stylus"))
+            .collect()
+    }
+
+    pub fn get_evm_contracts(&self) -> Vec<&ContractInfo> {
+        self.contracts
+            .values()
+            .filter(|contract| contract.environment.eq_ignore_ascii_case("evm"))
+            .collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.contracts.clear();
+        self.stylus_addresses.clear();
+        self.evm_addresses.clear();
+    }
+
+    pub fn to_value(&self) -> Value {
+        json!({
+            "contracts": self.contracts
+        })
+    }
+
+    pub fn from_value(value: &Value) -> serde_json::Result<Self> {
+        let mut registry = Self::new();
+        registry.load_from_value(value)?;
+        Ok(registry)
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let content = serde_json::to_string_pretty(&self.to_value()).map_err(json_to_io_error)?;
+        fs::write(path, content)
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let value = serde_json::from_str::<Value>(&content).map_err(json_to_io_error)?;
+        Self::from_value(&value).map_err(json_to_io_error)
+    }
+
+    pub fn load_from_file(&mut self, path: impl AsRef<Path>) -> std::io::Result<usize> {
+        let content = fs::read_to_string(path)?;
+        let value = serde_json::from_str::<Value>(&content).map_err(json_to_io_error)?;
+        self.load_from_value(&value).map_err(json_to_io_error)
+    }
+
+    pub fn load_from_value(&mut self, value: &Value) -> serde_json::Result<usize> {
+        match value.get("contracts") {
+            Some(Value::Array(contracts)) => {
+                for item in contracts {
+                    let contract = serde_json::from_value::<ContractInfo>(item.clone())?;
+                    self.register(contract);
+                }
+                Ok(contracts.len())
+            }
+            Some(Value::Object(contracts)) => {
+                for (address, item) in contracts {
+                    let mut item = item.as_object().cloned().unwrap_or_default();
+                    item.entry("address".to_owned())
+                        .or_insert_with(|| Value::String(address.clone()));
+                    let contract = serde_json::from_value::<ContractInfo>(Value::Object(item))?;
+                    self.register(contract);
+                }
+                Ok(contracts.len())
+            }
+            _ => Ok(0),
+        }
+    }
+}
+
+pub const STYLUS_BYTECODE_PREFIX: &[u8] = &[0xef, 0x00, 0x01];
+pub const STYLUS_MARKER_PATTERNS: &[&[u8]] = &[b"\x00asm"];
+
+pub fn detect_stylus_bytecode(bytecode: &[u8]) -> bool {
+    if bytecode.len() < 4 {
+        return false;
+    }
+
+    STYLUS_MARKER_PATTERNS.iter().any(|pattern| {
+        bytecode[..bytecode.len().min(100)]
+            .windows(pattern.len())
+            .any(|window| window == *pattern)
+    }) || bytecode.starts_with(STYLUS_BYTECODE_PREFIX)
+}
+
+fn json_to_io_error(error: serde_json::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
 fn default_protocol_version() -> String {
     PROTOCOL_VERSION.to_owned()
 }
@@ -363,8 +531,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BridgeMessage, CallArgument, ContractInfo, CrossEnvCall, CrossEnvTrace, Environment,
-        MessageType, SourceLocation, TraceRequest, TraceResponse, PROTOCOL_VERSION,
+        detect_stylus_bytecode, BridgeMessage, CallArgument, ContractInfo, ContractRegistry,
+        CrossEnvCall, CrossEnvTrace, Environment, MessageType, SourceLocation, TraceRequest,
+        TraceResponse, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -461,5 +630,110 @@ mod tests {
         let encoded = serde_json::to_value(error).expect("error response");
         assert_eq!(encoded["error_code"], "not_found");
         assert!(encoded.get("trace").is_none());
+    }
+
+    #[test]
+    fn contract_registry_formats_and_persists_addresses() {
+        let mut registry = ContractRegistry::new();
+        let mut evm = ContractInfo::new("ABCDEF", Environment::Evm.as_str(), "EVM");
+        evm.debug_dir = Some("debug".to_owned());
+        let mut stylus = ContractInfo::new("0x1234", Environment::Stylus.as_str(), "Stylus");
+        stylus.lib_path = Some("lib.so".to_owned());
+
+        registry.register(evm);
+        registry.register(stylus);
+
+        assert!(registry.is_registered("0xabcdef"));
+        assert!(registry.is_evm("abcdef"));
+        assert!(registry.is_stylus("1234"));
+        assert_eq!(registry.get_environment("0x1234"), Some("stylus"));
+        assert_eq!(registry.get_evm_contracts()[0].name, "EVM");
+        assert_eq!(registry.get_stylus_contracts()[0].name, "Stylus");
+        assert_eq!(
+            registry.get("ABCDEF").expect("contract").address,
+            "0xabcdef"
+        );
+
+        let restored = ContractRegistry::from_value(&registry.to_value()).expect("restore");
+        assert_eq!(
+            restored
+                .get("0x1234")
+                .expect("restored")
+                .lib_path
+                .as_deref(),
+            Some("lib.so")
+        );
+    }
+
+    #[test]
+    fn contract_registry_loads_list_and_dict_config_formats() {
+        let mut registry = ContractRegistry::new();
+        let loaded = registry
+            .load_from_value(&json!({
+                "contracts": [
+                    {"address": "0xaaa", "environment": "evm", "name": "A", "debug_dir": "d"},
+                    {"address": "0xbbb", "environment": "stylus", "name": "B", "lib_path": "l"}
+                ]
+            }))
+            .expect("load list");
+
+        assert_eq!(loaded, 2);
+        assert!(registry.is_evm("aaa"));
+        assert!(registry.is_stylus("bbb"));
+
+        let loaded = registry
+            .load_from_value(&json!({
+                "contracts": {
+                    "0xbeef": {"environment": "stylus", "name": "Beef", "project_path": "proj"}
+                }
+            }))
+            .expect("load dict");
+
+        assert_eq!(loaded, 1);
+        assert_eq!(
+            registry
+                .unregister("0xbeef")
+                .expect("registered")
+                .project_path
+                .as_deref(),
+            Some("proj")
+        );
+        registry.clear();
+        assert!(registry.get_all_contracts().is_empty());
+    }
+
+    #[test]
+    fn contract_registry_persists_to_disk() {
+        let mut registry = ContractRegistry::new();
+        registry.register(ContractInfo::new("0xabc", "evm", "Persisted"));
+
+        let path =
+            std::env::temp_dir().join(format!("soldb-bridge-registry-{}.json", std::process::id()));
+        registry.save(&path).expect("save registry");
+        let restored = ContractRegistry::load(&path).expect("load registry");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(restored.get("abc").expect("contract").name, "Persisted");
+    }
+
+    #[test]
+    fn register_moves_contract_between_environment_sets() {
+        let mut registry = ContractRegistry::new();
+        registry.register(ContractInfo::new("0xabc", "evm", "X"));
+        assert!(registry.is_evm("0xabc"));
+        assert!(!registry.is_stylus("0xabc"));
+
+        registry.register(ContractInfo::new("0xabc", "stylus", "X"));
+        assert!(registry.is_stylus("0xabc"));
+        assert!(!registry.is_evm("0xabc"));
+    }
+
+    #[test]
+    fn detects_stylus_bytecode_patterns() {
+        assert!(!detect_stylus_bytecode(b""));
+        assert!(!detect_stylus_bytecode(b"\x01\x02\x03"));
+        assert!(detect_stylus_bytecode(&[0xef, 0x00, 0x01, 0x00]));
+        assert!(detect_stylus_bytecode(b"\x00asm\x00\x00\x00\x00"));
+        assert!(!detect_stylus_bytecode(&[0x60, 0x80, 0x60, 0x40]));
     }
 }
