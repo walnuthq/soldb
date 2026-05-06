@@ -195,7 +195,8 @@ fn main() -> ExitCode {
         Command::Trace(args) => trace_command(&args),
         Command::Simulate(args) => simulate_command(&args),
         Command::ListEvents(args) => list_events_command(&args),
-        Command::Bridge(_) | Command::ListContracts(_) => Err(soldb_core::SoldbError::Message(
+        Command::ListContracts(args) => list_contracts_command(&args),
+        Command::Bridge(_) => Err(soldb_core::SoldbError::Message(
             "soldb Rust CLI skeleton: command implementation is not ported yet".to_owned(),
         )),
     };
@@ -270,6 +271,44 @@ fn list_events_command(args: &ListEventsArgs) -> SoldbResult<()> {
     } else {
         print_events(&logs);
     }
+    Ok(())
+}
+
+fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
+    let trace = soldb_rpc::trace_transaction(&args.rpc_url, &args.tx_hash)?;
+    println!(
+        "Looking for contracts in transaction: {} on {}..",
+        trace.tx_hash.as_deref().unwrap_or(&args.tx_hash),
+        args.rpc_url
+    );
+    println!();
+    println!("Contracts detected in transaction:");
+    println!("{}", "-".repeat(80));
+
+    let mut call_count = 0;
+    for step in &trace.steps {
+        if !matches!(step.op.as_str(), "CALL" | "DELEGATECALL" | "STATICCALL") {
+            continue;
+        }
+        let Some(address_word) = call_target_stack_word(&step.stack) else {
+            continue;
+        };
+        let Some(address) = extract_address_from_stack_word(address_word) else {
+            continue;
+        };
+        call_count += 1;
+        println!("Contract Address: {address}");
+        println!("Gas: {}", step.gas);
+        println!("{}", "-".repeat(80));
+    }
+
+    if call_count == 0 {
+        println!("No contract calls detected in this transaction.");
+        println!("Please verify:");
+        println!("  - The transaction hash is correct");
+        println!("  - The RPC URL is correct");
+    }
+
     Ok(())
 }
 
@@ -495,6 +534,27 @@ fn normalize_hex(value: &str) -> String {
     } else {
         format!("0x{value}")
     }
+}
+
+fn call_target_stack_word(stack: &[String]) -> Option<&str> {
+    if stack.len() < 2 {
+        return None;
+    }
+    stack.get(stack.len() - 2).map(String::as_str)
+}
+
+fn extract_address_from_stack_word(word: &str) -> Option<String> {
+    let hex = word.trim_start_matches("0x");
+    if hex.len() < 40 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let address = &hex[hex.len() - 40..];
+    if address.bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+
+    Some(format!("0x{}", address.to_ascii_lowercase()))
 }
 
 fn format_stack(stack: &[String]) -> String {
