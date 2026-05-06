@@ -1,8 +1,13 @@
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use soldb_core::{SoldbResult, TransactionTrace};
-use soldb_ethdebug::{encode_function_call, parse_ethdebug_spec, parse_signature};
+use soldb_ethdebug::{
+    encode_function_call, parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent,
+    EventRegistry,
+};
 use soldb_rpc::RpcLog;
+use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -266,10 +271,11 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
 
 fn list_events_command(args: &ListEventsArgs) -> SoldbResult<()> {
     let logs = soldb_rpc::transaction_logs(&args.rpc_url, &args.tx_hash)?;
+    let events = load_event_registry(args)?;
     if args.json_events {
-        println!("{}", events_to_json(&args.tx_hash, &logs)?);
+        println!("{}", events_to_json(&args.tx_hash, &logs, &events)?);
     } else {
-        print_events(&logs);
+        print_events(&logs, &events);
     }
     Ok(())
 }
@@ -408,7 +414,7 @@ fn print_simulation_summary(
     println!("Use --raw flag to see detailed instruction trace");
 }
 
-fn print_events(logs: &[RpcLog]) {
+fn print_events(logs: &[RpcLog], events: &EventRegistry) {
     println!("Events emitted in Transaction:");
     if logs.is_empty() {
         println!("No events found.");
@@ -416,6 +422,11 @@ fn print_events(logs: &[RpcLog]) {
     }
 
     for (index, log) in logs.iter().enumerate() {
+        if let Some(decoded) = events.decode_log(&log.topics, &log.data) {
+            print_decoded_event(index, &decoded);
+            continue;
+        }
+
         println!();
         println!("Event #{}: Contract Address: {}", index + 1, log.address);
         for topic in &log.topics {
@@ -425,11 +436,32 @@ fn print_events(logs: &[RpcLog]) {
     }
 }
 
-fn events_to_json(tx_hash: &str, logs: &[RpcLog]) -> SoldbResult<String> {
-    let events = logs
+fn print_decoded_event(index: usize, decoded: &DecodedEvent) {
+    println!();
+    print!("Event #{}: ", index + 1);
+    if let Some(contract_name) = &decoded.contract_name {
+        print!("{contract_name}::");
+    }
+    println!("{}", decoded.signature);
+    for arg in &decoded.args {
+        println!(
+            "    {}: {} ({})",
+            arg.name,
+            display_json_value(&arg.value),
+            arg.ty
+        );
+    }
+}
+
+fn events_to_json(tx_hash: &str, logs: &[RpcLog], events: &EventRegistry) -> SoldbResult<String> {
+    let event_items = logs
         .iter()
         .enumerate()
         .map(|(index, log)| {
+            if let Some(decoded) = events.decode_log(&log.topics, &log.data) {
+                return decoded_event_to_json(index, log, &decoded);
+            }
+
             let data = normalize_hex(&log.data);
             let signature = log.topics.first().cloned().unwrap_or_default();
             json!({
@@ -452,10 +484,66 @@ fn events_to_json(tx_hash: &str, logs: &[RpcLog]) -> SoldbResult<String> {
 
     serde_json::to_string_pretty(&json!({
         "transaction_hash": tx_hash,
-        "events": events,
+        "events": event_items,
         "total_events": logs.len(),
     }))
     .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))
+}
+
+fn decoded_event_to_json(index: usize, log: &RpcLog, decoded: &DecodedEvent) -> serde_json::Value {
+    let mut event = json!({
+        "index": index,
+        "address": log.address,
+        "topics": log.topics,
+        "data": normalize_hex(&log.data),
+        "datas": decoded.args.iter().map(|arg| {
+            json!({
+                "name": &arg.name,
+                "type": &arg.ty,
+                "value": &arg.value,
+            })
+        }).collect::<Vec<_>>(),
+        "event": &decoded.event,
+        "signature": &decoded.signature,
+    });
+    if let Some(contract_name) = &decoded.contract_name {
+        event["contract_name"] = json!(contract_name);
+    }
+    event
+}
+
+fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
+    let mut registry = EventRegistry::default();
+    for spec_text in &args.ethdebug_dir {
+        let spec = parse_ethdebug_spec(spec_text);
+        let Some(contract_name) = spec.name else {
+            continue;
+        };
+        let Some(abi_path) = abi_path_for_contract(&spec.path, &contract_name) else {
+            continue;
+        };
+        let content = fs::read_to_string(&abi_path).map_err(|error| {
+            soldb_core::SoldbError::Message(format!(
+                "Failed to read ABI {}: {error}",
+                abi_path.display()
+            ))
+        })?;
+        for event in parse_event_abis(&content)? {
+            registry.insert(Some(contract_name.clone()), event)?;
+        }
+    }
+    Ok(registry)
+}
+
+fn abi_path_for_contract(debug_dir: &str, contract_name: &str) -> Option<std::path::PathBuf> {
+    let dir = Path::new(debug_dir);
+    [
+        format!("{contract_name}.abi"),
+        format!("{contract_name}.json"),
+    ]
+    .into_iter()
+    .map(|file_name| dir.join(file_name))
+    .find(|path| path.exists())
 }
 
 fn trace_contract_name(args: &TraceArgs) -> Option<String> {
@@ -533,6 +621,13 @@ fn normalize_hex(value: &str) -> String {
         value.to_owned()
     } else {
         format!("0x{value}")
+    }
+}
+
+fn display_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        other => other.to_string(),
     }
 }
 
