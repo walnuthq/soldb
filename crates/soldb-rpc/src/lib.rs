@@ -14,7 +14,9 @@ use revm::interpreter::interpreter_types::{Jumps, LoopControl, MemoryTr};
 use revm::interpreter::Interpreter;
 use revm::primitives::{hardfork::SpecId, Address, Bytes, TxKind, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
-use revm::{Context, DatabaseRef, InspectEvm, Inspector, MainBuilder, MainContext};
+use revm::{
+    Context, DatabaseRef, ExecuteCommitEvm, InspectEvm, Inspector, MainBuilder, MainContext,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -422,7 +424,7 @@ pub struct RpcLog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct RpcBlock {
+struct RpcBlockHeader {
     #[serde(default)]
     hash: Option<String>,
     timestamp: String,
@@ -440,6 +442,14 @@ struct RpcBlock {
     miner: Option<String>,
     #[serde(default)]
     beneficiary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RpcBlockWithTransactions {
+    #[serde(flatten)]
+    header: RpcBlockHeader,
+    #[serde(default)]
+    transactions: Vec<RpcTransaction>,
 }
 
 impl DebugTraceResult {
@@ -698,22 +708,21 @@ fn replay_debug_trace(
         ));
     }
 
-    let tx_index = tx
+    let target_index = tx
         .transaction_index
         .as_deref()
         .map(parse_quantity)
         .transpose()?
-        .unwrap_or(0);
-    if tx_index != 0 {
-        return Err(SoldbError::Message(format!(
-            "Replay backend currently supports transactions at index 0 only; block-history replay is needed for index {tx_index}"
-        )));
-    }
+        .unwrap_or(0) as usize;
 
     let block_tag = format_quantity(block_number);
     let block = client
-        .request::<Option<RpcBlock>>("eth_getBlockByNumber", json!([block_tag, false]))?
+        .request::<Option<RpcBlockWithTransactions>>(
+            "eth_getBlockByNumber",
+            json!([block_tag, true]),
+        )?
         .ok_or_else(|| SoldbError::Message(format!("Block {block_number} not found")))?;
+    let target_index = replay_target_index(&block.transactions, target_index, &tx.hash)?;
     let parent_block_tag = format_quantity(block_number - 1);
     let chain_id = client
         .request::<String>("eth_chainId", json!([]))
@@ -736,13 +745,14 @@ fn replay_debug_trace(
         block_tag: parent_block_tag,
     };
     let cache_db = CacheDB::new(WrapDatabaseRef(state_db));
-    let context = Context::mainnet()
+    let mut context = Context::mainnet()
         .with_db(cache_db)
         .modify_block_chained(|block_env| {
             block_env.number = U256::from(block_number);
-            block_env.timestamp = U256::from(parse_quantity(&block.timestamp).unwrap_or(0));
-            block_env.gas_limit = parse_quantity(&block.gas_limit).unwrap_or(u64::MAX);
+            block_env.timestamp = U256::from(parse_quantity(&block.header.timestamp).unwrap_or(0));
+            block_env.gas_limit = parse_quantity(&block.header.gas_limit).unwrap_or(u64::MAX);
             block_env.basefee = block
+                .header
                 .base_fee_per_gas
                 .as_deref()
                 .map(parse_quantity)
@@ -750,6 +760,7 @@ fn replay_debug_trace(
                 .unwrap_or(None)
                 .unwrap_or_default();
             block_env.difficulty = block
+                .header
                 .difficulty
                 .as_deref()
                 .map(parse_u256_quantity)
@@ -757,16 +768,18 @@ fn replay_debug_trace(
                 .unwrap_or(None)
                 .unwrap_or_default();
             block_env.prevrandao = block
+                .header
                 .prevrandao
                 .as_deref()
-                .or(block.mix_hash.as_deref())
+                .or(block.header.mix_hash.as_deref())
                 .map(parse_b256)
                 .transpose()
                 .unwrap_or(None);
             block_env.beneficiary = block
+                .header
                 .beneficiary
                 .as_deref()
-                .or(block.miner.as_deref())
+                .or(block.header.miner.as_deref())
                 .map(parse_address)
                 .transpose()
                 .unwrap_or(None)
@@ -779,6 +792,20 @@ fn replay_debug_trace(
             cfg.disable_block_gas_limit = true;
             cfg.disable_base_fee = true;
         });
+
+    if target_index > 0 {
+        let mut evm = context.build_mainnet();
+        for (index, prior_tx) in block.transactions.iter().take(target_index).enumerate() {
+            let tx_env = tx_env_from_rpc_transaction(prior_tx, chain_id)?;
+            evm.transact_commit(tx_env).map_err(|error| {
+                SoldbError::Message(format!(
+                    "Replay backend failed while replaying prior block transaction {index} ({}): {error:?}",
+                    prior_tx.hash
+                ))
+            })?;
+        }
+        context = evm.ctx;
+    }
 
     let tx_env = tx_env_from_rpc_transaction(tx, chain_id)?;
     let mut inspector = ReplayStepInspector::default();
@@ -807,6 +834,34 @@ fn replay_debug_trace(
         failed: !result.is_success(),
         gas: Some(result.gas_used()),
     })
+}
+
+fn replay_target_index(
+    transactions: &[RpcTransaction],
+    expected_index: usize,
+    tx_hash: &str,
+) -> SoldbResult<usize> {
+    if transactions.is_empty() {
+        return Err(SoldbError::Message(
+            "Replay backend requires eth_getBlockByNumber with full transaction objects".to_owned(),
+        ));
+    }
+
+    if transactions
+        .get(expected_index)
+        .is_some_and(|tx| tx.hash.eq_ignore_ascii_case(tx_hash))
+    {
+        return Ok(expected_index);
+    }
+
+    transactions
+        .iter()
+        .position(|tx| tx.hash.eq_ignore_ascii_case(tx_hash))
+        .ok_or_else(|| {
+            SoldbError::Message(format!(
+                "Replay backend could not find transaction {tx_hash} in its block"
+            ))
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -891,7 +946,7 @@ impl DatabaseRef for RpcStateDb {
 
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         let block = self
-            .request_at_block::<Option<RpcBlock>>(
+            .request_at_block::<Option<RpcBlockHeader>>(
                 "eth_getBlockByNumber",
                 json!([format_quantity(number), false]),
             )?
@@ -1155,9 +1210,10 @@ mod tests {
     use std::thread;
 
     use super::{
-        build_transaction_trace, decode_revert_reason, simulate_call, trace_transaction,
-        trace_transaction_with_backend, transaction_logs, DebugTraceResult, HttpEndpoint,
-        HttpScheme, SimulateCallRequest, StructLog, TraceBackend, TraceEnvelope,
+        build_transaction_trace, decode_revert_reason, replay_target_index, simulate_call,
+        trace_transaction, trace_transaction_with_backend, transaction_logs, DebugTraceResult,
+        HttpEndpoint, HttpScheme, RpcTransaction, SimulateCallRequest, StructLog, TraceBackend,
+        TraceEnvelope,
     };
     use serde_json::json;
 
@@ -1363,6 +1419,24 @@ mod tests {
     }
 
     #[test]
+    fn replay_target_index_uses_rpc_index_or_hash_fallback() {
+        let transactions = vec![mock_rpc_transaction("0xaaa"), mock_rpc_transaction("0xbbb")];
+
+        assert_eq!(
+            replay_target_index(&transactions, 1, "0xbbb").expect("target by index"),
+            1
+        );
+        assert_eq!(
+            replay_target_index(&transactions, 9, "0xaaa").expect("target by hash"),
+            0
+        );
+        assert!(replay_target_index(&transactions, 0, "0xccc")
+            .expect_err("missing tx")
+            .to_string()
+            .contains("could not find transaction"));
+    }
+
+    #[test]
     fn simulates_call_through_http_json_rpc_client() {
         let rpc_url = start_trace_server(1);
         let trace = simulate_call(
@@ -1488,6 +1562,25 @@ mod tests {
         stream
             .write_all(http_response.as_bytes())
             .expect("write response");
+    }
+
+    fn mock_rpc_transaction(hash: &str) -> RpcTransaction {
+        RpcTransaction {
+            hash: hash.to_owned(),
+            from_addr: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_owned(),
+            to: Some("0x5fbdb2315678afecb367f032d93f642f64180aa3".to_owned()),
+            value: "0x0".to_owned(),
+            input_data: "0x".to_owned(),
+            gas: Some("0x5208".to_owned()),
+            gas_price: Some("0x1".to_owned()),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            nonce: Some("0x0".to_owned()),
+            block_number: Some("0x1".to_owned()),
+            transaction_index: Some("0x0".to_owned()),
+            transaction_type: Some("0x0".to_owned()),
+            chain_id: Some("0x1".to_owned()),
+        }
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {

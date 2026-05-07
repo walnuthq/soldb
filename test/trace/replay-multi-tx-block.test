@@ -1,0 +1,15 @@
+# Test replaying a transaction after earlier transactions in the same Anvil block
+# REQUIRES: soldb
+# RUN: TX=$(RPC_URL=%{rpc_url} PRIVATE_KEY=%{private_key} bash %S/create-multi-tx-block.sh %{contract_address}) && \
+# RUN:   %soldb trace $TX --backend debug-rpc --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw --max-steps 20 > %t.debug && \
+# RUN:   %soldb trace $TX --backend replay --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw --max-steps 20 > %t.replay && \
+# RUN:   sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.debug | head -n 20 > %t.debug.ops && \
+# RUN:   sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.replay | head -n 20 > %t.replay.ops && \
+# RUN:   diff -u %t.debug.ops %t.replay.ops
+# RUN: FileCheck %s < %t.replay
+
+# CHECK: Loading transaction
+# CHECK: Contract: TestContract
+# CHECK: Execution trace
+# CHECK: PUSH1
+# CHECK: CALLDATASIZE
