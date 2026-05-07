@@ -149,12 +149,13 @@ flowchart TD
 
     debug_rpc --> opcode_trace["opcode trace"]
     replay --> opcode_trace
-    metadata --> enriched["source lines<br/>call frames<br/>decoded values"]
+    metadata --> debugger["soldb-debugger<br/>source steps + variables"]
     opcode_trace --> enriched
+    debugger --> enriched["source lines<br/>call frames<br/>decoded values"]
     enriched --> outputs["CLI / JSON / REPL / DAP"]
 ```
 
-SolDB relies on compiler-generated debug information. Compile with `solc` ETHDebug output enabled, then pass the generated artifact directory with `--ethdebug-dir <address>:<contract>:<dir>`. SolDB uses that metadata to map low-level EVM execution back to Solidity source, functions, variables, and ABI values.
+SolDB relies on compiler-generated debug information. Compile with `solc` ETHDebug output enabled, then pass the generated artifact directory with `--ethdebug-dir <address>:<contract>:<dir>`. SolDB uses that metadata to map low-level EVM execution back to Solidity source, functions, variables, and ABI values. The debugger-side ETHDebug contract is documented in [docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
 
 ### Execution Backends
 
@@ -178,6 +179,7 @@ soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contra
 - `crates/soldb-core`: shared error types, trace models, and debugger data structures.
 - `crates/soldb-rpc`: JSON-RPC transport, debug-RPC backend, replay backend, transaction simulation, and event log retrieval.
 - `crates/soldb-ethdebug`: ETHDebug metadata loading, ABI helpers, source mapping, event decoding, and call-frame enrichment.
+- `crates/soldb-debugger`: reusable source-step, function, and variable decoding model shared by frontends.
 - `crates/soldb-repl`: interactive debugger state and REPL commands.
 - `crates/soldb-serializer`: JSON/web-facing trace and simulation serialization.
 - `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.

@@ -332,23 +332,16 @@ impl DapServer {
         let Some(index) = &self.source_index else {
             return Vec::new();
         };
+        let Some(trace) = self.debugger.trace() else {
+            return Vec::new();
+        };
 
-        index
-            .info
-            .variables_at_pc(step.pc)
+        soldb_debugger::variables_for_step(trace, &index.info, step)
             .into_iter()
             .map(|variable| {
-                let value = if variable.location_type == "stack" {
-                    step.stack
-                        .get(variable.offset as usize)
-                        .cloned()
-                        .unwrap_or_else(|| "<unavailable>".to_owned())
-                } else {
-                    format!("{}[{}]", variable.location_type, variable.offset)
-                };
                 json!({
                     "name": variable.name,
-                    "value": value,
+                    "value": variable.value.display,
                     "type": variable.ty,
                     "variablesReference": 0
                 })
@@ -866,6 +859,10 @@ mod tests {
         assert_eq!(
             messages[0].body.as_ref().expect("body")["variables"][0]["name"],
             "x"
+        );
+        assert_eq!(
+            messages[0].body.as_ref().expect("body")["variables"][0]["value"],
+            "42"
         );
     }
 

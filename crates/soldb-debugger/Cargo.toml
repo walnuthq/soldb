@@ -1,22 +1,18 @@
 [package]
-name = "soldb-dap"
+name = "soldb-debugger"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 soldb-core = { path = "../soldb-core" }
-soldb-debugger = { path = "../soldb-debugger" }
 soldb-ethdebug = { path = "../soldb-ethdebug" }
-soldb-repl = { path = "../soldb-repl" }
-soldb-rpc = { path = "../soldb-rpc" }
-
-[[bin]]
-name = "soldb-dap-server"
-path = "src/main.rs"
 
 [lints]
 workspace = true

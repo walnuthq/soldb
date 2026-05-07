@@ -4,6 +4,7 @@ members = [
     "crates/soldb-cli",
     "crates/soldb-compiler",
     "crates/soldb-core",
+    "crates/soldb-debugger",
     "crates/soldb-dap",
     "crates/soldb-ethdebug",
     "crates/soldb-repl",
