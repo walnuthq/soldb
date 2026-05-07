@@ -134,6 +134,12 @@ impl From<TraceBackendArg> for TraceBackend {
     }
 }
 
+impl TraceBackendArg {
+    fn as_str(self) -> &'static str {
+        TraceBackend::from(self).as_str()
+    }
+}
+
 #[derive(Debug, Args)]
 struct BridgeArgs {
     #[arg(long, default_value = "127.0.0.1")]
@@ -857,7 +863,7 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
 
 fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     let Some(spec) = trace_contract_spec(args) else {
-        print_plain_trace_summary(trace);
+        print_plain_trace_summary(trace, args);
         return;
     };
     let metadata = trace_debug_metadata(&spec);
@@ -870,12 +876,19 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     if metadata.is_legacy {
         println!("{} {}", info("Debug format:"), bold("srcmap-runtime"));
     }
+    println!("{} {}", info("Backend:"), bold(args.backend.as_str()));
     println!("{} {}", info("Contract:"), function_color(&spec.name));
     if let Some(compiler) = metadata.compiler_version {
         println!("{} solc {}", info("Compiler:"), number_color(compiler));
     }
     println!("{}", bold(info("Function Call Trace:")));
     println!("{} {}", info("Gas used:"), success(trace.gas_used));
+    let status = if trace.success {
+        success("SUCCESS")
+    } else {
+        error_color("REVERTED")
+    };
+    println!("{} {}", info("Status:"), status);
     if let Some(error) = &trace.error {
         println!("{} {}", error_color("Error:"), error_color(error));
     }
@@ -895,12 +908,13 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     );
 }
 
-fn print_plain_trace_summary(trace: &TransactionTrace) {
+fn print_plain_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     println!(
         "{} {}",
         info("Transaction"),
         address_color(trace.tx_hash.as_deref().unwrap_or("<simulated>"))
     );
+    println!("{} {}", info("Backend:"), bold(args.backend.as_str()));
     let status = if trace.success {
         success("SUCCESS")
     } else {
@@ -923,6 +937,7 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
     if let Some(contract_name) = trace_contract_name(args) {
         println!("{} {}", info("Contract:"), function_color(contract_name));
     }
+    println!("{} {}", info("Backend:"), bold(args.backend.as_str()));
     println!("{}", bold(info("Execution trace")));
     println!(
         "{} | {} | {} | {} | {}",
@@ -2918,8 +2933,6 @@ contract C {
         assert!(!metadata.is_legacy);
         assert_eq!(metadata.compiler_version.as_deref(), Some("0.8.31"));
 
-        let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
-        print_plain_trace_summary(&trace);
         let trace_args = TraceArgs {
             tx_hash: "0xabc".to_owned(),
             backend: TraceBackendArg::DebugRpc,
@@ -2934,6 +2947,8 @@ contract C {
             cross_env_bridge: None,
             stylus_contracts: None,
         };
+        let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
+        print_plain_trace_summary(&trace, &trace_args);
         print_raw_trace(&trace, &trace_args);
         assert_eq!(trace_contract_name(&trace_args).as_deref(), Some("Legacy"));
     }

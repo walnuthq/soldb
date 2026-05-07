@@ -1102,9 +1102,12 @@ impl RpcReplayStateProviderInner {
         method: &str,
         params: Value,
     ) -> Result<T, ReplayDbError> {
-        self.client
-            .request(method, params)
-            .map_err(ReplayDbError::from)
+        self.client.request(method, params).map_err(|error| {
+            ReplayDbError(format!(
+                "Replay backend could not read historical state with {method} at block {}; use an archive-capable RPC endpoint or a local node with the needed state history. Original error: {error}",
+                self.block_tag
+            ))
+        })
     }
 
     fn fetch_account(&self, address: Address) -> Result<AccountInfo, ReplayDbError> {
@@ -1703,6 +1706,23 @@ mod tests {
     }
 
     #[test]
+    fn replay_state_provider_reports_archive_state_hint() {
+        let rpc_url = start_replay_state_error_server();
+        let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
+        let db = RpcStateDb::new(RpcReplayStateProvider::new(client, "0x10".to_owned()));
+        let address = parse_address("0x5fbdb2315678afecb367f032d93f642f64180aa3").expect("address");
+
+        let error = db
+            .basic_ref(address)
+            .expect_err("state read should report contextual replay failure");
+        let message = error.to_string();
+        assert!(message.contains("historical state"), "{message}");
+        assert!(message.contains("archive-capable RPC"), "{message}");
+        assert!(message.contains("eth_getBalance"), "{message}");
+        assert!(message.contains("0x10"), "{message}");
+    }
+
+    #[test]
     fn selects_mainnet_specs_by_block_and_timestamp() {
         assert_eq!(replay_spec_for_chain(1, 0, 0), SpecId::FRONTIER);
         assert_eq!(
@@ -1827,6 +1847,16 @@ mod tests {
         (format!("http://{address}"), rx)
     }
 
+    fn start_replay_state_error_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind replay state error server");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept rpc request");
+            respond_to_replay_state_error_request(stream);
+        });
+        format!("http://{address}")
+    }
+
     fn respond_to_rpc_request(mut stream: TcpStream) {
         let request = read_http_request(&mut stream);
         let response = if request.contains("\"eth_getTransactionByHash\"") {
@@ -1928,6 +1958,27 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "result": result
+        });
+        let body = response.to_string();
+        let http_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(http_response.as_bytes())
+            .expect("write response");
+    }
+
+    fn respond_to_replay_state_error_request(mut stream: TcpStream) {
+        let _request = read_http_request(&mut stream);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": "missing trie node"
+            }
         });
         let body = response.to_string();
         let http_response = format!(
