@@ -2422,3 +2422,545 @@ fn shorten_hex(value: &str) -> String {
         value.to_owned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("soldb-cli-main-{label}-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn trace_step(pc: u64, stack: &[&str]) -> soldb_core::TraceStep {
+        soldb_core::TraceStep {
+            pc,
+            op: "JUMPDEST".to_owned(),
+            gas: 100,
+            gas_cost: 1,
+            depth: 0,
+            stack: stack.iter().map(|value| (*value).to_owned()).collect(),
+            memory: None,
+            storage: None,
+            error: None,
+        }
+    }
+
+    fn transaction_trace(
+        input_data: String,
+        steps: Vec<soldb_core::TraceStep>,
+    ) -> TransactionTrace {
+        TransactionTrace {
+            tx_hash: Some("0xabc".to_owned()),
+            from_addr: "0x1".to_owned(),
+            to_addr: Some("0x2".to_owned()),
+            value: "0x0".to_owned(),
+            input_data,
+            gas_used: 100,
+            output: "0x".to_owned(),
+            success: true,
+            error: None,
+            debug_trace_available: true,
+            contract_address: None,
+            steps,
+        }
+    }
+
+    fn simulate_args() -> SimulateArgs {
+        SimulateArgs {
+            from_addr: "0x1".to_owned(),
+            interactive: false,
+            contract_address: "0x2".to_owned(),
+            function_signature: None,
+            function_args: Vec::new(),
+            block: None,
+            tx_index: None,
+            value: "0".to_owned(),
+            ethdebug_dir: Vec::new(),
+            contracts: None,
+            multi_contract: false,
+            rpc_url: "http://localhost:8545".to_owned(),
+            json: false,
+            raw: false,
+            max_steps: 50,
+            raw_data: None,
+            constructor_args: Vec::new(),
+            solc_path: "solc".to_owned(),
+            dual_compile: false,
+            keep_build: false,
+            output_dir: "./out".to_owned(),
+            production_dir: "./build/contracts".to_owned(),
+            save_config: false,
+            verify_version: false,
+            no_cache: false,
+            cache_dir: ".soldb_cache".to_owned(),
+            fork_url: None,
+            fork_block: None,
+            fork_port: 8545,
+            keep_fork: false,
+            reuse_fork: false,
+            no_snapshot: false,
+            cross_env_bridge: None,
+            stylus_contracts: None,
+        }
+    }
+
+    fn list_events_args() -> ListEventsArgs {
+        ListEventsArgs {
+            tx_hash: "0xabc".to_owned(),
+            ethdebug_dir: Vec::new(),
+            contracts: None,
+            rpc_url: "http://localhost:8545".to_owned(),
+            multi_contract: false,
+            json_events: false,
+        }
+    }
+
+    #[test]
+    fn builds_call_frames_from_ethdebug_source_metadata() {
+        let dir = temp_dir("ethdebug-frames");
+        let source = r#"
+contract Counter {
+    function set(uint256 amount) public {
+        helper(amount, amount + 1);
+    }
+
+    function helper(uint256 amount, uint256 amount2) internal {
+    }
+}
+"#;
+        fs::write(dir.join("Counter.sol"), source).expect("write source");
+        fs::write(
+            dir.join("ethdebug.json"),
+            json!({
+                "compilation": {
+                    "compiler": {"name": "solc", "version": "0.8.31+commit.test"},
+                    "sources": [{"id": 0, "path": "Counter.sol"}]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write metadata");
+
+        let set_offset = source.find("function set").expect("set offset");
+        let helper_offset = source.find("function helper").expect("helper offset");
+        fs::write(
+            dir.join("Counter_ethdebug-runtime.json"),
+            json!({
+                "contract": {"name": "Counter"},
+                "environment": "runtime",
+                "instructions": [
+                    {
+                        "offset": 10,
+                        "operation": {"mnemonic": "JUMPDEST"},
+                        "context": {
+                            "code": {
+                                "source": {"id": 0},
+                                "range": {"offset": set_offset, "length": 12}
+                            }
+                        }
+                    },
+                    {
+                        "offset": 20,
+                        "operation": {"mnemonic": "JUMPDEST"},
+                        "context": {
+                            "code": {
+                                "source": {"id": 0},
+                                "range": {"offset": helper_offset, "length": 18}
+                            }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write runtime");
+
+        let spec = ResolvedContractSpec {
+            address: Some("0x2".to_owned()),
+            name: "Counter".to_owned(),
+            debug_dir: dir,
+        };
+        let calldata = encode_function_call("set(uint256)", &["4".to_owned()]).expect("calldata");
+        let trace = transaction_trace(
+            calldata,
+            vec![
+                trace_step(10, &["0x01", "0x02"]),
+                trace_step(20, &["0xaa", "0xbb", "0x04"]),
+            ],
+        );
+
+        let frames = build_trace_call_frames(&trace, &spec, None);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].name, "set");
+        assert_eq!(frames[0].params[0].name, "amount");
+        assert_eq!(frames[0].params[0].value, "4");
+        assert!(!frames[0].internal);
+        assert_eq!(frames[1].name, "helper");
+        assert!(frames[1].internal);
+        assert_eq!(frames[1].source_params[1].name, "amount2");
+        assert_eq!(
+            format_raw_stack(&frames[1].raw_stack),
+            "[0] 0xaa [1] 0xbb [2] 0x04"
+        );
+    }
+
+    #[test]
+    fn decodes_abi_descriptors_from_abi_and_combined_json() {
+        let abi_dir = temp_dir("abi");
+        fs::write(
+            abi_dir.join("Token.abi"),
+            r#"[{"type":"function","name":"transfer","inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]}]"#,
+        )
+        .expect("write abi");
+        let spec = ResolvedContractSpec {
+            address: Some("0x2".to_owned()),
+            name: "Token".to_owned(),
+            debug_dir: abi_dir,
+        };
+        let calldata = encode_function_call(
+            "transfer(address,uint256)",
+            &[
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_owned(),
+                "99".to_owned(),
+            ],
+        )
+        .expect("calldata");
+        let descriptor = abi_descriptor_for_calldata(&spec, &calldata).expect("descriptor");
+        assert_eq!(descriptor.name, "transfer");
+        assert_eq!(
+            descriptor.params[0].value,
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        );
+        assert_eq!(descriptor.params[1].value, "99");
+
+        let combined_dir = temp_dir("combined");
+        fs::write(
+            combined_dir.join("combined.json"),
+            json!({
+                "version": "0.8.16+commit.test",
+                "contracts": {
+                    "Legacy.sol:Legacy": {
+                        "abi": [
+                            {
+                                "type": "function",
+                                "name": "set",
+                                "inputs": [{"name": "value", "type": "string"}]
+                            }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined");
+        let legacy = ResolvedContractSpec {
+            address: None,
+            name: "Legacy".to_owned(),
+            debug_dir: combined_dir,
+        };
+        let raw = encode_function_call("set(string)", &["hi".to_owned()]).expect("calldata");
+        let descriptor = abi_descriptor_for_calldata(&legacy, &raw).expect("combined descriptor");
+        assert_eq!(descriptor.name, "set");
+        assert_eq!(descriptor.params[0].name, "value");
+        assert!(descriptor.params[0].raw);
+        assert_eq!(
+            descriptor.params[0].value,
+            "0x0000000000000000000000000000000000000000000000000000000000000020"
+        );
+    }
+
+    #[test]
+    fn parses_solidity_functions_and_helpers() {
+        let source = r#"
+contract C {
+    function mix((uint256,address) memory item, uint256[2] calldata values) public {}
+    function noop() external {}
+    functionNameLikeText();
+}
+"#;
+        let functions = parse_source_functions(7, source);
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions[0].source_id, 7);
+        assert_eq!(functions[0].name, "mix");
+        assert_eq!(functions[0].params[0].name, "item");
+        assert_eq!(functions[0].params[0].ty, "(uint256,address)");
+        assert_eq!(functions[0].params[1].name, "values");
+        assert_eq!(functions[0].params[1].ty, "uint256[2]");
+        assert_eq!(functions[1].name, "noop");
+
+        assert_eq!(
+            split_top_level_commas("(uint256,address), uint256[2], string"),
+            vec!["(uint256,address)", " uint256[2]", " string"]
+        );
+        assert!(find_solidity_keyword(source, "function", 0).is_some());
+        assert_eq!(parse_identifier(" _name42 ", 1), Some(("_name42", 8)));
+        assert!(is_identifier("_name42"));
+        assert!(!is_identifier("42name"));
+        assert_eq!(skip_ascii_whitespace(" \n\tabc", 0), 3);
+        assert_eq!(find_next_byte(source, 0, b'{'), source.find('{'));
+        assert_eq!(find_matching_delimiter("(a,(b,c))", 0, b'(', b')'), Some(8));
+    }
+
+    #[test]
+    fn resolves_contract_specs_from_supported_file_shapes() {
+        let dir = temp_dir("contracts");
+        let debug_dir = dir.join("debug");
+        fs::create_dir_all(&debug_dir).expect("create debug dir");
+        fs::write(debug_dir.join("Token.abi"), "[]").expect("write abi");
+
+        let mapping = dir.join("contracts.json");
+        fs::write(
+            &mapping,
+            json!({
+                "contracts": [
+                    {"address": "0xabc", "name": "Token", "debug_dir": "debug"}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write mapping");
+        let specs = load_contract_mapping_file(&mapping).expect("mapping");
+        assert_eq!(specs[0].address.as_deref(), Some("0xabc"));
+        assert_eq!(specs[0].debug_dir, debug_dir);
+
+        let deployment = dir.join("deployment.json");
+        fs::write(
+            &deployment,
+            json!({"address": "0xdef", "contract": "Token"}).to_string(),
+        )
+        .expect("write deployment");
+        let specs = load_deployment_file(&deployment).expect("deployment");
+        assert_eq!(specs[0].name, "Token");
+        assert_eq!(find_debug_dir_for_contract(&dir, "Token"), dir);
+        assert_eq!(infer_contract_name_from_dir(&dir), None);
+        assert_eq!(
+            infer_contract_name_from_dir(&debug_dir).as_deref(),
+            Some("Token")
+        );
+
+        let specs = resolve_ethdebug_spec(&format!("0xabc:{}", mapping.display()))
+            .expect("resolve with address");
+        assert_eq!(specs[0].name, "Token");
+
+        let fallback =
+            resolve_ethdebug_spec(&format!("0xmissing:{}", debug_dir.display())).expect("fallback");
+        assert_eq!(fallback[0].name, "Token");
+        assert_eq!(
+            abi_path_for_contract(&debug_dir, "Token").expect("abi path"),
+            debug_dir.join("Token.abi")
+        );
+    }
+
+    #[test]
+    fn event_json_covers_raw_and_decoded_paths() {
+        let event = parse_event_abis(
+            r#"[{"type":"event","name":"Updated","inputs":[{"name":"value","type":"uint256","indexed":false}]}]"#,
+        )
+        .expect("event abi")
+        .remove(0);
+        let topic = soldb_ethdebug::event_topic(&event);
+        let mut registry = EventRegistry::default();
+        registry
+            .insert(Some("Counter".to_owned()), event)
+            .expect("insert event");
+        let logs = vec![
+            RpcLog {
+                address: "0x2".to_owned(),
+                topics: vec![topic],
+                data: format!("0x{:064x}", 42),
+            },
+            RpcLog {
+                address: "0x3".to_owned(),
+                topics: vec!["0x1234".to_owned()],
+                data: "04".to_owned(),
+            },
+        ];
+
+        let output = events_to_json("0xabc", &logs, &registry).expect("events json");
+        assert!(output.contains("\"event\": \"Updated\""));
+        assert!(output.contains("\"value\": 42"));
+        assert!(output.contains("\"data\": \"0x04\""));
+        let raw_items = raw_event_data_items("0x");
+        assert_eq!(raw_items.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&raw_items[0]).expect("raw item")["value"],
+            "0x"
+        );
+
+        let mut args = list_events_args();
+        assert!(!should_decode_events(&args));
+        args.multi_contract = true;
+        assert!(should_decode_events(&args));
+    }
+
+    #[test]
+    fn simulate_and_format_helpers_cover_error_paths() {
+        let mut args = simulate_args();
+        assert!(maybe_auto_deploy(&args).expect("auto deploy").is_none());
+        assert!(simulate_calldata(&args).is_err());
+
+        args.function_signature = Some("increment(uint256)".to_owned());
+        args.function_args = vec!["4".to_owned()];
+        let calldata = simulate_calldata(&args).expect("encoded calldata");
+        assert!(calldata.starts_with("0x7cf5dab0"));
+        assert_eq!(
+            simulate_json_function_name(&args, &calldata),
+            "increment(uint256)"
+        );
+        assert_eq!(
+            simulate_display_function_name(&args, &calldata),
+            "increment"
+        );
+        let descriptor =
+            simulated_call_descriptor(&args, &calldata, "increment").expect("descriptor");
+        assert_eq!(descriptor.name, "increment(uint256)");
+        assert_eq!(descriptor.params[0].value, "4");
+        assert_eq!(format_simulated_call(&args, "increment"), "increment(4)");
+
+        args.raw_data = Some("0x1234".to_owned());
+        assert!(simulate_calldata(&args).is_err());
+        args.function_signature = None;
+        args.function_args.clear();
+        assert_eq!(simulate_calldata(&args).expect("raw calldata"), "0x1234");
+
+        assert!(validate_simulate_value("0x2a").is_ok());
+        assert!(validate_simulate_value("42").is_ok());
+        assert!(validate_simulate_value("nope").is_err());
+        assert_eq!(normalize_hex("abcd"), "0xabcd");
+        assert_eq!(normalize_hex("0xabcd"), "0xabcd");
+        assert_eq!(display_json_value(&json!("hello")), "hello");
+        assert_eq!(display_json_value(&json!({"a": 1})), "{\"a\":1}");
+        assert_eq!(shorten_hex("0x1234567890"), "0x1234...");
+        assert_eq!(shorten_hex("0x1234"), "0x1234");
+        assert_eq!(format_stack(&[]), "[empty]");
+        assert!(format_stack(&[
+            "0x01".to_owned(),
+            "0x02".to_owned(),
+            "0x03".to_owned(),
+            "0x04".to_owned()
+        ])
+        .contains("... +1 more"));
+        assert_eq!(
+            call_target_stack_word(&["0x1".to_owned(), "0x2".to_owned()]),
+            Some("0x1")
+        );
+        assert_eq!(call_target_stack_word(&["0x1".to_owned()]), None);
+        assert_eq!(
+            extract_address_from_stack_word(
+                "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+            )
+            .as_deref(),
+            Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266")
+        );
+        assert!(extract_address_from_stack_word("0x0").is_none());
+        assert!(extract_address_from_stack_word(&format!("0x{}", "0".repeat(64))).is_none());
+    }
+
+    #[test]
+    fn metadata_and_summary_helpers_cover_legacy_and_plain_paths() {
+        let dir = temp_dir("metadata");
+        fs::write(
+            dir.join("combined.json"),
+            json!({"version": "0.8.16+commit.test", "contracts": {}}).to_string(),
+        )
+        .expect("write combined");
+        let spec = ResolvedContractSpec {
+            address: None,
+            name: "Legacy".to_owned(),
+            debug_dir: dir.clone(),
+        };
+        let metadata = trace_debug_metadata(&spec);
+        assert!(metadata.is_legacy);
+        assert_eq!(metadata.compiler_version.as_deref(), Some("0.8.16"));
+
+        fs::remove_file(dir.join("combined.json")).expect("remove combined");
+        fs::write(
+            dir.join("ethdebug.json"),
+            json!({
+                "compilation": {
+                    "compiler": {"version": "0.8.31+commit.test"},
+                    "sources": [{"id": 0, "path": "Missing.sol"}]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write ethdebug");
+        let metadata = trace_debug_metadata(&spec);
+        assert!(!metadata.is_legacy);
+        assert_eq!(metadata.compiler_version.as_deref(), Some("0.8.31"));
+
+        let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
+        print_plain_trace_summary(&trace);
+        let trace_args = TraceArgs {
+            tx_hash: "0xabc".to_owned(),
+            ethdebug_dir: vec![format!("0x2:Legacy:{}", dir.display())],
+            contracts: None,
+            multi_contract: false,
+            rpc: "http://localhost:8545".to_owned(),
+            max_steps: 1,
+            interactive: false,
+            raw: false,
+            json: false,
+            cross_env_bridge: None,
+            stylus_contracts: None,
+        };
+        print_raw_trace(&trace, &trace_args);
+        assert_eq!(trace_contract_name(&trace_args).as_deref(), Some("Legacy"));
+    }
+
+    #[test]
+    fn decoded_word_helpers_keep_raw_fallbacks() {
+        let raw = "0xabcdef120000000000000000000000000000000000000000000000000000000000000020";
+        let word = decode_calldata_word(raw, 0, "string").expect("raw word");
+        assert!(word.raw);
+        assert_eq!(
+            word.value,
+            "0x0000000000000000000000000000000000000000000000000000000000000020"
+        );
+        assert_eq!(
+            decode_static_word(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "bool"
+            )
+            .as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            decode_static_word(
+                "000000000000000000000000000000000000000000000000000000000000002a",
+                "uint256"
+            )
+            .as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            decode_static_word(
+                "000000000000000000000000000000000000000000000000000000000000002a",
+                "bytes32"
+            )
+            .as_deref(),
+            Some("0x000000000000000000000000000000000000000000000000000000000000002a")
+        );
+        assert!(selector_from_calldata("0xxyz").is_none());
+        assert_eq!(selector_hex([0xab, 0xcd, 0xef, 0x12]), "abcdef12");
+        assert_eq!(
+            format_uint_word(&"f".repeat(64)),
+            format!("0x{}", "f".repeat(64))
+        );
+    }
+
+    #[test]
+    fn json_printing_reports_serialization_errors() {
+        let value: Value = serde_json::from_str(r#"{"ok":true}"#).expect("json");
+        print_json(&value).expect("print json");
+        assert!(read_json_file(Path::new("/definitely/missing/file.json")).is_err());
+    }
+}
