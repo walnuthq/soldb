@@ -739,6 +739,8 @@ fn replay_debug_trace(
                 .flatten()
         })
         .unwrap_or(1);
+    let block_timestamp = parse_quantity(&block.header.timestamp).unwrap_or(0);
+    let spec = replay_spec_for_chain(chain_id, block_number, block_timestamp);
 
     let state_db = RpcStateDb {
         client: client.clone(),
@@ -749,7 +751,7 @@ fn replay_debug_trace(
         .with_db(cache_db)
         .modify_block_chained(|block_env| {
             block_env.number = U256::from(block_number);
-            block_env.timestamp = U256::from(parse_quantity(&block.header.timestamp).unwrap_or(0));
+            block_env.timestamp = U256::from(block_timestamp);
             block_env.gas_limit = parse_quantity(&block.header.gas_limit).unwrap_or(u64::MAX);
             block_env.basefee = block
                 .header
@@ -787,7 +789,7 @@ fn replay_debug_trace(
         })
         .modify_cfg_chained(|cfg| {
             cfg.chain_id = chain_id;
-            cfg.spec = SpecId::PRAGUE;
+            cfg.set_spec_and_mainnet_gas_params(spec);
             cfg.disable_eip3607 = true;
             cfg.disable_block_gas_limit = true;
             cfg.disable_base_fee = true;
@@ -834,6 +836,137 @@ fn replay_debug_trace(
         failed: !result.is_success(),
         gas: Some(result.gas_used()),
     })
+}
+
+fn replay_spec_for_chain(chain_id: u64, block_number: u64, block_timestamp: u64) -> SpecId {
+    match chain_id {
+        1 => ethereum_mainnet_spec(block_number, block_timestamp),
+        11_155_111 => timestamp_scheduled_spec(
+            block_number,
+            block_timestamp,
+            TimestampForks {
+                base: SpecId::LONDON,
+                merge_block: Some(1_735_371),
+                shanghai_time: Some(1_677_557_088),
+                cancun_time: Some(1_706_655_072),
+                prague_time: Some(1_741_159_776),
+                osaka_time: Some(1_760_427_360),
+            },
+        ),
+        17_000 => timestamp_scheduled_spec(
+            block_number,
+            block_timestamp,
+            TimestampForks {
+                base: SpecId::MERGE,
+                merge_block: Some(0),
+                shanghai_time: Some(1_696_000_704),
+                cancun_time: Some(1_707_305_664),
+                prague_time: Some(1_740_434_112),
+                osaka_time: Some(1_759_308_480),
+            },
+        ),
+        560_048 => timestamp_scheduled_spec(
+            block_number,
+            block_timestamp,
+            TimestampForks {
+                base: SpecId::MERGE,
+                merge_block: Some(0),
+                shanghai_time: Some(0),
+                cancun_time: Some(0),
+                prague_time: Some(1_742_999_832),
+                osaka_time: Some(1_761_677_592),
+            },
+        ),
+        1_337 | 31_337 => SpecId::PRAGUE,
+        _ => SpecId::PRAGUE,
+    }
+}
+
+fn ethereum_mainnet_spec(block_number: u64, block_timestamp: u64) -> SpecId {
+    let pre_merge = [
+        (15_537_394, SpecId::MERGE),
+        (15_050_000, SpecId::GRAY_GLACIER),
+        (13_773_000, SpecId::ARROW_GLACIER),
+        (12_965_000, SpecId::LONDON),
+        (12_244_000, SpecId::BERLIN),
+        (9_200_000, SpecId::MUIR_GLACIER),
+        (9_069_000, SpecId::ISTANBUL),
+        (7_280_000, SpecId::PETERSBURG),
+        (4_370_000, SpecId::BYZANTIUM),
+        (2_675_000, SpecId::SPURIOUS_DRAGON),
+        (2_463_000, SpecId::TANGERINE),
+        (1_920_000, SpecId::DAO_FORK),
+        (1_150_000, SpecId::HOMESTEAD),
+        (200_000, SpecId::FRONTIER_THAWING),
+    ];
+
+    if block_number < 15_537_394 {
+        return pre_merge
+            .iter()
+            .find_map(|(fork_block, spec)| (block_number >= *fork_block).then_some(*spec))
+            .unwrap_or(SpecId::FRONTIER);
+    }
+
+    timestamp_scheduled_spec(
+        block_number,
+        block_timestamp,
+        TimestampForks {
+            base: SpecId::MERGE,
+            merge_block: Some(15_537_394),
+            shanghai_time: Some(1_681_338_455),
+            cancun_time: Some(1_710_338_135),
+            prague_time: Some(1_746_612_311),
+            osaka_time: Some(1_764_798_551),
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimestampForks {
+    base: SpecId,
+    merge_block: Option<u64>,
+    shanghai_time: Option<u64>,
+    cancun_time: Option<u64>,
+    prague_time: Option<u64>,
+    osaka_time: Option<u64>,
+}
+
+fn timestamp_scheduled_spec(
+    block_number: u64,
+    block_timestamp: u64,
+    forks: TimestampForks,
+) -> SpecId {
+    if forks
+        .osaka_time
+        .is_some_and(|fork_time| block_timestamp >= fork_time)
+    {
+        return SpecId::OSAKA;
+    }
+    if forks
+        .prague_time
+        .is_some_and(|fork_time| block_timestamp >= fork_time)
+    {
+        return SpecId::PRAGUE;
+    }
+    if forks
+        .cancun_time
+        .is_some_and(|fork_time| block_timestamp >= fork_time)
+    {
+        return SpecId::CANCUN;
+    }
+    if forks
+        .shanghai_time
+        .is_some_and(|fork_time| block_timestamp >= fork_time)
+    {
+        return SpecId::SHANGHAI;
+    }
+    if forks
+        .merge_block
+        .is_some_and(|fork_block| block_number >= fork_block)
+    {
+        return SpecId::MERGE;
+    }
+    forks.base
 }
 
 fn replay_target_index(
@@ -1210,10 +1343,10 @@ mod tests {
     use std::thread;
 
     use super::{
-        build_transaction_trace, decode_revert_reason, replay_target_index, simulate_call,
-        trace_transaction, trace_transaction_with_backend, transaction_logs, DebugTraceResult,
-        HttpEndpoint, HttpScheme, RpcTransaction, SimulateCallRequest, StructLog, TraceBackend,
-        TraceEnvelope,
+        build_transaction_trace, decode_revert_reason, replay_spec_for_chain, replay_target_index,
+        simulate_call, trace_transaction, trace_transaction_with_backend, transaction_logs,
+        DebugTraceResult, HttpEndpoint, HttpScheme, RpcTransaction, SimulateCallRequest, SpecId,
+        StructLog, TraceBackend, TraceEnvelope,
     };
     use serde_json::json;
 
@@ -1434,6 +1567,62 @@ mod tests {
             .expect_err("missing tx")
             .to_string()
             .contains("could not find transaction"));
+    }
+
+    #[test]
+    fn selects_mainnet_specs_by_block_and_timestamp() {
+        assert_eq!(replay_spec_for_chain(1, 0, 0), SpecId::FRONTIER);
+        assert_eq!(
+            replay_spec_for_chain(1, 200_000, 0),
+            SpecId::FRONTIER_THAWING
+        );
+        assert_eq!(replay_spec_for_chain(1, 1_150_000, 0), SpecId::HOMESTEAD);
+        assert_eq!(replay_spec_for_chain(1, 12_965_000, 0), SpecId::LONDON);
+        assert_eq!(replay_spec_for_chain(1, 15_537_394, 0), SpecId::MERGE);
+        assert_eq!(
+            replay_spec_for_chain(1, 17_034_870, 1_681_338_455),
+            SpecId::SHANGHAI
+        );
+        assert_eq!(
+            replay_spec_for_chain(1, 19_426_587, 1_710_338_135),
+            SpecId::CANCUN
+        );
+        assert_eq!(
+            replay_spec_for_chain(1, 22_431_084, 1_746_612_311),
+            SpecId::PRAGUE
+        );
+        assert_eq!(
+            replay_spec_for_chain(1, 24_800_000, 1_764_798_551),
+            SpecId::OSAKA
+        );
+    }
+
+    #[test]
+    fn selects_common_testnet_and_dev_specs() {
+        assert_eq!(
+            replay_spec_for_chain(11_155_111, 5_000_000, 1_706_655_072),
+            SpecId::CANCUN
+        );
+        assert_eq!(
+            replay_spec_for_chain(11_155_111, 5_000_000, 1_741_159_776),
+            SpecId::PRAGUE
+        );
+        assert_eq!(
+            replay_spec_for_chain(17_000, 1, 1_759_308_480),
+            SpecId::OSAKA
+        );
+        assert_eq!(
+            replay_spec_for_chain(560_048, 1, 1_742_999_831),
+            SpecId::CANCUN
+        );
+        assert_eq!(
+            replay_spec_for_chain(560_048, 1, 1_742_999_832),
+            SpecId::PRAGUE
+        );
+        assert_eq!(
+            replay_spec_for_chain(31_337, 1, 1_818_000_000),
+            SpecId::PRAGUE
+        );
     }
 
     #[test]

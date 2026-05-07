@@ -161,7 +161,7 @@ SolDB relies on compiler-generated debug information. Compile with `solc` ETHDeb
 The `trace` command currently supports two transaction tracing backends:
 
 - `debug-rpc` (default): calls `debug_traceTransaction` and is the fast path for Anvil, Geth, and other debug-capable nodes.
-- `replay`: loads transaction, receipt, parent-block state, bytecode, balances, nonces, and storage through normal Ethereum JSON-RPC, replays the transaction in REVM, and records opcode steps through inspectors. This path currently targets simple local Anvil transactions at index `0`; multi-transaction block replay, hardfork/spec selection, and archive-provider hardening are next-stage work.
+- `replay`: loads transaction, receipt, parent-block state, bytecode, balances, nonces, and storage through normal Ethereum JSON-RPC, replays prior transactions in the block when needed, then replays the target transaction in REVM with inspectors. It selects the REVM spec from chain/block/timestamp for mainnet, Sepolia, Holesky, and Hoodi; archive-provider hardening and broader cache tuning are next-stage work.
 
 Select the backend explicitly:
 
