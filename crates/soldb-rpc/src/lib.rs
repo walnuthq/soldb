@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
+use std::rc::Rc;
 use std::time::Duration;
 
 use revm::bytecode::opcode::OpCode;
@@ -742,10 +744,8 @@ fn replay_debug_trace(
     let block_timestamp = parse_quantity(&block.header.timestamp).unwrap_or(0);
     let spec = replay_spec_for_chain(chain_id, block_number, block_timestamp);
 
-    let state_db = RpcStateDb {
-        client: client.clone(),
-        block_tag: parent_block_tag,
-    };
+    let state_provider = RpcReplayStateProvider::new(client.clone(), parent_block_tag);
+    let state_db = RpcStateDb::new(state_provider);
     let cache_db = CacheDB::new(WrapDatabaseRef(state_db));
     let mut context = Context::mainnet()
         .with_db(cache_db)
@@ -999,8 +999,7 @@ fn replay_target_index(
 
 #[derive(Debug, Clone)]
 struct RpcStateDb {
-    client: HttpJsonRpcClient,
-    block_tag: String,
+    provider: RpcReplayStateProvider,
 }
 
 #[derive(Debug, Clone)]
@@ -1023,6 +1022,81 @@ impl From<SoldbError> for ReplayDbError {
 }
 
 impl RpcStateDb {
+    fn new(provider: RpcReplayStateProvider) -> Self {
+        Self { provider }
+    }
+}
+
+trait ReplayStateProvider {
+    fn account(&self, address: Address) -> Result<AccountInfo, ReplayDbError>;
+    fn storage(&self, address: Address, index: U256) -> Result<U256, ReplayDbError>;
+    fn block_hash(&self, number: u64) -> Result<B256, ReplayDbError>;
+}
+
+#[derive(Debug, Clone)]
+struct RpcReplayStateProvider {
+    inner: Rc<RefCell<RpcReplayStateProviderInner>>,
+}
+
+#[derive(Debug)]
+struct RpcReplayStateProviderInner {
+    client: HttpJsonRpcClient,
+    block_tag: String,
+    accounts: HashMap<Address, AccountInfo>,
+    storage: HashMap<(Address, U256), U256>,
+    block_hashes: HashMap<u64, B256>,
+}
+
+impl RpcReplayStateProvider {
+    fn new(client: HttpJsonRpcClient, block_tag: String) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(RpcReplayStateProviderInner {
+                client,
+                block_tag,
+                accounts: HashMap::new(),
+                storage: HashMap::new(),
+                block_hashes: HashMap::new(),
+            })),
+        }
+    }
+}
+
+impl ReplayStateProvider for RpcReplayStateProvider {
+    fn account(&self, address: Address) -> Result<AccountInfo, ReplayDbError> {
+        if let Some(account) = self.inner.borrow().accounts.get(&address).cloned() {
+            return Ok(account);
+        }
+
+        let mut inner = self.inner.borrow_mut();
+        let account = inner.fetch_account(address)?;
+        inner.accounts.insert(address, account.clone());
+        Ok(account)
+    }
+
+    fn storage(&self, address: Address, index: U256) -> Result<U256, ReplayDbError> {
+        if let Some(value) = self.inner.borrow().storage.get(&(address, index)).copied() {
+            return Ok(value);
+        }
+
+        let mut inner = self.inner.borrow_mut();
+        let value = inner.fetch_storage(address, index)?;
+        inner.storage.insert((address, index), value);
+        Ok(value)
+    }
+
+    fn block_hash(&self, number: u64) -> Result<B256, ReplayDbError> {
+        if let Some(hash) = self.inner.borrow().block_hashes.get(&number).copied() {
+            return Ok(hash);
+        }
+
+        let mut inner = self.inner.borrow_mut();
+        let hash = inner.fetch_block_hash(number)?;
+        inner.block_hashes.insert(number, hash);
+        Ok(hash)
+    }
+}
+
+impl RpcReplayStateProviderInner {
     fn request_at_block<T: DeserializeOwned>(
         &self,
         method: &str,
@@ -1032,19 +1106,17 @@ impl RpcStateDb {
             .request(method, params)
             .map_err(ReplayDbError::from)
     }
-}
 
-impl DatabaseRef for RpcStateDb {
-    type Error = ReplayDbError;
-
-    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let address = address.to_string();
+    fn fetch_account(&self, address: Address) -> Result<AccountInfo, ReplayDbError> {
+        let address_text = address.to_string();
         let block = self.block_tag.clone();
         let balance: String =
-            self.request_at_block("eth_getBalance", json!([address, block.clone()]))?;
-        let nonce: String =
-            self.request_at_block("eth_getTransactionCount", json!([address, block.clone()]))?;
-        let code: String = self.request_at_block("eth_getCode", json!([address, block]))?;
+            self.request_at_block("eth_getBalance", json!([address_text, block.clone()]))?;
+        let nonce: String = self.request_at_block(
+            "eth_getTransactionCount",
+            json!([address_text, block.clone()]),
+        )?;
+        let code: String = self.request_at_block("eth_getCode", json!([address_text, block]))?;
 
         let code_bytes = hex_to_bytes(code.trim_start_matches("0x")).ok_or_else(|| {
             ReplayDbError(format!(
@@ -1053,19 +1125,15 @@ impl DatabaseRef for RpcStateDb {
         })?;
         let bytecode = Bytecode::new_raw(Bytes::from(code_bytes));
         let code_hash = bytecode.hash_slow();
-        Ok(Some(AccountInfo::new(
+        Ok(AccountInfo::new(
             parse_u256_quantity(&balance).map_err(ReplayDbError::from)?,
             parse_quantity(&nonce).map_err(ReplayDbError::from)?,
             code_hash,
             bytecode,
-        )))
+        ))
     }
 
-    fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
-        Ok(Bytecode::default())
-    }
-
-    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+    fn fetch_storage(&self, address: Address, index: U256) -> Result<U256, ReplayDbError> {
         let value: String = self.request_at_block(
             "eth_getStorageAt",
             json!([
@@ -1077,7 +1145,7 @@ impl DatabaseRef for RpcStateDb {
         parse_u256_quantity(&value).map_err(ReplayDbError::from)
     }
 
-    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+    fn fetch_block_hash(&self, number: u64) -> Result<B256, ReplayDbError> {
         let block = self
             .request_at_block::<Option<RpcBlockHeader>>(
                 "eth_getBlockByNumber",
@@ -1089,6 +1157,26 @@ impl DatabaseRef for RpcStateDb {
             .as_deref()
             .ok_or_else(|| ReplayDbError(format!("Block {number} did not include a hash")))?;
         parse_b256(hash).map_err(ReplayDbError::from)
+    }
+}
+
+impl DatabaseRef for RpcStateDb {
+    type Error = ReplayDbError;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.provider.account(address).map(Some)
+    }
+
+    fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+        Ok(Bytecode::default())
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.provider.storage(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        self.provider.block_hash(number)
     }
 }
 
@@ -1340,13 +1428,18 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
 
+    use revm::primitives::{B256, U256};
+    use revm::DatabaseRef;
+
     use super::{
-        build_transaction_trace, decode_revert_reason, replay_spec_for_chain, replay_target_index,
-        simulate_call, trace_transaction, trace_transaction_with_backend, transaction_logs,
-        DebugTraceResult, HttpEndpoint, HttpScheme, RpcTransaction, SimulateCallRequest, SpecId,
-        StructLog, TraceBackend, TraceEnvelope,
+        build_transaction_trace, decode_revert_reason, parse_address, replay_spec_for_chain,
+        replay_target_index, simulate_call, trace_transaction, trace_transaction_with_backend,
+        transaction_logs, DebugTraceResult, HttpEndpoint, HttpJsonRpcClient, HttpScheme,
+        RpcReplayStateProvider, RpcStateDb, RpcTransaction, SimulateCallRequest, SpecId, StructLog,
+        TraceBackend, TraceEnvelope,
     };
     use serde_json::json;
 
@@ -1570,6 +1663,46 @@ mod tests {
     }
 
     #[test]
+    fn replay_state_provider_caches_account_storage_and_block_hash_reads() {
+        let (rpc_url, rx) = start_replay_state_server(5);
+        let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
+        let db = RpcStateDb::new(RpcReplayStateProvider::new(client, "0x10".to_owned()));
+        let address = parse_address("0x5fbdb2315678afecb367f032d93f642f64180aa3").expect("address");
+
+        assert!(db.basic_ref(address).expect("account").is_some());
+        assert!(db.basic_ref(address).expect("cached account").is_some());
+        assert_eq!(
+            db.storage_ref(address, U256::from(1)).expect("storage"),
+            U256::from(42)
+        );
+        assert_eq!(
+            db.storage_ref(address, U256::from(1))
+                .expect("cached storage"),
+            U256::from(42)
+        );
+        assert_ne!(db.block_hash_ref(7).expect("block hash"), B256::ZERO);
+        assert_eq!(
+            db.block_hash_ref(7).expect("cached block hash"),
+            db.block_hash_ref(7).expect("cached block hash again")
+        );
+
+        let methods: Vec<String> = rx.try_iter().collect();
+        assert_eq!(count_method(&methods, "eth_getBalance"), 1, "{methods:?}");
+        assert_eq!(
+            count_method(&methods, "eth_getTransactionCount"),
+            1,
+            "{methods:?}"
+        );
+        assert_eq!(count_method(&methods, "eth_getCode"), 1, "{methods:?}");
+        assert_eq!(count_method(&methods, "eth_getStorageAt"), 1, "{methods:?}");
+        assert_eq!(
+            count_method(&methods, "eth_getBlockByNumber"),
+            1,
+            "{methods:?}"
+        );
+    }
+
+    #[test]
     fn selects_mainnet_specs_by_block_and_timestamp() {
         assert_eq!(replay_spec_for_chain(1, 0, 0), SpecId::FRONTIER);
         assert_eq!(
@@ -1681,6 +1814,19 @@ mod tests {
         format!("http://{address}")
     }
 
+    fn start_replay_state_server(request_count: usize) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind replay state server");
+        let address = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..request_count {
+                let (stream, _) = listener.accept().expect("accept rpc request");
+                respond_to_replay_state_request(stream, &tx);
+            }
+        });
+        (format!("http://{address}"), rx)
+    }
+
     fn respond_to_rpc_request(mut stream: TcpStream) {
         let request = read_http_request(&mut stream);
         let response = if request.contains("\"eth_getTransactionByHash\"") {
@@ -1751,6 +1897,54 @@ mod tests {
         stream
             .write_all(http_response.as_bytes())
             .expect("write response");
+    }
+
+    fn respond_to_replay_state_request(mut stream: TcpStream, tx: &mpsc::Sender<String>) {
+        let request = read_http_request(&mut stream);
+        let (method, result) = if request.contains("\"eth_getBalance\"") {
+            ("eth_getBalance", json!("0x2a"))
+        } else if request.contains("\"eth_getTransactionCount\"") {
+            ("eth_getTransactionCount", json!("0x3"))
+        } else if request.contains("\"eth_getCode\"") {
+            ("eth_getCode", json!("0x60016000"))
+        } else if request.contains("\"eth_getStorageAt\"") {
+            ("eth_getStorageAt", json!("0x2a"))
+        } else if request.contains("\"eth_getBlockByNumber\"") {
+            (
+                "eth_getBlockByNumber",
+                json!({
+                    "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "timestamp": "0x1",
+                    "gasLimit": "0x1c9c380",
+                    "baseFeePerGas": "0x1"
+                }),
+            )
+        } else {
+            ("unknown", json!(null))
+        };
+        tx.send(method.to_owned()).expect("record method");
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": result
+        });
+        let body = response.to_string();
+        let http_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(http_response.as_bytes())
+            .expect("write response");
+    }
+
+    fn count_method(methods: &[String], method: &str) -> usize {
+        methods
+            .iter()
+            .filter(|entry| entry.as_str() == method)
+            .count()
     }
 
     fn mock_rpc_transaction(hash: &str) -> RpcTransaction {
