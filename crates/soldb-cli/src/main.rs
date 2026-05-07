@@ -2295,12 +2295,34 @@ fn simulate_calldata(args: &SimulateArgs) -> SoldbResult<String> {
 }
 
 fn validate_simulate_value(value: &str) -> Result<(), String> {
+    let value = value.trim();
     let parsed = if let Some(hex) = value.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16).map(|_| ())
+        (!hex.is_empty() && hex.chars().all(|ch| ch.is_ascii_hexdigit())).then_some(())
+    } else if let Some(ether) = strip_ether_value(value) {
+        validate_ether_value(ether)
     } else {
-        value.parse::<u64>().map(|_| ())
+        (!value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())).then_some(())
     };
-    parsed.map_err(|_| format!("Invalid value for --value: {value}"))
+    parsed.ok_or_else(|| format!("Invalid value for --value: {value}"))
+}
+
+fn strip_ether_value(value: &str) -> Option<&str> {
+    value
+        .get(..value.len().checked_sub("ether".len())?)
+        .filter(|_| value.to_ascii_lowercase().ends_with("ether"))
+        .map(str::trim)
+}
+
+fn validate_ether_value(value: &str) -> Option<()> {
+    let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
+    let valid_whole = whole.is_empty() || whole.chars().all(|ch| ch.is_ascii_digit());
+    let valid_fractional =
+        fractional.is_empty() || fractional.chars().all(|ch| ch.is_ascii_digit());
+    (valid_whole
+        && valid_fractional
+        && !(whole.is_empty() && fractional.is_empty())
+        && fractional.len() <= 18)
+        .then_some(())
 }
 
 fn print_json_command_error(
@@ -2867,7 +2889,11 @@ contract C {
 
         assert!(validate_simulate_value("0x2a").is_ok());
         assert!(validate_simulate_value("42").is_ok());
+        assert!(validate_simulate_value("1ether").is_ok());
+        assert!(validate_simulate_value("0.1ether").is_ok());
+        assert!(validate_simulate_value(".5ether").is_ok());
         assert!(validate_simulate_value("nope").is_err());
+        assert!(validate_simulate_value("0.0000000000000000001ether").is_err());
         assert_eq!(normalize_hex("abcd"), "0xabcd");
         assert_eq!(normalize_hex("0xabcd"), "0xabcd");
         assert_eq!(display_json_value(&json!("hello")), "hello");

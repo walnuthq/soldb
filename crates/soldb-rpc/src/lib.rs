@@ -1507,15 +1507,72 @@ fn quantity_is_one(value: &str) -> bool {
 }
 
 fn parse_value_quantity(value: &str) -> SoldbResult<String> {
+    let value = value.trim();
     if value.starts_with("0x") {
-        parse_quantity(value)?;
-        Ok(value.to_owned())
+        Ok(format_u256_quantity(parse_u256_quantity(value)?))
+    } else if let Some(ether_value) = strip_ether_suffix(value) {
+        Ok(format_u256_quantity(parse_ether_value(ether_value)?))
     } else {
-        let parsed = value.parse::<u64>().map_err(|error| {
+        let parsed = U256::from_str_radix(value, 10).map_err(|error| {
             SoldbError::Message(format!("Invalid call value '{value}': {error}"))
         })?;
-        Ok(format_quantity(parsed))
+        Ok(format_u256_quantity(parsed))
     }
+}
+
+fn strip_ether_suffix(value: &str) -> Option<&str> {
+    value
+        .get(..value.len().checked_sub("ether".len())?)
+        .filter(|_| value.to_ascii_lowercase().ends_with("ether"))
+        .map(str::trim)
+}
+
+fn parse_ether_value(value: &str) -> SoldbResult<U256> {
+    let value = value.trim();
+    let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty() && fractional.is_empty() {
+        return Err(SoldbError::Message("Invalid call value 'ether'".to_owned()));
+    }
+    if fractional.len() > 18 {
+        return Err(SoldbError::Message(format!(
+            "Invalid call value '{value}ether': too many decimal places"
+        )));
+    }
+    if (!whole.is_empty() && !whole.chars().all(|ch| ch.is_ascii_digit()))
+        || (!fractional.is_empty() && !fractional.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Err(SoldbError::Message(format!(
+            "Invalid call value '{value}ether': expected decimal ether amount"
+        )));
+    }
+
+    let ether = U256::from(1_000_000_000_000_000_000u64);
+    let whole_wei = if whole.is_empty() {
+        U256::ZERO
+    } else {
+        U256::from_str_radix(whole, 10)
+            .map_err(|error| {
+                SoldbError::Message(format!("Invalid call value '{value}ether': {error}"))
+            })?
+            .checked_mul(ether)
+            .ok_or_else(|| {
+                SoldbError::Message(format!("Invalid call value '{value}ether': overflow"))
+            })?
+    };
+
+    let fractional_wei = if fractional.is_empty() {
+        U256::ZERO
+    } else {
+        let mut padded = fractional.to_owned();
+        padded.extend(std::iter::repeat_n('0', 18 - fractional.len()));
+        U256::from_str_radix(&padded, 10).map_err(|error| {
+            SoldbError::Message(format!("Invalid call value '{value}ether': {error}"))
+        })?
+    };
+
+    whole_wei
+        .checked_add(fractional_wei)
+        .ok_or_else(|| SoldbError::Message(format!("Invalid call value '{value}ether': overflow")))
 }
 
 fn format_quantity(value: u64) -> String {
@@ -1531,7 +1588,8 @@ fn format_u256_quantity(value: U256) -> String {
         .iter()
         .position(|byte| *byte != 0)
         .unwrap_or(bytes.len() - 1);
-    format!("0x{}", bytes_to_hex(&bytes[first_non_zero..]))
+    let hex = bytes_to_hex(&bytes[first_non_zero..]);
+    format!("0x{}", hex.trim_start_matches('0'))
 }
 
 fn parse_address(value: &str) -> SoldbResult<Address> {
@@ -1590,12 +1648,13 @@ mod tests {
     use revm::DatabaseRef;
 
     use super::{
-        build_transaction_trace, decode_revert_reason, parse_address, replay_chain_id,
-        replay_full_block_transactions, replay_preflight_parent_state, replay_spec_for_chain,
-        replay_target_index, resolve_trace_backend, simulate_call, trace_transaction,
-        trace_transaction_with_backend, transaction_logs, DebugTraceResult, HttpEndpoint,
-        HttpJsonRpcClient, HttpScheme, RpcBlockTransaction, RpcReplayStateProvider, RpcStateDb,
-        RpcTransaction, SimulateCallRequest, SpecId, StructLog, TraceBackend, TraceEnvelope,
+        build_transaction_trace, decode_revert_reason, parse_address, parse_value_quantity,
+        replay_chain_id, replay_full_block_transactions, replay_preflight_parent_state,
+        replay_spec_for_chain, replay_target_index, resolve_trace_backend, simulate_call,
+        trace_transaction, trace_transaction_with_backend, transaction_logs, DebugTraceResult,
+        HttpEndpoint, HttpJsonRpcClient, HttpScheme, RpcBlockTransaction, RpcReplayStateProvider,
+        RpcStateDb, RpcTransaction, SimulateCallRequest, SpecId, StructLog, TraceBackend,
+        TraceEnvelope,
     };
     use serde_json::json;
     use soldb_core::TransactionTrace;
@@ -2086,6 +2145,27 @@ mod tests {
         assert_eq!(trace.gas_used, 42_000);
         assert!(trace.success);
         assert_eq!(trace.steps[1].op, "CALLDATASIZE");
+    }
+
+    #[test]
+    fn parses_simulation_value_quantities() {
+        assert_eq!(parse_value_quantity("0").expect("zero"), "0x0");
+        assert_eq!(parse_value_quantity("42").expect("decimal wei"), "0x2a");
+        assert_eq!(parse_value_quantity("0x2a").expect("hex wei"), "0x2a");
+        assert_eq!(
+            parse_value_quantity("1ether").expect("one ether"),
+            "0xde0b6b3a7640000"
+        );
+        assert_eq!(
+            parse_value_quantity("0.1ether").expect("decimal ether"),
+            "0x16345785d8a0000"
+        );
+        assert_eq!(
+            parse_value_quantity(".5ether").expect("fractional ether"),
+            "0x6f05b59d3b20000"
+        );
+        assert!(parse_value_quantity("0.0000000000000000001ether").is_err());
+        assert!(parse_value_quantity("nope").is_err());
     }
 
     #[test]
