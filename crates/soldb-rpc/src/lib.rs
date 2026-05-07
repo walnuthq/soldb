@@ -459,7 +459,14 @@ struct RpcBlockWithTransactions {
     #[serde(flatten)]
     header: RpcBlockHeader,
     #[serde(default)]
-    transactions: Vec<RpcTransaction>,
+    transactions: Vec<RpcBlockTransaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum RpcBlockTransaction {
+    Full(Box<RpcTransaction>),
+    Hash(String),
 }
 
 impl DebugTraceResult {
@@ -787,33 +794,26 @@ fn replay_debug_trace(
         .unwrap_or(0) as usize;
 
     let block_tag = format_quantity(block_number);
+    let parent_block_tag = format_quantity(block_number - 1);
+    let chain_id = replay_chain_id(client, tx)?;
     let block = client
         .request::<Option<RpcBlockWithTransactions>>(
             "eth_getBlockByNumber",
             json!([block_tag, true]),
-        )?
+        )
+        .map_err(|error| {
+            SoldbError::Message(format!(
+                "Replay backend preflight failed: could not load block {block_number} with full transactions: {error}",
+            ))
+        })?
         .ok_or_else(|| SoldbError::Message(format!("Block {block_number} not found")))?;
-    let target_index = replay_target_index(&block.transactions, target_index, &tx.hash)?;
-    let parent_block_tag = format_quantity(block_number - 1);
-    let chain_id = client
-        .request::<String>("eth_chainId", json!([]))
-        .ok()
-        .as_deref()
-        .map(parse_quantity)
-        .transpose()?
-        .or_else(|| {
-            tx.chain_id
-                .as_deref()
-                .map(parse_quantity)
-                .transpose()
-                .ok()
-                .flatten()
-        })
-        .unwrap_or(1);
+    let transactions = replay_full_block_transactions(block_number, &block.transactions)?;
+    let target_index = replay_target_index(&transactions, target_index, &tx.hash)?;
     let block_timestamp = parse_quantity(&block.header.timestamp).unwrap_or(0);
     let spec = replay_spec_for_chain(chain_id, block_number, block_timestamp);
 
     let state_provider = RpcReplayStateProvider::new(client.clone(), parent_block_tag);
+    replay_preflight_parent_state(&state_provider, tx)?;
     let state_db = RpcStateDb::new(state_provider);
     let cache_db = CacheDB::new(WrapDatabaseRef(state_db));
     let mut context = Context::mainnet()
@@ -866,7 +866,7 @@ fn replay_debug_trace(
 
     if target_index > 0 {
         let mut evm = context.build_mainnet();
-        for (index, prior_tx) in block.transactions.iter().take(target_index).enumerate() {
+        for (index, prior_tx) in transactions.iter().take(target_index).enumerate() {
             let tx_env = tx_env_from_rpc_transaction(prior_tx, chain_id)?;
             evm.transact_commit(tx_env).map_err(|error| {
                 SoldbError::Message(format!(
@@ -1036,6 +1036,89 @@ fn timestamp_scheduled_spec(
         return SpecId::MERGE;
     }
     forks.base
+}
+
+fn replay_chain_id(client: &HttpJsonRpcClient, tx: &RpcTransaction) -> SoldbResult<u64> {
+    match client.request::<String>("eth_chainId", json!([])) {
+        Ok(chain_id) => parse_quantity(&chain_id).map_err(|error| {
+            SoldbError::Message(format!(
+                "Replay backend preflight failed: could not parse eth_chainId response {chain_id}: {error}",
+            ))
+        }),
+        Err(error) => {
+            let Some(tx_chain_id) = tx.chain_id.as_deref() else {
+                return Err(SoldbError::Message(format!(
+                    "Replay backend preflight failed: chain id is required, eth_chainId failed, and the transaction has no chainId. Original error: {error}",
+                )));
+            };
+            parse_quantity(tx_chain_id).map_err(|parse_error| {
+                SoldbError::Message(format!(
+                    "Replay backend preflight failed: could not parse transaction chainId {tx_chain_id}: {parse_error}",
+                ))
+            })
+        }
+    }
+}
+
+fn replay_full_block_transactions(
+    block_number: u64,
+    transactions: &[RpcBlockTransaction],
+) -> SoldbResult<Vec<RpcTransaction>> {
+    if transactions.is_empty() {
+        return Err(SoldbError::Message(format!(
+            "Replay backend preflight failed: block {block_number} has no transactions in eth_getBlockByNumber response",
+        )));
+    }
+
+    transactions
+        .iter()
+        .map(|transaction| match transaction {
+            RpcBlockTransaction::Full(transaction) => Ok(transaction.as_ref().clone()),
+            RpcBlockTransaction::Hash(hash) => Err(SoldbError::Message(format!(
+                "Replay backend preflight failed: block {block_number} returned transaction hash {hash} instead of full transaction objects; replay requires eth_getBlockByNumber(block, true)",
+            ))),
+        })
+        .collect()
+}
+
+fn replay_preflight_parent_state(
+    provider: &RpcReplayStateProvider,
+    tx: &RpcTransaction,
+) -> SoldbResult<()> {
+    let from = parse_address(&tx.from_addr).map_err(|error| {
+        SoldbError::Message(format!(
+            "Replay backend preflight failed: invalid sender address {}: {error}",
+            tx.from_addr
+        ))
+    })?;
+    provider
+        .account(from)
+        .map_err(|error| replay_parent_state_error("sender account", error))?;
+
+    let storage_probe_address = if let Some(to) = tx.to.as_deref() {
+        let to = parse_address(to).map_err(|error| {
+            SoldbError::Message(format!(
+                "Replay backend preflight failed: invalid recipient address {to}: {error}",
+            ))
+        })?;
+        provider
+            .account(to)
+            .map_err(|error| replay_parent_state_error("recipient account", error))?;
+        to
+    } else {
+        from
+    };
+
+    provider
+        .storage(storage_probe_address, U256::ZERO)
+        .map_err(|error| replay_parent_state_error("storage slot 0", error))?;
+    Ok(())
+}
+
+fn replay_parent_state_error(context: &str, error: ReplayDbError) -> SoldbError {
+    SoldbError::Message(format!(
+        "Replay backend preflight failed: parent-block state is not readable while checking {context}. {error}",
+    ))
 }
 
 fn replay_target_index(
@@ -1507,11 +1590,12 @@ mod tests {
     use revm::DatabaseRef;
 
     use super::{
-        build_transaction_trace, decode_revert_reason, parse_address, replay_spec_for_chain,
+        build_transaction_trace, decode_revert_reason, parse_address, replay_chain_id,
+        replay_full_block_transactions, replay_preflight_parent_state, replay_spec_for_chain,
         replay_target_index, resolve_trace_backend, simulate_call, trace_transaction,
         trace_transaction_with_backend, transaction_logs, DebugTraceResult, HttpEndpoint,
-        HttpJsonRpcClient, HttpScheme, RpcReplayStateProvider, RpcStateDb, RpcTransaction,
-        SimulateCallRequest, SpecId, StructLog, TraceBackend, TraceEnvelope,
+        HttpJsonRpcClient, HttpScheme, RpcBlockTransaction, RpcReplayStateProvider, RpcStateDb,
+        RpcTransaction, SimulateCallRequest, SpecId, StructLog, TraceBackend, TraceEnvelope,
     };
     use serde_json::json;
     use soldb_core::TransactionTrace;
@@ -1787,6 +1871,85 @@ mod tests {
     }
 
     #[test]
+    fn replay_chain_id_requires_rpc_or_transaction_chain_id() {
+        let rpc_url = start_chain_id_error_server();
+        let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
+        let mut tx = mock_rpc_transaction("0xabc");
+        tx.chain_id = None;
+
+        let error = replay_chain_id(&client, &tx).expect_err("missing chain id should fail");
+        let message = error.to_string();
+        assert!(message.contains("chain id is required"), "{message}");
+        assert!(message.contains("eth_chainId failed"), "{message}");
+    }
+
+    #[test]
+    fn replay_chain_id_uses_transaction_chain_id_when_rpc_fails() {
+        let rpc_url = start_chain_id_error_server();
+        let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
+        let mut tx = mock_rpc_transaction("0xabc");
+        tx.chain_id = Some("0x7a69".to_owned());
+
+        assert_eq!(replay_chain_id(&client, &tx).expect("chain id"), 31_337);
+    }
+
+    #[test]
+    fn replay_full_block_transactions_rejects_hash_only_blocks() {
+        let error =
+            replay_full_block_transactions(12, &[RpcBlockTransaction::Hash("0xabc".to_owned())])
+                .expect_err("hash-only block should fail preflight");
+        let message = error.to_string();
+        assert!(message.contains("full transaction objects"), "{message}");
+        assert!(message.contains("block 12"), "{message}");
+
+        let transactions = replay_full_block_transactions(
+            12,
+            &[RpcBlockTransaction::Full(Box::new(mock_rpc_transaction(
+                "0xabc",
+            )))],
+        )
+        .expect("full transaction");
+        assert_eq!(transactions[0].hash, "0xabc");
+    }
+
+    #[test]
+    fn replay_preflight_parent_state_reads_account_and_storage() {
+        let (rpc_url, rx) = start_replay_state_server(7);
+        let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
+        let provider = RpcReplayStateProvider::new(client, "0x10".to_owned());
+
+        replay_preflight_parent_state(&provider, &mock_rpc_transaction("0xabc"))
+            .expect("preflight");
+
+        let methods: Vec<String> = rx.try_iter().collect();
+        assert_eq!(count_method(&methods, "eth_getBalance"), 2, "{methods:?}");
+        assert_eq!(
+            count_method(&methods, "eth_getTransactionCount"),
+            2,
+            "{methods:?}"
+        );
+        assert_eq!(count_method(&methods, "eth_getCode"), 2, "{methods:?}");
+        assert_eq!(count_method(&methods, "eth_getStorageAt"), 1, "{methods:?}");
+    }
+
+    #[test]
+    fn replay_preflight_parent_state_reports_archive_hint() {
+        let rpc_url = start_replay_state_error_server();
+        let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
+        let provider = RpcReplayStateProvider::new(client, "0x10".to_owned());
+
+        let error = replay_preflight_parent_state(&provider, &mock_rpc_transaction("0xabc"))
+            .expect_err("preflight should report state access failures");
+        let message = error.to_string();
+        assert!(
+            message.contains("parent-block state is not readable"),
+            "{message}"
+        );
+        assert!(message.contains("sender account"), "{message}");
+        assert!(message.contains("archive-capable RPC"), "{message}");
+    }
+
+    #[test]
     fn replay_state_provider_caches_account_storage_and_block_hash_reads() {
         let (rpc_url, rx) = start_replay_state_server(5);
         let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
@@ -1978,6 +2141,16 @@ mod tests {
         format!("http://{address}")
     }
 
+    fn start_chain_id_error_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind chain id error server");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept rpc request");
+            respond_to_chain_id_error_request(stream);
+        });
+        format!("http://{address}")
+    }
+
     fn respond_to_rpc_request(mut stream: TcpStream) {
         let request = read_http_request(&mut stream);
         let response = if request.contains("\"eth_getTransactionByHash\"") {
@@ -2099,6 +2272,27 @@ mod tests {
             "error": {
                 "code": -32000,
                 "message": "missing trie node"
+            }
+        });
+        let body = response.to_string();
+        let http_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(http_response.as_bytes())
+            .expect("write response");
+    }
+
+    fn respond_to_chain_id_error_request(mut stream: TcpStream) {
+        let _request = read_http_request(&mut stream);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32601,
+                "message": "method not found"
             }
         });
         let body = response.to_string();
