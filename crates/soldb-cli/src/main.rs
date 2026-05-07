@@ -121,6 +121,7 @@ enum Command {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum TraceBackendArg {
+    Auto,
     DebugRpc,
     Replay,
 }
@@ -128,15 +129,10 @@ enum TraceBackendArg {
 impl From<TraceBackendArg> for TraceBackend {
     fn from(value: TraceBackendArg) -> Self {
         match value {
+            TraceBackendArg::Auto => Self::Auto,
             TraceBackendArg::DebugRpc => Self::DebugRpc,
             TraceBackendArg::Replay => Self::Replay,
         }
-    }
-}
-
-impl TraceBackendArg {
-    fn as_str(self) -> &'static str {
-        TraceBackend::from(self).as_str()
     }
 }
 
@@ -219,7 +215,7 @@ struct ListEventsArgs {
 #[derive(Debug, Args)]
 struct TraceArgs {
     tx_hash: String,
-    #[arg(long, value_enum, default_value_t = TraceBackendArg::DebugRpc)]
+    #[arg(long, value_enum, default_value_t = TraceBackendArg::Auto)]
     backend: TraceBackendArg,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
@@ -467,7 +463,7 @@ fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
-    let trace = match soldb_rpc::trace_transaction_with_backend(
+    let resolved = match soldb_rpc::trace_transaction_with_resolved_backend(
         &args.rpc,
         &args.tx_hash,
         args.backend.into(),
@@ -487,14 +483,16 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
         }
         Err(error) => return Err(error),
     };
+    let trace = resolved.trace;
+    let backend = resolved.backend;
     if args.interactive {
         run_interactive_debugger(trace, "Transaction trace debugger")?;
     } else if args.json {
         println!("{}", soldb_serializer::trace_to_web_json(&trace)?);
     } else if args.raw {
-        print_raw_trace(&trace, args);
+        print_raw_trace(&trace, args, backend);
     } else {
-        print_trace_summary(&trace, args);
+        print_trace_summary(&trace, args, backend);
     }
 
     Ok(())
@@ -861,9 +859,9 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
     Ok(())
 }
 
-fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
+fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs, backend: TraceBackend) {
     let Some(spec) = trace_contract_spec(args) else {
-        print_plain_trace_summary(trace, args);
+        print_plain_trace_summary(trace, backend);
         return;
     };
     let metadata = trace_debug_metadata(&spec);
@@ -876,7 +874,7 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     if metadata.is_legacy {
         println!("{} {}", info("Debug format:"), bold("srcmap-runtime"));
     }
-    println!("{} {}", info("Backend:"), bold(args.backend.as_str()));
+    println!("{} {}", info("Backend:"), bold(backend.as_str()));
     println!("{} {}", info("Contract:"), function_color(&spec.name));
     if let Some(compiler) = metadata.compiler_version {
         println!("{} solc {}", info("Compiler:"), number_color(compiler));
@@ -908,13 +906,13 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     );
 }
 
-fn print_plain_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
+fn print_plain_trace_summary(trace: &TransactionTrace, backend: TraceBackend) {
     println!(
         "{} {}",
         info("Transaction"),
         address_color(trace.tx_hash.as_deref().unwrap_or("<simulated>"))
     );
-    println!("{} {}", info("Backend:"), bold(args.backend.as_str()));
+    println!("{} {}", info("Backend:"), bold(backend.as_str()));
     let status = if trace.success {
         success("SUCCESS")
     } else {
@@ -928,7 +926,7 @@ fn print_plain_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     }
 }
 
-fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
+fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs, backend: TraceBackend) {
     println!(
         "{} {}",
         info("Loading transaction"),
@@ -937,7 +935,7 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
     if let Some(contract_name) = trace_contract_name(args) {
         println!("{} {}", info("Contract:"), function_color(contract_name));
     }
-    println!("{} {}", info("Backend:"), bold(args.backend.as_str()));
+    println!("{} {}", info("Backend:"), bold(backend.as_str()));
     println!("{}", bold(info("Execution trace")));
     println!(
         "{} | {} | {} | {} | {}",
@@ -2948,8 +2946,8 @@ contract C {
             stylus_contracts: None,
         };
         let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
-        print_plain_trace_summary(&trace, &trace_args);
-        print_raw_trace(&trace, &trace_args);
+        print_plain_trace_summary(&trace, TraceBackend::DebugRpc);
+        print_raw_trace(&trace, &trace_args, TraceBackend::DebugRpc);
         assert_eq!(trace_contract_name(&trace_args).as_deref(), Some("Legacy"));
     }
 

@@ -45,6 +45,7 @@ pub struct HttpJsonRpcClient {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceBackend {
+    Auto,
     DebugRpc,
     Replay,
 }
@@ -53,10 +54,17 @@ impl TraceBackend {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::DebugRpc => "debug-rpc",
             Self::Replay => "replay",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTransactionTrace {
+    pub trace: TransactionTrace,
+    pub backend: TraceBackend,
 }
 
 pub trait TransactionTraceBackend {
@@ -535,7 +543,7 @@ pub fn build_transaction_trace(
 
 pub fn trace_transaction(rpc_url: &str, tx_hash: &str) -> SoldbResult<TransactionTrace> {
     let client = HttpJsonRpcClient::new(rpc_url)?;
-    trace_transaction_with_client_and_backend(&client, tx_hash, TraceBackend::DebugRpc)
+    trace_transaction_with_client_and_backend(&client, tx_hash, TraceBackend::Auto)
 }
 
 pub fn trace_transaction_with_backend(
@@ -547,15 +555,76 @@ pub fn trace_transaction_with_backend(
     trace_transaction_with_client_and_backend(&client, tx_hash, backend)
 }
 
+pub fn trace_transaction_with_resolved_backend(
+    rpc_url: &str,
+    tx_hash: &str,
+    backend: TraceBackend,
+) -> SoldbResult<ResolvedTransactionTrace> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    trace_transaction_with_client_and_resolved_backend(&client, tx_hash, backend)
+}
+
 pub fn trace_transaction_with_client_and_backend(
     client: &HttpJsonRpcClient,
     tx_hash: &str,
     backend: TraceBackend,
 ) -> SoldbResult<TransactionTrace> {
+    trace_transaction_with_client_and_resolved_backend(client, tx_hash, backend)
+        .map(|resolved| resolved.trace)
+}
+
+pub fn trace_transaction_with_client_and_resolved_backend(
+    client: &HttpJsonRpcClient,
+    tx_hash: &str,
+    backend: TraceBackend,
+) -> SoldbResult<ResolvedTransactionTrace> {
+    resolve_trace_backend(
+        backend,
+        || DebugRpcBackend::new(client).trace_transaction(tx_hash),
+        || ReplayBackend::new(client).trace_transaction(tx_hash),
+    )
+}
+
+fn resolve_trace_backend(
+    backend: TraceBackend,
+    debug_trace: impl FnOnce() -> SoldbResult<TransactionTrace>,
+    replay_trace: impl FnOnce() -> SoldbResult<TransactionTrace>,
+) -> SoldbResult<ResolvedTransactionTrace> {
     match backend {
-        TraceBackend::DebugRpc => DebugRpcBackend::new(client).trace_transaction(tx_hash),
-        TraceBackend::Replay => ReplayBackend::new(client).trace_transaction(tx_hash),
+        TraceBackend::Auto => match debug_trace() {
+            Ok(trace) => Ok(ResolvedTransactionTrace {
+                trace,
+                backend: TraceBackend::DebugRpc,
+            }),
+            Err(error) if debug_trace_unavailable(&error) => {
+                replay_trace().map(|trace| ResolvedTransactionTrace {
+                    trace,
+                    backend: TraceBackend::Replay,
+                })
+            }
+            Err(error) => Err(error),
+        },
+        TraceBackend::DebugRpc => debug_trace().map(|trace| ResolvedTransactionTrace {
+            trace,
+            backend: TraceBackend::DebugRpc,
+        }),
+        TraceBackend::Replay => replay_trace().map(|trace| ResolvedTransactionTrace {
+            trace,
+            backend: TraceBackend::Replay,
+        }),
     }
+}
+
+fn debug_trace_unavailable(error: &SoldbError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("debug_tracetransaction")
+        && (message.contains("-32601")
+            || message.contains("method not found")
+            || message.contains("method does not exist")
+            || message.contains("does not exist/is not available")
+            || message.contains("not available")
+            || message.contains("not supported")
+            || message.contains("unsupported"))
 }
 
 pub fn simulate_call(
@@ -1439,12 +1508,13 @@ mod tests {
 
     use super::{
         build_transaction_trace, decode_revert_reason, parse_address, replay_spec_for_chain,
-        replay_target_index, simulate_call, trace_transaction, trace_transaction_with_backend,
-        transaction_logs, DebugTraceResult, HttpEndpoint, HttpJsonRpcClient, HttpScheme,
-        RpcReplayStateProvider, RpcStateDb, RpcTransaction, SimulateCallRequest, SpecId, StructLog,
-        TraceBackend, TraceEnvelope,
+        replay_target_index, resolve_trace_backend, simulate_call, trace_transaction,
+        trace_transaction_with_backend, transaction_logs, DebugTraceResult, HttpEndpoint,
+        HttpJsonRpcClient, HttpScheme, RpcReplayStateProvider, RpcStateDb, RpcTransaction,
+        SimulateCallRequest, SpecId, StructLog, TraceBackend, TraceEnvelope,
     };
     use serde_json::json;
+    use soldb_core::TransactionTrace;
 
     #[test]
     fn parses_struct_logs_into_trace_steps() {
@@ -1621,8 +1691,59 @@ mod tests {
 
     #[test]
     fn trace_backend_names_are_stable() {
+        assert_eq!(TraceBackend::Auto.as_str(), "auto");
         assert_eq!(TraceBackend::DebugRpc.as_str(), "debug-rpc");
         assert_eq!(TraceBackend::Replay.as_str(), "replay");
+    }
+
+    #[test]
+    fn auto_backend_prefers_debug_rpc_when_available() {
+        let resolved = resolve_trace_backend(
+            TraceBackend::Auto,
+            || Ok(sample_transaction_trace("debug-rpc")),
+            || -> soldb_core::SoldbResult<TransactionTrace> {
+                panic!("auto should not call replay when debug-rpc succeeds")
+            },
+        )
+        .expect("resolved trace");
+
+        assert_eq!(resolved.backend, TraceBackend::DebugRpc);
+        assert_eq!(resolved.trace.output, "debug-rpc");
+    }
+
+    #[test]
+    fn auto_backend_falls_back_when_debug_rpc_is_unavailable() {
+        let resolved = resolve_trace_backend(
+            TraceBackend::Auto,
+            || {
+                Err(soldb_core::SoldbError::Message(
+                    r#"RPC method debug_traceTransaction returned error: {"code":-32601,"message":"method not found"}"#.to_owned(),
+                ))
+            },
+            || Ok(sample_transaction_trace("replay")),
+        )
+        .expect("fallback trace");
+
+        assert_eq!(resolved.backend, TraceBackend::Replay);
+        assert_eq!(resolved.trace.output, "replay");
+    }
+
+    #[test]
+    fn auto_backend_does_not_fallback_for_transaction_errors() {
+        let error = resolve_trace_backend(
+            TraceBackend::Auto,
+            || {
+                Err(soldb_core::SoldbError::Message(
+                    "Transaction not found: 0xabc".to_owned(),
+                ))
+            },
+            || -> soldb_core::SoldbResult<TransactionTrace> {
+                panic!("auto should not fallback on transaction lookup errors")
+            },
+        )
+        .expect_err("transaction lookup should stay fatal");
+
+        assert!(error.to_string().contains("Transaction not found"));
     }
 
     #[test]
@@ -1996,6 +2117,23 @@ mod tests {
             .iter()
             .filter(|entry| entry.as_str() == method)
             .count()
+    }
+
+    fn sample_transaction_trace(output: &str) -> TransactionTrace {
+        TransactionTrace {
+            tx_hash: Some("0xabc".to_owned()),
+            from_addr: "0x1".to_owned(),
+            to_addr: Some("0x2".to_owned()),
+            value: "0x0".to_owned(),
+            input_data: "0x".to_owned(),
+            gas_used: 21_000,
+            output: output.to_owned(),
+            success: true,
+            error: None,
+            debug_trace_available: true,
+            contract_address: None,
+            steps: Vec::new(),
+        }
     }
 
     fn mock_rpc_transaction(hash: &str) -> RpcTransaction {

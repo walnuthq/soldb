@@ -42,7 +42,7 @@ Trace a transaction:
 soldb trace <tx_hash> --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
 
-Use the replay backend for the first local REVM replay path:
+Force the replay backend when you want to avoid `debug_traceTransaction`:
 ```bash
 soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
@@ -158,14 +158,16 @@ SolDB relies on compiler-generated debug information. Compile with `solc` ETHDeb
 
 ### Execution Backends
 
-The `trace` command currently supports two transaction tracing backends:
+The `trace` command supports three backend modes:
 
-- `debug-rpc` (default): calls `debug_traceTransaction` and is the fast path for Anvil, Geth, and other debug-capable nodes.
+- `auto` (default): tries `debug-rpc` first, then falls back to `replay` when the node reports that `debug_traceTransaction` is unavailable.
+- `debug-rpc`: calls `debug_traceTransaction` and is the fast path for Anvil, Geth, and other debug-capable nodes.
 - `replay`: loads transaction, receipt, parent-block state, bytecode, balances, nonces, and storage through normal Ethereum JSON-RPC, replays prior transactions in the block when needed, then replays the target transaction in REVM with inspectors. It selects the REVM spec from chain/block/timestamp for mainnet, Sepolia, Holesky, and Hoodi; archive-provider hardening and broader cache tuning are next-stage work.
 
 Select the backend explicitly:
 
 ```bash
+soldb trace <tx_hash> --backend auto --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 soldb trace <tx_hash> --backend debug-rpc --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
