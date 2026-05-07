@@ -428,6 +428,7 @@ mod tests {
             memory: None,
             storage: Some(BTreeMap::new()),
             error: None,
+            snapshot: Default::default(),
         }
     }
 }

@@ -21,6 +21,7 @@ pub fn trace_to_web_json(trace: &TransactionTrace) -> SoldbResult<String> {
                 "gasCost": step.gas_cost,
                 "depth": step.depth,
                 "stack": step.stack,
+                "snapshot": step.normalized_snapshot(),
             })
         })
         .collect::<Vec<_>>();
@@ -64,6 +65,7 @@ pub fn simulate_to_web_json(trace: &TransactionTrace, function_name: &str) -> So
                 "gasCost": step.gas_cost,
                 "depth": step.depth,
                 "stack": step.stack,
+                "snapshot": step.normalized_snapshot(),
             })
         })
         .collect::<Vec<_>>();
@@ -144,6 +146,7 @@ mod tests {
         assert!(json.contains("\"traceCall\""));
         assert!(json.contains("\"gasUsed\": 21000"));
         assert!(json.contains("\"contracts\""));
+        assert!(json.contains("\"snapshot\""));
     }
 
     #[test]
@@ -180,6 +183,7 @@ mod tests {
                 memory: Some("aa".to_owned()),
                 storage: Some(BTreeMap::new()),
                 error: None,
+                snapshot: Default::default(),
             }],
         }
     }

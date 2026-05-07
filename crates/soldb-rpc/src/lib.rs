@@ -22,7 +22,9 @@ use revm::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use soldb_core::{SoldbError, SoldbResult, TraceStep, TransactionTrace};
+use soldb_core::{
+    SoldbError, SoldbResult, StepSnapshot, StorageChange, TraceStep, TransactionTrace,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcConfig {
@@ -355,6 +357,26 @@ pub struct StructLog {
 impl StructLog {
     #[must_use]
     pub fn into_trace_step(self) -> TraceStep {
+        self.into_trace_step_with_previous_storage(&BTreeMap::new())
+    }
+
+    #[must_use]
+    pub fn into_trace_step_with_previous_storage(
+        self,
+        previous_storage: &BTreeMap<String, String>,
+    ) -> TraceStep {
+        let memory = Some(self.memory.join(""));
+        let storage = self.storage.clone();
+        let snapshot = StepSnapshot {
+            stack: self.stack.clone(),
+            memory: memory.clone(),
+            storage: storage.clone(),
+            storage_diff: if storage.is_empty() {
+                BTreeMap::new()
+            } else {
+                storage_diff(previous_storage, &storage)
+            },
+        };
         TraceStep {
             pc: self.pc,
             op: self.op,
@@ -362,9 +384,10 @@ impl StructLog {
             gas_cost: self.gas_cost,
             depth: self.depth,
             stack: self.stack,
-            memory: Some(self.memory.join("")),
+            memory,
             storage: Some(self.storage),
             error: self.error,
+            snapshot,
         }
     }
 }
@@ -472,10 +495,17 @@ enum RpcBlockTransaction {
 impl DebugTraceResult {
     #[must_use]
     pub fn steps(&self) -> Vec<TraceStep> {
+        let mut previous_storage = BTreeMap::<String, String>::new();
         self.struct_logs
             .iter()
             .cloned()
-            .map(StructLog::into_trace_step)
+            .map(|log| {
+                let step = log
+                    .clone()
+                    .into_trace_step_with_previous_storage(&previous_storage);
+                previous_storage = log.storage;
+                step
+            })
             .collect()
     }
 
@@ -498,6 +528,30 @@ impl DebugTraceResult {
 
         None
     }
+}
+
+fn storage_diff(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> BTreeMap<String, StorageChange> {
+    let mut diff = BTreeMap::new();
+    for key in before.keys().chain(after.keys()) {
+        if diff.contains_key(key) {
+            continue;
+        }
+        let before_value = before.get(key).cloned();
+        let after_value = after.get(key).cloned();
+        if before_value != after_value {
+            diff.insert(
+                key.clone(),
+                StorageChange {
+                    before: before_value,
+                    after: after_value,
+                },
+            );
+        }
+    }
+    diff
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1393,8 +1447,48 @@ impl<CTX: ContextTr> Inspector<CTX> for ReplayStepInspector {
                 .as_ref()
                 .and_then(|action| action.instruction_result())
                 .map(|result| format!("{result:?}"));
+            record_replay_storage_touch(&mut log, interp);
             self.struct_logs.push(log);
         }
+    }
+}
+
+fn record_replay_storage_touch(log: &mut StructLog, interp: &Interpreter) {
+    match log.op.as_str() {
+        "SLOAD" => {
+            let Some(slot) = log.stack.last().cloned() else {
+                return;
+            };
+            let value = interp
+                .stack
+                .data()
+                .last()
+                .copied()
+                .map(format_u256_quantity)
+                .unwrap_or_else(|| "0x0".to_owned());
+            log.storage.insert(normalize_storage_key(&slot), value);
+        }
+        "SSTORE" => {
+            let Some(slot) = log.stack.last().cloned() else {
+                return;
+            };
+            let Some(value) = log.stack.get(log.stack.len().saturating_sub(2)).cloned() else {
+                return;
+            };
+            log.storage
+                .insert(normalize_storage_key(&slot), normalize_hex_output(&value));
+        }
+        _ => {}
+    }
+}
+
+fn normalize_storage_key(value: &str) -> String {
+    let value = normalize_hex_output(value);
+    let trimmed = value.trim_start_matches("0x").trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0x0".to_owned()
+    } else {
+        format!("0x{}", trimmed.to_ascii_lowercase())
     }
 }
 
@@ -1683,7 +1777,15 @@ mod tests {
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].memory.as_deref(), Some("aabb"));
         assert_eq!(steps[0].storage.as_ref().expect("storage")["0x00"], "0x2a");
+        assert_eq!(steps[0].snapshot.stack, ["0x01"]);
+        assert_eq!(steps[0].snapshot.memory.as_deref(), Some("aabb"));
+        assert_eq!(steps[0].snapshot.storage["0x00"], "0x2a");
+        assert_eq!(
+            steps[0].snapshot.storage_diff["0x00"].after.as_deref(),
+            Some("0x2a")
+        );
         assert_eq!(steps[1].gas_cost, 0);
+        assert!(steps[1].snapshot.storage_diff.is_empty());
     }
 
     #[test]

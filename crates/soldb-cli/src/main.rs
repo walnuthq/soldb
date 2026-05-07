@@ -2506,6 +2506,7 @@ mod tests {
             memory: None,
             storage: None,
             error: None,
+            snapshot: Default::default(),
         }
     }
 

@@ -914,6 +914,7 @@ mod tests {
                     memory: None,
                     storage: None,
                     error: None,
+                    snapshot: Default::default(),
                 },
                 TraceStep {
                     pc: 3,
@@ -925,6 +926,7 @@ mod tests {
                     memory: None,
                     storage: None,
                     error: None,
+                    snapshot: Default::default(),
                 },
             ],
         }

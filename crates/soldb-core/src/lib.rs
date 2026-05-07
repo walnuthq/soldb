@@ -22,6 +22,51 @@ pub struct TraceStep {
     pub memory: Option<String>,
     pub storage: Option<BTreeMap<String, String>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub snapshot: StepSnapshot,
+}
+
+impl TraceStep {
+    #[must_use]
+    pub fn normalized_snapshot(&self) -> StepSnapshot {
+        if !self.snapshot.is_empty() {
+            return self.snapshot.clone();
+        }
+        StepSnapshot {
+            stack: self.stack.clone(),
+            memory: self.memory.clone(),
+            storage: self.storage.clone().unwrap_or_default(),
+            storage_diff: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StepSnapshot {
+    #[serde(default)]
+    pub stack: Vec<String>,
+    #[serde(default)]
+    pub memory: Option<String>,
+    #[serde(default)]
+    pub storage: BTreeMap<String, String>,
+    #[serde(default)]
+    pub storage_diff: BTreeMap<String, StorageChange>,
+}
+
+impl StepSnapshot {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+            && self.memory.is_none()
+            && self.storage.is_empty()
+            && self.storage_diff.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageChange {
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,7 +99,7 @@ pub struct FunctionCall {
 
 #[cfg(test)]
 mod tests {
-    use super::{FunctionCall, TraceStep, TransactionTrace};
+    use super::{FunctionCall, StepSnapshot, StorageChange, TraceStep, TransactionTrace};
 
     #[test]
     fn core_models_are_serializable() {
@@ -78,6 +123,7 @@ mod tests {
                 memory: None,
                 storage: None,
                 error: None,
+                snapshot: StepSnapshot::default(),
             }],
             debug_trace_available: true,
             contract_address: None,
@@ -97,5 +143,11 @@ mod tests {
             contract_address: Some("0x2".to_owned()),
         };
         assert_eq!(call.call_type, "entry");
+
+        let change = StorageChange {
+            before: None,
+            after: Some("0x2a".to_owned()),
+        };
+        assert_eq!(change.after.as_deref(), Some("0x2a"));
     }
 }

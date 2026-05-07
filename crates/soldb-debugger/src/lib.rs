@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use soldb_core::{TraceStep, TransactionTrace};
+use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
 use soldb_ethdebug::{EthdebugInfo, VariableLocation};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +55,7 @@ impl DebugSession {
             depth: step.depth,
             source: self.source_span(step.pc),
             function: self.function_at_pc(step.pc).cloned(),
+            snapshot: step.normalized_snapshot(),
             variables: self.variables_at_step(step),
         })
     }
@@ -122,6 +123,7 @@ pub struct DebugStep {
     pub depth: u64,
     pub source: Option<SourceSpan>,
     pub function: Option<SourceFunction>,
+    pub snapshot: StepSnapshot,
     pub variables: Vec<DebugVariable>,
 }
 
@@ -228,14 +230,15 @@ fn raw_value_for_location(
     step: &TraceStep,
     variable: &VariableLocation,
 ) -> Option<String> {
+    let snapshot = step.normalized_snapshot();
     match variable.location_type.as_str() {
-        "stack" => step
+        "stack" => snapshot
             .stack
             .get(variable.offset as usize)
             .map(|value| normalize_hex(value)),
-        "memory" => word_from_hex_bytes(step.memory.as_deref()?, variable.offset as usize),
+        "memory" => word_from_hex_bytes(snapshot.memory.as_deref()?, variable.offset as usize),
         "calldata" => word_from_hex_bytes(&trace.input_data, variable.offset as usize),
-        "storage" => storage_value(step.storage.as_ref()?, variable.offset),
+        "storage" => storage_value(&snapshot.storage, variable.offset),
         _ => None,
     }
 }
@@ -597,6 +600,7 @@ mod tests {
         let step = session.step(0).expect("debug step");
         assert_eq!(step.source.as_ref().expect("source").line, 3);
         assert_eq!(step.function.as_ref().expect("function").name, "set");
+        assert_eq!(step.snapshot.stack, ["0x2a"]);
         assert_eq!(step.variables[0].name, "x");
         assert_eq!(step.variables[0].value.display, "42");
         assert_eq!(step.variables[0].value.status, DebugValueStatus::Decoded);
@@ -688,6 +692,7 @@ mod tests {
                 memory: Some(format!("{}{}", "00".repeat(32), "2a".repeat(32))),
                 storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                 error: None,
+                snapshot: Default::default(),
             }],
         }
     }
