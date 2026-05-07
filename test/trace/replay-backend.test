@@ -1,0 +1,14 @@
+# Test the local REVM replay backend against the debug-RPC backend for an automined Anvil tx
+# REQUIRES: soldb
+# RUN: %soldb trace %{test_tx} --backend debug-rpc --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw --max-steps 20 > %t.debug
+# RUN: %soldb trace %{test_tx} --backend replay --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw --max-steps 20 > %t.replay
+# RUN: sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.debug | head -n 20 > %t.debug.ops
+# RUN: sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.replay | head -n 20 > %t.replay.ops
+# RUN: diff -u %t.debug.ops %t.replay.ops
+# RUN: FileCheck %s < %t.replay
+
+# CHECK: Loading transaction
+# CHECK: Contract: TestContract
+# CHECK: Execution trace
+# CHECK: PUSH1
+# CHECK: CALLDATASIZE

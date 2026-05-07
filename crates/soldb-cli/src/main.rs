@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use soldb_core::{SoldbResult, TransactionTrace};
 use soldb_ethdebug::{
@@ -7,7 +7,7 @@ use soldb_ethdebug::{
     Instruction,
 };
 use soldb_repl::{DebuggerCommand, DebuggerState, StepOutcome};
-use soldb_rpc::RpcLog;
+use soldb_rpc::{RpcLog, TraceBackend};
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Display;
@@ -119,6 +119,21 @@ enum Command {
     Simulate(SimulateArgs),
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TraceBackendArg {
+    DebugRpc,
+    Replay,
+}
+
+impl From<TraceBackendArg> for TraceBackend {
+    fn from(value: TraceBackendArg) -> Self {
+        match value {
+            TraceBackendArg::DebugRpc => Self::DebugRpc,
+            TraceBackendArg::Replay => Self::Replay,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct BridgeArgs {
     #[arg(long, default_value = "127.0.0.1")]
@@ -198,6 +213,8 @@ struct ListEventsArgs {
 #[derive(Debug, Args)]
 struct TraceArgs {
     tx_hash: String,
+    #[arg(long, value_enum, default_value_t = TraceBackendArg::DebugRpc)]
+    backend: TraceBackendArg,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
     #[arg(long, short = 'c')]
@@ -444,7 +461,11 @@ fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
-    let trace = match soldb_rpc::trace_transaction(&args.rpc, &args.tx_hash) {
+    let trace = match soldb_rpc::trace_transaction_with_backend(
+        &args.rpc,
+        &args.tx_hash,
+        args.backend.into(),
+    ) {
         Ok(trace) => trace,
         Err(error) if args.json => {
             println!(
@@ -2901,6 +2922,7 @@ contract C {
         print_plain_trace_summary(&trace);
         let trace_args = TraceArgs {
             tx_hash: "0xabc".to_owned(),
+            backend: TraceBackendArg::DebugRpc,
             ethdebug_dir: vec![format!("0x2:Legacy:{}", dir.display())],
             contracts: None,
             multi_contract: false,

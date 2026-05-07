@@ -1,9 +1,20 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
 use std::time::Duration;
 
+use revm::bytecode::opcode::OpCode;
+use revm::context::{ContextTr, JournalTr, TxEnv};
+use revm::database::{CacheDB, WrapDatabaseRef};
+use revm::database_interface::DBErrorMarker;
+use revm::inspector::inspectors::GasInspector;
+use revm::interpreter::interpreter_types::{Jumps, LoopControl, MemoryTr};
+use revm::interpreter::Interpreter;
+use revm::primitives::{hardfork::SpecId, Address, Bytes, TxKind, B256, U256};
+use revm::state::{AccountInfo, Bytecode};
+use revm::{Context, DatabaseRef, InspectEvm, Inspector, MainBuilder, MainContext};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +37,60 @@ impl Default for RpcConfig {
 pub struct HttpJsonRpcClient {
     endpoint: HttpEndpoint,
     timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceBackend {
+    DebugRpc,
+    Replay,
+}
+
+impl TraceBackend {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DebugRpc => "debug-rpc",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+pub trait TransactionTraceBackend {
+    fn trace_transaction(&self, tx_hash: &str) -> SoldbResult<TransactionTrace>;
+}
+
+pub struct DebugRpcBackend<'a> {
+    client: &'a HttpJsonRpcClient,
+}
+
+impl<'a> DebugRpcBackend<'a> {
+    #[must_use]
+    pub fn new(client: &'a HttpJsonRpcClient) -> Self {
+        Self { client }
+    }
+}
+
+impl TransactionTraceBackend for DebugRpcBackend<'_> {
+    fn trace_transaction(&self, tx_hash: &str) -> SoldbResult<TransactionTrace> {
+        trace_transaction_with_client(self.client, tx_hash)
+    }
+}
+
+pub struct ReplayBackend<'a> {
+    client: &'a HttpJsonRpcClient,
+}
+
+impl<'a> ReplayBackend<'a> {
+    #[must_use]
+    pub fn new(client: &'a HttpJsonRpcClient) -> Self {
+        Self { client }
+    }
+}
+
+impl TransactionTraceBackend for ReplayBackend<'_> {
+    fn trace_transaction(&self, tx_hash: &str) -> SoldbResult<TransactionTrace> {
+        replay_transaction_with_client(self.client, tx_hash)
+    }
 }
 
 impl HttpJsonRpcClient {
@@ -316,6 +381,24 @@ pub struct RpcTransaction {
     pub value: String,
     #[serde(default, alias = "input")]
     pub input_data: String,
+    #[serde(default)]
+    pub gas: Option<String>,
+    #[serde(default, rename = "gasPrice")]
+    pub gas_price: Option<String>,
+    #[serde(default, rename = "maxFeePerGas")]
+    pub max_fee_per_gas: Option<String>,
+    #[serde(default, rename = "maxPriorityFeePerGas")]
+    pub max_priority_fee_per_gas: Option<String>,
+    #[serde(default)]
+    pub nonce: Option<String>,
+    #[serde(default, rename = "blockNumber")]
+    pub block_number: Option<String>,
+    #[serde(default, rename = "transactionIndex")]
+    pub transaction_index: Option<String>,
+    #[serde(default, rename = "type")]
+    pub transaction_type: Option<String>,
+    #[serde(default, rename = "chainId")]
+    pub chain_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +419,27 @@ pub struct RpcLog {
     pub topics: Vec<String>,
     #[serde(default)]
     pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RpcBlock {
+    #[serde(default)]
+    hash: Option<String>,
+    timestamp: String,
+    #[serde(rename = "gasLimit")]
+    gas_limit: String,
+    #[serde(default, rename = "baseFeePerGas")]
+    base_fee_per_gas: Option<String>,
+    #[serde(default)]
+    difficulty: Option<String>,
+    #[serde(default, rename = "mixHash")]
+    mix_hash: Option<String>,
+    #[serde(default, rename = "prevRandao")]
+    prevrandao: Option<String>,
+    #[serde(default)]
+    miner: Option<String>,
+    #[serde(default)]
+    beneficiary: Option<String>,
 }
 
 impl DebugTraceResult {
@@ -419,7 +523,27 @@ pub fn build_transaction_trace(
 
 pub fn trace_transaction(rpc_url: &str, tx_hash: &str) -> SoldbResult<TransactionTrace> {
     let client = HttpJsonRpcClient::new(rpc_url)?;
-    trace_transaction_with_client(&client, tx_hash)
+    trace_transaction_with_client_and_backend(&client, tx_hash, TraceBackend::DebugRpc)
+}
+
+pub fn trace_transaction_with_backend(
+    rpc_url: &str,
+    tx_hash: &str,
+    backend: TraceBackend,
+) -> SoldbResult<TransactionTrace> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    trace_transaction_with_client_and_backend(&client, tx_hash, backend)
+}
+
+pub fn trace_transaction_with_client_and_backend(
+    client: &HttpJsonRpcClient,
+    tx_hash: &str,
+    backend: TraceBackend,
+) -> SoldbResult<TransactionTrace> {
+    match backend {
+        TraceBackend::DebugRpc => DebugRpcBackend::new(client).trace_transaction(tx_hash),
+        TraceBackend::Replay => ReplayBackend::new(client).trace_transaction(tx_hash),
+    }
 }
 
 pub fn simulate_call(
@@ -529,6 +653,376 @@ pub fn simulate_call_with_client(
     })
 }
 
+fn replay_transaction_with_client(
+    client: &HttpJsonRpcClient,
+    tx_hash: &str,
+) -> SoldbResult<TransactionTrace> {
+    let tx = client
+        .request::<Option<RpcTransaction>>("eth_getTransactionByHash", json!([tx_hash]))?
+        .ok_or_else(|| SoldbError::Message(format!("Transaction not found: {tx_hash}")))?;
+
+    let receipt = client
+        .request::<Option<RpcReceipt>>("eth_getTransactionReceipt", json!([tx_hash]))?
+        .ok_or_else(|| SoldbError::Message(format!("Transaction receipt not found: {tx_hash}")))?;
+
+    let debug_result = replay_debug_trace(client, &tx)?;
+    let envelope = TraceEnvelope {
+        tx_hash: Some(tx.hash),
+        from_addr: tx.from_addr,
+        to_addr: tx.to,
+        value: tx.value,
+        input_data: normalize_hex_output(&tx.input_data),
+        gas_used: parse_quantity(&receipt.gas_used)?,
+        success: receipt.status.as_deref().is_none_or(quantity_is_one),
+        contract_address: receipt.contract_address,
+        debug_trace_available: true,
+        debug_error: None,
+    };
+    Ok(build_transaction_trace(envelope, &debug_result))
+}
+
+fn replay_debug_trace(
+    client: &HttpJsonRpcClient,
+    tx: &RpcTransaction,
+) -> SoldbResult<DebugTraceResult> {
+    let block_number = tx
+        .block_number
+        .as_deref()
+        .ok_or_else(|| {
+            SoldbError::Message("Replay backend requires a mined transaction".to_owned())
+        })
+        .and_then(parse_quantity)?;
+    if block_number == 0 {
+        return Err(SoldbError::Message(
+            "Replay backend cannot use parent state for block 0".to_owned(),
+        ));
+    }
+
+    let tx_index = tx
+        .transaction_index
+        .as_deref()
+        .map(parse_quantity)
+        .transpose()?
+        .unwrap_or(0);
+    if tx_index != 0 {
+        return Err(SoldbError::Message(format!(
+            "Replay backend currently supports transactions at index 0 only; block-history replay is needed for index {tx_index}"
+        )));
+    }
+
+    let block_tag = format_quantity(block_number);
+    let block = client
+        .request::<Option<RpcBlock>>("eth_getBlockByNumber", json!([block_tag, false]))?
+        .ok_or_else(|| SoldbError::Message(format!("Block {block_number} not found")))?;
+    let parent_block_tag = format_quantity(block_number - 1);
+    let chain_id = client
+        .request::<String>("eth_chainId", json!([]))
+        .ok()
+        .as_deref()
+        .map(parse_quantity)
+        .transpose()?
+        .or_else(|| {
+            tx.chain_id
+                .as_deref()
+                .map(parse_quantity)
+                .transpose()
+                .ok()
+                .flatten()
+        })
+        .unwrap_or(1);
+
+    let state_db = RpcStateDb {
+        client: client.clone(),
+        block_tag: parent_block_tag,
+    };
+    let cache_db = CacheDB::new(WrapDatabaseRef(state_db));
+    let context = Context::mainnet()
+        .with_db(cache_db)
+        .modify_block_chained(|block_env| {
+            block_env.number = U256::from(block_number);
+            block_env.timestamp = U256::from(parse_quantity(&block.timestamp).unwrap_or(0));
+            block_env.gas_limit = parse_quantity(&block.gas_limit).unwrap_or(u64::MAX);
+            block_env.basefee = block
+                .base_fee_per_gas
+                .as_deref()
+                .map(parse_quantity)
+                .transpose()
+                .unwrap_or(None)
+                .unwrap_or_default();
+            block_env.difficulty = block
+                .difficulty
+                .as_deref()
+                .map(parse_u256_quantity)
+                .transpose()
+                .unwrap_or(None)
+                .unwrap_or_default();
+            block_env.prevrandao = block
+                .prevrandao
+                .as_deref()
+                .or(block.mix_hash.as_deref())
+                .map(parse_b256)
+                .transpose()
+                .unwrap_or(None);
+            block_env.beneficiary = block
+                .beneficiary
+                .as_deref()
+                .or(block.miner.as_deref())
+                .map(parse_address)
+                .transpose()
+                .unwrap_or(None)
+                .unwrap_or(Address::ZERO);
+        })
+        .modify_cfg_chained(|cfg| {
+            cfg.chain_id = chain_id;
+            cfg.spec = SpecId::PRAGUE;
+            cfg.disable_eip3607 = true;
+            cfg.disable_block_gas_limit = true;
+            cfg.disable_base_fee = true;
+        });
+
+    let tx_env = tx_env_from_rpc_transaction(tx, chain_id)?;
+    let mut inspector = ReplayStepInspector::default();
+    let mut evm = context.build_mainnet_with_inspector(&mut inspector);
+    let result = evm.inspect_one_tx(tx_env).map_err(|error| {
+        SoldbError::Message(format!("Replay backend execution failed: {error:?}"))
+    })?;
+
+    let return_value = result
+        .output()
+        .map_or_else(String::new, |output| bytes_to_hex(output.as_ref()));
+    let error = match &result {
+        revm::context::result::ExecutionResult::Success { .. } => None,
+        revm::context::result::ExecutionResult::Revert { output, .. } => {
+            let encoded = bytes_to_hex(output.as_ref());
+            decode_revert_reason(&encoded)
+                .or_else(|| Some(format!("Reverted with data: 0x{encoded}")))
+        }
+        revm::context::result::ExecutionResult::Halt { reason, .. } => Some(format!("{reason:?}")),
+    };
+
+    Ok(DebugTraceResult {
+        struct_logs: inspector.into_struct_logs(),
+        return_value,
+        error,
+        failed: !result.is_success(),
+        gas: Some(result.gas_used()),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct RpcStateDb {
+    client: HttpJsonRpcClient,
+    block_tag: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayDbError(String);
+
+impl fmt::Display for ReplayDbError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReplayDbError {}
+
+impl DBErrorMarker for ReplayDbError {}
+
+impl From<SoldbError> for ReplayDbError {
+    fn from(error: SoldbError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl RpcStateDb {
+    fn request_at_block<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, ReplayDbError> {
+        self.client
+            .request(method, params)
+            .map_err(ReplayDbError::from)
+    }
+}
+
+impl DatabaseRef for RpcStateDb {
+    type Error = ReplayDbError;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        let address = address.to_string();
+        let block = self.block_tag.clone();
+        let balance: String =
+            self.request_at_block("eth_getBalance", json!([address, block.clone()]))?;
+        let nonce: String =
+            self.request_at_block("eth_getTransactionCount", json!([address, block.clone()]))?;
+        let code: String = self.request_at_block("eth_getCode", json!([address, block]))?;
+
+        let code_bytes = hex_to_bytes(code.trim_start_matches("0x")).ok_or_else(|| {
+            ReplayDbError(format!(
+                "Invalid bytecode returned for account {address}: {code}"
+            ))
+        })?;
+        let bytecode = Bytecode::new_raw(Bytes::from(code_bytes));
+        let code_hash = bytecode.hash_slow();
+        Ok(Some(AccountInfo::new(
+            parse_u256_quantity(&balance).map_err(ReplayDbError::from)?,
+            parse_quantity(&nonce).map_err(ReplayDbError::from)?,
+            code_hash,
+            bytecode,
+        )))
+    }
+
+    fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+        Ok(Bytecode::default())
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        let value: String = self.request_at_block(
+            "eth_getStorageAt",
+            json!([
+                address.to_string(),
+                format_u256_quantity(index),
+                self.block_tag
+            ]),
+        )?;
+        parse_u256_quantity(&value).map_err(ReplayDbError::from)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        let block = self
+            .request_at_block::<Option<RpcBlock>>(
+                "eth_getBlockByNumber",
+                json!([format_quantity(number), false]),
+            )?
+            .ok_or_else(|| ReplayDbError(format!("Block {number} not found")))?;
+        let hash = block
+            .hash
+            .as_deref()
+            .ok_or_else(|| ReplayDbError(format!("Block {number} did not include a hash")))?;
+        parse_b256(hash).map_err(ReplayDbError::from)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReplayStepInspector {
+    gas: GasInspector,
+    pending: Option<StructLog>,
+    struct_logs: Vec<StructLog>,
+}
+
+impl ReplayStepInspector {
+    fn into_struct_logs(self) -> Vec<StructLog> {
+        self.struct_logs
+    }
+}
+
+impl<CTX: ContextTr> Inspector<CTX> for ReplayStepInspector {
+    fn initialize_interp(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        self.gas.initialize_interp(&interp.gas);
+    }
+
+    fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+        self.gas.step(&interp.gas);
+        let opcode = interp.bytecode.opcode();
+        let op = OpCode::new(opcode).map_or_else(
+            || format!("UNKNOWN(0x{opcode:02x})"),
+            |op| op.as_str().to_owned(),
+        );
+        let stack = interp
+            .stack
+            .data()
+            .iter()
+            .map(|value| format_u256_quantity(*value))
+            .collect();
+        let memory = bytes_to_hex(interp.memory.slice(0..interp.memory.size()).as_ref());
+        self.pending = Some(StructLog {
+            pc: interp.bytecode.pc() as u64,
+            op,
+            gas: interp.gas.remaining(),
+            gas_cost: 0,
+            depth: context.journal_mut().depth() as u64,
+            stack,
+            memory: memory
+                .is_empty()
+                .then(Vec::new)
+                .unwrap_or_else(|| vec![memory]),
+            storage: BTreeMap::new(),
+            error: None,
+        });
+    }
+
+    fn step_end(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        self.gas.step_end(&interp.gas);
+        if let Some(mut log) = self.pending.take() {
+            log.gas_cost = self.gas.last_gas_cost();
+            log.error = interp
+                .bytecode
+                .action()
+                .as_ref()
+                .and_then(|action| action.instruction_result())
+                .map(|result| format!("{result:?}"));
+            self.struct_logs.push(log);
+        }
+    }
+}
+
+fn tx_env_from_rpc_transaction(tx: &RpcTransaction, chain_id: u64) -> SoldbResult<TxEnv> {
+    let gas_limit = tx
+        .gas
+        .as_deref()
+        .map(parse_quantity)
+        .transpose()?
+        .unwrap_or(30_000_000);
+    let gas_price = tx
+        .max_fee_per_gas
+        .as_deref()
+        .or(tx.gas_price.as_deref())
+        .map(parse_u128_quantity)
+        .transpose()?
+        .unwrap_or_default();
+    let gas_priority_fee = tx
+        .max_priority_fee_per_gas
+        .as_deref()
+        .map(parse_u128_quantity)
+        .transpose()?;
+    let nonce = tx
+        .nonce
+        .as_deref()
+        .map(parse_quantity)
+        .transpose()?
+        .unwrap_or_default();
+    let mut builder = TxEnv::builder()
+        .caller(parse_address(&tx.from_addr)?)
+        .gas_limit(gas_limit)
+        .gas_price(gas_price)
+        .value(parse_u256_quantity(&tx.value)?)
+        .data(Bytes::from(
+            hex_to_bytes(tx.input_data.trim_start_matches("0x")).ok_or_else(|| {
+                SoldbError::Message(format!("Invalid transaction input: {}", tx.input_data))
+            })?,
+        ))
+        .nonce(nonce)
+        .chain_id(Some(chain_id));
+
+    if let Some(priority_fee) = gas_priority_fee {
+        builder = builder.gas_priority_fee(Some(priority_fee));
+    }
+
+    builder = match tx.to.as_deref() {
+        Some(to) => builder.kind(TxKind::Call(parse_address(to)?)),
+        None => builder.create(),
+    };
+
+    if let Some(tx_type) = tx.transaction_type.as_deref() {
+        builder = builder.tx_type(Some(parse_quantity(tx_type)? as u8));
+    }
+
+    builder.build().map_err(|error| {
+        SoldbError::Message(format!("Failed to build replay transaction: {error}"))
+    })
+}
+
 #[must_use]
 pub fn decode_revert_reason(return_value: &str) -> Option<String> {
     let data = return_value.trim_start_matches("0x");
@@ -562,6 +1056,21 @@ fn parse_quantity(value: &str) -> SoldbResult<u64> {
         .map_err(|error| SoldbError::Message(format!("Invalid RPC quantity '{value}': {error}")))
 }
 
+fn parse_u128_quantity(value: &str) -> SoldbResult<u128> {
+    let hex = value.trim_start_matches("0x");
+    u128::from_str_radix(hex, 16)
+        .map_err(|error| SoldbError::Message(format!("Invalid RPC quantity '{value}': {error}")))
+}
+
+fn parse_u256_quantity(value: &str) -> SoldbResult<U256> {
+    let hex = value.trim_start_matches("0x");
+    if hex.is_empty() {
+        return Ok(U256::ZERO);
+    }
+    U256::from_str_radix(hex, 16)
+        .map_err(|error| SoldbError::Message(format!("Invalid RPC quantity '{value}': {error}")))
+}
+
 fn quantity_is_one(value: &str) -> bool {
     parse_quantity(value).is_ok_and(|quantity| quantity == 1)
 }
@@ -582,6 +1091,42 @@ fn format_quantity(value: u64) -> String {
     format!("0x{value:x}")
 }
 
+fn format_u256_quantity(value: U256) -> String {
+    if value == U256::ZERO {
+        return "0x0".to_owned();
+    }
+    let bytes = value.to_be_bytes::<32>();
+    let first_non_zero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    format!("0x{}", bytes_to_hex(&bytes[first_non_zero..]))
+}
+
+fn parse_address(value: &str) -> SoldbResult<Address> {
+    let bytes = hex_to_bytes(value.trim_start_matches("0x"))
+        .ok_or_else(|| SoldbError::Message(format!("Invalid address '{value}'")))?;
+    if bytes.len() != 20 {
+        return Err(SoldbError::Message(format!(
+            "Invalid address '{value}': expected 20 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(Address::from_slice(&bytes))
+}
+
+fn parse_b256(value: &str) -> SoldbResult<B256> {
+    let bytes = hex_to_bytes(value.trim_start_matches("0x"))
+        .ok_or_else(|| SoldbError::Message(format!("Invalid bytes32 value '{value}'")))?;
+    if bytes.len() != 32 {
+        return Err(SoldbError::Message(format!(
+            "Invalid bytes32 value '{value}': expected 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(B256::from_slice(&bytes))
+}
+
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return None;
@@ -593,6 +1138,16 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -601,8 +1156,8 @@ mod tests {
 
     use super::{
         build_transaction_trace, decode_revert_reason, simulate_call, trace_transaction,
-        transaction_logs, DebugTraceResult, HttpEndpoint, HttpScheme, SimulateCallRequest,
-        StructLog, TraceEnvelope,
+        trace_transaction_with_backend, transaction_logs, DebugTraceResult, HttpEndpoint,
+        HttpScheme, SimulateCallRequest, StructLog, TraceBackend, TraceEnvelope,
     };
     use serde_json::json;
 
@@ -777,6 +1332,34 @@ mod tests {
         assert_eq!(trace.steps.len(), 3);
         assert_eq!(trace.steps[0].op, "PUSH1");
         assert_eq!(trace.steps[1].memory.as_deref(), Some("aabb"));
+    }
+
+    #[test]
+    fn trace_backend_names_are_stable() {
+        assert_eq!(TraceBackend::DebugRpc.as_str(), "debug-rpc");
+        assert_eq!(TraceBackend::Replay.as_str(), "replay");
+    }
+
+    #[test]
+    fn traces_transaction_through_explicit_debug_rpc_backend() {
+        let rpc_url = start_trace_server(3);
+        let trace = trace_transaction_with_backend(&rpc_url, "0xabc", TraceBackend::DebugRpc)
+            .expect("trace");
+
+        assert_eq!(trace.tx_hash.as_deref(), Some("0xabc"));
+        assert_eq!(trace.steps.len(), 3);
+        assert_eq!(trace.steps[0].op, "PUSH1");
+    }
+
+    #[test]
+    fn replay_backend_requires_mined_transaction() {
+        let rpc_url = start_trace_server(2);
+        let error = trace_transaction_with_backend(&rpc_url, "0xabc", TraceBackend::Replay)
+            .expect_err("unmined mock transaction should fail replay");
+
+        assert!(error
+            .to_string()
+            .contains("Replay backend requires a mined transaction"));
     }
 
     #[test]
