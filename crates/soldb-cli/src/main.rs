@@ -488,7 +488,13 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
     if args.interactive {
         run_interactive_debugger(trace, "Transaction trace debugger")?;
     } else if args.json {
-        println!("{}", soldb_serializer::trace_to_web_json(&trace)?);
+        println!(
+            "{}",
+            soldb_serializer::trace_to_web_json_with_contracts(
+                &trace,
+                trace_web_contracts(args, &trace)
+            )?
+        );
     } else if args.raw {
         print_raw_trace(&trace, args, backend);
     } else {
@@ -547,7 +553,11 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     } else if args.json {
         println!(
             "{}",
-            soldb_serializer::simulate_to_web_json(&trace, &json_function_name)?
+            soldb_serializer::simulate_to_web_json_with_contracts(
+                &trace,
+                &json_function_name,
+                simulate_web_contracts(args, &trace, &contract_address)
+            )?
         );
     } else if args.raw {
         print_raw_simulation(&trace, args, &contract_address);
@@ -1531,9 +1541,17 @@ fn abi_descriptor_for_calldata(
 }
 
 fn abi_entries_for_spec(spec: &ResolvedContractSpec) -> Option<Vec<FunctionAbiEntry>> {
+    serde_json::from_value(abi_value_for_spec(spec)?).ok()
+}
+
+fn abi_value_for_spec(spec: &ResolvedContractSpec) -> Option<serde_json::Value> {
     if let Some(abi_path) = abi_path_for_contract(&spec.debug_dir, &spec.name) {
         let content = fs::read_to_string(abi_path).ok()?;
-        return serde_json::from_str::<Vec<FunctionAbiEntry>>(&content).ok();
+        let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+        if value.is_array() {
+            return Some(value);
+        }
+        return value.get("abi").filter(|abi| abi.is_array()).cloned();
     }
 
     let combined = read_json_file(&spec.debug_dir.join("combined.json")).ok()?;
@@ -1544,8 +1562,7 @@ fn abi_entries_for_spec(spec: &ResolvedContractSpec) -> Option<Vec<FunctionAbiEn
             key.rsplit_once(':')
                 .map_or(*key == &spec.name, |(_, name)| name == spec.name)
         })
-        .and_then(|(_, contract)| contract.get("abi").cloned())
-        .and_then(|abi| serde_json::from_value::<Vec<FunctionAbiEntry>>(abi).ok())
+        .and_then(|(_, contract)| contract.get("abi").filter(|abi| abi.is_array()).cloned())
 }
 
 fn descriptor_from_source_function(function: &SourceFunction, calldata: &str) -> CallDescriptor {
@@ -2292,6 +2309,105 @@ fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::p
     .find(|path| path.exists())
 }
 
+fn trace_web_contracts(
+    args: &TraceArgs,
+    trace: &TransactionTrace,
+) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
+    let specs =
+        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).unwrap_or_default();
+    web_contracts_for_specs(specs, trace, None)
+}
+
+fn simulate_web_contracts(
+    args: &SimulateArgs,
+    trace: &TransactionTrace,
+    contract_address: &str,
+) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
+    let specs =
+        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).unwrap_or_default();
+    web_contracts_for_specs(specs, trace, Some(contract_address))
+}
+
+fn web_contracts_for_specs(
+    specs: Vec<ResolvedContractSpec>,
+    trace: &TransactionTrace,
+    fallback_address: Option<&str>,
+) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
+    let single_spec = specs.len() == 1;
+    specs
+        .into_iter()
+        .filter_map(|spec| {
+            let address = spec
+                .address
+                .clone()
+                .or_else(|| {
+                    single_spec
+                        .then(|| fallback_address.map(str::to_owned))
+                        .flatten()
+                })
+                .or_else(|| {
+                    single_spec
+                        .then(|| {
+                            trace
+                                .to_addr
+                                .clone()
+                                .or_else(|| trace.contract_address.clone())
+                        })
+                        .flatten()
+                })?;
+            let metadata = web_contract_metadata_for_spec(&spec)?;
+            Some((normalize_contract_address_key(&address), metadata))
+        })
+        .collect()
+}
+
+fn web_contract_metadata_for_spec(
+    spec: &ResolvedContractSpec,
+) -> Option<soldb_serializer::WebContractMetadata> {
+    let source_index = TraceSourceIndex::load(spec).ok();
+    let mut pc_to_source_mappings = BTreeMap::new();
+    let mut source_paths = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+
+    if let Some(source_index) = source_index {
+        for instruction in &source_index.info.instructions {
+            let Some(location) = instruction.source_location() else {
+                continue;
+            };
+            pc_to_source_mappings.insert(
+                instruction.offset,
+                format!(
+                    "{}:{}:{}",
+                    location.offset, location.length, location.source_id
+                ),
+            );
+        }
+        for (source_id, source_path) in &source_index.info.sources {
+            source_paths.insert(*source_id, source_path.clone());
+            let source = read_debug_source(&spec.debug_dir, source_path)
+                .unwrap_or_else(|| source_path.clone());
+            sources.insert(*source_id, source);
+        }
+    }
+
+    let abi = abi_value_for_spec(spec);
+    if pc_to_source_mappings.is_empty() && sources.is_empty() && abi.is_none() {
+        return None;
+    }
+
+    Some(soldb_serializer::WebContractMetadata {
+        pc_to_source_mappings,
+        source_paths,
+        debug_available: !sources.is_empty(),
+        sources,
+        abi,
+    })
+}
+
+fn normalize_contract_address_key(address: &str) -> String {
+    address.to_ascii_lowercase()
+}
+
 fn trace_contract_name(args: &TraceArgs) -> Option<String> {
     resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
         .ok()
@@ -2789,6 +2905,70 @@ contract Counter {
             format_raw_stack(&frames[1].raw_stack),
             "[0] 0xaa [1] 0xbb [2] 0x04"
         );
+    }
+
+    #[test]
+    fn builds_web_contract_metadata_from_ethdebug_artifacts() {
+        let dir = temp_dir("web-contract-metadata");
+        let source = "contract Counter { function set(uint256 amount) public {} }";
+        fs::write(dir.join("Counter.sol"), source).expect("write source");
+        fs::write(
+            dir.join("ethdebug.json"),
+            json!({
+                "compilation": {
+                    "compiler": {"name": "solc", "version": "0.8.31+commit.test"},
+                    "sources": [{"id": 0, "path": "Counter.sol"}]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write metadata");
+        fs::write(
+            dir.join("Counter_ethdebug-runtime.json"),
+            json!({
+                "contract": {"name": "Counter"},
+                "environment": "runtime",
+                "instructions": [
+                    {
+                        "offset": 10,
+                        "operation": {"mnemonic": "JUMPDEST"},
+                        "context": {
+                            "code": {
+                                "source": {"id": 0},
+                                "range": {"offset": 4, "length": 8}
+                            }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write runtime");
+        fs::write(
+            dir.join("Counter.abi"),
+            r#"[{"type":"function","name":"set","inputs":[{"name":"amount","type":"uint256"}]}]"#,
+        )
+        .expect("write abi");
+
+        let spec = ResolvedContractSpec {
+            address: None,
+            name: "Counter".to_owned(),
+            debug_dir: dir,
+        };
+        let trace = transaction_trace("0x".to_owned(), Vec::new());
+        let contracts = web_contracts_for_specs(vec![spec], &trace, None);
+        let metadata = contracts.get("0x2").expect("contract metadata");
+        assert_eq!(
+            metadata.pc_to_source_mappings.get(&10).map(String::as_str),
+            Some("4:8:0")
+        );
+        assert_eq!(metadata.sources.get(&0).map(String::as_str), Some(source));
+        assert_eq!(
+            metadata.source_paths.get(&0).map(String::as_str),
+            Some("Counter.sol")
+        );
+        assert!(metadata.debug_available);
+        assert_eq!(metadata.abi.as_ref().expect("abi")[0]["name"], "set");
     }
 
     #[test]

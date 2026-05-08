@@ -1595,6 +1595,8 @@ where
             id,
             parent_id,
             depth,
+            entry_step: Some(self.struct_logs.len()),
+            exit_step: None,
             call_type: call_scheme_name(inputs.scheme).to_owned(),
             from: address_hex(inputs.caller),
             to: address_hex(inputs.target_address),
@@ -1616,6 +1618,7 @@ where
         if let Some(id) = self.call_stack.pop() {
             if let Some(call) = self.artifacts.calls.get_mut(id) {
                 let result = *outcome.instruction_result();
+                call.exit_step = Some(self.struct_logs.len());
                 call.gas_used = Some(outcome.gas().used());
                 call.output = Some(bytes_to_prefixed_hex(outcome.output().as_ref()));
                 call.success = Some(result.is_ok());
@@ -1632,6 +1635,8 @@ where
             id,
             parent_id,
             depth: context.journal().depth() as u64 + 1,
+            entry_step: Some(self.struct_logs.len()),
+            exit_step: None,
             create_type: create_scheme_name(inputs.scheme()).to_owned(),
             caller: address_hex(inputs.caller()),
             address: None,
@@ -1657,6 +1662,7 @@ where
         if let Some(id) = self.create_stack.pop() {
             if let Some(create) = self.artifacts.creations.get_mut(id) {
                 let result = *outcome.instruction_result();
+                create.exit_step = Some(self.struct_logs.len());
                 create.address = outcome.address.map(address_hex);
                 create.gas_used = Some(outcome.gas().used());
                 create.output = Some(bytes_to_prefixed_hex(outcome.output().as_ref()));

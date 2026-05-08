@@ -183,7 +183,7 @@ soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contra
 - `crates/soldb-ethdebug`: ETHDebug metadata loading, ABI helpers, source mapping, event decoding, and call-frame enrichment.
 - `crates/soldb-debugger`: reusable source-step, function, and variable decoding model shared by frontends.
 - `crates/soldb-repl`: interactive debugger state and REPL commands.
-- `crates/soldb-serializer`: JSON/web-facing trace and simulation serialization.
+- `crates/soldb-serializer`: JSON/web-facing trace and simulation serialization, including nested call trees and ETHDebug source metadata.
 - `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.
 - `crates/soldb-bridge`: bridge server for cross-environment Solidity<>Stylus debugging.
 - `crates/soldb-dap`: Debug Adapter Protocol server for editor integrations.

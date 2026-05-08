@@ -140,6 +140,10 @@ pub struct ExecutionCall {
     pub id: usize,
     pub parent_id: Option<usize>,
     pub depth: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_step: Option<usize>,
     pub call_type: String,
     pub from: String,
     pub to: String,
@@ -158,6 +162,10 @@ pub struct ContractCreation {
     pub id: usize,
     pub parent_id: Option<usize>,
     pub depth: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_step: Option<usize>,
     pub create_type: String,
     pub caller: String,
     pub address: Option<String>,
