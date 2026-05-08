@@ -2,32 +2,18 @@ use serde::Serialize;
 use serde_json::json;
 use soldb_core::{SoldbResult, TraceArtifacts, TraceCapabilities, TransactionTrace};
 
+pub const WEB_JSON_SCHEMA_VERSION: u64 = 1;
+
 pub fn trace_to_json(trace: &TransactionTrace) -> SoldbResult<String> {
     serde_json::to_string_pretty(trace)
         .map_err(|err| soldb_core::SoldbError::Message(err.to_string()))
 }
 
 pub fn trace_to_web_json(trace: &TransactionTrace) -> SoldbResult<String> {
-    let steps = trace
-        .steps
-        .iter()
-        .enumerate()
-        .map(|(index, step)| {
-            json!({
-                "step": index,
-                "pc": step.pc,
-                "op": step.op,
-                "gas": step.gas,
-                "gasCost": step.gas_cost,
-                "depth": step.depth,
-                "stack": step.stack,
-                "snapshot": step.normalized_snapshot(),
-            })
-        })
-        .collect::<Vec<_>>();
-
     let response = TraceWebResponse {
+        schema_version: WEB_JSON_SCHEMA_VERSION,
         status: if trace.success { "success" } else { "reverted" },
+        error: trace.error.as_deref(),
         backend: trace.backend.as_deref(),
         capabilities: &trace.capabilities,
         artifacts: &trace.artifacts,
@@ -37,16 +23,23 @@ pub fn trace_to_web_json(trace: &TransactionTrace) -> SoldbResult<String> {
             } else {
                 "CALL"
             },
+            call_id: 0,
+            parent_call_id: None,
+            children_call_ids: Vec::new(),
+            function_name: Some("runtime_dispatcher"),
             from: &trace.from_addr,
-            to: trace.to_addr.as_deref(),
+            to: trace
+                .to_addr
+                .as_deref()
+                .or(trace.contract_address.as_deref()),
             value: &trace.value,
             gas: trace.steps.first().map_or(0, |step| step.gas),
             gas_used: trace.gas_used,
             input: &trace.input_data,
             output: &trace.output,
-            call_id: None,
+            is_reverted_frame: !trace.success,
         },
-        steps,
+        steps: web_steps(trace),
         contracts: json!({}),
     };
 
@@ -55,31 +48,19 @@ pub fn trace_to_web_json(trace: &TransactionTrace) -> SoldbResult<String> {
 }
 
 pub fn simulate_to_web_json(trace: &TransactionTrace, function_name: &str) -> SoldbResult<String> {
-    let steps = trace
-        .steps
-        .iter()
-        .enumerate()
-        .map(|(index, step)| {
-            json!({
-                "step": index,
-                "pc": step.pc,
-                "op": step.op,
-                "gas": step.gas,
-                "gasCost": step.gas_cost,
-                "depth": step.depth,
-                "stack": step.stack,
-                "snapshot": step.normalized_snapshot(),
-            })
-        })
-        .collect::<Vec<_>>();
-
     let response = SimulateWebResponse {
+        schema_version: WEB_JSON_SCHEMA_VERSION,
         status: if trace.success { "success" } else { "reverted" },
+        error: trace.error.as_deref(),
         backend: trace.backend.as_deref(),
         capabilities: &trace.capabilities,
         artifacts: &trace.artifacts,
         trace_call: TraceCallWeb {
             ty: "ENTRY",
+            call_id: 0,
+            parent_call_id: None,
+            children_call_ids: Vec::new(),
+            function_name: Some(function_name),
             from: &trace.from_addr,
             to: trace.to_addr.as_deref(),
             value: &trace.value,
@@ -87,9 +68,9 @@ pub fn simulate_to_web_json(trace: &TransactionTrace, function_name: &str) -> So
             gas_used: trace.gas_used,
             input: &trace.input_data,
             output: &trace.output,
-            call_id: Some(0),
+            is_reverted_frame: !trace.success,
         },
-        steps,
+        steps: web_steps(trace),
         function_name,
         is_verified: false,
     };
@@ -98,10 +79,39 @@ pub fn simulate_to_web_json(trace: &TransactionTrace, function_name: &str) -> So
         .map_err(|err| soldb_core::SoldbError::Message(err.to_string()))
 }
 
+fn web_steps(trace: &TransactionTrace) -> Vec<serde_json::Value> {
+    trace
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            json!({
+                "step": index,
+                "pc": step.pc,
+                "traceCallIndex": 0,
+                "op": step.op,
+                "gas": step.gas,
+                "gasCost": step.gas_cost,
+                "depth": step.depth,
+                "stack": step.stack,
+                "snapshot": step.normalized_snapshot(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Serialize)]
 struct TraceCallWeb<'a> {
     #[serde(rename = "type")]
     ty: &'a str,
+    #[serde(rename = "callId")]
+    call_id: u64,
+    #[serde(rename = "parentCallId", skip_serializing_if = "Option::is_none")]
+    parent_call_id: Option<u64>,
+    #[serde(rename = "childrenCallIds")]
+    children_call_ids: Vec<u64>,
+    #[serde(rename = "functionName", skip_serializing_if = "Option::is_none")]
+    function_name: Option<&'a str>,
     from: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     to: Option<&'a str>,
@@ -111,13 +121,16 @@ struct TraceCallWeb<'a> {
     gas_used: u64,
     input: &'a str,
     output: &'a str,
-    #[serde(rename = "callId", skip_serializing_if = "Option::is_none")]
-    call_id: Option<u64>,
+    #[serde(rename = "isRevertedFrame")]
+    is_reverted_frame: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct TraceWebResponse<'a> {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u64,
     status: &'static str,
+    error: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<&'a str>,
     capabilities: &'a TraceCapabilities,
@@ -130,7 +143,10 @@ struct TraceWebResponse<'a> {
 
 #[derive(Debug, Serialize)]
 struct SimulateWebResponse<'a> {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u64,
     status: &'static str,
+    error: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<&'a str>,
     capabilities: &'a TraceCapabilities,
@@ -156,6 +172,7 @@ mod tests {
         let trace = sample_trace();
 
         let json = trace_to_web_json(&trace).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
         assert!(json.contains("\"status\": \"success\""));
         assert!(json.contains("\"traceCall\""));
         assert!(json.contains("\"gasUsed\": 21000"));
@@ -164,6 +181,12 @@ mod tests {
         assert!(json.contains("\"backend\": \"debug-rpc\""));
         assert!(json.contains("\"capabilities\""));
         assert!(json.contains("\"artifacts\""));
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["error"], serde_json::Value::Null);
+        assert_eq!(value["traceCall"]["callId"], 0);
+        assert_eq!(value["traceCall"]["functionName"], "runtime_dispatcher");
+        assert_eq!(value["traceCall"]["childrenCallIds"], serde_json::json!([]));
+        assert_eq!(value["steps"][0]["traceCallIndex"], 0);
     }
 
     #[test]
@@ -171,6 +194,7 @@ mod tests {
         let trace = sample_trace();
 
         let json = simulate_to_web_json(&trace, "raw_data").expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
         assert!(json.contains("\"type\": \"ENTRY\""));
         assert!(json.contains("\"callId\": 0"));
         assert!(json.contains("\"function_name\": \"raw_data\""));
@@ -178,6 +202,9 @@ mod tests {
         assert!(json.contains("\"backend\": \"debug-rpc\""));
         assert!(json.contains("\"capabilities\""));
         assert!(json.contains("\"artifacts\""));
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["traceCall"]["functionName"], "raw_data");
+        assert_eq!(value["steps"][0]["traceCallIndex"], 0);
     }
 
     fn sample_trace() -> TransactionTrace {

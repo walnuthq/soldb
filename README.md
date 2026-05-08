@@ -157,6 +157,8 @@ flowchart TD
 
 SolDB relies on compiler-generated debug information. Compile with `solc` ETHDebug output enabled, then pass the generated artifact directory with `--ethdebug-dir <address>:<contract>:<dir>`. SolDB uses that metadata to map low-level EVM execution back to Solidity source, functions, variables, and ABI values. The debugger-side ETHDebug contract is documented in [docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
 
+The `--json` output for `trace` and `simulate` is versioned for web and explorer integrations. See [docs/json.md](docs/json.md) for the current schema, capability flags, replay artifacts, and compatibility rules.
+
 ### Execution Backends
 
 The `trace` command supports three backend modes:

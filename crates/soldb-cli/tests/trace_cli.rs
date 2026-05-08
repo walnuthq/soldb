@@ -95,6 +95,10 @@ fn trace_json_uses_rpc_trace_data() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("trace json");
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["traceCall"]["callId"], 0);
+    assert_eq!(value["steps"][0]["traceCallIndex"], 0);
     assert!(stdout.contains("\"status\": \"success\""));
     assert!(stdout.contains("\"traceCall\""));
     assert!(stdout.contains("\"gasUsed\": 21000"));
@@ -206,6 +210,11 @@ fn simulate_json_labels_raw_data_without_metadata() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("simulate json");
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["traceCall"]["callId"], 0);
+    assert_eq!(value["traceCall"]["functionName"], "raw_data");
+    assert_eq!(value["steps"][0]["traceCallIndex"], 0);
     assert!(stdout.contains("\"status\": \"success\""));
     assert!(stdout.contains("\"type\": \"ENTRY\""));
     assert!(stdout.contains("\"callId\": 0"));
