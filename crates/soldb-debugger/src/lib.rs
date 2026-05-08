@@ -682,6 +682,9 @@ mod tests {
             error: None,
             debug_trace_available: true,
             contract_address: None,
+            backend: Some("debug-rpc".to_owned()),
+            capabilities: Default::default(),
+            artifacts: Default::default(),
             steps: vec![TraceStep {
                 pc: 0,
                 op: "PUSH1".to_owned(),

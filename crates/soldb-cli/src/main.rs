@@ -875,6 +875,7 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs, backend: Trac
         println!("{} {}", info("Debug format:"), bold("srcmap-runtime"));
     }
     println!("{} {}", info("Backend:"), bold(backend.as_str()));
+    print_trace_backend_details(trace);
     println!("{} {}", info("Contract:"), function_color(&spec.name));
     if let Some(compiler) = metadata.compiler_version {
         println!("{} solc {}", info("Compiler:"), number_color(compiler));
@@ -913,6 +914,7 @@ fn print_plain_trace_summary(trace: &TransactionTrace, backend: TraceBackend) {
         address_color(trace.tx_hash.as_deref().unwrap_or("<simulated>"))
     );
     println!("{} {}", info("Backend:"), bold(backend.as_str()));
+    print_trace_backend_details(trace);
     let status = if trace.success {
         success("SUCCESS")
     } else {
@@ -926,6 +928,84 @@ fn print_plain_trace_summary(trace: &TransactionTrace, backend: TraceBackend) {
     }
 }
 
+fn print_trace_backend_details(trace: &TransactionTrace) {
+    let capabilities = format_capabilities(&trace.capabilities);
+    if !capabilities.is_empty() {
+        println!("{} {}", info("Capabilities:"), capabilities);
+    }
+    for note in &trace.capabilities.notes {
+        println!("{} {}", warning("Capability note:"), note);
+    }
+
+    let artifacts = &trace.artifacts;
+    if !artifacts.calls.is_empty()
+        || !artifacts.creations.is_empty()
+        || !artifacts.logs.is_empty()
+        || !artifacts.account_changes.is_empty()
+    {
+        println!(
+            "{} calls={}, creates={}, logs={}, account_changes={}",
+            info("Artifacts:"),
+            number_color(artifacts.calls.len()),
+            number_color(artifacts.creations.len()),
+            number_color(artifacts.logs.len()),
+            number_color(artifacts.account_changes.len())
+        );
+    }
+    if let Some(gas) = &artifacts.gas {
+        let mut gas_parts = vec![format!("used={}", gas.used)];
+        if let Some(spent) = gas.spent {
+            gas_parts.push(format!("spent={spent}"));
+        }
+        if let Some(refunded) = gas.refunded {
+            gas_parts.push(format!("refunded={refunded}"));
+        }
+        println!(
+            "{} {}",
+            info("Gas details:"),
+            number_color(gas_parts.join(", "))
+        );
+    }
+}
+
+fn format_capabilities(capabilities: &soldb_core::TraceCapabilities) -> String {
+    let mut enabled = Vec::new();
+    if capabilities.opcode_steps {
+        enabled.push("opcodes");
+    }
+    if capabilities.stack {
+        enabled.push("stack");
+    }
+    if capabilities.memory {
+        enabled.push("memory");
+    }
+    if capabilities.storage {
+        enabled.push("storage");
+    }
+    if capabilities.storage_diff {
+        enabled.push("storage-diff");
+    }
+    if capabilities.call_trace {
+        enabled.push("calls");
+    }
+    if capabilities.contract_creation {
+        enabled.push("create");
+    }
+    if capabilities.logs {
+        enabled.push("logs");
+    }
+    if capabilities.revert_data {
+        enabled.push("revert-data");
+    }
+    if capabilities.gas_details {
+        enabled.push("gas");
+    }
+    if capabilities.account_changes {
+        enabled.push("accounts");
+    }
+    enabled.join(", ")
+}
+
 fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs, backend: TraceBackend) {
     println!(
         "{} {}",
@@ -936,14 +1016,16 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs, backend: TraceBac
         println!("{} {}", info("Contract:"), function_color(contract_name));
     }
     println!("{} {}", info("Backend:"), bold(backend.as_str()));
+    print_trace_backend_details(trace);
     println!("{}", bold(info("Execution trace")));
     println!(
-        "{} | {} | {} | {} | {}",
+        "{} | {} | {} | {} | {} | {}",
         bold("Step"),
         bold("PC"),
         bold("Op"),
         bold("Gas"),
-        bold("Stack")
+        bold("Stack"),
+        bold("State")
     );
 
     let max_steps = if args.max_steps < 0 {
@@ -953,13 +1035,15 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs, backend: TraceBac
     };
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
+        let snapshot = step.normalized_snapshot();
         println!(
-            "{} | {} | {} | {} | {}",
+            "{} | {} | {} | {} | {} | {}",
             number_color(format!("{index:>4}")),
             number_color(format!("{:>4}", step.pc)),
             opcode_color(format!("{:<14}", step.op)),
             success(format!("{:>8}", step.gas)),
-            format_stack(&step.stack)
+            format_stack(&snapshot.stack),
+            format_snapshot_state(&snapshot)
         );
     }
 }
@@ -973,14 +1057,21 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_
     if let Some(contract_name) = simulate_contract_name(args) {
         println!("{} {}", info("Contract:"), function_color(contract_name));
     }
+    println!(
+        "{} {}",
+        info("Backend:"),
+        bold(trace.backend.as_deref().unwrap_or("debug-rpc"))
+    );
+    print_trace_backend_details(trace);
     println!("{}", bold(info("Execution trace")));
     println!(
-        "{} | {} | {} | {} | {}",
+        "{} | {} | {} | {} | {} | {}",
         bold("Step"),
         bold("PC"),
         bold("Op"),
         bold("Gas"),
-        bold("Stack")
+        bold("Stack"),
+        bold("State")
     );
 
     let max_steps = if args.max_steps < 0 {
@@ -990,13 +1081,15 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_
     };
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
+        let snapshot = step.normalized_snapshot();
         println!(
-            "{} | {} | {} | {} | {}",
+            "{} | {} | {} | {} | {} | {}",
             number_color(format!("{index:>4}")),
             number_color(format!("{:>4}", step.pc)),
             opcode_color(format!("{:<14}", step.op)),
             success(format!("{:>8}", step.gas)),
-            format_stack(&step.stack)
+            format_stack(&snapshot.stack),
+            format_snapshot_state(&snapshot)
         );
     }
 }
@@ -1029,6 +1122,12 @@ fn print_simulation_summary(
         }
     }
     println!("{} {}", info("Contract:"), function_color(&contract_name));
+    println!(
+        "{} {}",
+        info("Backend:"),
+        bold(trace.backend.as_deref().unwrap_or("debug-rpc"))
+    );
+    print_trace_backend_details(trace);
     println!("{}", bold(info("Function Call Trace:")));
     println!("{} {}", info("Gas used:"), success(trace.gas_used));
     let status = if trace.success {
@@ -2471,6 +2570,26 @@ fn format_stack(stack: &[String]) -> String {
     items.join(" ")
 }
 
+fn format_snapshot_state(snapshot: &soldb_core::StepSnapshot) -> String {
+    let mut items = Vec::new();
+    if let Some(memory) = &snapshot.memory {
+        if !memory.is_empty() {
+            items.push(format!("mem={}b", memory.len() / 2));
+        }
+    }
+    if !snapshot.storage.is_empty() {
+        items.push(format!("storage={}", snapshot.storage.len()));
+    }
+    if !snapshot.storage_diff.is_empty() {
+        items.push(format!("diff={}", snapshot.storage_diff.len()));
+    }
+    if items.is_empty() {
+        dim("[none]")
+    } else {
+        number_color(items.join(", "))
+    }
+}
+
 fn shorten_hex(value: &str) -> String {
     if value.len() > 10 && value.starts_with("0x") {
         format!("0x{}...", &value[2..6])
@@ -2526,6 +2645,9 @@ mod tests {
             error: None,
             debug_trace_available: true,
             contract_address: None,
+            backend: Some("debug-rpc".to_owned()),
+            capabilities: Default::default(),
+            artifacts: Default::default(),
             steps,
         }
     }

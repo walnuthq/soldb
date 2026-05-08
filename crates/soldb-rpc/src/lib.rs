@@ -8,12 +8,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use revm::bytecode::opcode::OpCode;
-use revm::context::{ContextTr, JournalTr, TxEnv};
+use revm::context::{ContextTr, JournalEntry, JournalTr, TxEnv};
 use revm::database::{CacheDB, WrapDatabaseRef};
 use revm::database_interface::DBErrorMarker;
 use revm::inspector::inspectors::GasInspector;
+use revm::inspector::JournalExt;
 use revm::interpreter::interpreter_types::{Jumps, LoopControl, MemoryTr};
-use revm::interpreter::Interpreter;
+use revm::interpreter::{
+    CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Interpreter,
+};
 use revm::primitives::{hardfork::SpecId, Address, Bytes, TxKind, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 use revm::{
@@ -23,7 +26,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use soldb_core::{
-    SoldbError, SoldbResult, StepSnapshot, StorageChange, TraceStep, TransactionTrace,
+    AccountChange, ContractCreation, ExecutionCall, ExecutionLog, GasSummary, SoldbError,
+    SoldbResult, StepSnapshot, StorageChange, TraceArtifacts, TraceCapabilities, TraceStep,
+    TransactionTrace,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +409,8 @@ pub struct DebugTraceResult {
     pub failed: bool,
     #[serde(default)]
     pub gas: Option<u64>,
+    #[serde(default)]
+    pub artifacts: TraceArtifacts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -566,6 +573,8 @@ pub struct TraceEnvelope {
     pub contract_address: Option<String>,
     pub debug_trace_available: bool,
     pub debug_error: Option<String>,
+    pub backend: Option<String>,
+    pub capabilities: TraceCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +594,22 @@ pub fn build_transaction_trace(
     let failure = debug_result.failure_message();
     let success = envelope.success && failure.is_none();
     let error = failure.or(envelope.debug_error.clone());
+    let output = normalize_hex_output(&debug_result.return_value);
+    let mut artifacts = debug_result.artifacts.clone();
+    if artifacts.gas.is_none() {
+        if let Some(used) = debug_result.gas {
+            artifacts.gas = Some(GasSummary {
+                used,
+                spent: None,
+                refunded: None,
+                remaining: None,
+                limit: None,
+            });
+        }
+    }
+    if artifacts.revert_data.is_none() && !success && output != "0x" {
+        artifacts.revert_data = Some(output.clone());
+    }
 
     TransactionTrace {
         tx_hash: envelope.tx_hash,
@@ -593,11 +618,14 @@ pub fn build_transaction_trace(
         value: envelope.value,
         input_data: envelope.input_data,
         gas_used: envelope.gas_used,
-        output: normalize_hex_output(&debug_result.return_value),
+        output,
         success,
         error,
         debug_trace_available: envelope.debug_trace_available,
         contract_address: envelope.contract_address,
+        backend: envelope.backend,
+        capabilities: envelope.capabilities,
+        artifacts,
         steps: debug_result.steps(),
     }
 }
@@ -676,6 +704,54 @@ fn resolve_trace_backend(
     }
 }
 
+fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
+    let has_steps = !result.struct_logs.is_empty();
+    let has_storage = result
+        .struct_logs
+        .iter()
+        .any(|step| !step.storage.is_empty());
+    let has_storage_diff = result
+        .steps()
+        .iter()
+        .any(|step| !step.snapshot.storage_diff.is_empty());
+    let mut notes = Vec::new();
+    if has_steps && !has_storage {
+        notes.push("debug-rpc node did not return per-step storage".to_owned());
+    }
+
+    TraceCapabilities {
+        opcode_steps: has_steps,
+        stack: has_steps,
+        memory: has_steps,
+        storage: has_storage,
+        storage_diff: has_storage_diff,
+        call_trace: false,
+        contract_creation: false,
+        logs: false,
+        revert_data: result.failed && !result.return_value.is_empty(),
+        gas_details: result.gas.is_some(),
+        account_changes: false,
+        notes,
+    }
+}
+
+fn replay_capabilities() -> TraceCapabilities {
+    TraceCapabilities {
+        opcode_steps: true,
+        stack: true,
+        memory: true,
+        storage: true,
+        storage_diff: true,
+        call_trace: true,
+        contract_creation: true,
+        logs: true,
+        revert_data: true,
+        gas_details: true,
+        account_changes: true,
+        notes: Vec::new(),
+    }
+}
+
 fn debug_trace_unavailable(error: &SoldbError) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("debug_tracetransaction")
@@ -736,6 +812,8 @@ pub fn trace_transaction_with_client(
         contract_address: receipt.contract_address,
         debug_trace_available: true,
         debug_error: None,
+        backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
+        capabilities: debug_rpc_capabilities(&debug_result),
     };
     Ok(build_transaction_trace(envelope, &debug_result))
 }
@@ -791,6 +869,21 @@ pub fn simulate_call_with_client(
         error: failure,
         debug_trace_available: true,
         contract_address: None,
+        backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
+        capabilities: debug_rpc_capabilities(&debug_result),
+        artifacts: {
+            let mut artifacts = debug_result.artifacts.clone();
+            if artifacts.gas.is_none() {
+                artifacts.gas = Some(GasSummary {
+                    used: debug_result.gas.unwrap_or(0),
+                    spent: None,
+                    refunded: None,
+                    remaining: None,
+                    limit: None,
+                });
+            }
+            artifacts
+        },
         steps: debug_result.steps(),
     })
 }
@@ -819,6 +912,8 @@ fn replay_transaction_with_client(
         contract_address: receipt.contract_address,
         debug_trace_available: true,
         debug_error: None,
+        backend: Some(TraceBackend::Replay.as_str().to_owned()),
+        capabilities: replay_capabilities(),
     };
     Ok(build_transaction_trace(envelope, &debug_result))
 }
@@ -951,13 +1046,31 @@ fn replay_debug_trace(
         }
         revm::context::result::ExecutionResult::Halt { reason, .. } => Some(format!("{reason:?}")),
     };
+    let (struct_logs, mut artifacts) = inspector.into_parts();
+    if artifacts.logs.is_empty() {
+        artifacts.logs = result
+            .logs()
+            .iter()
+            .enumerate()
+            .map(|(index, log)| log_artifact(index, 0, log))
+            .collect();
+    }
+    artifacts.gas = Some(gas_summary_from_result(&result));
+    if !result.is_success() && !return_value.is_empty() {
+        artifacts.revert_data = Some(bytes_to_prefixed_hex(
+            result
+                .output()
+                .map_or([].as_slice(), |output| output.as_ref()),
+        ));
+    }
 
     Ok(DebugTraceResult {
-        struct_logs: inspector.into_struct_logs(),
+        struct_logs,
         return_value,
         error,
         failed: !result.is_success(),
         gas: Some(result.gas_used()),
+        artifacts,
     })
 }
 
@@ -1394,15 +1507,23 @@ struct ReplayStepInspector {
     gas: GasInspector,
     pending: Option<StructLog>,
     struct_logs: Vec<StructLog>,
+    artifacts: TraceArtifacts,
+    call_stack: Vec<usize>,
+    create_stack: Vec<usize>,
+    journal_entries_seen: usize,
 }
 
 impl ReplayStepInspector {
-    fn into_struct_logs(self) -> Vec<StructLog> {
-        self.struct_logs
+    fn into_parts(self) -> (Vec<StructLog>, TraceArtifacts) {
+        (self.struct_logs, self.artifacts)
     }
 }
 
-impl<CTX: ContextTr> Inspector<CTX> for ReplayStepInspector {
+impl<CTX> Inspector<CTX> for ReplayStepInspector
+where
+    CTX: ContextTr,
+    CTX::Journal: JournalExt,
+{
     fn initialize_interp(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
         self.gas.initialize_interp(&interp.gas);
     }
@@ -1450,6 +1571,262 @@ impl<CTX: ContextTr> Inspector<CTX> for ReplayStepInspector {
             record_replay_storage_touch(&mut log, interp);
             self.struct_logs.push(log);
         }
+    }
+
+    fn log_full(
+        &mut self,
+        _interp: &mut Interpreter,
+        context: &mut CTX,
+        log: revm::primitives::Log,
+    ) {
+        let index = self.artifacts.logs.len();
+        self.artifacts
+            .logs
+            .push(log_artifact(index, context.journal().depth() as u64, &log));
+        self.record_journal_changes(context);
+    }
+
+    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        let id = self.artifacts.calls.len();
+        let parent_id = self.call_stack.last().copied();
+        let depth = context.journal().depth() as u64 + 1;
+        let input = bytes_to_prefixed_hex(inputs.input.bytes(context).as_ref());
+        self.artifacts.calls.push(ExecutionCall {
+            id,
+            parent_id,
+            depth,
+            call_type: call_scheme_name(inputs.scheme).to_owned(),
+            from: address_hex(inputs.caller),
+            to: address_hex(inputs.target_address),
+            bytecode_address: address_hex(inputs.bytecode_address),
+            value: format_u256_quantity(inputs.call_value()),
+            input,
+            gas_limit: inputs.gas_limit,
+            gas_used: None,
+            output: None,
+            success: None,
+            error: None,
+        });
+        self.call_stack.push(id);
+        self.record_journal_changes(context);
+        None
+    }
+
+    fn call_end(&mut self, context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        if let Some(id) = self.call_stack.pop() {
+            if let Some(call) = self.artifacts.calls.get_mut(id) {
+                let result = *outcome.instruction_result();
+                call.gas_used = Some(outcome.gas().used());
+                call.output = Some(bytes_to_prefixed_hex(outcome.output().as_ref()));
+                call.success = Some(result.is_ok());
+                call.error = (!result.is_ok()).then(|| format!("{result:?}"));
+            }
+        }
+        self.record_journal_changes(context);
+    }
+
+    fn create(&mut self, context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        let id = self.artifacts.creations.len();
+        let parent_id = self.call_stack.last().copied();
+        self.artifacts.creations.push(ContractCreation {
+            id,
+            parent_id,
+            depth: context.journal().depth() as u64 + 1,
+            create_type: create_scheme_name(inputs.scheme()).to_owned(),
+            caller: address_hex(inputs.caller()),
+            address: None,
+            value: format_u256_quantity(inputs.value()),
+            init_code: bytes_to_prefixed_hex(inputs.init_code().as_ref()),
+            gas_limit: inputs.gas_limit(),
+            gas_used: None,
+            output: None,
+            success: None,
+            error: None,
+        });
+        self.create_stack.push(id);
+        self.record_journal_changes(context);
+        None
+    }
+
+    fn create_end(
+        &mut self,
+        context: &mut CTX,
+        _inputs: &CreateInputs,
+        outcome: &mut CreateOutcome,
+    ) {
+        if let Some(id) = self.create_stack.pop() {
+            if let Some(create) = self.artifacts.creations.get_mut(id) {
+                let result = *outcome.instruction_result();
+                create.address = outcome.address.map(address_hex);
+                create.gas_used = Some(outcome.gas().used());
+                create.output = Some(bytes_to_prefixed_hex(outcome.output().as_ref()));
+                create.success = Some(result.is_ok());
+                create.error = (!result.is_ok()).then(|| format!("{result:?}"));
+            }
+        }
+        self.record_journal_changes(context);
+    }
+
+    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
+        self.artifacts.account_changes.push(AccountChange {
+            depth: 0,
+            kind: "selfdestruct".to_owned(),
+            address: Some(address_hex(contract)),
+            from: Some(address_hex(contract)),
+            to: Some(address_hex(target)),
+            value: Some(format_u256_quantity(value)),
+            key: None,
+            previous_value: None,
+            previous_nonce: None,
+        });
+    }
+}
+
+impl ReplayStepInspector {
+    fn record_journal_changes<CTX>(&mut self, context: &mut CTX)
+    where
+        CTX: ContextTr,
+        CTX::Journal: JournalExt,
+    {
+        let journal = context.journal().journal();
+        for entry in journal.iter().skip(self.journal_entries_seen) {
+            if let Some(change) =
+                account_change_from_journal_entry(context.journal().depth() as u64, entry)
+            {
+                self.artifacts.account_changes.push(change);
+            }
+        }
+        self.journal_entries_seen = journal.len();
+    }
+}
+
+fn log_artifact(index: usize, depth: u64, log: &revm::primitives::Log) -> ExecutionLog {
+    ExecutionLog {
+        index,
+        depth,
+        address: address_hex(log.address),
+        topics: log
+            .data
+            .topics()
+            .iter()
+            .map(|topic| b256_hex(*topic))
+            .collect(),
+        data: bytes_to_prefixed_hex(log.data.data.as_ref()),
+    }
+}
+
+fn account_change_from_journal_entry(depth: u64, entry: &JournalEntry) -> Option<AccountChange> {
+    let base = |kind: &str| AccountChange {
+        depth,
+        kind: kind.to_owned(),
+        address: None,
+        from: None,
+        to: None,
+        value: None,
+        key: None,
+        previous_value: None,
+        previous_nonce: None,
+    };
+
+    match entry {
+        JournalEntry::AccountDestroyed {
+            had_balance,
+            address,
+            target,
+            ..
+        } => {
+            let mut change = base("account_destroyed");
+            change.address = Some(address_hex(*address));
+            change.from = Some(address_hex(*address));
+            change.to = Some(address_hex(*target));
+            change.value = Some(format_u256_quantity(*had_balance));
+            Some(change)
+        }
+        JournalEntry::AccountTouched { address } => {
+            let mut change = base("account_touched");
+            change.address = Some(address_hex(*address));
+            Some(change)
+        }
+        JournalEntry::BalanceChange {
+            old_balance,
+            address,
+        } => {
+            let mut change = base("balance_change");
+            change.address = Some(address_hex(*address));
+            change.previous_value = Some(format_u256_quantity(*old_balance));
+            Some(change)
+        }
+        JournalEntry::BalanceTransfer { balance, from, to } => {
+            let mut change = base("balance_transfer");
+            change.from = Some(address_hex(*from));
+            change.to = Some(address_hex(*to));
+            change.value = Some(format_u256_quantity(*balance));
+            Some(change)
+        }
+        JournalEntry::NonceChange {
+            address,
+            previous_nonce,
+        } => {
+            let mut change = base("nonce_change");
+            change.address = Some(address_hex(*address));
+            change.previous_nonce = Some(*previous_nonce);
+            Some(change)
+        }
+        JournalEntry::NonceBump { address } => {
+            let mut change = base("nonce_bump");
+            change.address = Some(address_hex(*address));
+            Some(change)
+        }
+        JournalEntry::AccountCreated { address, .. } => {
+            let mut change = base("account_created");
+            change.address = Some(address_hex(*address));
+            Some(change)
+        }
+        JournalEntry::StorageChanged {
+            address,
+            key,
+            had_value,
+        } => {
+            let mut change = base("storage_change");
+            change.address = Some(address_hex(*address));
+            change.key = Some(format_u256_quantity(*key));
+            change.previous_value = Some(format_u256_quantity(*had_value));
+            Some(change)
+        }
+        JournalEntry::TransientStorageChange {
+            address,
+            key,
+            had_value,
+        } => {
+            let mut change = base("transient_storage_change");
+            change.address = Some(address_hex(*address));
+            change.key = Some(format_u256_quantity(*key));
+            change.previous_value = Some(format_u256_quantity(*had_value));
+            Some(change)
+        }
+        JournalEntry::CodeChange { address } => {
+            let mut change = base("code_change");
+            change.address = Some(address_hex(*address));
+            Some(change)
+        }
+        JournalEntry::AccountWarmed { .. } | JournalEntry::StorageWarmed { .. } => None,
+    }
+}
+
+fn call_scheme_name(scheme: CallScheme) -> &'static str {
+    match scheme {
+        CallScheme::Call => "CALL",
+        CallScheme::CallCode => "CALLCODE",
+        CallScheme::DelegateCall => "DELEGATECALL",
+        CallScheme::StaticCall => "STATICCALL",
+    }
+}
+
+fn create_scheme_name(scheme: revm::context_interface::CreateScheme) -> &'static str {
+    match scheme {
+        revm::context_interface::CreateScheme::Create => "CREATE",
+        revm::context_interface::CreateScheme::Create2 { .. } => "CREATE2",
+        revm::context_interface::CreateScheme::Custom { .. } => "CUSTOM_CREATE",
     }
 }
 
@@ -1731,6 +2108,29 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+fn bytes_to_prefixed_hex(bytes: &[u8]) -> String {
+    format!("0x{}", bytes_to_hex(bytes))
+}
+
+fn address_hex(address: Address) -> String {
+    bytes_to_prefixed_hex(address.as_slice())
+}
+
+fn b256_hex(value: B256) -> String {
+    bytes_to_prefixed_hex(value.as_slice())
+}
+
+fn gas_summary_from_result(result: &revm::context::result::ExecutionResult) -> GasSummary {
+    let gas = result.gas();
+    GasSummary {
+        used: gas.used(),
+        spent: Some(gas.spent()),
+        refunded: Some(gas.final_refunded()),
+        remaining: Some(gas.remaining()),
+        limit: Some(gas.limit()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -1742,12 +2142,13 @@ mod tests {
     use revm::DatabaseRef;
 
     use super::{
-        build_transaction_trace, decode_revert_reason, parse_address, parse_value_quantity,
-        replay_chain_id, replay_full_block_transactions, replay_preflight_parent_state,
-        replay_spec_for_chain, replay_target_index, resolve_trace_backend, simulate_call,
-        trace_transaction, trace_transaction_with_backend, transaction_logs, DebugTraceResult,
-        HttpEndpoint, HttpJsonRpcClient, HttpScheme, RpcBlockTransaction, RpcReplayStateProvider,
-        RpcStateDb, RpcTransaction, SimulateCallRequest, SpecId, StructLog, TraceBackend,
+        build_transaction_trace, debug_rpc_capabilities, decode_revert_reason, parse_address,
+        parse_value_quantity, replay_chain_id, replay_full_block_transactions,
+        replay_preflight_parent_state, replay_spec_for_chain, replay_target_index,
+        resolve_trace_backend, simulate_call, trace_transaction, trace_transaction_with_backend,
+        transaction_logs, DebugTraceResult, HttpEndpoint, HttpJsonRpcClient, HttpScheme,
+        RpcBlockTransaction, RpcReplayStateProvider, RpcStateDb, RpcTransaction,
+        SimulateCallRequest, SpecId, StructLog, TraceArtifacts, TraceBackend, TraceCapabilities,
         TraceEnvelope,
     };
     use serde_json::json;
@@ -1806,6 +2207,7 @@ mod tests {
         let result: DebugTraceResult = serde_json::from_value(json!({
             "returnValue": "",
             "failed": false,
+            "gas": 7,
             "structLogs": [{"pc": 0, "op": "STOP", "gas": 1, "depth": 0}]
         }))
         .expect("debug trace");
@@ -1820,12 +2222,52 @@ mod tests {
             contract_address: None,
             debug_trace_available: true,
             debug_error: None,
+            backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
+            capabilities: debug_rpc_capabilities(&result),
         };
 
         let trace = build_transaction_trace(envelope, &result);
         assert!(trace.success);
         assert_eq!(trace.output, "0x");
+        assert_eq!(trace.backend.as_deref(), Some("debug-rpc"));
+        assert!(trace.capabilities.opcode_steps);
+        assert!(trace.capabilities.stack);
+        assert!(trace.capabilities.memory);
+        assert!(trace.capabilities.gas_details);
+        assert_eq!(trace.artifacts.gas.as_ref().map(|gas| gas.used), Some(7));
         assert_eq!(trace.steps[0].op, "STOP");
+    }
+
+    #[test]
+    fn debug_rpc_capabilities_reflect_returned_trace_data() {
+        let result: DebugTraceResult = serde_json::from_value(json!({
+            "returnValue": "08c379a0",
+            "failed": true,
+            "gas": 9,
+            "structLogs": [
+                {
+                    "pc": 0,
+                    "op": "SSTORE",
+                    "gas": 100,
+                    "gasCost": 3,
+                    "depth": 0,
+                    "stack": ["0x2a", "0x0"],
+                    "storage": {"0x0": "0x2a"}
+                }
+            ]
+        }))
+        .expect("debug trace");
+
+        let capabilities = debug_rpc_capabilities(&result);
+
+        assert!(capabilities.opcode_steps);
+        assert!(capabilities.stack);
+        assert!(capabilities.memory);
+        assert!(capabilities.storage);
+        assert!(capabilities.storage_diff);
+        assert!(capabilities.revert_data);
+        assert!(capabilities.gas_details);
+        assert!(capabilities.notes.is_empty());
     }
 
     #[test]
@@ -1846,6 +2288,8 @@ mod tests {
             contract_address: None,
             debug_trace_available: false,
             debug_error: Some("debug_traceTransaction not available".to_owned()),
+            backend: Some(TraceBackend::Auto.as_str().to_owned()),
+            capabilities: TraceCapabilities::default(),
         };
 
         let trace = build_transaction_trace(envelope, &result);
@@ -1864,6 +2308,7 @@ mod tests {
             error: Some("bad opcode".to_owned()),
             failed: true,
             gas: None,
+            artifacts: TraceArtifacts::default(),
         };
 
         assert_eq!(result.failure_message().as_deref(), Some("bad opcode"));
@@ -1929,6 +2374,21 @@ mod tests {
         assert_eq!(trace.to_addr.as_deref(), Some("0x2"));
         assert_eq!(trace.gas_used, 21_000);
         assert!(trace.success);
+        assert_eq!(trace.backend.as_deref(), Some("debug-rpc"));
+        assert!(trace.capabilities.opcode_steps);
+        assert!(trace.capabilities.stack);
+        assert!(trace.capabilities.memory);
+        assert!(trace.capabilities.gas_details);
+        assert!(!trace.capabilities.storage);
+        assert!(trace
+            .capabilities
+            .notes
+            .iter()
+            .any(|note| note.contains("per-step storage")));
+        assert_eq!(
+            trace.artifacts.gas.as_ref().map(|gas| gas.used),
+            Some(21_000)
+        );
         assert_eq!(trace.steps.len(), 3);
         assert_eq!(trace.steps[0].op, "PUSH1");
         assert_eq!(trace.steps[1].memory.as_deref(), Some("aabb"));
@@ -2246,6 +2706,12 @@ mod tests {
         assert_eq!(trace.input_data, "0x1234");
         assert_eq!(trace.gas_used, 42_000);
         assert!(trace.success);
+        assert_eq!(trace.backend.as_deref(), Some("debug-rpc"));
+        assert!(trace.capabilities.gas_details);
+        assert_eq!(
+            trace.artifacts.gas.as_ref().map(|gas| gas.used),
+            Some(42_000)
+        );
         assert_eq!(trace.steps[1].op, "CALLDATASIZE");
     }
 
@@ -2367,6 +2833,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "result": {
+                    "gas": 21000,
                     "returnValue": "",
                     "structLogs": [
                         {"pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3, "depth": 0, "stack": []},
@@ -2508,6 +2975,9 @@ mod tests {
             error: None,
             debug_trace_available: true,
             contract_address: None,
+            backend: Some(output.to_owned()),
+            capabilities: TraceCapabilities::default(),
+            artifacts: TraceArtifacts::default(),
             steps: Vec::new(),
         }
     }

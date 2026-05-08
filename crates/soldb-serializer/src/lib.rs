@@ -1,6 +1,6 @@
 use serde::Serialize;
 use serde_json::json;
-use soldb_core::{SoldbResult, TransactionTrace};
+use soldb_core::{SoldbResult, TraceArtifacts, TraceCapabilities, TransactionTrace};
 
 pub fn trace_to_json(trace: &TransactionTrace) -> SoldbResult<String> {
     serde_json::to_string_pretty(trace)
@@ -28,6 +28,9 @@ pub fn trace_to_web_json(trace: &TransactionTrace) -> SoldbResult<String> {
 
     let response = TraceWebResponse {
         status: if trace.success { "success" } else { "reverted" },
+        backend: trace.backend.as_deref(),
+        capabilities: &trace.capabilities,
+        artifacts: &trace.artifacts,
         trace_call: TraceCallWeb {
             ty: if trace.contract_address.is_some() {
                 "CREATE"
@@ -72,6 +75,9 @@ pub fn simulate_to_web_json(trace: &TransactionTrace, function_name: &str) -> So
 
     let response = SimulateWebResponse {
         status: if trace.success { "success" } else { "reverted" },
+        backend: trace.backend.as_deref(),
+        capabilities: &trace.capabilities,
+        artifacts: &trace.artifacts,
         trace_call: TraceCallWeb {
             ty: "ENTRY",
             from: &trace.from_addr,
@@ -112,6 +118,10 @@ struct TraceCallWeb<'a> {
 #[derive(Debug, Serialize)]
 struct TraceWebResponse<'a> {
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<&'a str>,
+    capabilities: &'a TraceCapabilities,
+    artifacts: &'a TraceArtifacts,
     #[serde(rename = "traceCall")]
     trace_call: TraceCallWeb<'a>,
     steps: Vec<serde_json::Value>,
@@ -121,6 +131,10 @@ struct TraceWebResponse<'a> {
 #[derive(Debug, Serialize)]
 struct SimulateWebResponse<'a> {
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<&'a str>,
+    capabilities: &'a TraceCapabilities,
+    artifacts: &'a TraceArtifacts,
     #[serde(rename = "traceCall")]
     trace_call: TraceCallWeb<'a>,
     steps: Vec<serde_json::Value>,
@@ -147,6 +161,9 @@ mod tests {
         assert!(json.contains("\"gasUsed\": 21000"));
         assert!(json.contains("\"contracts\""));
         assert!(json.contains("\"snapshot\""));
+        assert!(json.contains("\"backend\": \"debug-rpc\""));
+        assert!(json.contains("\"capabilities\""));
+        assert!(json.contains("\"artifacts\""));
     }
 
     #[test]
@@ -158,6 +175,9 @@ mod tests {
         assert!(json.contains("\"callId\": 0"));
         assert!(json.contains("\"function_name\": \"raw_data\""));
         assert!(json.contains("\"isVerified\": false"));
+        assert!(json.contains("\"backend\": \"debug-rpc\""));
+        assert!(json.contains("\"capabilities\""));
+        assert!(json.contains("\"artifacts\""));
     }
 
     fn sample_trace() -> TransactionTrace {
@@ -173,6 +193,9 @@ mod tests {
             error: None,
             debug_trace_available: true,
             contract_address: None,
+            backend: Some("debug-rpc".to_owned()),
+            capabilities: Default::default(),
+            artifacts: Default::default(),
             steps: vec![TraceStep {
                 pc: 0,
                 op: "PUSH1".to_owned(),

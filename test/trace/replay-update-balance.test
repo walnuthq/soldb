@@ -21,6 +21,13 @@
 # CHECK: SSTORE
 # CHECK: LOG2
 
+# JSON: "backend": "replay"
+# JSON: "capabilities"
+# JSON: "call_trace": true
+# JSON: "artifacts"
+# JSON: "logs"
+# JSON: "account_changes"
+# JSON: "gas"
 # JSON: "snapshot"
 # JSON: "storage"
 # JSON: "storage_diff"

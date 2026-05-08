@@ -82,7 +82,123 @@ pub struct TransactionTrace {
     pub error: Option<String>,
     pub debug_trace_available: bool,
     pub contract_address: Option<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub capabilities: TraceCapabilities,
+    #[serde(default)]
+    pub artifacts: TraceArtifacts,
     pub steps: Vec<TraceStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TraceCapabilities {
+    #[serde(default)]
+    pub opcode_steps: bool,
+    #[serde(default)]
+    pub stack: bool,
+    #[serde(default)]
+    pub memory: bool,
+    #[serde(default)]
+    pub storage: bool,
+    #[serde(default)]
+    pub storage_diff: bool,
+    #[serde(default)]
+    pub call_trace: bool,
+    #[serde(default)]
+    pub contract_creation: bool,
+    #[serde(default)]
+    pub logs: bool,
+    #[serde(default)]
+    pub revert_data: bool,
+    #[serde(default)]
+    pub gas_details: bool,
+    #[serde(default)]
+    pub account_changes: bool,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TraceArtifacts {
+    #[serde(default)]
+    pub calls: Vec<ExecutionCall>,
+    #[serde(default)]
+    pub creations: Vec<ContractCreation>,
+    #[serde(default)]
+    pub logs: Vec<ExecutionLog>,
+    #[serde(default)]
+    pub account_changes: Vec<AccountChange>,
+    #[serde(default)]
+    pub gas: Option<GasSummary>,
+    #[serde(default)]
+    pub revert_data: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionCall {
+    pub id: usize,
+    pub parent_id: Option<usize>,
+    pub depth: u64,
+    pub call_type: String,
+    pub from: String,
+    pub to: String,
+    pub bytecode_address: String,
+    pub value: String,
+    pub input: String,
+    pub gas_limit: u64,
+    pub gas_used: Option<u64>,
+    pub output: Option<String>,
+    pub success: Option<bool>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractCreation {
+    pub id: usize,
+    pub parent_id: Option<usize>,
+    pub depth: u64,
+    pub create_type: String,
+    pub caller: String,
+    pub address: Option<String>,
+    pub value: String,
+    pub init_code: String,
+    pub gas_limit: u64,
+    pub gas_used: Option<u64>,
+    pub output: Option<String>,
+    pub success: Option<bool>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionLog {
+    pub index: usize,
+    pub depth: u64,
+    pub address: String,
+    pub topics: Vec<String>,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountChange {
+    pub depth: u64,
+    pub kind: String,
+    pub address: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub value: Option<String>,
+    pub key: Option<String>,
+    pub previous_value: Option<String>,
+    pub previous_nonce: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GasSummary {
+    pub used: u64,
+    pub spent: Option<u64>,
+    pub refunded: Option<u64>,
+    pub remaining: Option<u64>,
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,7 +215,10 @@ pub struct FunctionCall {
 
 #[cfg(test)]
 mod tests {
-    use super::{FunctionCall, StepSnapshot, StorageChange, TraceStep, TransactionTrace};
+    use super::{
+        FunctionCall, StepSnapshot, StorageChange, TraceArtifacts, TraceCapabilities, TraceStep,
+        TransactionTrace,
+    };
 
     #[test]
     fn core_models_are_serializable() {
@@ -127,6 +246,9 @@ mod tests {
             }],
             debug_trace_available: true,
             contract_address: None,
+            backend: Some("debug-rpc".to_owned()),
+            capabilities: TraceCapabilities::default(),
+            artifacts: TraceArtifacts::default(),
         };
 
         let encoded = serde_json::to_string(&trace).expect("trace serializes");

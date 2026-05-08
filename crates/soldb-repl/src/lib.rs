@@ -408,6 +408,9 @@ mod tests {
             error: None,
             debug_trace_available: true,
             contract_address: None,
+            backend: Some("debug-rpc".to_owned()),
+            capabilities: Default::default(),
+            artifacts: Default::default(),
             steps: vec![
                 step(0, "PUSH1", 100),
                 step(2, "MSTORE", 97),

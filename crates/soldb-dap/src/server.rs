@@ -17,6 +17,8 @@ use crate::{
 const LOCALS_REF: u64 = 1000;
 const STACK_REF: u64 = 1001;
 const STEP_REF: u64 = 1002;
+const MEMORY_REF: u64 = 1003;
+const STORAGE_REF: u64 = 1004;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DapServer {
@@ -229,6 +231,8 @@ impl DapServer {
                 "scopes": [
                     {"name": "Locals", "variablesReference": LOCALS_REF, "expensive": false},
                     {"name": "Stack", "variablesReference": STACK_REF, "expensive": false},
+                    {"name": "Memory", "variablesReference": MEMORY_REF, "expensive": false},
+                    {"name": "Storage", "variablesReference": STORAGE_REF, "expensive": false},
                     {"name": "Step", "variablesReference": STEP_REF, "expensive": false}
                 ]
             })),
@@ -246,6 +250,8 @@ impl DapServer {
         let variables = match reference {
             LOCALS_REF => self.local_variables(),
             STACK_REF => self.stack_variables(),
+            MEMORY_REF => self.memory_variables(),
+            STORAGE_REF => self.storage_variables(),
             STEP_REF => self.step_variables(),
             _ => Vec::new(),
         };
@@ -353,13 +359,62 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        step.stack
+        step.normalized_snapshot()
+            .stack
             .iter()
             .enumerate()
             .map(|(index, value)| {
                 json!({"name": format!("stack[{index}]"), "value": value, "variablesReference": 0})
             })
             .collect()
+    }
+
+    fn memory_variables(&self) -> Vec<Value> {
+        let Some(step) = self.debugger.current_step_data() else {
+            return Vec::new();
+        };
+        let Some(memory) = step.normalized_snapshot().memory else {
+            return Vec::new();
+        };
+        if memory.is_empty() {
+            return Vec::new();
+        }
+        memory
+            .as_bytes()
+            .chunks(64)
+            .enumerate()
+            .map(|(index, chunk)| {
+                json!({
+                    "name": format!("memory[0x{:x}]", index * 32),
+                    "value": std::str::from_utf8(chunk).unwrap_or_default(),
+                    "variablesReference": 0
+                })
+            })
+            .collect()
+    }
+
+    fn storage_variables(&self) -> Vec<Value> {
+        let Some(step) = self.debugger.current_step_data() else {
+            return Vec::new();
+        };
+        let snapshot = step.normalized_snapshot();
+        let mut variables = snapshot
+            .storage
+            .iter()
+            .map(|(slot, value)| json!({"name": slot, "value": value, "variablesReference": 0}))
+            .collect::<Vec<_>>();
+        variables.extend(snapshot.storage_diff.iter().map(|(slot, change)| {
+            json!({
+                "name": format!("{slot} diff"),
+                "value": format!(
+                    "{} -> {}",
+                    change.before.as_deref().unwrap_or("<unset>"),
+                    change.after.as_deref().unwrap_or("<unset>")
+                ),
+                "variablesReference": 0
+            })
+        }));
+        variables
     }
 
     fn step_variables(&self) -> Vec<Value> {
@@ -392,7 +447,16 @@ impl DapServer {
                     .parse::<usize>()
                     .ok();
                 index
-                    .and_then(|index| step.stack.get(index))
+                    .and_then(|index| step.normalized_snapshot().stack.get(index).cloned())
+                    .unwrap_or_else(|| "<unavailable>".to_owned())
+            }
+            expression if expression.starts_with("storage[") && expression.ends_with(']') => {
+                let slot = expression
+                    .trim_start_matches("storage[")
+                    .trim_end_matches(']');
+                step.normalized_snapshot()
+                    .storage
+                    .get(slot)
                     .cloned()
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
@@ -720,6 +784,7 @@ fn line_column(content: &str, offset: u64) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -728,7 +793,7 @@ mod tests {
 
     use crate::{decode_dap_frame, encode_dap_frame, DapMessage};
 
-    use super::{run_stdio_server, DapServer, STACK_REF};
+    use super::{run_stdio_server, DapServer, MEMORY_REF, STACK_REF, STORAGE_REF};
 
     #[test]
     fn handles_initialize_and_threads() {
@@ -777,8 +842,19 @@ mod tests {
             "step 0: PUSH1 @ pc 0"
         );
 
+        let scopes = DapMessage::request(3, "scopes", None);
+        let messages = server.handle_message(&scopes);
+        let scope_names = messages[0].body.as_ref().expect("body")["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .map(|scope| scope["name"].as_str().expect("scope name"))
+            .collect::<Vec<_>>();
+        assert!(scope_names.contains(&"Memory"));
+        assert!(scope_names.contains(&"Storage"));
+
         let variables = DapMessage::request(
-            3,
+            4,
             "variables",
             Some(json!({"variablesReference": STACK_REF})),
         );
@@ -787,6 +863,33 @@ mod tests {
             messages[0].body.as_ref().expect("body")["variables"][0]["value"],
             "0x2a"
         );
+
+        let memory = DapMessage::request(
+            5,
+            "variables",
+            Some(json!({"variablesReference": MEMORY_REF})),
+        );
+        let messages = server.handle_message(&memory);
+        assert_eq!(
+            messages[0].body.as_ref().expect("body")["variables"][0]["value"],
+            "aa"
+        );
+
+        let storage = DapMessage::request(
+            6,
+            "variables",
+            Some(json!({"variablesReference": STORAGE_REF})),
+        );
+        let messages = server.handle_message(&storage);
+        assert_eq!(
+            messages[0].body.as_ref().expect("body")["variables"][0]["value"],
+            "0x2a"
+        );
+
+        let evaluate =
+            DapMessage::request(7, "evaluate", Some(json!({"expression": "storage[0x0]"})));
+        let messages = server.handle_message(&evaluate);
+        assert_eq!(messages[0].body.as_ref().expect("body")["result"], "0x2a");
     }
 
     #[test]
@@ -903,6 +1006,9 @@ mod tests {
             error: None,
             debug_trace_available: true,
             contract_address: None,
+            backend: Some("debug-rpc".to_owned()),
+            capabilities: Default::default(),
+            artifacts: Default::default(),
             steps: vec![
                 TraceStep {
                     pc: 0,
@@ -911,8 +1017,8 @@ mod tests {
                     gas_cost: 1,
                     depth: 0,
                     stack: vec!["0x2a".to_owned()],
-                    memory: None,
-                    storage: None,
+                    memory: Some("aa".to_owned()),
+                    storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                     error: None,
                     snapshot: Default::default(),
                 },
