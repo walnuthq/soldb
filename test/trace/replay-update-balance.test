@@ -1,0 +1,33 @@
+# Test replay parity for a transaction that writes storage and emits an event.
+# REQUIRES: soldb
+# RUN: TX=$(%S/create-replay-parity-tx.sh update-balance %{contract_address}) && \
+# RUN:   %soldb trace $TX --backend debug-rpc --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw --max-steps=10000 > %t.debug && \
+# RUN:   %soldb trace $TX --backend replay --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw --max-steps=10000 > %t.replay && \
+# RUN:   sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.debug > %t.debug.ops && \
+# RUN:   sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.replay > %t.replay.ops && \
+# RUN:   diff -u %t.debug.ops %t.replay.ops && \
+# RUN:   %soldb trace $TX --backend debug-rpc --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --json > %t.debug.json && \
+# RUN:   %soldb trace $TX --backend replay --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --json > %t.replay.json && \
+# RUN:   jq '[.steps[] | select(.op == "SLOAD" or .op == "SSTORE") | {pc, op, stack: .snapshot.stack, memory: .snapshot.memory}]' %t.debug.json > %t.debug.snapshots && \
+# RUN:   jq '[.steps[] | select(.op == "SLOAD" or .op == "SSTORE") | {pc, op, stack: .snapshot.stack, memory: .snapshot.memory}]' %t.replay.json > %t.replay.snapshots && \
+# RUN:   diff -u %t.debug.snapshots %t.replay.snapshots
+# RUN: FileCheck %s < %t.replay
+# RUN: FileCheck %s --check-prefix=JSON < %t.replay.json
+
+# CHECK: Loading transaction
+# CHECK: Contract: TestContract
+# CHECK: Backend: replay
+# CHECK: Execution trace
+# CHECK: SSTORE
+# CHECK: LOG2
+
+# JSON: "backend": "replay"
+# JSON: "capabilities"
+# JSON: "call_trace": true
+# JSON: "artifacts"
+# JSON: "logs"
+# JSON: "account_changes"
+# JSON: "gas"
+# JSON: "snapshot"
+# JSON: "storage"
+# JSON: "storage_diff"

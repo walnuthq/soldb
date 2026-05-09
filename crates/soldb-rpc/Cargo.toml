@@ -1,0 +1,24 @@
+[package]
+name = "soldb-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+soldb-core = { path = "../soldb-core" }
+revm = { version = "36.0", default-features = false, features = [
+    "std",
+    "serde",
+    "optional_eip3607",
+    "optional_block_gas_limit",
+    "optional_no_base_fee",
+] }
+
+[lints]
+workspace = true

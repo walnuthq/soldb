@@ -1,0 +1,17 @@
+[package]
+name = "soldb-serializer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+soldb-core = { path = "../soldb-core" }
+
+[lints]
+workspace = true

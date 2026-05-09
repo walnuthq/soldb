@@ -19,7 +19,6 @@ RUN_SIMULATE_TESTS=true
 RUN_EVENTS_TESTS=true
 RUN_CLI_TESTS=true
 VERBOSE=false
-RUN_COVERAGE=false
 SEPOLIA_KEY=""
 
 for arg in "$@"; do
@@ -61,7 +60,8 @@ for arg in "$@"; do
             shift
             ;;
         --coverage)
-            RUN_COVERAGE=true
+            # Backward-compatible no-op. Implementation coverage is handled by
+            # cargo llvm-cov; this script always runs the Rust soldb binary.
             shift
             ;;
         -h|--help)
@@ -73,7 +73,7 @@ for arg in "$@"; do
             echo "  --events-only      Run only events tests (from test/events/)"
             echo "  --cli-only         Run only CLI tests (from test/cli/)"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
-            echo "  --coverage         Run soldb CLI invocations under coverage.py"
+            echo "  --coverage         Accepted for compatibility; use cargo llvm-cov for coverage"
             echo "  -v, --verbose      Run tests with verbose output"
             echo "  -h, --help         Show this help message"
             echo ""
@@ -86,9 +86,9 @@ for arg in "$@"; do
             echo "Environment variables:"
             echo "  RPC_URL            RPC endpoint (default: http://localhost:8545)"
             echo "  SOLC_PATH          Path to solc binary (default: solc)"
+            echo "  SOLDB_BIN          Path to soldb executable override"
             echo "  TEST_TX            Specific transaction hash to test"
             echo "  SEPOLIA_KEY        Optimism Sepolia API key (can also use --sepolia-key)"
-            echo "  COVERAGE_FILE      Coverage data file base path (default: .coverage in project root)"
             echo ""
             echo "Examples:"
             echo "  $0                           # Run all tests"
@@ -173,8 +173,8 @@ else
     echo -e "${YELLOW}No Sepolia API key provided (use --sepolia-key=KEY to enable remote tests)${NC}"
 fi
 
-# Export SOLC_PATH so it's available to the Python config
-# Note: Individual tests will set their own solc version via solc-select
+# Export SOLC_PATH so it is available to deployment and lit helpers.
+# Note: Individual tests will set their own solc version via solc-select.
 export SOLC_PATH
 
 echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
@@ -301,10 +301,22 @@ if [ -n "$TEST_TX_NO_EVENTS" ]; then
 fi
 echo ""
 
-# Find soldb - prefer system-wide installation
+# Find soldb - prefer the Rust binary during the migration.
 SOLDB_CMD=""
 SOLDB_TYPE=""
-if command -v soldb &> /dev/null; then
+if [ -n "${SOLDB_BIN:-}" ]; then
+    SOLDB_CMD="${SOLDB_BIN}"
+    SOLDB_TYPE="override"
+    echo -e "${GREEN}Using SOLDB_BIN override: ${SOLDB_CMD}${NC}"
+elif [ -x "${PROJECT_DIR}/target/debug/soldb" ]; then
+    SOLDB_CMD="${PROJECT_DIR}/target/debug/soldb"
+    SOLDB_TYPE="rust"
+    echo -e "${GREEN}Using Rust soldb binary${NC}"
+elif [ -x "${PROJECT_DIR}/target/release/soldb" ]; then
+    SOLDB_CMD="${PROJECT_DIR}/target/release/soldb"
+    SOLDB_TYPE="rust"
+    echo -e "${GREEN}Using release Rust soldb binary${NC}"
+elif command -v soldb &> /dev/null; then
     # Use the soldb executable already selected by PATH.
     SOLDB_CMD="soldb"
     SOLDB_TYPE="path"
@@ -321,29 +333,9 @@ elif [ -f "${PROJECT_DIR}/MyEnv/bin/soldb" ]; then
     echo -e "${GREEN}Using venv soldb${NC}"
 else
     echo -e "${RED}Error: soldb not found${NC}"
-    echo "Install with: pip install -e ${PROJECT_DIR}"
+    echo "Build it with: cargo build --bin soldb"
+    echo "Or install it with: cargo install --path ${PROJECT_DIR}/crates/soldb-cli"
     exit 1
-fi
-
-if [ "$RUN_COVERAGE" = true ]; then
-    PYTHON_CMD="${PYTHON:-python}"
-    if [[ "$PYTHON_CMD" != /* && -x "${PROJECT_DIR}/${PYTHON_CMD}" ]]; then
-        PYTHON_CMD="${PROJECT_DIR}/${PYTHON_CMD}"
-    elif [[ "$PYTHON_CMD" != */* ]]; then
-        PYTHON_CMD="$(command -v "$PYTHON_CMD" || echo "$PYTHON_CMD")"
-    fi
-    if ! "$PYTHON_CMD" -m coverage --version >/dev/null 2>&1; then
-        echo -e "${RED}Error: coverage.py not found${NC}"
-        echo "Install with: pip install -e '${PROJECT_DIR}[dev]'"
-        exit 1
-    fi
-    COVERAGE_FILE="${COVERAGE_FILE:-${PROJECT_DIR}/.coverage}"
-    COVERAGE_RCFILE="${COVERAGE_RCFILE:-${PROJECT_DIR}/pyproject.toml}"
-    export COVERAGE_FILE
-    export COVERAGE_RCFILE
-    SOLDB_CMD="$PYTHON_CMD -m coverage run --parallel-mode -m soldb.cli.main"
-    SOLDB_TYPE="coverage"
-    echo -e "${GREEN}Using coverage-wrapped soldb (${COVERAGE_FILE}.*)${NC}"
 fi
 
 # Create lit config with relative paths

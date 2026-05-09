@@ -6,14 +6,11 @@ This directory contains the test infrastructure for SolDB.
 
 ```
 test/
-├── unit/            # Pytest unit tests for isolated Python modules
-├── integration/     # Pytest integration tests
 ├── trace/           # Trace command tests (lit + FileCheck)
 ├── simulate/        # Simulate command tests (lit + FileCheck)
 ├── events/          # Events command tests (lit + FileCheck)
 ├── cli/             # CLI command and validation tests (lit + FileCheck)
 ├── stylus/          # Stylus interop test contracts and scripts
-├── conftest.py      # Shared pytest constants
 ├── run-tests.sh     # Main test runner script
 ├── lit.cfg.py       # Test framework configuration
 ├── lit.site.cfg.py  # Generated site-specific configuration (gitignored)
@@ -64,31 +61,6 @@ Tests for command-line parsing and shared command behavior:
 - **list-contracts-basic.test**: Contract listing for a local transaction
 - **bridge-invalid-host.test**: Bridge command startup error handling
 
-### Unit Tests (`test/unit/`)
-
-Pytest tests for isolated Python modules — each test targets a single module with mocked dependencies:
-
-- Bridge client request and error handling
-- Protocol and contract registry round-trips
-- ABI parsing, exception formatting, logging helpers
-- Tracer decode/format/extract helpers
-- Serializer log extraction, encoding, and contract mapping
-- REPL debugger commands, stepping, and source loading
-- Compiler ETHDebug main, SourceMapper, tuple formatting
-
-### Integration Tests (`test/integration/`)
-
-Pytest tests that exercise multiple modules together with real parsers and ETHDebug data:
-
-- CLI command flows (trace, simulate, events, contracts) end-to-end
-- Full `analyze_function_calls` with CALL/DELEGATECALL/CREATE/REVERT traces
-- EVMDebugger sessions with real ETHDebug — stepping, breakpoints, variables
-- Auto-deploy compile and deploy lifecycle
-- ETHDebug/source-map parser edge cases and SourceMappingManager
-- Multi-contract trace analysis and serialization
-
-Shared fixtures (`conftest.py`) provide `write_ethdebug_project`, `build_tracer`, and automatic source cache cleanup.
-
 ### Stylus Interop Tests (`test/stylus/`)
 
 Tests for Solidity <> Stylus cross-environment tracing:
@@ -128,26 +100,16 @@ cd test
 ./run-tests.sh -v
 ```
 
-### Run Unit and Integration Tests
-
-```bash
-pytest test/unit test/integration
-```
-
 ### Run with Coverage
 
 ```bash
-coverage erase
-coverage run --parallel-mode -m pytest test/unit test/integration
-./run-tests.sh --coverage
-coverage combine
-coverage report
-coverage html
-coverage xml
+cargo llvm-cov --workspace --all-targets --fail-under-lines 80
+./run-tests.sh
 ```
 
-This records pytest unit and integration coverage, wraps each `soldb` CLI invocation in `coverage run --parallel-mode`, then combines all subprocess data after lit finishes.
-CI enforces a 70% total coverage gate for the Python module scope configured in `pyproject.toml`, plus at least 80% coverage on Python lines changed in each pull request.
+This records implementation coverage for the Rust workspace and then runs the
+Rust `soldb` binary through lit as an end-to-end command test. CI enforces at
+least 80% Rust line coverage.
 
 ### Run Remote Tests with Sepolia API Key
 

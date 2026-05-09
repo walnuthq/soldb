@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/soldb-bridge",
+    "crates/soldb-cli",
+    "crates/soldb-compiler",
+    "crates/soldb-core",
+    "crates/soldb-debugger",
+    "crates/soldb-dap",
+    "crates/soldb-ethdebug",
+    "crates/soldb-repl",
+    "crates/soldb-rpc",
+    "crates/soldb-serializer",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/walnuthq/soldb"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

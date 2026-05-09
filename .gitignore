@@ -1,8 +1,10 @@
 cache/
 dist/
+target/
 .coverage
 .coverage.*
 coverage.xml
+rust-coverage.xml
 htmlcov/
 examples/debug/
 examples/debug*/

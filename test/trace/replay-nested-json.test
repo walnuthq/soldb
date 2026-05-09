@@ -1,0 +1,16 @@
+# Test replay JSON call tree and opcode-to-call indexing for an external nested call.
+# REQUIRES: soldb
+# RUN: RESULT=$(%S/create-nested-call-tx.sh %t.nested) && \
+# RUN:   set -- $RESULT && TX=$1 && CALLER=$2 && CALLEE=$3 && DEBUG_DIR=$4 && \
+# RUN:   %soldb trace $TX --backend replay --ethdebug-dir $CALLER:Caller:$DEBUG_DIR --ethdebug-dir $CALLEE:Callee:$DEBUG_DIR --rpc %{rpc_url} --json > %t.json && \
+# RUN:   jq -e '.backend == "replay" and (.traceCall.callId == 0) and (.traceCall.calls | length > 0) and (.traceCall.calls[0].parentCallId == .traceCall.callId) and ([.steps[].traceCallIndex] | any(. > 0))' %t.json
+# RUN: FileCheck %s < %t.json
+
+# CHECK: "backend": "replay"
+# CHECK: "traceCall": {
+# CHECK: "callId": 0
+# CHECK: "childrenCallIds": [
+# CHECK: 1
+# CHECK: "calls": [
+# CHECK: "parentCallId": 0
+# CHECK: "traceCallIndex": 1

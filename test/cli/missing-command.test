@@ -1,6 +1,7 @@
-# Test that argparse reports a missing command
+# Test that the Rust CLI reports a missing command
 # REQUIRES: soldb
 # RUN: not %soldb 2>&1 | FileCheck %s
 
-# CHECK: usage:
-# CHECK: error: the following arguments are required: command
+# CHECK: SolDB - Ethereum transaction analysis tool
+# CHECK: Usage:
+# CHECK: Commands:

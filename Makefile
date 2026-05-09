@@ -1,46 +1,45 @@
-.PHONY: help install dev test coverage test-setup test-deploy publish clean
+.PHONY: help install dev test coverage rust-test lit-test test-setup test-deploy clean
 
 help:
 	@echo "SolDB - Build and Distribution"
 	@echo ""
 	@echo "Available commands:"
-	@echo "  make install         Install package locally"
-	@echo "  make dev            Install in development mode"
-	@echo "  make test           Run tests"
-	@echo "  make coverage       Run tests with Python coverage"
+	@echo "  make install         Install Rust binaries locally"
+	@echo "  make dev            Build Rust workspace"
+	@echo "  make test           Run Rust and LIT tests"
+	@echo "  make coverage       Run Rust coverage and LIT tests"
+	@echo "  make rust-test      Run Rust workspace tests"
+	@echo "  make lit-test       Run LIT tests"
 	@echo "  make test-setup     Setup and verify test environment"
 	@echo "  make test-deploy    Deploy test contracts"
-	@echo "  make publish        Publish to PyPI"
 	@echo "  make clean          Clean build artifacts"
 
 install:
-	pip install .
+	cargo install --path crates/soldb-cli
+	cargo install --path crates/soldb-dap
 
 dev:
-	pip install -e .
-	pip install -r requirements.txt
+	cargo build --workspace --all-targets
 
 test:
-	pytest test/unit
+	cargo test --workspace --all-targets
 	./test/run-tests.sh
 
 coverage:
-	coverage erase
-	coverage run --parallel-mode -m pytest test/unit
-	./test/run-tests.sh --coverage
-	coverage combine
-	coverage report
-	coverage html
-	coverage xml
+	cargo llvm-cov --workspace --all-targets --fail-under-lines 80
+	./test/run-tests.sh
+
+rust-test:
+	cargo test --workspace --all-targets
+
+lit-test:
+	./test/run-tests.sh
 
 test-setup:
 	./test/test-setup.sh
 
 test-deploy:
 	./test/test-setup.sh --deploy-test
-
-publish:
-	./scripts/publish-pypi.sh
 
 clean:
 	rm -rf build dist *.egg-info

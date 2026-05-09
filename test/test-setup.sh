@@ -59,15 +59,6 @@ else
     echo "  Make sure Anvil is running: anvil --fork-url <RPC> --steps-tracing"
 fi
 
-# Test Python dependencies
-echo -n "Testing Python dependencies... "
-if python3 -c "import web3, eth_utils" 2>/dev/null; then
-    echo -e "${GREEN}✓ OK${NC}"
-else
-    echo -e "${YELLOW}⚠ Missing${NC}"
-    echo "  Install with: pip install -r requirements.txt"
-fi
-
 # Test cast (Foundry)
 echo -n "Testing cast (Foundry)... "
 if command -v cast &> /dev/null; then

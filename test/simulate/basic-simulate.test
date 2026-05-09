@@ -19,7 +19,11 @@
 
 # Check for nested function calls
 # CHECK: increment2 [internal]
+# CHECK: args: amount:uint256
+# CHECK: raw stack:
 # CHECK: increment3 [internal]
+# CHECK: args: amount:uint256, amount2:uint256
+# CHECK: raw stack:
 
 # Check for the footer
 # CHECK: ------------------------------------------------------------

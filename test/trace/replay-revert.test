@@ -1,0 +1,18 @@
+# Test replay parity for a reverted transaction and preserve the decoded revert reason.
+# REQUIRES: soldb
+# RUN: TX=$(%S/create-replay-parity-tx.sh revert-increment %{contract_address}) && \
+# RUN:   %soldb trace $TX --backend debug-rpc --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw --max-steps=10000 > %t.debug && \
+# RUN:   %soldb trace $TX --backend replay --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --raw --max-steps=10000 > %t.replay && \
+# RUN:   sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.debug > %t.debug.ops && \
+# RUN:   sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.replay > %t.replay.ops && \
+# RUN:   diff -u %t.debug.ops %t.replay.ops && \
+# RUN:   %soldb trace $TX --backend replay --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} > %t.summary
+# RUN: FileCheck %s --check-prefix=RAW < %t.replay
+# RUN: FileCheck %s --check-prefix=SUMMARY < %t.summary
+
+# RAW: Backend: replay
+# RAW: REVERT
+
+# SUMMARY: Backend: replay
+# SUMMARY: Status: REVERTED
+# SUMMARY: Error: Amount must be positive

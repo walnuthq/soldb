@@ -1,0 +1,18 @@
+# Test replay parity for a contract creation transaction.
+# REQUIRES: soldb
+# RUN: INFO=$(%S/create-replay-parity-tx.sh create-contract) && \
+# RUN:   TX=$(echo "$INFO" | awk '{print $1}') && \
+# RUN:   CONTRACT=$(echo "$INFO" | awk '{print $2}') && \
+# RUN:   DEBUG_DIR=$(echo "$INFO" | awk '{print $3}') && \
+# RUN:   %soldb trace $TX --backend debug-rpc --ethdebug-dir $CONTRACT:TestContract:$DEBUG_DIR --rpc %{rpc_url} --raw --max-steps=10000 > %t.debug && \
+# RUN:   %soldb trace $TX --backend replay --ethdebug-dir $CONTRACT:TestContract:$DEBUG_DIR --rpc %{rpc_url} --raw --max-steps=10000 > %t.replay && \
+# RUN:   sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.debug > %t.debug.ops && \
+# RUN:   sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.replay > %t.replay.ops && \
+# RUN:   diff -u %t.debug.ops %t.replay.ops
+# RUN: FileCheck %s < %t.replay
+
+# CHECK: Loading transaction
+# CHECK: Contract: TestContract
+# CHECK: Backend: replay
+# CHECK: Execution trace
+# CHECK: CODECOPY

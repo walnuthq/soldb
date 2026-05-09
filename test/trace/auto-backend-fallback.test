@@ -1,0 +1,14 @@
+# Test auto backend fallback when debug_traceTransaction is unavailable.
+# REQUIRES: soldb
+# RUN: rm -f %t.proxy.url; env -u PYTHONPATH python3 %S/no-debug-rpc-proxy.py %{rpc_url} %t.proxy.url & PROXY_PID=$!; trap 'kill $PROXY_PID >/dev/null 2>&1 || true; wait $PROXY_PID >/dev/null 2>&1 || true' EXIT; \
+# RUN:   for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s %t.proxy.url ] && break; sleep 0.1; done; \
+# RUN:   [ -s %t.proxy.url ]; \
+# RUN:   PROXY=$(cat %t.proxy.url); \
+# RUN:   %soldb trace %{test_tx} --backend auto --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc $PROXY --raw --max-steps 20 > %t.out
+# RUN: FileCheck %s < %t.out
+
+# CHECK: Loading transaction
+# CHECK: Contract: TestContract
+# CHECK: Backend: replay
+# CHECK: Execution trace
+# CHECK: PUSH1

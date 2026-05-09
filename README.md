@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/walnuthq/soldb/actions/workflows/ci.yml/badge.svg)](https://github.com/walnuthq/soldb/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 
 > **Note**: SolDB is in public beta; expect ongoing changes and occasional inaccuracies.  
 
 > **Note**: SolDB relies on ETHDebug metadata. Complete, accurate debug info implies better breakpoints/stepping/variable views; incomplete info can cause gaps or inconsistencies.
 
-SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
+SolDB is an open-source, ETHDebug-first, LLDB-style debugger for Solidity and the EVM.
 
 ![soldb demo 11 sept 2025](https://github.com/user-attachments/assets/7376da04-96b0-4aae-8c9b-154680ffe6b4)
 
@@ -17,9 +17,14 @@ SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
 
 ## Quick Start
 
-Install via pip:
+Install SolDB:
 ```bash
-pip install git+https://github.com/walnuthq/soldb.git
+cargo install --git https://github.com/walnuthq/soldb.git soldb-cli
+```
+
+Optional debug-adapter binary:
+```bash
+cargo install --git https://github.com/walnuthq/soldb.git soldb-dap
 ```
 
 Run against a local node (Anvil):
@@ -35,6 +40,11 @@ solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime --bin --abi --
 Trace a transaction:
 ```bash
 soldb trace <tx_hash> --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
+```
+
+Force the replay backend when you want to avoid `debug_traceTransaction`:
+```bash
+soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
 
 ---
@@ -115,11 +125,69 @@ Inside REPL:
 
 ## Features
 
+- ETHDebug-first source debugging built around compiler-generated `solc --debug-info ethdebug` metadata
 - Full transaction traces with internal calls & decoded parameters
 - Transaction simulation with arbitrary calldata (including structs & tuples)
 - Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations
-- Supports any RPC (local Anvil or hosted)
+- HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and normal-RPC replay for local Anvil transactions
 - **Stylus interop** – Cross-environment debugging for Solidity<>Stylus contract calls
+
+## Architecture
+
+SolDB is split into focused crates so RPC transport, ETHDebug parsing, execution backends, CLI presentation, and interactive debugging can evolve independently.
+
+```mermaid
+flowchart TD
+    contracts["Solidity contracts"] --> solc["solc<br/>--debug-info ethdebug<br/>--ethdebug --ethdebug-runtime"]
+    solc --> artifacts["ETHDebug + ABI artifacts"]
+
+    cli["soldb trace / simulate"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]
+    artifacts --> metadata
+
+    cli --> selector["soldb-rpc<br/>backend selector"]
+    selector --> debug_rpc["debug-rpc backend<br/>debug_traceTransaction / debug_traceCall"]
+    selector --> replay["replay backend<br/>normal RPC state -> REVM inspectors"]
+
+    debug_rpc --> opcode_trace["opcode trace"]
+    replay --> opcode_trace
+    metadata --> debugger["soldb-debugger<br/>source steps + variables"]
+    opcode_trace --> enriched
+    debugger --> enriched["source lines<br/>call frames<br/>decoded values"]
+    enriched --> outputs["CLI / JSON / REPL / DAP"]
+```
+
+SolDB relies on compiler-generated debug information. Compile with `solc` ETHDebug output enabled, then pass the generated artifact directory with `--ethdebug-dir <address>:<contract>:<dir>`. SolDB uses that metadata to map low-level EVM execution back to Solidity source, functions, variables, and ABI values. The debugger-side ETHDebug contract is documented in [docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
+
+The `--json` output for `trace` and `simulate` is versioned for web and explorer integrations. See [docs/json.md](docs/json.md) for the current schema, capability flags, replay artifacts, and compatibility rules.
+
+### Execution Backends
+
+The `trace` command supports three backend modes:
+
+- `auto` (default): tries `debug-rpc` first, then falls back to `replay` when the node reports that `debug_traceTransaction` is unavailable.
+- `debug-rpc`: calls `debug_traceTransaction` and is the fast path for Anvil, Geth, and other debug-capable nodes.
+- `replay`: loads transaction, receipt, parent-block state, bytecode, balances, nonces, and storage through normal Ethereum JSON-RPC, replays prior transactions in the block when needed, then replays the target transaction in REVM with inspectors. It selects the REVM spec from chain/block/timestamp for mainnet, Sepolia, Holesky, and Hoodi; archive-provider hardening and broader cache tuning are next-stage work.
+
+Select the backend explicitly:
+
+```bash
+soldb trace <tx_hash> --backend auto --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
+soldb trace <tx_hash> --backend debug-rpc --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
+soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
+```
+
+### Crates
+
+- `crates/soldb-cli`: command-line interface, output formatting, and command wiring.
+- `crates/soldb-core`: shared error types, trace models, and debugger data structures.
+- `crates/soldb-rpc`: JSON-RPC transport, debug-RPC backend, replay backend, transaction simulation, and event log retrieval.
+- `crates/soldb-ethdebug`: ETHDebug metadata loading, ABI helpers, source mapping, event decoding, and call-frame enrichment.
+- `crates/soldb-debugger`: reusable source-step, function, and variable decoding model shared by frontends.
+- `crates/soldb-repl`: interactive debugger state and REPL commands.
+- `crates/soldb-serializer`: JSON/web-facing trace and simulation serialization, including nested call trees and ETHDebug source metadata.
+- `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.
+- `crates/soldb-bridge`: bridge server for cross-environment Solidity<>Stylus debugging.
+- `crates/soldb-dap`: Debug Adapter Protocol server for editor integrations.
 
 ---
 
@@ -212,27 +280,30 @@ Call Stack:
 
 ---
 
-## Advanced
+## Development
 
 ### Install From Source
 
 ```bash
 git clone https://github.com/walnuthq/soldb.git
 cd soldb
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
+cargo build --workspace --all-targets
+cargo install --path crates/soldb-cli
+cargo install --path crates/soldb-dap
 ```
 
 ### Run Automated Tests
 
 **Prerequisites**  
+- Rust stable toolchain
 - RPC at `http://localhost:8545` (Anvil default)  
 - Anvil running with tracing enabled:  
   ```bash
   anvil --steps-tracing
   ```
+- Solidity compiler:
+  - `solc` 0.8.29+ for ETHDebug tests
+  - `solc` 0.8.16 for legacy source-map tests
 - LLVM tools (`lit`, `FileCheck`)  
   ```bash
     # Install LLVM
@@ -242,10 +313,28 @@ pip install -e .
     sudo apt-get install llvm-dev
   ```
 
-Run tests:
+Run unit tests:
 ```bash
-cd test
-./run-tests.sh SOLC_PATH=/path/to/solc
+cargo test --workspace --all-targets
+```
+
+Run lit end-to-end CLI tests:
+```bash
+./test/run-tests.sh SOLC_PATH=/path/to/solc
+```
+
+Run the full local test target:
+```bash
+make test
+```
+
+### Coverage
+
+Line coverage is enforced at 80% in CI.
+
+```bash
+cargo llvm-cov --workspace --all-targets --fail-under-lines 80
+make coverage
 ```
 
 ---

@@ -1,1 +1,0 @@
-# SolDB DAP Server module

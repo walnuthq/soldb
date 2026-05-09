@@ -5,11 +5,14 @@
 
 # When using --json flag, we should get valid JSON output
 # CHECK: {
+# CHECK:   "schemaVersion": 1
 # CHECK:   "status": "success"
 # CHECK:   "traceCall": {
 # CHECK:     "type": "ENTRY"
-# CHECK:     "input": "0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004"
 # CHECK:     "callId": 0
+# CHECK:     "functionName": "increment(uint256)"
+# CHECK:     "input": "0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004"
 # CHECK:   }
+# CHECK:   "traceCallIndex": 0
 # CHECK:   "function_name": "increment(uint256)"
 # CHECK:   "isVerified": false
