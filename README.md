@@ -130,7 +130,7 @@ Inside REPL:
 - Transaction simulation with arbitrary calldata (including structs & tuples)
 - Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations
 - HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and normal-RPC replay for local Anvil transactions
-- **Stylus interop** – Cross-environment debugging for Solidity<>Stylus contract calls
+- Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
 
 ## Architecture
 
@@ -204,7 +204,15 @@ soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contra
 
 ---
 
-## Stylus Interoperability
+## Interop
+
+Ethereum is moving toward richer interoperability, where applications may span multiple chains, execution environments, and VMs. SolDB is designed around that direction: keep Solidity and EVM debugging grounded in compiler-generated ETHDebug metadata, while allowing other execution environments to plug into the same trace, call-stack, and debugger-output model.
+
+The goal is for developers to debug cross-environment transactions without switching mental models at every call boundary. EVM debug-RPC and replay remain the core path for Solidity execution, and bridge integrations can attach additional VM-specific debuggers as ecosystems adopt interop patterns.
+
+Stylus is the first integrated non-EVM environment. Additional runtimes can follow the same bridge-oriented model.
+
+### Stylus
 
 SolDB supports cross-environment debugging for Solidity<>Stylus interactions. This allows tracing transactions where Solidity contracts call Stylus contracts and vice versa.
 
