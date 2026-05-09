@@ -8,7 +8,7 @@
 
 > **Note**: SolDB relies on ETHDebug metadata. Complete, accurate debug info implies better breakpoints/stepping/variable views; incomplete info can cause gaps or inconsistencies.
 
-SolDB is an open-source, LLDB-style debugger for Solidity and the EVM.
+SolDB is an open-source, ETHDebug-first, LLDB-style debugger for Solidity and the EVM.
 
 ![soldb demo 11 sept 2025](https://github.com/user-attachments/assets/7376da04-96b0-4aae-8c9b-154680ffe6b4)
 
@@ -125,6 +125,7 @@ Inside REPL:
 
 ## Features
 
+- ETHDebug-first source debugging built around compiler-generated `solc --debug-info ethdebug` metadata
 - Full transaction traces with internal calls & decoded parameters
 - Transaction simulation with arbitrary calldata (including structs & tuples)
 - Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations

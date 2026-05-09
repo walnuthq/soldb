@@ -1,11 +1,21 @@
 # Test JSON trace output for a successful transaction
 # REQUIRES: soldb
-# RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --json 2>&1 | FileCheck %s
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --json > %t.json 2>&1
+# RUN: jq -e '.contracts | to_entries as $contracts | ($contracts | length == 1) and ($contracts[0].value.debugAvailable == true) and (($contracts[0].value.pcToSourceMappings | length) > 0) and ($contracts[0].value.sourcePaths | to_entries | any(.value | contains("TestContract.sol"))) and ($contracts[0].value.sources | to_entries | any(.value | contains("contract TestContract"))) and (($contracts[0].value.abi | length) > 0)' %t.json
+# RUN: FileCheck %s < %t.json
 
 # CHECK: {
+# CHECK: "schemaVersion": 1
 # CHECK: "status": "success",
 # CHECK: "traceCall": {
 # CHECK: "gasUsed":
 # CHECK: "input": "0x
 # CHECK: "steps": [
 # CHECK: "contracts": {
+# CHECK: "pcToSourceMappings": {
+# CHECK: "sourcePaths": {
+# CHECK: "TestContract.sol"
+# CHECK: "sources": {
+# CHECK: contract TestContract
+# CHECK: "debugAvailable": true
+# CHECK: "abi": [
