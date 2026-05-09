@@ -22,13 +22,19 @@ class NoDebugProxy(BaseHTTPRequestHandler):
             self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
             return
 
-        if payload.get("method") == "debug_traceTransaction":
+        if isinstance(payload, list):
+            if any(item.get("method") == "debug_traceTransaction" for item in payload if isinstance(item, dict)):
+                responses = []
+                for item in payload:
+                    if isinstance(item, dict) and item.get("method") == "debug_traceTransaction":
+                        responses.append(self.debug_trace_unavailable_response(item))
+                    else:
+                        responses.append(self.forward_json_payload(item))
+                self.send_json(responses)
+                return
+        elif payload.get("method") == "debug_traceTransaction":
             self.send_json(
-                {
-                    "jsonrpc": "2.0",
-                    "id": payload.get("id"),
-                    "error": {"code": -32601, "message": "method not found"},
-                }
+                self.debug_trace_unavailable_response(payload)
             )
             return
 
@@ -62,6 +68,27 @@ class NoDebugProxy(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def debug_trace_unavailable_response(self, payload: dict) -> dict:
+        return {
+            "jsonrpc": "2.0",
+            "id": payload.get("id"),
+            "error": {"code": -32601, "message": "method not found"},
+        }
+
+    def forward_json_payload(self, payload: object) -> object:
+        request_body = json.dumps(payload).encode()
+        request = urllib.request.Request(
+            self.upstream,
+            data=request_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return json.loads(error.read())
 
 
 def main() -> int:

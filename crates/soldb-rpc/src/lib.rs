@@ -134,14 +134,43 @@ impl HttpJsonRpcClient {
             "params": params,
         });
         let body = payload.to_string();
-        if self.endpoint.scheme == HttpScheme::Https {
-            return self.request_value_with_curl(method, &body);
-        }
-
-        self.request_value_with_tcp(method, &body)
+        let response_body = self.request_body(method, &body)?;
+        parse_json_rpc_body(method, &response_body)
     }
 
-    fn request_value_with_tcp(&self, method: &str, body: &str) -> SoldbResult<Value> {
+    fn request_batch_values(&self, requests: &[(&str, Value)]) -> SoldbResult<Vec<Value>> {
+        let payload = Value::Array(
+            requests
+                .iter()
+                .enumerate()
+                .map(|(index, (method, params))| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": index + 1,
+                        "method": method,
+                        "params": params,
+                    })
+                })
+                .collect(),
+        );
+        let method_names = requests
+            .iter()
+            .map(|(method, _)| *method)
+            .collect::<Vec<_>>();
+        let body = payload.to_string();
+        let response_body = self.request_body("batch", &body)?;
+        parse_json_rpc_batch_body(&method_names, &response_body)
+    }
+
+    fn request_body(&self, method: &str, body: &str) -> SoldbResult<String> {
+        if self.endpoint.scheme == HttpScheme::Https {
+            return self.request_body_with_curl(method, body);
+        }
+
+        self.request_body_with_tcp(method, body)
+    }
+
+    fn request_body_with_tcp(&self, method: &str, body: &str) -> SoldbResult<String> {
         let mut stream = TcpStream::connect(self.endpoint.socket_addr()).map_err(|error| {
             SoldbError::Message(format!(
                 "Failed to connect to {}: {error}",
@@ -172,10 +201,10 @@ impl HttpJsonRpcClient {
         stream.read_to_string(&mut response).map_err(|error| {
             SoldbError::Message(format!("Failed to read RPC response: {error}"))
         })?;
-        parse_http_json_response(method, &response)
+        parse_http_response_body(method, &response)
     }
 
-    fn request_value_with_curl(&self, method: &str, body: &str) -> SoldbResult<Value> {
+    fn request_body_with_curl(&self, method: &str, body: &str) -> SoldbResult<String> {
         let output = Command::new("curl")
             .args([
                 "--fail",
@@ -211,7 +240,7 @@ impl HttpJsonRpcClient {
                 "Invalid UTF-8 HTTPS RPC response for {method}: {error}"
             ))
         })?;
-        parse_json_rpc_body(method, &body)
+        Ok(body)
     }
 }
 
@@ -310,7 +339,7 @@ impl HttpEndpoint {
     }
 }
 
-fn parse_http_json_response(method: &str, response: &str) -> SoldbResult<Value> {
+fn parse_http_response_body(method: &str, response: &str) -> SoldbResult<String> {
     let (headers, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
         SoldbError::Message(format!(
             "Malformed HTTP response for {method}: missing body"
@@ -323,7 +352,7 @@ fn parse_http_json_response(method: &str, response: &str) -> SoldbResult<Value> 
         )));
     }
 
-    parse_json_rpc_body(method, body)
+    Ok(body.to_owned())
 }
 
 fn parse_json_rpc_body(method: &str, body: &str) -> SoldbResult<Value> {
@@ -339,6 +368,45 @@ fn parse_json_rpc_body(method: &str, body: &str) -> SoldbResult<Value> {
     value.get("result").cloned().ok_or_else(|| {
         SoldbError::Message(format!("RPC response for {method} did not contain result"))
     })
+}
+
+fn parse_json_rpc_batch_body(methods: &[&str], body: &str) -> SoldbResult<Vec<Value>> {
+    let value = serde_json::from_str::<Value>(body.trim())
+        .map_err(|error| SoldbError::Message(format!("Invalid JSON batch response: {error}")))?;
+    let responses = value.as_array().ok_or_else(|| {
+        SoldbError::Message("RPC batch response did not contain an array".to_owned())
+    })?;
+
+    let mut by_id = HashMap::<usize, Value>::new();
+    for response in responses {
+        let id = response.get("id").and_then(Value::as_u64).ok_or_else(|| {
+            SoldbError::Message("RPC batch response missing numeric id".to_owned())
+        })? as usize;
+        let method = methods
+            .get(id.saturating_sub(1))
+            .copied()
+            .unwrap_or("unknown");
+        if let Some(error) = response.get("error") {
+            return Err(SoldbError::Message(format!(
+                "RPC method {method} returned error: {error}"
+            )));
+        }
+        let result = response.get("result").cloned().ok_or_else(|| {
+            SoldbError::Message(format!("RPC response for {method} did not contain result"))
+        })?;
+        by_id.insert(id, result);
+    }
+
+    (1..=methods.len())
+        .map(|id| {
+            by_id.remove(&id).ok_or_else(|| {
+                SoldbError::Message(format!(
+                    "RPC batch response did not include result for {}",
+                    methods[id - 1]
+                ))
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1429,16 +1497,47 @@ impl RpcReplayStateProviderInner {
         })
     }
 
+    fn request_account_batch_at_block(
+        &self,
+        requests: &[(&str, Value)],
+    ) -> Result<Vec<Value>, ReplayDbError> {
+        self.client.request_batch_values(requests).map_err(|error| {
+            ReplayDbError(format!(
+                "Replay backend could not read historical account state at block {}; use an archive-capable RPC endpoint or a local node with the needed state history. Original error: {error}",
+                self.block_tag
+            ))
+        })
+    }
+
     fn fetch_account(&self, address: Address) -> Result<AccountInfo, ReplayDbError> {
         let address_text = address.to_string();
         let block = self.block_tag.clone();
-        let balance: String =
-            self.request_at_block("eth_getBalance", json!([address_text, block.clone()]))?;
-        let nonce: String = self.request_at_block(
-            "eth_getTransactionCount",
-            json!([address_text, block.clone()]),
-        )?;
-        let code: String = self.request_at_block("eth_getCode", json!([address_text, block]))?;
+        let results = self.request_account_batch_at_block(&[
+            (
+                "eth_getBalance",
+                json!([address_text.clone(), block.clone()]),
+            ),
+            (
+                "eth_getTransactionCount",
+                json!([address_text.clone(), block.clone()]),
+            ),
+            ("eth_getCode", json!([address_text, block])),
+        ])?;
+        let balance: String = serde_json::from_value(results[0].clone()).map_err(|error| {
+            ReplayDbError(format!(
+                "Invalid eth_getBalance response for account {address}: {error}"
+            ))
+        })?;
+        let nonce: String = serde_json::from_value(results[1].clone()).map_err(|error| {
+            ReplayDbError(format!(
+                "Invalid eth_getTransactionCount response for account {address}: {error}"
+            ))
+        })?;
+        let code: String = serde_json::from_value(results[2].clone()).map_err(|error| {
+            ReplayDbError(format!(
+                "Invalid eth_getCode response for account {address}: {error}"
+            ))
+        })?;
 
         let code_bytes = hex_to_bytes(code.trim_start_matches("0x")).ok_or_else(|| {
             ReplayDbError(format!(
@@ -2157,7 +2256,7 @@ mod tests {
         SimulateCallRequest, SpecId, StructLog, TraceArtifacts, TraceBackend, TraceCapabilities,
         TraceEnvelope,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use soldb_core::TransactionTrace;
 
     #[test]
@@ -2371,6 +2470,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_json_rpc_batch_bodies_by_id() {
+        let result = super::parse_json_rpc_batch_body(
+            &["eth_getBalance", "eth_getCode"],
+            r#"[
+                {"jsonrpc":"2.0","id":2,"result":"0x6000"},
+                {"jsonrpc":"2.0","id":1,"result":"0x2a"}
+            ]"#,
+        )
+        .expect("batch result");
+        assert_eq!(result, vec![json!("0x2a"), json!("0x6000")]);
+
+        let error = super::parse_json_rpc_batch_body(
+            &["eth_getBalance", "eth_getCode"],
+            r#"[
+                {"jsonrpc":"2.0","id":1,"result":"0x2a"},
+                {"jsonrpc":"2.0","id":2,"error":{"message":"missing trie node"}}
+            ]"#,
+        )
+        .expect_err("batch method error");
+        assert!(error.to_string().contains("eth_getCode"), "{error}");
+        assert!(error.to_string().contains("missing trie node"), "{error}");
+    }
+
+    #[test]
     fn traces_transaction_through_http_json_rpc_client() {
         let rpc_url = start_trace_server(3);
         let trace = trace_transaction(&rpc_url, "0xabc").expect("trace");
@@ -2541,7 +2664,7 @@ mod tests {
 
     #[test]
     fn replay_preflight_parent_state_reads_account_and_storage() {
-        let (rpc_url, rx) = start_replay_state_server(7);
+        let (rpc_url, rx) = start_replay_state_server(3);
         let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
         let provider = RpcReplayStateProvider::new(client, "0x10".to_owned());
 
@@ -2578,7 +2701,7 @@ mod tests {
 
     #[test]
     fn replay_state_provider_caches_account_storage_and_block_hash_reads() {
-        let (rpc_url, rx) = start_replay_state_server(5);
+        let (rpc_url, rx) = start_replay_state_server(3);
         let client = HttpJsonRpcClient::new(&rpc_url).expect("client");
         let db = RpcStateDb::new(RpcReplayStateProvider::new(client, "0x10".to_owned()));
         let address = parse_address("0x5fbdb2315678afecb367f032d93f642f64180aa3").expect("address");
@@ -2627,7 +2750,7 @@ mod tests {
             .basic_ref(address)
             .expect_err("state read should report contextual replay failure");
         let message = error.to_string();
-        assert!(message.contains("historical state"), "{message}");
+        assert!(message.contains("historical account state"), "{message}");
         assert!(message.contains("archive-capable RPC"), "{message}");
         assert!(message.contains("eth_getBalance"), "{message}");
         assert!(message.contains("0x10"), "{message}");
@@ -2880,34 +3003,39 @@ mod tests {
 
     fn respond_to_replay_state_request(mut stream: TcpStream, tx: &mpsc::Sender<String>) {
         let request = read_http_request(&mut stream);
-        let (method, result) = if request.contains("\"eth_getBalance\"") {
-            ("eth_getBalance", json!("0x2a"))
-        } else if request.contains("\"eth_getTransactionCount\"") {
-            ("eth_getTransactionCount", json!("0x3"))
-        } else if request.contains("\"eth_getCode\"") {
-            ("eth_getCode", json!("0x60016000"))
-        } else if request.contains("\"eth_getStorageAt\"") {
-            ("eth_getStorageAt", json!("0x2a"))
-        } else if request.contains("\"eth_getBlockByNumber\"") {
-            (
-                "eth_getBlockByNumber",
-                json!({
-                    "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                    "timestamp": "0x1",
-                    "gasLimit": "0x1c9c380",
-                    "baseFeePerGas": "0x1"
-                }),
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let payload = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+        let response = if let Some(batch) = payload.as_array() {
+            Value::Array(
+                batch
+                    .iter()
+                    .map(|item| {
+                        let method = item
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        tx.send(method.to_owned()).expect("record method");
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": item.get("id").cloned().unwrap_or(json!(null)),
+                            "result": replay_state_result(method),
+                        })
+                    })
+                    .collect(),
             )
         } else {
-            ("unknown", json!(null))
+            let method = payload
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            tx.send(method.to_owned()).expect("record method");
+            json!({
+                "jsonrpc": "2.0",
+                "id": payload.get("id").cloned().unwrap_or(json!(1)),
+                "result": replay_state_result(method)
+            })
         };
-        tx.send(method.to_owned()).expect("record method");
 
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": result
-        });
         let body = response.to_string();
         let http_response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2919,16 +3047,52 @@ mod tests {
             .expect("write response");
     }
 
+    fn replay_state_result(method: &str) -> Value {
+        match method {
+            "eth_getBalance" => json!("0x2a"),
+            "eth_getTransactionCount" => json!("0x3"),
+            "eth_getCode" => json!("0x60016000"),
+            "eth_getStorageAt" => json!("0x2a"),
+            "eth_getBlockByNumber" => json!({
+                "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "timestamp": "0x1",
+                "gasLimit": "0x1c9c380",
+                "baseFeePerGas": "0x1"
+            }),
+            _ => json!(null),
+        }
+    }
+
     fn respond_to_replay_state_error_request(mut stream: TcpStream) {
-        let _request = read_http_request(&mut stream);
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": {
-                "code": -32000,
-                "message": "missing trie node"
-            }
-        });
+        let request = read_http_request(&mut stream);
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let payload = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+        let response = if let Some(batch) = payload.as_array() {
+            Value::Array(
+                batch
+                    .iter()
+                    .map(|item| {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": item.get("id").cloned().unwrap_or(json!(null)),
+                            "error": {
+                                "code": -32000,
+                                "message": "missing trie node"
+                            }
+                        })
+                    })
+                    .collect(),
+            )
+        } else {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32000,
+                    "message": "missing trie node"
+                }
+            })
+        };
         let body = response.to_string();
         let http_response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
