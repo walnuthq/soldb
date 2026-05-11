@@ -1,18 +1,11 @@
 cache/
 dist/
 target/
-.coverage
-.coverage.*
-coverage.xml
 rust-coverage.xml
-htmlcov/
 examples/debug/
 examples/debug*/
 examples/out*/
 out/
-__pycache__/
-*.txt
-src/soldb.egg-info/PKG-INFO
 
 examples/test_debug/
 test/Output/
