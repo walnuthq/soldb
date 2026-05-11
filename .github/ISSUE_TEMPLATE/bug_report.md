@@ -14,6 +14,7 @@ labels: bug
 
 
 **Environment**
-- SolDB version:
-- Python version:
+- SolDB version (`soldb --version`):
+- Rust toolchain (`rustc --version`):
+- `solc` version:
 - OS:
