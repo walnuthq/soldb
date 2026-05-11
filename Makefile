@@ -42,7 +42,6 @@ test-deploy:
 	./test/test-setup.sh --deploy-test
 
 clean:
-	rm -rf build dist *.egg-info
-	rm -rf __pycache__ */__pycache__ */*/__pycache__
-	find . -name "*.pyc" -delete
+	cargo clean
+	rm -rf build dist out test/Output
 	find . -name ".DS_Store" -delete
