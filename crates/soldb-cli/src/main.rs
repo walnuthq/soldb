@@ -93,7 +93,12 @@ fn separator(width: usize) -> String {
     disable_version_flag = true
 )]
 struct Cli {
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    #[arg(
+        short = 'v',
+        long = "version",
+        action = clap::ArgAction::Version,
+        help = "Print version"
+    )]
     _version: Option<bool>,
     #[command(subcommand)]
     command: Command,
