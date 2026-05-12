@@ -263,6 +263,7 @@ struct SimulateArgs {
     #[arg(
         long = "rpc-url",
         alias = "rpc",
+        short = 'r',
         default_value = "http://localhost:8545"
     )]
     rpc_url: String,
