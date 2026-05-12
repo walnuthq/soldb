@@ -321,16 +321,6 @@ elif command -v soldb &> /dev/null; then
     SOLDB_CMD="soldb"
     SOLDB_TYPE="path"
     echo -e "${GREEN}Using PATH soldb${NC}"
-elif [ -f "${PROJECT_DIR}/.venv/bin/soldb" ]; then
-    # Fall back to local virtual environment
-    SOLDB_CMD="${PROJECT_DIR}/.venv/bin/soldb"
-    SOLDB_TYPE="venv"
-    echo -e "${GREEN}Using .venv soldb${NC}"
-elif [ -f "${PROJECT_DIR}/MyEnv/bin/soldb" ]; then
-    # Fall back to virtual environment
-    SOLDB_CMD="${PROJECT_DIR}/MyEnv/bin/soldb"
-    SOLDB_TYPE="venv"
-    echo -e "${GREEN}Using venv soldb${NC}"
 else
     echo -e "${RED}Error: soldb not found${NC}"
     echo "Build it with: cargo build --bin soldb"
@@ -355,10 +345,6 @@ if "${SOLDB_CMD}":
     config.soldb = "${SOLDB_CMD}"
 elif shutil.which('soldb'):
     config.soldb = shutil.which('soldb')
-elif os.path.exists(os.path.join(project_dir, '.venv', 'bin', 'soldb')):
-    config.soldb = os.path.join(project_dir, '.venv', 'bin', 'soldb')
-elif os.path.exists(os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')):
-    config.soldb = os.path.join(project_dir, 'MyEnv', 'bin', 'soldb')
 else:
     config.soldb = "${SOLDB_CMD}"
 config.rpc_url = "${RPC_URL}"
