@@ -128,7 +128,7 @@ Inside REPL:
 - ETHDebug-first source debugging built around compiler-generated `solc --debug-info ethdebug` metadata
 - Full transaction traces with internal calls & decoded parameters
 - Transaction simulation with arbitrary calldata (including structs & tuples)
-- Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations
+- Interactive LLDB-like REPL (`step`, `next`, `break`, `continue`, etc.) – works for both transactions and simulations
 - HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and normal-RPC replay for local Anvil transactions
 - Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
 
