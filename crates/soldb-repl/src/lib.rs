@@ -26,19 +26,37 @@ impl DisplayMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreakpointTarget {
+    Pc(u64),
+    SourceLine(SourceBreakpointTarget),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceBreakpointTarget {
+    pub file: Option<String>,
+    pub line: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DebuggerCommand {
     Next,
     NextInstruction,
     Step,
     Continue,
     Goto(usize),
+    Info(DebuggerInfoCommand),
     Mode(Option<DisplayMode>),
-    Break(u64),
-    Clear(u64),
+    Break(BreakpointTarget),
+    Clear(BreakpointTarget),
     Help(Option<String>),
     Quit,
     Empty,
     Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebuggerInfoCommand {
+    Resources { json: bool },
 }
 
 impl DebuggerCommand {
@@ -60,15 +78,18 @@ impl DebuggerCommand {
                 .parse::<usize>()
                 .map(Self::Goto)
                 .unwrap_or_else(|_| Self::Unknown(line.to_owned())),
+            "info" => parse_info_command(&rest)
+                .map(Self::Info)
+                .unwrap_or_else(|| Self::Unknown(line.to_owned())),
             "mode" => Self::Mode(
                 (!rest.is_empty())
                     .then(|| DisplayMode::parse(&rest))
                     .flatten(),
             ),
-            "break" | "b" => parse_u64_arg(&rest)
+            "break" | "b" => parse_breakpoint_target(&rest)
                 .map(Self::Break)
                 .unwrap_or_else(|| Self::Unknown(line.to_owned())),
-            "clear" => parse_u64_arg(&rest)
+            "clear" => parse_breakpoint_target(&rest)
                 .map(Self::Clear)
                 .unwrap_or_else(|| Self::Unknown(line.to_owned())),
             "help" => Self::Help((!rest.is_empty()).then_some(rest)),
@@ -237,10 +258,13 @@ impl DebuggerState {
             DebuggerCommand::Continue => Some(self.continue_execution()),
             DebuggerCommand::Goto(step) => Some(self.goto_step(step)),
             DebuggerCommand::Mode(Some(mode)) => Some(self.set_display_mode(mode)),
-            DebuggerCommand::Break(pc) => Some(self.set_breakpoint(pc)),
-            DebuggerCommand::Clear(pc) => Some(self.clear_breakpoint(pc)),
+            DebuggerCommand::Break(BreakpointTarget::Pc(pc)) => Some(self.set_breakpoint(pc)),
+            DebuggerCommand::Clear(BreakpointTarget::Pc(pc)) => Some(self.clear_breakpoint(pc)),
+            DebuggerCommand::Break(BreakpointTarget::SourceLine(_))
+            | DebuggerCommand::Clear(BreakpointTarget::SourceLine(_)) => None,
             DebuggerCommand::Empty
             | DebuggerCommand::Help(_)
+            | DebuggerCommand::Info(_)
             | DebuggerCommand::Mode(None)
             | DebuggerCommand::Quit
             | DebuggerCommand::Unknown(_) => None,
@@ -265,6 +289,16 @@ impl DebuggerState {
     }
 }
 
+fn parse_info_command(input: &str) -> Option<DebuggerInfoCommand> {
+    match input.trim() {
+        "resources" => Some(DebuggerInfoCommand::Resources { json: false }),
+        "resources --json" | "resources json" => {
+            Some(DebuggerInfoCommand::Resources { json: true })
+        }
+        _ => None,
+    }
+}
+
 fn parse_u64_arg(input: &str) -> Option<u64> {
     let input = input.trim();
     if let Some(hex) = input.strip_prefix("0x") {
@@ -274,11 +308,42 @@ fn parse_u64_arg(input: &str) -> Option<u64> {
     }
 }
 
+fn parse_breakpoint_target(input: &str) -> Option<BreakpointTarget> {
+    parse_source_breakpoint_target(input)
+        .map(BreakpointTarget::SourceLine)
+        .or_else(|| parse_u64_arg(input).map(BreakpointTarget::Pc))
+}
+
+fn parse_source_breakpoint_target(input: &str) -> Option<SourceBreakpointTarget> {
+    let input = input.trim();
+    if let Some(line) = input.strip_prefix("line ") {
+        return parse_source_line_number(line)
+            .map(|line| SourceBreakpointTarget { file: None, line });
+    }
+
+    let (file, line) = input.rsplit_once(':')?;
+    let file = file.trim();
+    if file.is_empty() {
+        return None;
+    }
+    parse_source_line_number(line).map(|line| SourceBreakpointTarget {
+        file: Some(file.to_owned()),
+        line,
+    })
+}
+
+fn parse_source_line_number(input: &str) -> Option<u64> {
+    input.trim().parse::<u64>().ok().filter(|line| *line > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{DebuggerCommand, DebuggerState, DisplayMode, StepOutcome};
+    use super::{
+        BreakpointTarget, DebuggerCommand, DebuggerInfoCommand, DebuggerState, DisplayMode,
+        SourceBreakpointTarget, StepOutcome,
+    };
     use soldb_core::{TraceStep, TransactionTrace};
 
     #[test]
@@ -293,14 +358,39 @@ mod tests {
         assert_eq!(DebuggerCommand::parse("c"), DebuggerCommand::Continue);
         assert_eq!(DebuggerCommand::parse("goto 2"), DebuggerCommand::Goto(2));
         assert_eq!(
+            DebuggerCommand::parse("info resources"),
+            DebuggerCommand::Info(DebuggerInfoCommand::Resources { json: false })
+        );
+        assert_eq!(
+            DebuggerCommand::parse("info resources --json"),
+            DebuggerCommand::Info(DebuggerInfoCommand::Resources { json: true })
+        );
+        assert_eq!(
             DebuggerCommand::parse("mode assembly"),
             DebuggerCommand::Mode(Some(DisplayMode::Assembly))
         );
         assert_eq!(
             DebuggerCommand::parse("break 0x10"),
-            DebuggerCommand::Break(16)
+            DebuggerCommand::Break(BreakpointTarget::Pc(16))
         );
-        assert_eq!(DebuggerCommand::parse("clear 8"), DebuggerCommand::Clear(8));
+        assert_eq!(
+            DebuggerCommand::parse("break Counter.sol:7"),
+            DebuggerCommand::Break(BreakpointTarget::SourceLine(SourceBreakpointTarget {
+                file: Some("Counter.sol".to_owned()),
+                line: 7
+            }))
+        );
+        assert_eq!(
+            DebuggerCommand::parse("break line 7"),
+            DebuggerCommand::Break(BreakpointTarget::SourceLine(SourceBreakpointTarget {
+                file: None,
+                line: 7
+            }))
+        );
+        assert_eq!(
+            DebuggerCommand::parse("clear 8"),
+            DebuggerCommand::Clear(BreakpointTarget::Pc(8))
+        );
         assert_eq!(
             DebuggerCommand::parse("help mode"),
             DebuggerCommand::Help(Some("mode".to_owned()))
@@ -384,7 +474,7 @@ mod tests {
         );
         assert_eq!(state.display_mode.as_str(), "asm");
         assert_eq!(
-            state.apply_command(DebuggerCommand::Break(2)),
+            state.apply_command(DebuggerCommand::Break(BreakpointTarget::Pc(2))),
             Some(StepOutcome::BreakpointSet(2))
         );
         assert_eq!(

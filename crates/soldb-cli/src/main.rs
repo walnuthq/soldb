@@ -1,12 +1,16 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use serde_json::json;
 use soldb_core::{SoldbResult, TransactionTrace};
 use soldb_ethdebug::{
     encode_function_call, function_selector, parse_ethdebug_spec, parse_event_abis,
     parse_signature, parse_variable_locations, DecodedEvent, EthdebugInfo, EventRegistry,
-    Instruction,
+    Instruction, SourceLocation,
 };
-use soldb_repl::{DebuggerCommand, DebuggerState, StepOutcome};
+use soldb_repl::{
+    BreakpointTarget, DebuggerCommand, DebuggerInfoCommand, DebuggerState, SourceBreakpointTarget,
+    StepOutcome,
+};
 use soldb_rpc::{RpcLog, TraceBackend};
 use std::collections::BTreeMap;
 use std::env;
@@ -106,6 +110,8 @@ enum Command {
     Bridge(BridgeArgs),
     #[command(about = "Compile Solidity contracts with ETHDebug artifacts")]
     Compile(CompileArgs),
+    #[command(about = "Inspect ETHDebug metadata")]
+    Info(InfoArgs),
     #[command(name = "list-contracts", about = "List all contracts in the project")]
     ListContracts(ListContractsArgs),
     #[command(
@@ -170,6 +176,28 @@ struct CompileArgs {
     verify_version: bool,
     #[arg(long)]
     save_config: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct InfoArgs {
+    #[command(subcommand)]
+    command: InfoCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum InfoCommand {
+    #[command(about = "Print ETHDebug resources metadata")]
+    Resources(InfoResourcesArgs),
+}
+
+#[derive(Debug, Args)]
+struct InfoResourcesArgs {
+    #[arg(long = "ethdebug-dir", short = 'e')]
+    ethdebug_dir: Vec<String>,
+    #[arg(long, short = 'c')]
+    contracts: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -321,6 +349,7 @@ fn main() -> ExitCode {
         Command::ListContracts(args) => list_contracts_command(&args),
         Command::Bridge(args) => bridge_command(&args),
         Command::Compile(args) => compile_command(&args),
+        Command::Info(args) => info_command(&args),
     };
 
     match result {
@@ -331,6 +360,88 @@ fn main() -> ExitCode {
             }
             ExitCode::from(2)
         }
+    }
+}
+
+fn info_command(args: &InfoArgs) -> SoldbResult<()> {
+    match &args.command {
+        InfoCommand::Resources(resources) => info_resources_command(resources),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InfoResourcesJson {
+    contracts: Vec<InfoResourcesContractJson>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InfoResourcesContractJson {
+    address: Option<String>,
+    name: String,
+    debug_dir: String,
+    resources: serde_json::Value,
+}
+
+fn info_resources_command(args: &InfoResourcesArgs) -> SoldbResult<()> {
+    let specs = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())?;
+    if specs.is_empty() {
+        return Err(soldb_core::SoldbError::Message(
+            "No ETHDebug contract specs provided".to_owned(),
+        ));
+    }
+
+    let contracts = specs
+        .iter()
+        .map(|spec| {
+            Ok(InfoResourcesContractJson {
+                address: spec.address.clone(),
+                name: spec.name.clone(),
+                debug_dir: spec.debug_dir.display().to_string(),
+                resources: ethdebug_resources_for_spec(spec)?,
+            })
+        })
+        .collect::<SoldbResult<Vec<_>>>()?;
+
+    if args.json {
+        print_json(&InfoResourcesJson { contracts })?;
+    } else {
+        print_info_resources(&contracts);
+    }
+    Ok(())
+}
+
+fn print_info_resources(contracts: &[InfoResourcesContractJson]) {
+    for contract in contracts {
+        println!("Contract: {}", contract.name);
+        if let Some(address) = &contract.address {
+            println!("Address: {address}");
+        }
+        println!("Debug directory: {}", contract.debug_dir);
+        if let Some(compiler) = contract
+            .resources
+            .get("compilation")
+            .and_then(|compilation| compilation.get("compiler"))
+        {
+            let name = compiler
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unknown>");
+            let version = compiler
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unknown>");
+            println!("Compiler: {name} {version}");
+        }
+        let source_count = contract
+            .resources
+            .get("compilation")
+            .and_then(|compilation| compilation.get("sources"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        println!("Sources: {source_count}");
+        println!();
     }
 }
 
@@ -486,7 +597,8 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
     let trace = resolved.trace;
     let backend = resolved.backend;
     if args.interactive {
-        run_interactive_debugger(trace, "Transaction trace debugger")?;
+        let source_index = interactive_trace_source_index(args, &trace);
+        run_interactive_debugger(trace, "Transaction trace debugger", source_index)?;
     } else if args.json {
         println!(
             "{}",
@@ -549,7 +661,8 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
             &calldata,
             &display_function_name,
         );
-        run_interactive_debugger(trace, "Simulation debugger")?;
+        let source_index = interactive_simulation_source_index(args, &contract_address);
+        run_interactive_debugger(trace, "Simulation debugger", source_index)?;
     } else if args.json {
         println!(
             "{}",
@@ -653,10 +766,59 @@ fn print_simulation_interactive_prelude(
     }
 }
 
-fn run_interactive_debugger(trace: TransactionTrace, title: &str) -> SoldbResult<()> {
+fn interactive_trace_source_index(
+    args: &TraceArgs,
+    trace: &TransactionTrace,
+) -> Option<TraceSourceIndex> {
+    let contract_address = trace.to_addr.as_ref().or(trace.contract_address.as_ref());
+    source_index_for_specs(
+        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).ok()?,
+        contract_address.map(String::as_str),
+    )
+}
+
+fn interactive_simulation_source_index(
+    args: &SimulateArgs,
+    contract_address: &str,
+) -> Option<TraceSourceIndex> {
+    source_index_for_specs(
+        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).ok()?,
+        Some(contract_address),
+    )
+}
+
+fn source_index_for_specs(
+    specs: Vec<ResolvedContractSpec>,
+    contract_address: Option<&str>,
+) -> Option<TraceSourceIndex> {
+    if let Some(contract_address) = contract_address {
+        if let Some(index) = specs
+            .iter()
+            .filter(|spec| {
+                spec.address
+                    .as_deref()
+                    .is_some_and(|address| address.eq_ignore_ascii_case(contract_address))
+            })
+            .find_map(|spec| TraceSourceIndex::load(spec).ok())
+        {
+            return Some(index);
+        }
+    }
+
+    specs
+        .iter()
+        .find_map(|spec| TraceSourceIndex::load(spec).ok())
+}
+
+fn run_interactive_debugger(
+    trace: TransactionTrace,
+    title: &str,
+    source_index: Option<TraceSourceIndex>,
+) -> SoldbResult<()> {
     let contract_address = trace.to_addr.clone().or(trace.contract_address.clone());
     let mut state = DebuggerState::new();
     state.load_trace(trace);
+    let mut source_breakpoints = BTreeMap::<u64, ResolvedSourceBreakpoint>::new();
 
     println!("{}", bold(info("Starting interactive debugger...")));
     if let Some(address) = contract_address {
@@ -701,18 +863,188 @@ fn run_interactive_debugger(trace: TransactionTrace, title: &str) -> SoldbResult
             DebuggerCommand::Mode(None) => {
                 println!("{} {}", info("Mode:"), bold(state.display_mode.as_str()));
             }
+            DebuggerCommand::Break(target) => {
+                handle_break_command(
+                    &mut state,
+                    source_index.as_ref(),
+                    &mut source_breakpoints,
+                    target,
+                );
+            }
+            DebuggerCommand::Clear(target) => {
+                handle_clear_command(
+                    &mut state,
+                    source_index.as_ref(),
+                    &mut source_breakpoints,
+                    target,
+                );
+            }
+            DebuggerCommand::Info(DebuggerInfoCommand::Resources { json }) => {
+                if let Err(error) = print_debugger_resources(source_index.as_ref(), json) {
+                    println!("{} {}", warning("Could not print resources:"), error);
+                }
+            }
             DebuggerCommand::Unknown(command) => {
                 println!("{} {}", warning("Unknown command:"), command);
             }
             command => {
                 if let Some(outcome) = state.apply_command(command) {
-                    print_step_outcome(&state, &outcome);
+                    print_step_outcome(&state, &outcome, &source_breakpoints);
                 }
             }
         }
     }
 
     Ok(())
+}
+
+fn print_debugger_resources(
+    source_index: Option<&TraceSourceIndex>,
+    json_output: bool,
+) -> SoldbResult<()> {
+    let Some(source_index) = source_index else {
+        println!("{}", warning("ETHDebug resources are not loaded."));
+        return Ok(());
+    };
+
+    let contract = InfoResourcesContractJson {
+        address: source_index.spec.address.clone(),
+        name: source_index.spec.name.clone(),
+        debug_dir: source_index.spec.debug_dir.display().to_string(),
+        resources: source_index.resources.clone(),
+    };
+
+    if json_output {
+        print_json(&InfoResourcesJson {
+            contracts: vec![contract],
+        })
+    } else {
+        print_info_resources(&[contract]);
+        Ok(())
+    }
+}
+
+fn handle_break_command(
+    state: &mut DebuggerState,
+    source_index: Option<&TraceSourceIndex>,
+    source_breakpoints: &mut BTreeMap<u64, ResolvedSourceBreakpoint>,
+    target: BreakpointTarget,
+) {
+    match target {
+        BreakpointTarget::Pc(pc) => {
+            let outcome = state.set_breakpoint(pc);
+            print_step_outcome(state, &outcome, source_breakpoints);
+        }
+        BreakpointTarget::SourceLine(target) => {
+            let Some(source_index) = source_index else {
+                println!(
+                    "{}",
+                    warning("Source breakpoints require ETHDebug metadata.")
+                );
+                return;
+            };
+            let Some(trace) = state.trace() else {
+                println!("{}", warning("No trace loaded."));
+                return;
+            };
+            match source_index.resolve_breakpoint(&target, trace, state.current_step) {
+                Ok(breakpoint) => {
+                    state.set_breakpoint(breakpoint.pc);
+                    println!(
+                        "{} {}, PC {}",
+                        success("Breakpoint set at"),
+                        source_breakpoint_label(&breakpoint),
+                        number_color(breakpoint.pc)
+                    );
+                    source_breakpoints.insert(breakpoint.pc, breakpoint);
+                }
+                Err(message) => println!("{} {}", warning("Could not set breakpoint:"), message),
+            }
+        }
+    }
+}
+
+fn handle_clear_command(
+    state: &mut DebuggerState,
+    source_index: Option<&TraceSourceIndex>,
+    source_breakpoints: &mut BTreeMap<u64, ResolvedSourceBreakpoint>,
+    target: BreakpointTarget,
+) {
+    match target {
+        BreakpointTarget::Pc(pc) => {
+            let outcome = state.clear_breakpoint(pc);
+            if matches!(outcome, StepOutcome::BreakpointCleared(_)) {
+                source_breakpoints.remove(&pc);
+            }
+            print_step_outcome(state, &outcome, source_breakpoints);
+        }
+        BreakpointTarget::SourceLine(target) => {
+            let Some(source_index) = source_index else {
+                println!(
+                    "{}",
+                    warning("Source breakpoints require ETHDebug metadata.")
+                );
+                return;
+            };
+            let Some(trace) = state.trace() else {
+                println!("{}", warning("No trace loaded."));
+                return;
+            };
+            let existing = find_existing_source_breakpoint(source_breakpoints, &target)
+                .or_else(|| source_index.resolve_breakpoint(&target, trace, 0).ok());
+            match existing {
+                Some(breakpoint) => {
+                    let outcome = state.clear_breakpoint(breakpoint.pc);
+                    if matches!(outcome, StepOutcome::BreakpointCleared(_)) {
+                        source_breakpoints.remove(&breakpoint.pc);
+                        println!(
+                            "{} {}, PC {}",
+                            info("Breakpoint cleared at"),
+                            source_breakpoint_label(&breakpoint),
+                            number_color(breakpoint.pc)
+                        );
+                    } else {
+                        println!(
+                            "{} {}, PC {}",
+                            warning("No breakpoint set at"),
+                            source_breakpoint_label(&breakpoint),
+                            number_color(breakpoint.pc)
+                        );
+                    }
+                }
+                None => println!(
+                    "{} {}",
+                    warning("Could not clear breakpoint:"),
+                    source_breakpoint_target_label(&target)
+                ),
+            }
+        }
+    }
+}
+
+fn find_existing_source_breakpoint(
+    source_breakpoints: &BTreeMap<u64, ResolvedSourceBreakpoint>,
+    target: &SourceBreakpointTarget,
+) -> Option<ResolvedSourceBreakpoint> {
+    let matches = source_breakpoints
+        .values()
+        .filter(|breakpoint| {
+            breakpoint.line == target.line
+                && target
+                    .file
+                    .as_ref()
+                    .map_or(true, |file| source_path_matches(&breakpoint.path, file))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then(|| matches[0].clone())
+}
+
+fn source_breakpoint_target_label(target: &SourceBreakpointTarget) -> String {
+    target.file.as_ref().map_or_else(
+        || format!("line {}", target.line),
+        |file| format!("{file}:{}", target.line),
+    )
 }
 
 fn print_current_debugger_step(state: &DebuggerState) {
@@ -752,17 +1084,31 @@ fn print_current_debugger_step(state: &DebuggerState) {
     }
 }
 
-fn print_step_outcome(state: &DebuggerState, outcome: &StepOutcome) {
+fn print_step_outcome(
+    state: &DebuggerState,
+    outcome: &StepOutcome,
+    source_breakpoints: &BTreeMap<u64, ResolvedSourceBreakpoint>,
+) {
     match outcome {
         StepOutcome::NoTrace => println!("{}", warning("No trace loaded.")),
         StepOutcome::Moved { .. } => print_current_debugger_step(state),
         StepOutcome::BreakpointHit { step, pc } => {
-            println!(
-                "{} step {}, PC {}",
-                success("Breakpoint hit at"),
-                number_color(step),
-                number_color(pc)
-            );
+            if let Some(breakpoint) = source_breakpoints.get(pc) {
+                println!(
+                    "{} step {}, {}, PC {}",
+                    success("Breakpoint hit at"),
+                    number_color(step),
+                    source_breakpoint_label(breakpoint),
+                    number_color(pc)
+                );
+            } else {
+                println!(
+                    "{} step {}, PC {}",
+                    success("Breakpoint hit at"),
+                    number_color(step),
+                    number_color(pc)
+                );
+            }
             print_current_debugger_step(state);
         }
         StepOutcome::AtEnd { step } => {
@@ -805,10 +1151,14 @@ fn print_step_outcome(state: &DebuggerState, outcome: &StepOutcome) {
 fn print_debugger_help(topic: Option<&str>) {
     match topic {
         Some("mode") => println!("mode source|asm - switch display mode"),
+        Some("info") => println!("info resources [--json] - print loaded ETHDebug resources"),
         Some(topic) => println!("No help for {topic}"),
         None => {
             println!("Commands: next, nexti, step, continue, goto <step>");
-            println!("          break <pc>, clear <pc>, mode source|asm, help, quit");
+            println!("          break <pc>|<file>:<line>|line <line>");
+            println!("          clear <pc>|<file>:<line>|line <line>");
+            println!("          info resources [--json]");
+            println!("          mode source|asm, help, quit");
         }
     }
 }
@@ -1206,9 +1556,19 @@ struct SourceParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSourceBreakpoint {
+    pc: u64,
+    path: String,
+    line: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TraceSourceIndex {
+    spec: ResolvedContractSpec,
     info: EthdebugInfo,
+    resources: serde_json::Value,
     functions: Vec<SourceFunction>,
+    source_contents: BTreeMap<u64, String>,
 }
 
 impl TraceSourceIndex {
@@ -1223,6 +1583,7 @@ impl TraceSourceIndex {
 
         let metadata = read_json_file(&metadata_path)?;
         let runtime = read_json_file(&runtime_path)?;
+        let resources = ethdebug_resources_from_metadata(&metadata_path, &metadata)?;
         let instructions = runtime
             .get("instructions")
             .cloned()
@@ -1251,13 +1612,23 @@ impl TraceSourceIndex {
         };
 
         let mut functions = Vec::new();
+        let mut source_contents = BTreeMap::new();
         for (source_id, source_path) in &info.sources {
-            if let Some(source) = read_debug_source(&spec.debug_dir, source_path) {
+            if let Some(source) = read_compilation_source(&info.compilation, *source_id)
+                .or_else(|| read_debug_source(&spec.debug_dir, source_path))
+            {
                 functions.extend(parse_source_functions(*source_id, &source));
+                source_contents.insert(*source_id, source);
             }
         }
 
-        Ok(Self { info, functions })
+        Ok(Self {
+            spec: spec.clone(),
+            info,
+            resources,
+            functions,
+            source_contents,
+        })
     }
 
     fn function_at_pc(&self, pc: u64) -> Option<&SourceFunction> {
@@ -1281,6 +1652,141 @@ impl TraceSourceIndex {
                 .then(|| descriptor_from_source_function(function, calldata))
         })
     }
+
+    fn resolve_breakpoint(
+        &self,
+        target: &SourceBreakpointTarget,
+        trace: &TransactionTrace,
+        current_step: usize,
+    ) -> Result<ResolvedSourceBreakpoint, String> {
+        let source_ids = self.resolve_source_ids(target)?;
+        let mut candidates = Vec::<ResolvedSourceBreakpoint>::new();
+
+        for source_id in source_ids {
+            let Some(source) = self.source_contents.get(&source_id) else {
+                continue;
+            };
+            if target.line > line_count(source) {
+                continue;
+            }
+            for instruction in &self.info.instructions {
+                let Some(location) = instruction.source_location() else {
+                    continue;
+                };
+                if location.source_id != source_id
+                    || !span_intersects_line(source, &location, target.line)
+                {
+                    continue;
+                }
+                let path = self
+                    .info
+                    .sources
+                    .get(&source_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("source:{source_id}"));
+                candidates.push(ResolvedSourceBreakpoint {
+                    pc: instruction.offset,
+                    path,
+                    line: target.line,
+                });
+            }
+        }
+
+        if candidates.is_empty() {
+            return Err(match &target.file {
+                Some(file) => format!("no instruction maps to {file}:{}", target.line),
+                None => format!("no instruction maps to line {}", target.line),
+            });
+        }
+
+        for step in trace.steps.iter().skip(current_step.saturating_add(1)) {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.pc == step.pc)
+                .cloned()
+            {
+                return Ok(candidate);
+            }
+        }
+
+        for step in &trace.steps {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.pc == step.pc)
+                .cloned()
+            {
+                return Ok(candidate);
+            }
+        }
+
+        Ok(candidates
+            .into_iter()
+            .min_by_key(|candidate| candidate.pc)
+            .expect("candidates are non-empty"))
+    }
+
+    fn resolve_source_ids(&self, target: &SourceBreakpointTarget) -> Result<Vec<u64>, String> {
+        if let Some(file) = &target.file {
+            let matches = self
+                .info
+                .sources
+                .iter()
+                .filter_map(|(source_id, source_path)| {
+                    source_path_matches(source_path, file).then_some(*source_id)
+                })
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Err(format!("source file not found: {file}"));
+            }
+            return Ok(matches);
+        }
+
+        let source_ids = self.source_contents.keys().copied().collect::<Vec<_>>();
+        match source_ids.len() {
+            0 => Err("no source files are available".to_owned()),
+            1 => Ok(source_ids),
+            _ => Err("line breakpoint is ambiguous; use break <file>:<line>".to_owned()),
+        }
+    }
+}
+
+fn source_breakpoint_label(breakpoint: &ResolvedSourceBreakpoint) -> String {
+    format!("{}:{}", breakpoint.path, breakpoint.line)
+}
+
+fn source_path_matches(source_path: &str, requested: &str) -> bool {
+    source_path == requested
+        || source_path.ends_with(requested)
+        || Path::new(source_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == requested)
+}
+
+fn span_intersects_line(source: &str, location: &SourceLocation, line: u64) -> bool {
+    let start = line_for_offset(source, location.offset as usize);
+    let end_offset = location
+        .offset
+        .saturating_add(location.length.saturating_sub(1)) as usize;
+    let end = line_for_offset(source, end_offset);
+    start <= line && line <= end
+}
+
+fn line_for_offset(source: &str, offset: usize) -> u64 {
+    let mut line = 1_u64;
+    for (index, byte) in source.bytes().enumerate() {
+        if index >= offset {
+            break;
+        }
+        if byte == b'\n' {
+            line += 1;
+        }
+    }
+    line
+}
+
+fn line_count(source: &str) -> u64 {
+    source.bytes().filter(|byte| *byte == b'\n').count() as u64 + 1
 }
 
 fn print_call_frames(frames: &[CallFrame]) {
@@ -1707,6 +2213,21 @@ fn parse_compilation_sources(compilation: &serde_json::Value) -> BTreeMap<u64, S
             ))
         })
         .collect()
+}
+
+fn read_compilation_source(compilation: &serde_json::Value, source_id: u64) -> Option<String> {
+    compilation
+        .get("sources")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|source| source.get("id").and_then(serde_json::Value::as_u64) == Some(source_id))
+        .and_then(|source| {
+            source
+                .get("contents")
+                .or_else(|| source.get("content"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_owned)
 }
 
 fn read_debug_source(root: &Path, source_path: &str) -> Option<String> {
@@ -2296,6 +2817,34 @@ fn read_json_file(path: &Path) -> SoldbResult<serde_json::Value> {
     serde_json::from_str(&content).map_err(|error| {
         soldb_core::SoldbError::Message(format!("Invalid JSON {}: {error}", path.display()))
     })
+}
+
+fn ethdebug_resources_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<serde_json::Value> {
+    let path = spec.debug_dir.join("ethdebug.json");
+    let metadata = read_json_file(&path)?;
+    ethdebug_resources_from_metadata(&path, &metadata)
+}
+
+fn ethdebug_resources_from_metadata(
+    path: &Path,
+    metadata: &serde_json::Value,
+) -> SoldbResult<serde_json::Value> {
+    if let Some(resources) = metadata.get("resources") {
+        return Ok(resources.clone());
+    }
+
+    let Some(compilation) = metadata.get("compilation") else {
+        return Err(soldb_core::SoldbError::Message(format!(
+            "ETHDebug metadata {} does not contain resources or compilation",
+            path.display()
+        )));
+    };
+
+    Ok(json!({
+        "compilation": compilation,
+        "types": metadata.get("types").cloned().unwrap_or_else(|| json!({})),
+        "pointers": metadata.get("pointers").cloned().unwrap_or_else(|| json!({})),
+    }))
 }
 
 fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::path::PathBuf> {
