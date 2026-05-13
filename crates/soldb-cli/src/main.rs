@@ -1033,7 +1033,7 @@ fn find_existing_source_breakpoint(
                 && target
                     .file
                     .as_ref()
-                    .map_or(true, |file| source_path_matches(&breakpoint.path, file))
+                    .is_none_or(|file| source_path_matches(&breakpoint.path, file))
         })
         .cloned()
         .collect::<Vec<_>>();
