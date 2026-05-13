@@ -75,9 +75,9 @@ soldb trace <tx_hash> --ethdebug-dir <contract_address>:<contract_name>:./out --
 
 Inside REPL:
 ```
-(soldb) break TestContract.sol:42
-(soldb) next
-(soldb) print balance
+soldb> break TestContract.sol:42
+soldb> next
+soldb> print balance
 ```
 
 ---
@@ -116,9 +116,9 @@ soldb simulate <contract_address> "increment(uint256)" 5     --from <sender_addr
 
 Inside REPL:
 ```
-(soldb) break TestContract.sol:38
-(soldb) step
-(soldb) vars
+soldb> break TestContract.sol:38
+soldb> step
+soldb> vars
 ```
 
 ---
