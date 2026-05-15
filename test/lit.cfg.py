@@ -33,13 +33,6 @@ if hasattr(config, 'soldb') and config.soldb:
     soldb_path = config.soldb
 else:
     soldb_path = shutil.which('soldb')
-    if not soldb_path and hasattr(config, 'soldb_dir'):
-        # Try to find it in the virtual environment
-        for venv_name in ('.venv', 'MyEnv'):
-            venv_path = os.path.join(config.soldb_dir, venv_name, 'bin', 'soldb')
-            if os.path.exists(venv_path):
-                soldb_path = venv_path
-                break
 
 if soldb_path:
     config.substitutions.append(('%soldb', soldb_path))
@@ -156,10 +149,4 @@ for env_var in ('COVERAGE_FILE', 'COVERAGE_RCFILE'):
     if env_var in os.environ:
         config.environment[env_var] = os.environ[env_var]
 
-if not hasattr(config, 'soldb') or not config.soldb:
-    config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
-elif 'venv' in config.soldb or 'MyEnv' in config.soldb:
-    # Using venv - don't set PYTHONPATH, let venv handle it
-    pass
-else:
-    config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
+config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
