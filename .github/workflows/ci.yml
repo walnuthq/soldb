@@ -21,6 +21,8 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -78,6 +80,8 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build Rust binaries
         run: cargo build --bin soldb --bin soldb-dap-server
 
@@ -120,6 +124,8 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install Rust coverage tool
         run: cargo install cargo-llvm-cov --locked
