@@ -122,7 +122,9 @@ jobs:
           rustup default stable
 
       - name: Install Rust coverage tool
-        run: cargo install cargo-llvm-cov --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Run Rust coverage
         run: cargo llvm-cov --workspace --all-targets --cobertura --output-path rust-coverage.xml --fail-under-lines 80
