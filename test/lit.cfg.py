@@ -80,13 +80,13 @@ elif platform.system() == 'Linux':
 
 # Check if soldb is available
 def check_soldb():
+    if not soldb_path:
+        return False
     try:
-        if soldb_path:
-            subprocess.run(shlex.split(soldb_path) + ['--help'], check=True, capture_output=True)
-            return True
-    except:
-        pass
-    return False
+        subprocess.run(shlex.split(soldb_path) + ['--help'], check=True, capture_output=True)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 if check_soldb():
     config.available_features.add('soldb')
