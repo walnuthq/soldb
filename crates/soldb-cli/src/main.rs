@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
-use soldb_core::{SoldbResult, TransactionTrace};
+use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace};
 use soldb_ethdebug::{
     encode_function_call, function_selector, parse_ethdebug_spec, parse_event_abis,
     parse_signature, parse_variable_locations, DecodedEvent, EthdebugInfo, EventRegistry,
@@ -1264,6 +1264,7 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
         function_color(format!("{}::runtime_dispatcher", spec.name))
     );
     print_call_frames(&build_trace_call_frames(trace, &spec, None));
+    print_trace_event_lines(trace, &trace_event_registry(args));
     println!("{}", separator(60));
     println!(
         "{}",
@@ -1296,34 +1297,21 @@ fn print_trace_backend_details(trace: &TransactionTrace) {
         println!("{} {}", warning("Capability note:"), note);
     }
 
-    let artifacts = &trace.artifacts;
-    if !artifacts.calls.is_empty()
-        || !artifacts.creations.is_empty()
-        || !artifacts.logs.is_empty()
-        || !artifacts.account_changes.is_empty()
-    {
-        println!(
-            "{} calls={}, creates={}, logs={}, account_changes={}",
-            info("Artifacts:"),
-            number_color(artifacts.calls.len()),
-            number_color(artifacts.creations.len()),
-            number_color(artifacts.logs.len()),
-            number_color(artifacts.account_changes.len())
-        );
-    }
-    if let Some(gas) = &artifacts.gas {
-        let mut gas_parts = vec![format!("used={}", gas.used)];
+    if let Some(gas) = &trace.artifacts.gas {
+        let mut gas_parts = Vec::new();
         if let Some(spent) = gas.spent {
             gas_parts.push(format!("spent={spent}"));
         }
         if let Some(refunded) = gas.refunded {
             gas_parts.push(format!("refunded={refunded}"));
         }
-        println!(
-            "{} {}",
-            info("Gas details:"),
-            number_color(gas_parts.join(", "))
-        );
+        if !gas_parts.is_empty() {
+            println!(
+                "{} {}",
+                info("Gas details:"),
+                number_color(gas_parts.join(", "))
+            );
+        }
     }
 }
 
@@ -1460,6 +1448,7 @@ fn print_simulation_summary(
     print_call_frames(&build_simulation_call_frames(
         trace, args, raw_data, fallback,
     ));
+    print_trace_event_lines(trace, &simulate_event_registry(args));
     println!("{}", separator(60));
     println!(
         "{}",
@@ -1472,6 +1461,8 @@ struct CallFrame {
     name: String,
     params: Vec<DecodedCallParam>,
     source_params: Vec<SourceParam>,
+    source_path: Option<String>,
+    source_line: Option<u64>,
     raw_stack: Vec<String>,
     internal: bool,
 }
@@ -1496,6 +1487,7 @@ struct SourceFunction {
     name: String,
     params: Vec<SourceParam>,
     declaration_start: u64,
+    declaration_line: u64,
     body_end: u64,
 }
 
@@ -1742,18 +1734,21 @@ fn line_count(source: &str) -> u64 {
 fn print_call_frames(frames: &[CallFrame]) {
     for (index, frame) in frames.iter().enumerate() {
         let call = format_call_frame(frame);
+        let location = format_call_frame_location(frame);
         if frame.internal {
             println!(
-                "{} {} {}",
+                "{} {} {}{}",
                 dim(format!("#{}", index + 1)),
                 function_color(call),
-                dim("[internal]")
+                dim("[internal]"),
+                location
             );
         } else {
             println!(
-                "{} {}",
+                "{} {}{}",
                 dim(format!("#{}", index + 1)),
-                function_color(call)
+                function_color(call),
+                location
             );
         }
         if frame.internal && frame.params.is_empty() && !frame.source_params.is_empty() {
@@ -1776,6 +1771,54 @@ fn format_call_frame(frame: &CallFrame) -> String {
         return format_source_prototype(&frame.name, &frame.source_params);
     }
     frame.name.clone()
+}
+
+fn format_call_frame_location(frame: &CallFrame) -> String {
+    match (&frame.source_path, frame.source_line) {
+        (Some(path), Some(line)) => dim(format!(" at {path}:{line}")),
+        _ => String::new(),
+    }
+}
+
+fn print_trace_event_lines(trace: &TransactionTrace, events: &EventRegistry) {
+    for log in &trace.artifacts.logs {
+        println!(
+            "  {} {}",
+            dim("emit"),
+            function_color(format_trace_event(log, events))
+        );
+    }
+}
+
+fn format_trace_event(log: &ExecutionLog, events: &EventRegistry) -> String {
+    if let Some(decoded) = events.decode_log(&log.topics, &log.data) {
+        return format_decoded_event_inline(&decoded);
+    }
+    let topic = log.topics.first().map_or("<anonymous>", String::as_str);
+    format!("{topic}(data = {})", normalize_hex(&log.data))
+}
+
+fn format_decoded_event_inline(decoded: &DecodedEvent) -> String {
+    let name = decoded.contract_name.as_ref().map_or_else(
+        || decoded.event.clone(),
+        |contract| format!("{contract}::{}", decoded.event),
+    );
+    format!(
+        "{}({})",
+        name,
+        decoded
+            .args
+            .iter()
+            .map(|arg| {
+                if arg.name.is_empty() {
+                    display_json_value(&arg.value)
+                } else {
+                    format!("{} = {}", arg.name, display_json_value(&arg.value))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn build_trace_call_frames(
@@ -1840,6 +1883,8 @@ fn build_call_frames(
                 name: function.name.clone(),
                 params: Vec::new(),
                 source_params: function.params.clone(),
+                source_path: index.info.sources.get(&function.source_id).cloned(),
+                source_line: Some(function.declaration_line),
                 raw_stack: step.stack.clone(),
                 internal: false,
             });
@@ -1859,6 +1904,8 @@ fn build_call_frames(
                     name: descriptor.name,
                     params: descriptor.params,
                     source_params: Vec::new(),
+                    source_path: None,
+                    source_line: None,
                     raw_stack: Vec::new(),
                     internal: false,
                 },
@@ -2167,7 +2214,7 @@ fn format_raw_stack(stack: &[String]) -> String {
     stack
         .iter()
         .enumerate()
-        .map(|(index, value)| format!("[{index}] {}", normalize_hex(value)))
+        .map(|(index, value)| format!("[{index}] {}", normalize_stack_word(value)))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -2272,6 +2319,7 @@ fn parse_source_functions(source_id: u64, source: &str) -> Vec<SourceFunction> {
             name: name.to_owned(),
             params,
             declaration_start: keyword_start as u64,
+            declaration_line: line_for_offset(source, keyword_start),
             body_end: body_end as u64,
         });
         cursor = body_end + 1;
@@ -2564,11 +2612,30 @@ fn event_data_json(name: Option<&str>, ty: &str, value: serde_json::Value) -> Ev
 }
 
 fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
-    let mut registry = EventRegistry::default();
     if !should_decode_events(args) {
-        return Ok(registry);
+        return Ok(EventRegistry::default());
     }
-    for spec in resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())? {
+    event_registry_for_specs(resolve_contract_specs(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+    )?)
+}
+
+fn trace_event_registry(args: &TraceArgs) -> EventRegistry {
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .and_then(event_registry_for_specs)
+        .unwrap_or_default()
+}
+
+fn simulate_event_registry(args: &SimulateArgs) -> EventRegistry {
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .and_then(event_registry_for_specs)
+        .unwrap_or_default()
+}
+
+fn event_registry_for_specs(specs: Vec<ResolvedContractSpec>) -> SoldbResult<EventRegistry> {
+    let mut registry = EventRegistry::default();
+    for spec in specs {
         let Some(abi_path) = abi_path_for_contract(&spec.debug_dir, &spec.name) else {
             continue;
         };
@@ -3166,6 +3233,17 @@ fn normalize_hex(value: &str) -> String {
     }
 }
 
+fn normalize_stack_word(value: &str) -> String {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    if hex.is_empty() {
+        return "0x0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+    }
+    if hex.len() >= 64 {
+        return format!("0x{hex}");
+    }
+    format!("0x{:0>64}", hex)
+}
+
 fn display_json_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
@@ -3435,8 +3513,12 @@ contract Counter {
         assert_eq!(frames[0].name, "set");
         assert_eq!(frames[0].params[0].name, "amount");
         assert_eq!(frames[0].params[0].value, "4");
+        assert_eq!(frames[0].source_path.as_deref(), Some("Counter.sol"));
+        assert_eq!(frames[0].source_line, Some(3));
         assert!(!frames[0].internal);
         assert_eq!(frames[1].name, "helper");
+        assert_eq!(frames[1].source_path.as_deref(), Some("Counter.sol"));
+        assert_eq!(frames[1].source_line, Some(7));
         assert!(frames[1].internal);
         assert!(frames[1].params.is_empty());
         assert_eq!(
@@ -3445,7 +3527,7 @@ contract Counter {
         );
         assert_eq!(
             format_raw_stack(&frames[1].raw_stack),
-            "[0] 0xaa [1] 0xbb [2] 0x04"
+            "[0] 0x00000000000000000000000000000000000000000000000000000000000000aa [1] 0x00000000000000000000000000000000000000000000000000000000000000bb [2] 0x0000000000000000000000000000000000000000000000000000000000000004"
         );
     }
 
