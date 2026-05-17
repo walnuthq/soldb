@@ -1751,14 +1751,16 @@ fn print_call_frames(frames: &[CallFrame]) {
                 location
             );
         }
-        if frame.internal && frame.params.is_empty() && !frame.source_params.is_empty() {
-            if !frame.raw_stack.is_empty() {
-                println!(
-                    "  {} {}",
-                    info("raw entry stack:"),
-                    number_color(format_raw_stack(&frame.raw_stack))
-                );
-            }
+        if frame.internal
+            && frame.params.is_empty()
+            && !frame.source_params.is_empty()
+            && !frame.raw_stack.is_empty()
+        {
+            println!(
+                "  {} {}",
+                info("raw entry stack:"),
+                number_color(format_raw_stack(&frame.raw_stack))
+            );
         }
     }
 }
