@@ -13,7 +13,6 @@
 # CHECK: Environment: runtime
 
 # Check function call trace header
-# CHECK: Function Call Trace:
 # CHECK: StylusCounterCaller
 # CHECK: Status: SUCCESS
 

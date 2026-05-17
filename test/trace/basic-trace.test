@@ -5,7 +5,6 @@
 # Check that we get the basic tracing output structure
 # CHECK: Loading transaction
 # CHECK: Contract: TestContract
-# CHECK: Function Call Trace:
 # CHECK: Gas used:
 
 # Check for the call stack header

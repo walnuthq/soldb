@@ -5,7 +5,6 @@
 
 # Check that we get the basic simulation output structure with raw data
 # CHECK: Contract: TestContract
-# CHECK: Function Call Trace:
 # CHECK: Gas used:
 
 # Check for the call stack header

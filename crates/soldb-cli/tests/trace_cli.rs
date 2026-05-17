@@ -525,7 +525,6 @@ fn simulate_auto_deploys_solidity_file_before_trace_call() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Deployed Counter at 0x5fbdb2315678afecb367f032d93f642f64180aa3"));
     assert!(stdout.contains("Contract: Counter"));
-    assert!(stdout.contains("Function Call Trace:"));
     assert!(out.join("deployment.json").exists());
 }
 
@@ -555,7 +554,6 @@ fn simulate_raw_data_prints_call_summary() {
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Contract: TestContract"));
-    assert!(stdout.contains("Function Call Trace:"));
     assert!(stdout.contains("Gas used: 42000"));
     assert!(stdout.contains("Call Stack:"));
     assert!(stdout.contains("#0 TestContract::runtime_dispatcher"));

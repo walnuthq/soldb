@@ -601,7 +601,6 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
         Err(error) => return Err(error),
     };
     let trace = resolved.trace;
-    let backend = resolved.backend;
     if args.interactive {
         let source_index = interactive_trace_source_index(args, &trace);
         run_interactive_debugger(trace, "Transaction trace debugger", source_index)?;
@@ -614,9 +613,9 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
             )?
         );
     } else if args.raw {
-        print_raw_trace(&trace, args, backend);
+        print_raw_trace(&trace, args);
     } else {
-        print_trace_summary(&trace, args, backend);
+        print_trace_summary(&trace, args);
     }
 
     Ok(())
@@ -1225,9 +1224,9 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
     Ok(())
 }
 
-fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs, backend: TraceBackend) {
+fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     let Some(spec) = trace_contract_spec(args) else {
-        print_plain_trace_summary(trace, backend);
+        print_plain_trace_summary(trace);
         return;
     };
     let metadata = trace_debug_metadata(&spec);
@@ -1240,13 +1239,11 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs, backend: Trac
     if metadata.is_legacy {
         println!("{} {}", info("Debug format:"), bold("srcmap-runtime"));
     }
-    println!("{} {}", info("Backend:"), bold(backend.as_str()));
     print_trace_backend_details(trace);
     println!("{} {}", info("Contract:"), function_color(&spec.name));
     if let Some(compiler) = metadata.compiler_version {
         println!("{} solc {}", info("Compiler:"), number_color(compiler));
     }
-    println!("{}", bold(info("Function Call Trace:")));
     println!("{} {}", info("Gas used:"), success(trace.gas_used));
     let status = if trace.success {
         success("SUCCESS")
@@ -1273,13 +1270,12 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs, backend: Trac
     );
 }
 
-fn print_plain_trace_summary(trace: &TransactionTrace, backend: TraceBackend) {
+fn print_plain_trace_summary(trace: &TransactionTrace) {
     println!(
         "{} {}",
         info("Transaction"),
         address_color(trace.tx_hash.as_deref().unwrap_or("<simulated>"))
     );
-    println!("{} {}", info("Backend:"), bold(backend.as_str()));
     print_trace_backend_details(trace);
     let status = if trace.success {
         success("SUCCESS")
@@ -1295,10 +1291,6 @@ fn print_plain_trace_summary(trace: &TransactionTrace, backend: TraceBackend) {
 }
 
 fn print_trace_backend_details(trace: &TransactionTrace) {
-    let capabilities = format_capabilities(&trace.capabilities);
-    if !capabilities.is_empty() {
-        println!("{} {}", info("Capabilities:"), capabilities);
-    }
     for note in &trace.capabilities.notes {
         println!("{} {}", warning("Capability note:"), note);
     }
@@ -1334,45 +1326,7 @@ fn print_trace_backend_details(trace: &TransactionTrace) {
     }
 }
 
-fn format_capabilities(capabilities: &soldb_core::TraceCapabilities) -> String {
-    let mut enabled = Vec::new();
-    if capabilities.opcode_steps {
-        enabled.push("opcodes");
-    }
-    if capabilities.stack {
-        enabled.push("stack");
-    }
-    if capabilities.memory {
-        enabled.push("memory");
-    }
-    if capabilities.storage {
-        enabled.push("storage");
-    }
-    if capabilities.storage_diff {
-        enabled.push("storage-diff");
-    }
-    if capabilities.call_trace {
-        enabled.push("calls");
-    }
-    if capabilities.contract_creation {
-        enabled.push("create");
-    }
-    if capabilities.logs {
-        enabled.push("logs");
-    }
-    if capabilities.revert_data {
-        enabled.push("revert-data");
-    }
-    if capabilities.gas_details {
-        enabled.push("gas");
-    }
-    if capabilities.account_changes {
-        enabled.push("accounts");
-    }
-    enabled.join(", ")
-}
-
-fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs, backend: TraceBackend) {
+fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
     println!(
         "{} {}",
         info("Loading transaction"),
@@ -1381,7 +1335,6 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs, backend: TraceBac
     if let Some(contract_name) = trace_contract_name(args) {
         println!("{} {}", info("Contract:"), function_color(contract_name));
     }
-    println!("{} {}", info("Backend:"), bold(backend.as_str()));
     print_trace_backend_details(trace);
     println!("{}", bold(info("Execution trace")));
     println!(
@@ -1423,11 +1376,6 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_
     if let Some(contract_name) = simulate_contract_name(args) {
         println!("{} {}", info("Contract:"), function_color(contract_name));
     }
-    println!(
-        "{} {}",
-        info("Backend:"),
-        bold(trace.backend.as_deref().unwrap_or("debug-rpc"))
-    );
     print_trace_backend_details(trace);
     println!("{}", bold(info("Execution trace")));
     println!(
@@ -1488,13 +1436,7 @@ fn print_simulation_summary(
         }
     }
     println!("{} {}", info("Contract:"), function_color(&contract_name));
-    println!(
-        "{} {}",
-        info("Backend:"),
-        bold(trace.backend.as_deref().unwrap_or("debug-rpc"))
-    );
     print_trace_backend_details(trace);
-    println!("{}", bold(info("Function Call Trace:")));
     println!("{} {}", info("Gas used:"), success(trace.gas_used));
     let status = if trace.success {
         success("SUCCESS")
@@ -3830,8 +3772,8 @@ contract C {
             stylus_contracts: None,
         };
         let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
-        print_plain_trace_summary(&trace, TraceBackend::DebugRpc);
-        print_raw_trace(&trace, &trace_args, TraceBackend::DebugRpc);
+        print_plain_trace_summary(&trace);
+        print_raw_trace(&trace, &trace_args);
         assert_eq!(trace_contract_name(&trace_args).as_deref(), Some("Legacy"));
     }
 
