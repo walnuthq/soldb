@@ -756,6 +756,7 @@ fn print_simulation_interactive_prelude(
                     .enumerate()
                     .map(|(index, value)| DecodedCallParam {
                         name: format!("arg{index}"),
+                        ty: None,
                         value: value.clone(),
                         raw: false,
                     })
@@ -1484,6 +1485,7 @@ struct CallDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DecodedCallParam {
     name: String,
+    ty: Option<String>,
     value: String,
     raw: bool,
 }
@@ -1739,45 +1741,41 @@ fn line_count(source: &str) -> u64 {
 
 fn print_call_frames(frames: &[CallFrame]) {
     for (index, frame) in frames.iter().enumerate() {
+        let call = format_call_frame(frame);
         if frame.internal {
             println!(
                 "{} {} {}",
                 dim(format!("#{}", index + 1)),
-                function_color(&frame.name),
+                function_color(call),
                 dim("[internal]")
             );
         } else {
             println!(
                 "{} {}",
                 dim(format!("#{}", index + 1)),
-                function_color(&frame.name)
+                function_color(call)
             );
         }
-        for param in &frame.params {
-            let label = if param.raw {
-                format!("{} raw:", param.name)
-            } else {
-                format!("{}:", param.name)
-            };
-            println!("  {} {}", info(label), number_color(&param.value));
-        }
-        if frame.internal && !frame.source_params.is_empty() && frame.params.is_empty() {
-            let signature = frame
-                .source_params
-                .iter()
-                .map(|param| format!("{}:{}", param.name, param.ty))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("  {} {}", info("args:"), dim(signature));
+        if frame.internal && frame.params.is_empty() && !frame.source_params.is_empty() {
             if !frame.raw_stack.is_empty() {
                 println!(
                     "  {} {}",
-                    info("raw stack:"),
+                    info("raw entry stack:"),
                     number_color(format_raw_stack(&frame.raw_stack))
                 );
             }
         }
     }
+}
+
+fn format_call_frame(frame: &CallFrame) -> String {
+    if !frame.params.is_empty() {
+        return format_decoded_call(&frame.name, &frame.params);
+    }
+    if !frame.source_params.is_empty() {
+        return format_source_prototype(&frame.name, &frame.source_params);
+    }
+    frame.name.clone()
 }
 
 fn build_trace_call_frames(
@@ -1900,6 +1898,7 @@ fn simulated_call_descriptor(
             .filter_map(|(index, _)| {
                 args.function_args.get(index).map(|value| DecodedCallParam {
                     name: format!("arg{index}"),
+                    ty: parsed.arg_types.get(index).cloned(),
                     value: value.clone(),
                     raw: false,
                 })
@@ -1985,6 +1984,7 @@ fn abi_descriptor_for_calldata(
                     };
                     decode_calldata_word(calldata, index, &input.ty).map(|word| DecodedCallParam {
                         name,
+                        ty: Some(input.ty.clone()),
                         value: word.value,
                         raw: word.raw,
                     })
@@ -2027,6 +2027,7 @@ fn descriptor_from_source_function(function: &SourceFunction, calldata: &str) ->
         .filter_map(|(index, param)| {
             decode_calldata_word(calldata, index, &param.ty).map(|word| DecodedCallParam {
                 name: param.name.clone(),
+                ty: Some(param.ty.clone()),
                 value: word.value,
                 raw: word.raw,
             })
@@ -2117,6 +2118,46 @@ fn format_uint_word(word: &str) -> String {
             .unwrap_or_else(|_| format!("0x{}", trimmed.to_ascii_lowercase()));
     }
     format!("0x{}", trimmed.to_ascii_lowercase())
+}
+
+fn format_source_prototype(name: &str, params: &[SourceParam]) -> String {
+    format!(
+        "{}({})",
+        name,
+        params
+            .iter()
+            .map(|param| {
+                if param.name.is_empty() {
+                    param.ty.clone()
+                } else {
+                    format!("{} {}", param.ty, param.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn format_decoded_call(name: &str, params: &[DecodedCallParam]) -> String {
+    format!(
+        "{}({})",
+        name,
+        params
+            .iter()
+            .map(format_decoded_call_param)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn format_decoded_call_param(param: &DecodedCallParam) -> String {
+    let value_label = if param.raw { "raw = " } else { "= " };
+    match (param.ty.as_deref(), param.name.is_empty()) {
+        (Some(ty), false) => format!("{ty} {} {value_label}{}", param.name, param.value),
+        (Some(ty), true) => format!("{ty} {value_label}{}", param.value),
+        (None, false) => format!("{} {value_label}{}", param.name, param.value),
+        (None, true) => param.value.clone(),
+    }
 }
 
 fn format_raw_stack(stack: &[String]) -> String {
@@ -3397,7 +3438,11 @@ contract Counter {
         assert!(!frames[0].internal);
         assert_eq!(frames[1].name, "helper");
         assert!(frames[1].internal);
-        assert_eq!(frames[1].source_params[1].name, "amount2");
+        assert!(frames[1].params.is_empty());
+        assert_eq!(
+            format_source_prototype(&frames[1].name, &frames[1].source_params),
+            "helper(uint256 amount, uint256 amount2)"
+        );
         assert_eq!(
             format_raw_stack(&frames[1].raw_stack),
             "[0] 0xaa [1] 0xbb [2] 0x04"

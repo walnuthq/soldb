@@ -12,5 +12,4 @@
 
 # Check for the call hierarchy with increment function (legacy format - basic structure only)
 # CHECK: #0 TestContract::runtime_dispatcher
-# CHECK: #1 increment
-# CHECK: amount: 4
+# CHECK: #1 increment(uint256 amount = 4)

@@ -13,16 +13,13 @@
 
 # Check that we see the increment function call
 # CHECK: #0 TestContract::runtime_dispatcher
-# CHECK: #1 increment
-# CHECK: amount: 4
+# CHECK: #1 increment(uint256 amount = 4)
 
 # Check for nested function calls
-# CHECK: increment2 [internal]
-# CHECK: args: amount:uint256
-# CHECK: raw stack:
-# CHECK: increment3 [internal]
-# CHECK: args: amount:uint256, amount2:uint256
-# CHECK: raw stack:
+# CHECK: increment2(uint256 amount) [internal]
+# CHECK: raw entry stack:
+# CHECK: increment3(uint256 amount, uint256 amount2) [internal]
+# CHECK: raw entry stack:
 
 # Check for the footer
 # CHECK: ------------------------------------------------------------

@@ -13,8 +13,7 @@
 
 # Check that we see the increment function call (raw data should decode to increment(4))
 # CHECK: #0 TestContract::runtime_dispatcher
-# CHECK: #1 increment
-# CHECK: amount: 4
+# CHECK: #1 increment(uint256 amount = 4)
 
 # Check for the footer
 # CHECK: ------------------------------------------------------------
