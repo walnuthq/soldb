@@ -883,7 +883,12 @@ pub fn trace_transaction_with_client(
         backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
         capabilities: debug_rpc_capabilities(&debug_result),
     };
-    Ok(build_transaction_trace(envelope, &debug_result))
+    let mut trace = build_transaction_trace(envelope, &debug_result);
+    if !receipt.logs.is_empty() && trace.artifacts.logs.is_empty() {
+        trace.artifacts.logs = receipt_logs_to_artifacts(&receipt.logs);
+        trace.capabilities.logs = true;
+    }
+    Ok(trace)
 }
 
 pub fn transaction_logs_with_client(
@@ -1818,6 +1823,19 @@ fn log_artifact(index: usize, depth: u64, log: &revm::primitives::Log) -> Execut
             .collect(),
         data: bytes_to_prefixed_hex(log.data.data.as_ref()),
     }
+}
+
+fn receipt_logs_to_artifacts(logs: &[RpcLog]) -> Vec<ExecutionLog> {
+    logs.iter()
+        .enumerate()
+        .map(|(index, log)| ExecutionLog {
+            index,
+            depth: 0,
+            address: log.address.clone(),
+            topics: log.topics.clone(),
+            data: normalize_hex_output(&log.data),
+        })
+        .collect()
 }
 
 fn account_change_from_journal_entry(depth: u64, entry: &JournalEntry) -> Option<AccountChange> {

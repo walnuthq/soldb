@@ -4,7 +4,6 @@
 # Check that we get the basic tracing output structure
 # CHECK: Connecting to RPC: https://opt-sepolia.g.alchemy.com/v2/{{.*}}
 # CHECK: Loading transaction 0x1362ee26050935178c2f491dbe2a5f0d277903cb5d77fa9e6e30d8b2db31a541...
-# CHECK: Function Call Trace: 0x1362ee26050935178c2f491dbe2a5f0d277903cb5d77fa9e6e30d8b2db31a541
 # CHECK:   Contract: 0x59A714559B46c823d87986b5c5B7C630e2f5668d
 # CHECK:   Gas used: 82711
 # CHECK:   Status: SUCCESS

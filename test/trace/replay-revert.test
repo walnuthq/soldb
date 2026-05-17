@@ -10,9 +10,7 @@
 # RUN: FileCheck %s --check-prefix=RAW < %t.replay
 # RUN: FileCheck %s --check-prefix=SUMMARY < %t.summary
 
-# RAW: Backend: replay
 # RAW: REVERT
 
-# SUMMARY: Backend: replay
 # SUMMARY: Status: REVERTED
 # SUMMARY: Error: Amount must be positive

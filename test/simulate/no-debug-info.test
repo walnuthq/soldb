@@ -4,6 +4,5 @@
 
 # CHECK: Connecting to RPC:
 # CHECK: No ABI files found. Proceeding with function signature: memoryTest()
-# CHECK: Function Call Trace:
 # CHECK: Status: SUCCESS
 # CHECK: #1 memoryTest()

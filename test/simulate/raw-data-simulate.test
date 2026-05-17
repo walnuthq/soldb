@@ -5,7 +5,6 @@
 
 # Check that we get the basic simulation output structure with raw data
 # CHECK: Contract: TestContract
-# CHECK: Function Call Trace:
 # CHECK: Gas used:
 
 # Check for the call stack header
@@ -14,8 +13,7 @@
 
 # Check that we see the increment function call (raw data should decode to increment(4))
 # CHECK: #0 TestContract::runtime_dispatcher
-# CHECK: #1 increment
-# CHECK: amount: 4
+# CHECK: #1 increment(uint256 amount = 4) at TestContract.sol:23
 
 # Check for the footer
 # CHECK: ------------------------------------------------------------

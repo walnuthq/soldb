@@ -208,6 +208,35 @@ fn trace_summary_prints_status_and_step_count() {
 }
 
 #[test]
+fn trace_summary_prints_decoded_event_lines() {
+    let rpc_url = start_rpc_server(3);
+    let (_abi_dir, ethdebug_spec) = write_function_abi(
+        "TestContract",
+        r#"[{"type":"event","name":"CounterIncremented","inputs":[{"name":"newValue","type":"uint256","indexed":false}]}]"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "trace",
+            "0xabc",
+            "--rpc",
+            &rpc_url,
+            "--ethdebug-dir",
+            &ethdebug_spec,
+        ])
+        .output()
+        .expect("run soldb");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("emit TestContract::CounterIncremented(newValue = 4)"));
+    assert!(!stdout.contains("Artifacts:"));
+}
+
+#[test]
 fn trace_interactive_accepts_repl_commands() {
     let rpc_url = start_rpc_server(3);
     let output = run_with_stdin(
@@ -525,7 +554,6 @@ fn simulate_auto_deploys_solidity_file_before_trace_call() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Deployed Counter at 0x5fbdb2315678afecb367f032d93f642f64180aa3"));
     assert!(stdout.contains("Contract: Counter"));
-    assert!(stdout.contains("Function Call Trace:"));
     assert!(out.join("deployment.json").exists());
 }
 
@@ -555,7 +583,6 @@ fn simulate_raw_data_prints_call_summary() {
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Contract: TestContract"));
-    assert!(stdout.contains("Function Call Trace:"));
     assert!(stdout.contains("Gas used: 42000"));
     assert!(stdout.contains("Call Stack:"));
     assert!(stdout.contains("#0 TestContract::runtime_dispatcher"));
@@ -591,8 +618,7 @@ fn simulate_abi_call_prints_call_summary() {
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Contract: TestContract"));
-    assert!(stdout.contains("#1 increment"));
-    assert!(stdout.contains("arg0: 4"));
+    assert!(stdout.contains("#1 increment(uint256 arg0 = 4)"));
     assert!(!stdout.contains("increment2 [internal]"));
     assert!(!stdout.contains("increment3 [internal]"));
 }
@@ -628,9 +654,9 @@ fn simulate_summary_prints_raw_word_for_unsupported_abi_arg() {
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("Contract: TestContract"));
-    assert!(stdout.contains("#1 set"));
-    assert!(stdout
-        .contains("value raw: 0x0000000000000000000000000000000000000000000000000000000000000020"));
+    assert!(stdout.contains(
+        "#1 set(string value raw = 0x0000000000000000000000000000000000000000000000000000000000000020)"
+    ));
 }
 
 #[test]

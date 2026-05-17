@@ -4,7 +4,6 @@
 # Check that we get the basic tracing output structure
 # CHECK: Connecting to RPC: https://opt-sepolia.g.alchemy.com/v2/{{.*}}
 # CHECK: Loading transaction 0x1362ee26050935178c2f491dbe2a5f0d277903cb5d77fa9e6e30d8b2db31a541...
-# CHECK: Function Call Trace: 0x1362ee26050935178c2f491dbe2a5f0d277903cb5d77fa9e6e30d8b2db31a541
 # CHECK:   TaxCalculator (0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd)
 # CHECK:   ShippingManager (0xbE734aD6434E16f6bE04706005faED6fD38eb2B2)
 # CHECK:   PaymentProcessor (0xf776FF56e2400e31f3070c1ac70Ab80433B01823)

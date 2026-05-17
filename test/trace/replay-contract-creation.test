@@ -13,6 +13,5 @@
 
 # CHECK: Loading transaction
 # CHECK: Contract: TestContract
-# CHECK: Backend: replay
 # CHECK: Execution trace
 # CHECK: CODECOPY

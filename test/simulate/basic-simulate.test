@@ -5,7 +5,6 @@
 
 # Check that we get the basic simulation output structure
 # CHECK: Contract: TestContract
-# CHECK: Function Call Trace:
 # CHECK: Gas used:
 
 # Check for the call stack header
@@ -14,16 +13,13 @@
 
 # Check that we see the increment function call
 # CHECK: #0 TestContract::runtime_dispatcher
-# CHECK: #1 increment
-# CHECK: amount: 4
+# CHECK: #1 increment(uint256 amount = 4) at TestContract.sol:23
 
 # Check for nested function calls
-# CHECK: increment2 [internal]
-# CHECK: args: amount:uint256
-# CHECK: raw stack:
-# CHECK: increment3 [internal]
-# CHECK: args: amount:uint256, amount2:uint256
-# CHECK: raw stack:
+# CHECK: increment2(uint256 amount) [internal] at TestContract.sol:39
+# CHECK: raw entry stack:
+# CHECK: increment3(uint256 amount, uint256 amount2) [internal] at TestContract.sol:54
+# CHECK: raw entry stack:
 
 # Check for the footer
 # CHECK: ------------------------------------------------------------
