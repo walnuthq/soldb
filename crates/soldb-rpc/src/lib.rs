@@ -578,7 +578,7 @@ impl DebugTraceResult {
                 let step = log
                     .clone()
                     .into_trace_step_with_previous_storage(&previous_storage);
-                previous_storage = log.storage;
+                previous_storage.extend(log.storage);
                 step
             })
             .collect()
@@ -2310,6 +2310,38 @@ mod tests {
         );
         assert_eq!(steps[1].gas_cost, 0);
         assert!(steps[1].snapshot.storage_diff.is_empty());
+    }
+
+    #[test]
+    fn storage_diff_uses_prior_observed_slot_value() {
+        let result: DebugTraceResult = serde_json::from_value(json!({
+            "returnValue": "",
+            "structLogs": [
+                {
+                    "pc": 0,
+                    "op": "SSTORE",
+                    "gas": 100,
+                    "gasCost": 3,
+                    "depth": 0,
+                    "storage": {"0x04": "0x32"}
+                },
+                {"pc": 1, "op": "PUSH1", "gas": 97, "depth": 0},
+                {
+                    "pc": 2,
+                    "op": "SSTORE",
+                    "gas": 96,
+                    "gasCost": 3,
+                    "depth": 0,
+                    "storage": {"0x04": "0x4b"}
+                }
+            ]
+        }))
+        .expect("debug trace");
+
+        let steps = result.steps();
+        let second_write = &steps[2].snapshot.storage_diff["0x04"];
+        assert_eq!(second_write.before.as_deref(), Some("0x32"));
+        assert_eq!(second_write.after.as_deref(), Some("0x4b"));
     }
 
     #[test]
