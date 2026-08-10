@@ -31,8 +31,23 @@ jobs:
         run: cargo test --workspace --all-targets
 
   lit:
-    name: lit
+    name: lit (solc ${{ matrix.solc.version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ETHDebug artifacts are requested through different solc CLI flags depending on the
+        # compiler version, so cover both paths. See CompilerConfig::compile_with_ethdebug.
+        solc:
+          # Legacy flags: --ethdebug / --ethdebug-runtime, global file `ethdebug.json`.
+          - version: "0.8.31"
+            binary: solc-linux-amd64-v0.8.31+commit.fd3a2265
+            sha256: aac9cd0116e9ae0cd3d8f64a8641381845dc9f12e2a52653de36fb619323e557
+          # Modern flags: --experimental --ethdebug-program / --ethdebug-program-runtime /
+          # --ethdebug-resources, global file `ethdebug_resources.json`.
+          - version: "0.8.36"
+            binary: solc-linux-amd64-v0.8.36+commit.8a079791
+            sha256: c8d35afdddc3cd2743ee88b8f25e0fecd16e2bdd5f2120f37e52cd9cc45ae0e6
     steps:
       - uses: actions/checkout@v4
 
@@ -55,23 +70,31 @@ jobs:
         run: python -m pip install lit
 
       - name: Install Solidity compilers
+        env:
+          ETHDEBUG_SOLC_VERSION: ${{ matrix.solc.version }}
+          ETHDEBUG_SOLC_BINARY: ${{ matrix.solc.binary }}
+          ETHDEBUG_SOLC_SHA256: ${{ matrix.solc.sha256 }}
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
 
+          # ETHDebug compiler under test (matrixed).
           curl -fsSL \
-            -o "$HOME/.local/bin/solc-0.8.31" \
-            https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.31+commit.fd3a2265
-          echo "aac9cd0116e9ae0cd3d8f64a8641381845dc9f12e2a52653de36fb619323e557  $HOME/.local/bin/solc-0.8.31" | sha256sum -c -
+            -o "$HOME/.local/bin/solc-$ETHDEBUG_SOLC_VERSION" \
+            "https://binaries.soliditylang.org/linux-amd64/$ETHDEBUG_SOLC_BINARY"
+          echo "$ETHDEBUG_SOLC_SHA256  $HOME/.local/bin/solc-$ETHDEBUG_SOLC_VERSION" | sha256sum -c -
 
+          # Always needed: the legacy srcmap format test pins solc 0.8.16 (pre-ETHDebug).
           curl -fsSL \
             -o "$HOME/.local/bin/solc-0.8.16" \
             https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.16+commit.07a7930e
           echo "1632786c6c1f856a4a899232ec975a12f305118f43cce90e724ed0b2eebfeee1  $HOME/.local/bin/solc-0.8.16" | sha256sum -c -
 
-          chmod +x "$HOME/.local/bin/solc-0.8.31" "$HOME/.local/bin/solc-0.8.16"
-          ln -sf "$HOME/.local/bin/solc-0.8.31" "$HOME/.local/bin/solc"
+          chmod +x "$HOME/.local/bin/solc-$ETHDEBUG_SOLC_VERSION" "$HOME/.local/bin/solc-0.8.16"
+          # Some tests invoke bare `solc`, so point it at the version under test.
+          ln -sf "$HOME/.local/bin/solc-$ETHDEBUG_SOLC_VERSION" "$HOME/.local/bin/solc"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "SOLC_PATH=$HOME/.local/bin/solc-$ETHDEBUG_SOLC_VERSION" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         run: |

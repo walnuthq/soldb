@@ -24,8 +24,9 @@ get_debug_command() {
         abs_debug_dir="$(pwd)/$DEBUG_DIR"
     fi
     
-    # Check if ethdebug format is available
-    if [ -f "$abs_debug_dir/ethdebug.json" ]; then
+    # Check if ethdebug format is available. Modern solc renames the global resources file
+    # from `ethdebug.json` to `ethdebug_resources.json`; accept either.
+    if [ -f "$abs_debug_dir/ethdebug.json" ] || [ -f "$abs_debug_dir/ethdebug_resources.json" ]; then
         # Get contract address and name from deployment.json
         if [ -f "$abs_debug_dir/deployment.json" ]; then
             CONTRACT_ADDR=$(jq -r '.address' "$abs_debug_dir/deployment.json")

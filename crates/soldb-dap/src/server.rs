@@ -602,7 +602,7 @@ struct SourceIndex {
 
 impl SourceIndex {
     fn load(root: &Path, contract_name: Option<String>) -> SoldbResult<Self> {
-        let metadata = read_json(root.join("ethdebug.json"))?;
+        let metadata = read_json(find_ethdebug_metadata(root)?)?;
         let runtime_path = find_runtime_ethdebug(root, contract_name.as_deref())?;
         let runtime = read_json(&runtime_path)?;
         let instructions = runtime
@@ -673,6 +673,23 @@ fn read_json(path: impl AsRef<Path>) -> SoldbResult<Value> {
     })?;
     serde_json::from_str(&content)
         .map_err(|error| SoldbError::Message(format!("Invalid JSON {}: {error}", path.display())))
+}
+
+fn find_ethdebug_metadata(root: &Path) -> SoldbResult<PathBuf> {
+    // Modern solc (>= ~0.8.32) renamed the global ETHDebug metadata file from
+    // `ethdebug.json` to `ethdebug_resources.json`; accept either.
+    [
+        root.join("ethdebug.json"),
+        root.join("ethdebug_resources.json"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+    .ok_or_else(|| {
+        SoldbError::Message(format!(
+            "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
+            root.display()
+        ))
+    })
 }
 
 fn find_runtime_ethdebug(root: &Path, contract_name: Option<&str>) -> SoldbResult<PathBuf> {
