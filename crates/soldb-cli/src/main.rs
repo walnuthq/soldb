@@ -1515,7 +1515,12 @@ struct TraceSourceIndex {
 
 impl TraceSourceIndex {
     fn load(spec: &ResolvedContractSpec) -> SoldbResult<Self> {
-        let metadata_path = spec.debug_dir.join("ethdebug.json");
+        let metadata_path = find_ethdebug_metadata(&spec.debug_dir).ok_or_else(|| {
+            soldb_core::SoldbError::Message(format!(
+                "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
+                spec.debug_dir.display()
+            ))
+        })?;
         let runtime_path = find_runtime_ethdebug(&spec.debug_dir, &spec.name).ok_or_else(|| {
             soldb_core::SoldbError::Message(format!(
                 "No ETHDebug runtime file found in {}",
@@ -2219,6 +2224,17 @@ fn format_raw_stack(stack: &[String]) -> String {
         .map(|(index, value)| format!("[{index}] {}", normalize_stack_word(value)))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn find_ethdebug_metadata(root: &Path) -> Option<PathBuf> {
+    // Modern solc (>= ~0.8.32) renamed the global ETHDebug metadata file from
+    // `ethdebug.json` to `ethdebug_resources.json`; accept either.
+    [
+        root.join("ethdebug.json"),
+        root.join("ethdebug_resources.json"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
 }
 
 fn find_runtime_ethdebug(root: &Path, contract_name: &str) -> Option<PathBuf> {

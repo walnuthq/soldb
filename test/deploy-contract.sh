@@ -165,6 +165,31 @@ echo -e "${BLUE}Running: $SOLC_PATH ${COMPILE_FLAGS[*]} $CONTRACT_FILE${NC}"
 
 # Check for errors
 COMPILE_EXIT_CODE=${PIPESTATUS[0]}
+
+# solc >= ~0.8.32 dropped the `--ethdebug`/`--ethdebug-runtime` flags in favor of
+# `--ethdebug-program`/`--ethdebug-program-runtime` (gated behind `--experimental`), and
+# moved the global resources output behind its own `--ethdebug-resources` flag. Retry with
+# the modern flag names if solc specifically rejected the legacy ones, rather than hardcoding
+# a version cutoff that will inevitably drift out of date again.
+if [ "$USE_ETHDEBUG" = true ] && [ $COMPILE_EXIT_CODE -ne 0 ] && grep -q "unrecognised option" "$DEBUG_DIR/compile.log" && grep -q -- "--ethdebug" "$DEBUG_DIR/compile.log"; then
+    echo -e "${YELLOW}Legacy ETHDebug flags not recognised by this solc; retrying with modern flag names...${NC}"
+    COMPILE_FLAGS=(
+        --via-ir
+        --debug-info ethdebug
+        --experimental
+        --ethdebug-program
+        --ethdebug-program-runtime
+        --ethdebug-resources
+        --bin
+        --abi
+        --overwrite
+        -o "$DEBUG_DIR"
+    )
+    echo -e "${BLUE}Running: $SOLC_PATH ${COMPILE_FLAGS[*]} $CONTRACT_FILE${NC}"
+    "$SOLC_PATH" "${COMPILE_FLAGS[@]}" "$CONTRACT_FILE" 2>&1 | tee "$DEBUG_DIR/compile.log"
+    COMPILE_EXIT_CODE=${PIPESTATUS[0]}
+fi
+
 if [ $COMPILE_EXIT_CODE -ne 0 ]; then
     if [ "$USE_ETHDEBUG" = true ]; then
         echo -e "${RED}ETHDebug compilation failed with exit code $COMPILE_EXIT_CODE${NC}"
@@ -178,9 +203,11 @@ fi
 # Verify output files were created
 if [ "$USE_ETHDEBUG" = true ]; then
     echo -e "\n${BLUE}Verifying ETHDebug output...${NC}"
-    
-    if [ ! -f "$DEBUG_DIR/ethdebug.json" ]; then
-        echo -e "${YELLOW}Warning: Main ethdebug.json file not found${NC}"
+
+    # Modern solc renames the global resources file from `ethdebug.json` to
+    # `ethdebug_resources.json`; accept either.
+    if [ ! -f "$DEBUG_DIR/ethdebug.json" ] && [ ! -f "$DEBUG_DIR/ethdebug_resources.json" ]; then
+        echo -e "${YELLOW}Warning: Main ethdebug.json/ethdebug_resources.json file not found${NC}"
     else
         echo -e "${GREEN}✓ Found ethdebug.json${NC}"
     fi
