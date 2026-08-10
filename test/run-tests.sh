@@ -438,9 +438,10 @@ if [ "$RUN_TRACE_TESTS" = true ]; then
             "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/trace/increment-trace-legacy.test"
         fi
         
-        # Then run all other trace tests (they use solc 0.8.31)
-        # Ensure solc is set to 0.8.31 after legacy test may have changed it
-        echo -e "${BLUE}Running ETHDebug tests (solc 0.8.31)...${NC}"
+        # Then run all other trace tests (they need an ETHDebug-capable solc)
+        # Re-assert the ETHDebug compiler in case the legacy test changed it.
+        # ensure_ethdebug_solc reports the version actually selected.
+        echo -e "${BLUE}Running ETHDebug tests...${NC}"
         ensure_ethdebug_solc "$SOLC_PATH"
         export SOLC_PATH
         # Use lit's filter-out to exclude legacy test

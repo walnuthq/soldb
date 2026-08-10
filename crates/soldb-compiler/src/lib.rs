@@ -88,12 +88,38 @@ impl CompilerConfig {
     ) -> SoldbResult<CompilationResult> {
         let output_dir = output_dir.unwrap_or(&self.debug_output_dir);
         self.ensure_directories()?;
-        run_solc(
+        // solc >= ~0.8.32 dropped the `--ethdebug`/`--ethdebug-runtime` flags in favor of
+        // `--ethdebug-program`/`--ethdebug-program-runtime` (gated behind `--experimental`).
+        // Try the configured (legacy) flags first for compatibility with older/pinned solc
+        // installs, and fall back to the modern flag names only if solc specifically rejects
+        // the legacy ones - this keeps a single code path working across solc versions without
+        // needing to parse and hardcode a version cutoff.
+        match run_solc(
             &self.solc_path,
             &self.ethdebug_flags,
             contract_file.as_ref(),
             output_dir,
-        )
+        ) {
+            Ok(result) => Ok(result),
+            Err(SoldbError::Message(legacy_error))
+                if is_unrecognised_ethdebug_option(&legacy_error) =>
+            {
+                let modern_flags = modern_ethdebug_flags(&self.ethdebug_flags);
+                run_solc(
+                    &self.solc_path,
+                    &modern_flags,
+                    contract_file.as_ref(),
+                    output_dir,
+                )
+                .map_err(|modern_error| {
+                    SoldbError::Message(format!(
+                        "Compilation failed with legacy ETHDebug flags ({legacy_error}); \
+                             retry with modern ETHDebug flags also failed ({modern_error})"
+                    ))
+                })
+            }
+            Err(other) => Err(other),
+        }
     }
 
     pub fn compile_for_production(
@@ -387,12 +413,47 @@ fn run_solc(
     })
 }
 
+/// solc's replacement names for the ETHDebug flags it dropped (see
+/// `CompilerConfig::compile_with_ethdebug`). Kept as an explicit table rather than a
+/// string-pattern rewrite so it's obvious exactly which flags are affected.
+const MODERN_ETHDEBUG_REPLACEMENTS: &[(&str, &str)] = &[
+    ("--ethdebug", "--ethdebug-program"),
+    ("--ethdebug-runtime", "--ethdebug-program-runtime"),
+];
+
+fn modern_ethdebug_flags(flags: &[String]) -> Vec<String> {
+    let mut modern = Vec::with_capacity(flags.len() + 2);
+    modern.push("--experimental".to_owned());
+    for flag in flags {
+        let replacement = MODERN_ETHDEBUG_REPLACEMENTS
+            .iter()
+            .find(|(old, _)| *old == flag)
+            .map_or_else(|| flag.clone(), |(_, new)| (*new).to_owned());
+        modern.push(replacement);
+    }
+    // The old single `--ethdebug` flag also produced the global resources file
+    // (`ethdebug.json`); the modern API splits that out into its own opt-in flag.
+    if flags.iter().any(|flag| flag == "--ethdebug") {
+        modern.push("--ethdebug-resources".to_owned());
+    }
+    modern
+}
+
+fn is_unrecognised_ethdebug_option(error_message: &str) -> bool {
+    error_message.contains("unrecognised option") && error_message.contains("--ethdebug")
+}
+
 fn discover_output_files(output_dir: &Path) -> SoldbResult<CompilerOutputFiles> {
+    // Modern solc renames the global resources file from `ethdebug.json` to
+    // `ethdebug_resources.json`; accept either.
+    let global_ethdebug = [
+        output_dir.join("ethdebug.json"),
+        output_dir.join("ethdebug_resources.json"),
+    ]
+    .into_iter()
+    .find(|path| path.exists());
     let mut files = CompilerOutputFiles {
-        ethdebug: output_dir
-            .join("ethdebug.json")
-            .exists()
-            .then(|| output_dir.join("ethdebug.json")),
+        ethdebug: global_ethdebug,
         contracts: BTreeMap::new(),
     };
 

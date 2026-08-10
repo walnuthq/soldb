@@ -1515,7 +1515,12 @@ struct TraceSourceIndex {
 
 impl TraceSourceIndex {
     fn load(spec: &ResolvedContractSpec) -> SoldbResult<Self> {
-        let metadata_path = spec.debug_dir.join("ethdebug.json");
+        let metadata_path = find_ethdebug_metadata(&spec.debug_dir).ok_or_else(|| {
+            soldb_core::SoldbError::Message(format!(
+                "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
+                spec.debug_dir.display()
+            ))
+        })?;
         let runtime_path = find_runtime_ethdebug(&spec.debug_dir, &spec.name).ok_or_else(|| {
             soldb_core::SoldbError::Message(format!(
                 "No ETHDebug runtime file found in {}",
@@ -2221,6 +2226,17 @@ fn format_raw_stack(stack: &[String]) -> String {
         .join(" ")
 }
 
+fn find_ethdebug_metadata(root: &Path) -> Option<PathBuf> {
+    // Modern solc (>= ~0.8.32) renamed the global ETHDebug metadata file from
+    // `ethdebug.json` to `ethdebug_resources.json`; accept either.
+    [
+        root.join("ethdebug.json"),
+        root.join("ethdebug_resources.json"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+}
+
 fn find_runtime_ethdebug(root: &Path, contract_name: &str) -> Option<PathBuf> {
     let named = root.join(format!("{contract_name}_ethdebug-runtime.json"));
     if named.exists() {
@@ -2839,7 +2855,7 @@ fn find_debug_dir_for_contract(base_dir: &Path, contract_name: &str) -> PathBuf 
     ];
     candidates
         .into_iter()
-        .find(|candidate| candidate.join("ethdebug.json").exists())
+        .find(|candidate| find_ethdebug_metadata(candidate).is_some())
         .unwrap_or_else(|| base_dir.to_path_buf())
 }
 
@@ -2878,7 +2894,12 @@ fn read_json_file(path: &Path) -> SoldbResult<serde_json::Value> {
 }
 
 fn ethdebug_resources_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<serde_json::Value> {
-    let path = spec.debug_dir.join("ethdebug.json");
+    let path = find_ethdebug_metadata(&spec.debug_dir).ok_or_else(|| {
+        soldb_core::SoldbError::Message(format!(
+            "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
+            spec.debug_dir.display()
+        ))
+    })?;
     let metadata = read_json_file(&path)?;
     ethdebug_resources_from_metadata(&path, &metadata)
 }
@@ -3056,9 +3077,8 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
         };
     }
 
-    let ethdebug_json = spec.debug_dir.join("ethdebug.json");
-    let compiler_version = read_json_file(&ethdebug_json)
-        .ok()
+    let compiler_version = find_ethdebug_metadata(&spec.debug_dir)
+        .and_then(|ethdebug_json| read_json_file(&ethdebug_json).ok())
         .and_then(|value| {
             value
                 .get("compilation")
@@ -3187,7 +3207,7 @@ fn simulation_source_file(args: &SimulateArgs, contract_name: &str) -> Option<St
         .into_iter()
         .find(|spec| spec.name == contract_name)
         .and_then(|spec| {
-            let ethdebug = spec.debug_dir.join("ethdebug.json");
+            let ethdebug = find_ethdebug_metadata(&spec.debug_dir)?;
             read_json_file(&ethdebug).ok().and_then(|value| {
                 value
                     .get("compilation")
