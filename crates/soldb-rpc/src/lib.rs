@@ -444,10 +444,66 @@ pub struct StructLog {
     pub error: Option<String>,
 }
 
+/// Joins a `structLogs` memory array into one unprefixed hex string.
+///
+/// Nodes disagree on whether the words carry a `0x` prefix. Joining prefixed words
+/// verbatim produces `0x..0x..0x..`, which is neither valid hex nor indexable by byte
+/// offset, and it makes this backend disagree with the replay backend, which emits one
+/// unprefixed string. A step's memory is documented to be a flat byte sequence, and
+/// byte-offset lookups such as memory-located variable decoding assume exactly that.
+fn joined_memory(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            word.strip_prefix("0x")
+                .or_else(|| word.strip_prefix("0X"))
+                .unwrap_or(word)
+        })
+        .collect()
+}
+
 impl StructLog {
     #[must_use]
     pub fn into_trace_step(self) -> TraceStep {
         self.into_trace_step_with_previous_storage(&BTreeMap::new())
+    }
+
+    /// Builds a [`TraceStep`] from a borrowed log.
+    ///
+    /// Prefer this when walking a whole trace: the owning version cannot be used without
+    /// first cloning the log, which doubles the per-step copying for no benefit.
+    ///
+    /// A `TraceStep` records its stack, memory, and storage twice — once in the flat
+    /// fields and once in the snapshot — so two copies of each are unavoidable here. That
+    /// is the floor, and this function stays at it.
+    #[must_use]
+    pub fn to_trace_step_with_previous_storage(
+        &self,
+        previous_storage: &BTreeMap<String, String>,
+    ) -> TraceStep {
+        let memory = joined_memory(&self.memory);
+        let snapshot = StepSnapshot {
+            stack: self.stack.clone(),
+            memory: Some(memory.clone()),
+            storage: self.storage.clone(),
+            storage_diff: if self.storage.is_empty() {
+                BTreeMap::new()
+            } else {
+                storage_diff(previous_storage, &self.storage)
+            },
+        };
+        TraceStep {
+            pc: self.pc,
+            op: self.op.clone(),
+            gas: self.gas,
+            gas_cost: self.gas_cost,
+            depth: self.depth,
+            stack: self.stack.clone(),
+            memory: Some(memory),
+            storage: Some(self.storage.clone()),
+            error: self.error.clone(),
+            snapshot,
+        }
     }
 
     #[must_use]
@@ -455,16 +511,16 @@ impl StructLog {
         self,
         previous_storage: &BTreeMap<String, String>,
     ) -> TraceStep {
-        let memory = Some(self.memory.join(""));
-        let storage = self.storage.clone();
+        let memory = joined_memory(&self.memory);
+        // Clone into the snapshot first, then move the originals into the flat fields.
         let snapshot = StepSnapshot {
             stack: self.stack.clone(),
-            memory: memory.clone(),
-            storage: storage.clone(),
-            storage_diff: if storage.is_empty() {
+            memory: Some(memory.clone()),
+            storage: self.storage.clone(),
+            storage_diff: if self.storage.is_empty() {
                 BTreeMap::new()
             } else {
-                storage_diff(previous_storage, &storage)
+                storage_diff(previous_storage, &self.storage)
             },
         };
         TraceStep {
@@ -474,7 +530,7 @@ impl StructLog {
             gas_cost: self.gas_cost,
             depth: self.depth,
             stack: self.stack,
-            memory,
+            memory: Some(memory),
             storage: Some(self.storage),
             error: self.error,
             snapshot,
@@ -2318,7 +2374,7 @@ mod tests {
                     "gasCost": 3,
                     "depth": 0,
                     "stack": ["0x01"],
-                    "memory": ["aa", "bb"],
+                    "memory": ["0xaa", "bb"],
                     "storage": {"0x00": "0x2a"}
                 },
                 {"pc": 2, "op": "STOP", "gas": 97, "depth": 0}
@@ -2328,6 +2384,8 @@ mod tests {
 
         let steps = result.steps();
         assert_eq!(steps.len(), 2);
+        // Memory words are normalized to one unprefixed hex string whether or not the node
+        // prefixed them, so byte-offset lookups stay valid and both backends agree.
         assert_eq!(steps[0].memory.as_deref(), Some("aabb"));
         assert_eq!(steps[0].storage.as_ref().expect("storage")["0x00"], "0x2a");
         assert_eq!(steps[0].snapshot.stack, ["0x01"]);
