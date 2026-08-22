@@ -56,6 +56,13 @@ pub enum DebuggerCommand {
     Step,
     Continue,
     Goto(usize),
+    /// List every source variable ETHDebug reports as live at the current program counter.
+    Vars,
+    /// Print one source variable by name at the current program counter.
+    ///
+    /// An empty name means the user typed `print` with no argument; the frontend reports
+    /// the usage rather than treating it as an unknown command.
+    Print(String),
     Info(DebuggerInfoCommand),
     Mode(Option<DisplayMode>),
     Break(BreakpointTarget),
@@ -86,6 +93,8 @@ impl DebuggerCommand {
             "nexti" | "ni" | "stepi" | "si" => Self::NextInstruction,
             "step" | "s" => Self::Step,
             "continue" | "c" => Self::Continue,
+            "vars" | "locals" => Self::Vars,
+            "print" | "p" => Self::Print(rest),
             "goto" => rest
                 .parse::<usize>()
                 .map(Self::Goto)
@@ -278,8 +287,10 @@ impl DebuggerState {
             | DebuggerCommand::Help(_)
             | DebuggerCommand::Info(_)
             | DebuggerCommand::Mode(None)
+            | DebuggerCommand::Print(_)
             | DebuggerCommand::Quit
-            | DebuggerCommand::Unknown(_) => None,
+            | DebuggerCommand::Unknown(_)
+            | DebuggerCommand::Vars => None,
         }
     }
 
@@ -369,6 +380,20 @@ mod tests {
         assert_eq!(DebuggerCommand::parse("s"), DebuggerCommand::Step);
         assert_eq!(DebuggerCommand::parse("c"), DebuggerCommand::Continue);
         assert_eq!(DebuggerCommand::parse("goto 2"), DebuggerCommand::Goto(2));
+        assert_eq!(DebuggerCommand::parse("vars"), DebuggerCommand::Vars);
+        assert_eq!(DebuggerCommand::parse("LOCALS"), DebuggerCommand::Vars);
+        assert_eq!(
+            DebuggerCommand::parse("print balance"),
+            DebuggerCommand::Print("balance".to_owned())
+        );
+        assert_eq!(
+            DebuggerCommand::parse("p   balance  "),
+            DebuggerCommand::Print("balance".to_owned())
+        );
+        assert_eq!(
+            DebuggerCommand::parse("print"),
+            DebuggerCommand::Print(String::new())
+        );
         assert_eq!(
             DebuggerCommand::parse("info resources"),
             DebuggerCommand::Info(DebuggerInfoCommand::Resources { json: false })

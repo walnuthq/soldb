@@ -908,6 +908,17 @@ fn run_interactive_debugger(
                     println!("{} {}", warning("Could not print resources:"), error);
                 }
             }
+            DebuggerCommand::Vars => {
+                print_debugger_variables(&state, source_index.as_ref(), None);
+            }
+            DebuggerCommand::Print(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    println!("{} print <variable>", warning("Usage:"));
+                } else {
+                    print_debugger_variables(&state, source_index.as_ref(), Some(name));
+                }
+            }
             DebuggerCommand::Unknown(command) => {
                 println!("{} {}", warning("Unknown command:"), command);
             }
@@ -1172,15 +1183,90 @@ fn print_step_outcome(
     }
 }
 
+/// Prints the source variables ETHDebug reports as live at the current program counter.
+///
+/// With `filter` set, only the variable of that name is printed. This is the terminal
+/// counterpart of the DAP `variables` request; both go through
+/// `soldb_debugger::variables_for_step` so the two frontends decode identically.
+fn print_debugger_variables(
+    state: &DebuggerState,
+    source_index: Option<&TraceSourceIndex>,
+    filter: Option<&str>,
+) {
+    let Some(index) = source_index else {
+        println!(
+            "{} no ETHDebug metadata is loaded; start the session with `--ethdebug-dir <address>:<contract>:<dir>`",
+            warning("Cannot read variables:")
+        );
+        return;
+    };
+    let Some(trace) = state.trace() else {
+        println!("{} no trace is loaded", warning("Cannot read variables:"));
+        return;
+    };
+    let Some(step) = state.current_step_data() else {
+        println!(
+            "{} step {} is outside the loaded trace",
+            warning("Cannot read variables:"),
+            state.current_step
+        );
+        return;
+    };
+
+    let variables = soldb_debugger::variables_for_step(trace, &index.info, step);
+    let selected = variables
+        .iter()
+        .filter(|variable| filter.is_none_or(|name| variable.name == name))
+        .collect::<Vec<_>>();
+
+    if selected.is_empty() {
+        match filter {
+            Some(name) => println!(
+                "{} `{name}` is not in scope at PC {}",
+                warning("No such variable:"),
+                number_color(step.pc)
+            ),
+            None => println!(
+                "{} no variables in scope at PC {}",
+                dim("Variables:"),
+                number_color(step.pc)
+            ),
+        }
+        return;
+    }
+
+    for variable in selected {
+        let value = match variable.value.status {
+            soldb_debugger::DebugValueStatus::Unavailable => warning(&variable.value.display),
+            _ => success(&variable.value.display),
+        };
+        println!(
+            "{} {} = {} {}",
+            info(&variable.ty),
+            bold(&variable.name),
+            value,
+            dim(format!(
+                "[{}+{}]",
+                variable.location.kind, variable.location.offset
+            ))
+        );
+    }
+}
+
 fn print_debugger_help(topic: Option<&str>) {
     match topic {
         Some("mode") => println!("mode source|asm - switch display mode"),
         Some("info") => println!("info resources [--json] - print loaded ETHDebug resources"),
+        Some("vars" | "locals" | "print") => {
+            println!("vars - print every source variable live at the current PC");
+            println!("print <variable> - print one source variable by name");
+        }
         Some(topic) => println!("No help for {topic}"),
         None => {
             println!("Commands: next, nexti, step, continue, goto <step>");
             println!("          break <pc>|<file>:<line>|line <line>");
             println!("          clear <pc>|<file>:<line>|line <line>");
+            println!("          vars, print <variable>");
             println!("          info resources [--json]");
             println!("          mode source|asm, help, quit");
         }

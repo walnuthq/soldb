@@ -116,6 +116,48 @@ soldb> mode asm
 soldb> mode assembly
 ```
 
+## Variables
+
+Both commands read the ETHDebug variable information for the current program counter, so
+the session must be started with `--ethdebug-dir <address>:<contract>:<dir>`. They share
+their decoding with the DAP server's variables view.
+
+Note that a compiler only reports variables if it emits `context.variables` in its
+ETHDebug output. Compilers that do not yet emit it make these commands report that
+nothing is in scope, which is a limitation of the debug info rather than of the lookup.
+
+### `vars`
+
+Aliases: `locals`
+
+Print every source variable ETHDebug reports as live at the current program counter, with
+its declared type, decoded value, and the location the value was read from.
+
+```text
+soldb> vars
+uint256 amount = 5 [stack+2]
+uint256 oldValue = 0 [stack+1]
+```
+
+A value shown as `<unavailable>` means the backend did not capture the stack, memory, or
+storage the variable lives in — not that the variable is unset.
+
+### `print <variable>`
+
+Aliases: `p <variable>`
+
+Print one variable by name.
+
+```text
+soldb> print amount
+uint256 amount = 5 [stack+2]
+soldb> p oldValue
+uint256 oldValue = 0 [stack+1]
+```
+
+If the name is not live at the current program counter, SolDB says so and names the PC it
+looked at, so you can step to a point where the variable is in scope.
+
 ## Metadata
 
 ### `info resources`
@@ -154,8 +196,12 @@ soldb> b 0x8d
 
 Aliases: `b <file>:<line>`
 
-Set a breakpoint at the first EVM program counter mapped to a source line by
-ETHDebug metadata.
+Set a breakpoint at the first executed EVM program counter generated for a source line.
+
+Among the instructions whose ETHDebug span touches the line, SolDB prefers those whose
+span *begins* on it. Compilers attach a whole-contract span to the dispatcher preamble,
+and that span technically contains every line, so without this preference every source
+breakpoint would resolve to the start of the contract.
 
 ```text
 soldb> break Counter.sol:7
@@ -218,8 +264,24 @@ Current output:
 Commands: next, nexti, step, continue, goto <step>
           break <pc>|<file>:<line>|line <line>
           clear <pc>|<file>:<line>|line <line>
+          vars, print <variable>
           info resources [--json]
           mode source|asm, help, quit
+```
+
+### `help vars`
+
+Print help for variable inspection. `help locals` and `help print` show the same text.
+
+```text
+soldb> help vars
+```
+
+Current output:
+
+```text
+vars - print every source variable live at the current PC
+print <variable> - print one source variable by name
 ```
 
 ### `help info`

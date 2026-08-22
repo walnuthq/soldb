@@ -2559,6 +2559,7 @@ dependencies = [
  "soldb-bridge",
  "soldb-compiler",
  "soldb-core",
+ "soldb-debugger",
  "soldb-ethdebug",
  "soldb-repl",
  "soldb-rpc",
