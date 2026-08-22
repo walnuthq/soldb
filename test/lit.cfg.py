@@ -123,7 +123,10 @@ if not not_path:
             not_path = candidate
             break
 if not_path:
-    config.substitutions.append(('not', not_path))
+    # Anchor on word boundaries. lit substitutions are regular expressions applied to the
+    # whole RUN line, so a bare 'not' also rewrites the substring inside identifiers,
+    # paths, and expected output such as 'definitely_not_a_variable'.
+    config.substitutions.append((r'\bnot\b', not_path))
 
 # Find and add FileCheck
 filecheck_path = None
