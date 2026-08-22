@@ -104,8 +104,8 @@ fn web_steps(trace: &TransactionTrace) -> Vec<serde_json::Value> {
                 "gas": step.gas,
                 "gasCost": step.gas_cost,
                 "depth": step.depth,
-                "stack": step.stack,
-                "snapshot": step.normalized_snapshot(),
+                "stack": step.snapshot_ref().stack,
+                "snapshot": step.snapshot_ref(),
             })
         })
         .collect()

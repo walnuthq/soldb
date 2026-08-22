@@ -1114,8 +1114,9 @@ fn print_current_debugger_step(state: &DebuggerState) {
         number_color(step.pc),
         opcode_color(&step.op)
     );
-    if !step.stack.is_empty() {
-        println!("{} {}", info("Stack:"), format_stack(&step.stack));
+    let stack = step.snapshot_ref().stack;
+    if !stack.is_empty() {
+        println!("{} {}", info("Stack:"), format_stack(stack));
     }
 }
 
@@ -1307,7 +1308,7 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
         if !matches!(step.op.as_str(), "CALL" | "DELEGATECALL" | "STATICCALL") {
             continue;
         }
-        let Some(address_word) = call_target_stack_word(&step.stack) else {
+        let Some(address_word) = call_target_stack_word(step.snapshot_ref().stack) else {
             continue;
         };
         let Some(address) = extract_address_from_stack_word(address_word) else {
@@ -1447,15 +1448,15 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
     };
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
-        let snapshot = step.normalized_snapshot();
+        let snapshot = step.snapshot_ref();
         println!(
             "{} | {} | {} | {} | {} | {}",
             number_color(format!("{index:>4}")),
             number_color(format!("{:>4}", step.pc)),
             opcode_color(format!("{:<14}", step.op)),
             success(format!("{:>8}", step.gas)),
-            format_stack(&snapshot.stack),
-            format_snapshot_state(&snapshot)
+            format_stack(snapshot.stack),
+            format_snapshot_state(snapshot)
         );
     }
 }
@@ -1488,15 +1489,15 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_
     };
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
-        let snapshot = step.normalized_snapshot();
+        let snapshot = step.snapshot_ref();
         println!(
             "{} | {} | {} | {} | {} | {}",
             number_color(format!("{index:>4}")),
             number_color(format!("{:>4}", step.pc)),
             opcode_color(format!("{:<14}", step.op)),
             success(format!("{:>8}", step.gas)),
-            format_stack(&snapshot.stack),
-            format_snapshot_state(&snapshot)
+            format_stack(snapshot.stack),
+            format_snapshot_state(snapshot)
         );
     }
 }
@@ -2031,7 +2032,7 @@ fn build_call_frames(
                 source_params: function.params.clone(),
                 source_path: index.info.sources.get(&function.source_id).cloned(),
                 source_line: Some(function.declaration_line),
-                raw_stack: step.stack.clone(),
+                raw_stack: step.snapshot_ref().stack.to_vec(),
                 internal: false,
             });
         }
@@ -3463,9 +3464,9 @@ fn format_stack(stack: &[String]) -> String {
     items.join(" ")
 }
 
-fn format_snapshot_state(snapshot: &soldb_core::StepSnapshot) -> String {
+fn format_snapshot_state(snapshot: soldb_core::StepSnapshotRef<'_>) -> String {
     let mut items = Vec::new();
-    if let Some(memory) = &snapshot.memory {
+    if let Some(memory) = snapshot.memory {
         if !memory.is_empty() {
             items.push(format!("mem={}b", memory.len() / 2));
         }

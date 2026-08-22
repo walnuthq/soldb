@@ -368,7 +368,7 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        step.normalized_snapshot()
+        step.snapshot_ref()
             .stack
             .iter()
             .enumerate()
@@ -382,7 +382,7 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        let Some(memory) = step.normalized_snapshot().memory else {
+        let Some(memory) = step.snapshot_ref().memory else {
             return Vec::new();
         };
         if memory.is_empty() {
@@ -406,7 +406,7 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        let snapshot = step.normalized_snapshot();
+        let snapshot = step.snapshot_ref();
         let mut variables = snapshot
             .storage
             .iter()
@@ -456,14 +456,14 @@ impl DapServer {
                     .parse::<usize>()
                     .ok();
                 index
-                    .and_then(|index| step.normalized_snapshot().stack.get(index).cloned())
+                    .and_then(|index| step.snapshot_ref().stack.get(index).cloned())
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
             expression if expression.starts_with("storage[") && expression.ends_with(']') => {
                 let slot = expression
                     .trim_start_matches("storage[")
                     .trim_end_matches(']');
-                step.normalized_snapshot()
+                step.snapshot_ref()
                     .storage
                     .get(slot)
                     .cloned()

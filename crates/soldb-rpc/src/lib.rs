@@ -643,15 +643,16 @@ enum RpcBlockTransaction {
 impl DebugTraceResult {
     #[must_use]
     pub fn steps(&self) -> Vec<TraceStep> {
-        let mut previous_storage = BTreeMap::<String, String>::new();
+        static EMPTY_STORAGE: BTreeMap<String, String> = BTreeMap::new();
+
+        // Borrow the previous log's storage rather than copying it forward: this runs once
+        // per EVM step, and a trace can have hundreds of thousands of them.
+        let mut previous_storage = &EMPTY_STORAGE;
         self.struct_logs
             .iter()
-            .cloned()
             .map(|log| {
-                let step = log
-                    .clone()
-                    .into_trace_step_with_previous_storage(&previous_storage);
-                previous_storage = log.storage;
+                let step = log.to_trace_step_with_previous_storage(previous_storage);
+                previous_storage = &log.storage;
                 step
             })
             .collect()
@@ -851,10 +852,21 @@ fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
         .struct_logs
         .iter()
         .any(|step| !step.storage.is_empty());
-    let has_storage_diff = result
-        .steps()
-        .iter()
-        .any(|step| !step.snapshot.storage_diff.is_empty());
+    // Whether any step reports a storage change, read straight off the logs. Calling
+    // `steps()` here would build the entire trace a second time — hundreds of thousands of
+    // steps, each with a copy of the stack and of all of memory — and then throw it away to
+    // answer a boolean. This mirrors what `to_trace_step_with_previous_storage` computes:
+    // a step has a diff when its own storage is non-empty and differs from the previous
+    // step's.
+    let has_storage_diff = {
+        static EMPTY_STORAGE: BTreeMap<String, String> = BTreeMap::new();
+        let mut previous = &EMPTY_STORAGE;
+        result.struct_logs.iter().any(|log| {
+            let changed = !log.storage.is_empty() && *previous != log.storage;
+            previous = &log.storage;
+            changed
+        })
+    };
     let mut notes = Vec::new();
     if has_steps && !has_storage {
         notes.push("debug-rpc node did not return per-step storage".to_owned());
@@ -1688,6 +1700,13 @@ struct ReplayStepInspector {
     call_stack: Vec<usize>,
     create_stack: Vec<usize>,
     journal_entries_seen: usize,
+    /// EVM memory as of the last step that changed it, with its hex encoding.
+    ///
+    /// Most instructions leave memory untouched, but the inspector records memory on every
+    /// step. Without this the encoder runs a full pass over memory per step even when
+    /// nothing moved.
+    last_memory: Vec<u8>,
+    last_memory_hex: String,
 }
 
 impl ReplayStepInspector {
@@ -1718,7 +1737,20 @@ where
             .iter()
             .map(|value| format_u256_quantity(*value))
             .collect();
-        let memory = bytes_to_hex(interp.memory.slice(0..interp.memory.size()).as_ref());
+        {
+            let memory_slice = interp.memory.slice(0..interp.memory.size());
+            let memory_bytes: &[u8] = memory_slice.as_ref();
+            if self.last_memory != memory_bytes {
+                self.last_memory.clear();
+                self.last_memory.extend_from_slice(memory_bytes);
+                self.last_memory_hex = bytes_to_hex(memory_bytes);
+            }
+        }
+        let memory = if self.last_memory_hex.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.last_memory_hex.clone()]
+        };
         self.pending = Some(StructLog {
             pc: interp.bytecode.pc() as u64,
             op,
@@ -1726,10 +1758,7 @@ where
             gas_cost: 0,
             depth: context.journal_mut().depth() as u64,
             stack,
-            memory: memory
-                .is_empty()
-                .then(Vec::new)
-                .unwrap_or_else(|| vec![memory]),
+            memory,
             storage: BTreeMap::new(),
             error: None,
         });
@@ -2361,6 +2390,69 @@ mod tests {
     };
     use serde_json::{json, Value};
     use soldb_core::TransactionTrace;
+
+    #[test]
+    fn storage_diff_capability_matches_the_materialized_steps() {
+        // `debug_rpc_capabilities` reads the storage-diff flag off the raw logs instead of
+        // building every step. Pin it against the definition it replaces.
+        let log = |storage: &[(&str, &str)]| StructLog {
+            pc: 0,
+            op: "SSTORE".to_owned(),
+            gas: 0,
+            gas_cost: 0,
+            depth: 0,
+            stack: Vec::new(),
+            memory: Vec::new(),
+            storage: storage
+                .iter()
+                .map(|(slot, value)| ((*slot).to_owned(), (*value).to_owned()))
+                .collect(),
+            error: None,
+        };
+
+        let cases = [
+            Vec::new(),
+            vec![log(&[])],
+            vec![log(&[("0x00", "0x01")])],
+            vec![log(&[("0x00", "0x01")]), log(&[("0x00", "0x01")])],
+            vec![log(&[("0x00", "0x01")]), log(&[("0x00", "0x02")])],
+            vec![log(&[("0x00", "0x01")]), log(&[])],
+            vec![log(&[]), log(&[("0x00", "0x01")])],
+        ];
+
+        for struct_logs in cases {
+            let result = DebugTraceResult {
+                struct_logs,
+                return_value: String::new(),
+                error: None,
+                failed: false,
+                gas: None,
+                artifacts: TraceArtifacts::default(),
+            };
+            let materialized = result
+                .steps()
+                .iter()
+                .any(|step| !step.snapshot.storage_diff.is_empty());
+            assert_eq!(
+                super::debug_rpc_capabilities(&result).storage_diff,
+                materialized,
+                "logs: {:?}",
+                result.struct_logs
+            );
+        }
+    }
+
+    #[test]
+    fn hex_decoding_rejects_non_ascii_without_panicking() {
+        // Hex strings arrive from RPC responses and CLI arguments. Slicing them by byte
+        // offset panicked when a multi-byte character straddled a digit pair.
+        assert_eq!(super::hex_to_bytes("\u{20ac}\u{20ac}"), None);
+        assert_eq!(super::hex_to_bytes("0\u{20ac}"), None);
+        assert_eq!(super::hex_to_bytes("zz"), None);
+        assert_eq!(super::hex_to_bytes("abc"), None);
+        assert_eq!(super::hex_to_bytes("0a1B"), Some(vec![0x0a, 0x1b]));
+        assert_eq!(super::hex_to_bytes(""), Some(Vec::new()));
+    }
 
     #[test]
     fn parses_struct_logs_into_trace_steps() {

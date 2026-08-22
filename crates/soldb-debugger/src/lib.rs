@@ -245,15 +245,15 @@ fn raw_value_for_location(
     step: &TraceStep,
     variable: &VariableLocation,
 ) -> Option<String> {
-    let snapshot = step.normalized_snapshot();
+    let snapshot = step.snapshot_ref();
     match variable.location_type.as_str() {
         "stack" => snapshot
             .stack
             .get(variable.offset as usize)
             .map(|value| normalize_hex(value)),
-        "memory" => word_from_hex_bytes(snapshot.memory.as_deref()?, variable.offset as usize),
+        "memory" => word_from_hex_bytes(snapshot.memory?, variable.offset as usize),
         "calldata" => word_from_hex_bytes(&trace.input_data, variable.offset as usize),
-        "storage" => storage_value(&snapshot.storage, variable.offset),
+        "storage" => storage_value(snapshot.storage, variable.offset),
         _ => None,
     }
 }

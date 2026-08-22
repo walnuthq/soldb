@@ -50,16 +50,68 @@ pub struct TraceStep {
 }
 
 impl TraceStep {
+    /// Borrows the machine state this step captured, without copying it.
+    ///
+    /// A step records the same data twice: the flat `stack`/`memory`/`storage` fields, and
+    /// a [`StepSnapshot`] that additionally carries the storage diff. Whichever is
+    /// populated, this returns a view of it.
+    ///
+    /// Prefer this over [`TraceStep::normalized_snapshot`] anywhere that walks a trace.
+    /// Traces routinely run to hundreds of thousands of steps and each one's `memory` can
+    /// be tens of kilobytes, so copying per step — or, as variable decoding does, per
+    /// variable per step — dominates the cost of reading a trace.
+    #[must_use]
+    pub fn snapshot_ref(&self) -> StepSnapshotRef<'_> {
+        static EMPTY_STORAGE: BTreeMap<String, String> = BTreeMap::new();
+        static EMPTY_STORAGE_DIFF: BTreeMap<String, StorageChange> = BTreeMap::new();
+
+        if !self.snapshot.is_empty() {
+            return StepSnapshotRef {
+                stack: &self.snapshot.stack,
+                memory: self.snapshot.memory.as_deref(),
+                storage: &self.snapshot.storage,
+                storage_diff: &self.snapshot.storage_diff,
+            };
+        }
+        StepSnapshotRef {
+            stack: &self.stack,
+            memory: self.memory.as_deref(),
+            storage: self.storage.as_ref().unwrap_or(&EMPTY_STORAGE),
+            storage_diff: &EMPTY_STORAGE_DIFF,
+        }
+    }
+
+    /// Copies the machine state this step captured into an owned [`StepSnapshot`].
+    ///
+    /// Use this only when ownership is genuinely required; [`TraceStep::snapshot_ref`] is
+    /// the same view without the copy.
     #[must_use]
     pub fn normalized_snapshot(&self) -> StepSnapshot {
-        if !self.snapshot.is_empty() {
-            return self.snapshot.clone();
-        }
+        self.snapshot_ref().to_owned_snapshot()
+    }
+}
+
+/// A borrowed view of one step's captured machine state.
+///
+/// Serializes identically to [`StepSnapshot`], so it can stand in wherever a snapshot is
+/// written out. Produced by [`TraceStep::snapshot_ref`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct StepSnapshotRef<'a> {
+    pub stack: &'a [String],
+    pub memory: Option<&'a str>,
+    pub storage: &'a BTreeMap<String, String>,
+    pub storage_diff: &'a BTreeMap<String, StorageChange>,
+}
+
+impl StepSnapshotRef<'_> {
+    /// Copies this view into an owned [`StepSnapshot`].
+    #[must_use]
+    pub fn to_owned_snapshot(&self) -> StepSnapshot {
         StepSnapshot {
-            stack: self.stack.clone(),
-            memory: self.memory.clone(),
-            storage: self.storage.clone().unwrap_or_default(),
-            storage_diff: BTreeMap::new(),
+            stack: self.stack.to_vec(),
+            memory: self.memory.map(str::to_owned),
+            storage: self.storage.clone(),
+            storage_diff: self.storage_diff.clone(),
         }
     }
 }
@@ -246,10 +298,69 @@ pub struct FunctionCall {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         FunctionCall, StepSnapshot, StorageChange, TraceArtifacts, TraceCapabilities, TraceStep,
         TransactionTrace,
     };
+
+    fn step_with(snapshot: StepSnapshot) -> TraceStep {
+        TraceStep {
+            pc: 3,
+            op: "SSTORE".to_owned(),
+            gas: 100,
+            gas_cost: 5,
+            depth: 1,
+            stack: vec!["0x01".to_owned(), "0x02".to_owned()],
+            memory: Some("aabb".to_owned()),
+            storage: Some(BTreeMap::from([("0x00".to_owned(), "0x2a".to_owned())])),
+            error: None,
+            snapshot,
+        }
+    }
+
+    #[test]
+    fn borrowed_snapshot_matches_the_owned_one() {
+        // `snapshot_ref` is what every trace walk uses, so it has to be indistinguishable
+        // from `normalized_snapshot` in both shapes a step can take: snapshot populated,
+        // and only the flat fields populated. The serialized forms must match too, because
+        // the web JSON document writes a snapshot per step.
+        let flat = step_with(StepSnapshot::default());
+        let populated = step_with(StepSnapshot {
+            stack: vec!["0x09".to_owned()],
+            memory: Some("ccdd".to_owned()),
+            storage: BTreeMap::from([("0x01".to_owned(), "0x63".to_owned())]),
+            storage_diff: BTreeMap::from([(
+                "0x01".to_owned(),
+                StorageChange {
+                    before: None,
+                    after: Some("0x63".to_owned()),
+                },
+            )]),
+        });
+
+        for step in [&flat, &populated] {
+            assert_eq!(
+                step.snapshot_ref().to_owned_snapshot(),
+                step.normalized_snapshot()
+            );
+            assert_eq!(
+                serde_json::to_string(&step.snapshot_ref()).expect("borrowed snapshot"),
+                serde_json::to_string(&step.normalized_snapshot()).expect("owned snapshot"),
+            );
+        }
+
+        // The flat shape falls back to the top-level fields and reports no storage diff.
+        assert_eq!(flat.snapshot_ref().stack, ["0x01", "0x02"]);
+        assert_eq!(flat.snapshot_ref().memory, Some("aabb"));
+        assert!(flat.snapshot_ref().storage_diff.is_empty());
+
+        // A populated snapshot wins over the flat fields.
+        assert_eq!(populated.snapshot_ref().stack, ["0x09"]);
+        assert_eq!(populated.snapshot_ref().memory, Some("ccdd"));
+        assert_eq!(populated.snapshot_ref().storage_diff.len(), 1);
+    }
 
     #[test]
     fn core_models_are_serializable() {
