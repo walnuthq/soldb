@@ -1624,7 +1624,12 @@ impl TraceSourceIndex {
         current_step: usize,
     ) -> Result<ResolvedSourceBreakpoint, String> {
         let source_ids = self.resolve_source_ids(target)?;
-        let mut candidates = Vec::<ResolvedSourceBreakpoint>::new();
+        // Rank every instruction whose source span touches the line. A span that *begins*
+        // on the line describes code generated for that line; a span that merely contains
+        // it can be an enclosing range. solc attributes the dispatcher preamble to the
+        // whole contract, and that range intersects every line, so ranking is what keeps
+        // `break File.sol:N` from resolving to the contract's first instruction for any N.
+        let mut ranked = Vec::<(bool, u64, ResolvedSourceBreakpoint)>::new();
 
         for source_id in source_ids {
             let Some(source) = self.source_contents.get(&source_id) else {
@@ -1648,20 +1653,38 @@ impl TraceSourceIndex {
                     .get(&source_id)
                     .cloned()
                     .unwrap_or_else(|| format!("source:{source_id}"));
-                candidates.push(ResolvedSourceBreakpoint {
-                    pc: instruction.offset,
-                    path,
-                    line: target.line,
-                });
+                ranked.push((
+                    span_starts_on_line(source, &location, target.line),
+                    location.length,
+                    ResolvedSourceBreakpoint {
+                        pc: instruction.offset,
+                        path,
+                        line: target.line,
+                    },
+                ));
             }
         }
 
-        if candidates.is_empty() {
+        let Some(&(starts_on_line, narrowest, _)) = ranked
+            .iter()
+            .min_by_key(|(starts_on_line, length, _)| (!*starts_on_line, *length))
+        else {
             return Err(match &target.file {
                 Some(file) => format!("no instruction maps to {file}:{}", target.line),
                 None => format!("no instruction maps to line {}", target.line),
             });
-        }
+        };
+
+        // Keep every instruction generated for the line. When nothing starts on the line
+        // the target sits inside a multi-line construct, so keep only the tightest spans
+        // and let wider enclosing ranges lose.
+        let candidates = ranked
+            .into_iter()
+            .filter(|(candidate_starts, length, _)| {
+                *candidate_starts == starts_on_line && (starts_on_line || *length == narrowest)
+            })
+            .map(|(_, _, candidate)| candidate)
+            .collect::<Vec<_>>();
 
         for step in trace.steps.iter().skip(current_step.saturating_add(1)) {
             if let Some(candidate) = candidates
@@ -1683,10 +1706,13 @@ impl TraceSourceIndex {
             }
         }
 
-        Ok(candidates
+        candidates
             .into_iter()
             .min_by_key(|candidate| candidate.pc)
-            .expect("candidates are non-empty"))
+            .ok_or_else(|| match &target.file {
+                Some(file) => format!("no instruction maps to {file}:{}", target.line),
+                None => format!("no instruction maps to line {}", target.line),
+            })
     }
 
     fn resolve_source_ids(&self, target: &SourceBreakpointTarget) -> Result<Vec<u64>, String> {
@@ -1725,6 +1751,15 @@ fn source_path_matches(source_path: &str, requested: &str) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == requested)
+}
+
+/// Reports whether an ETHDebug source span begins on `line`.
+///
+/// Spans that begin on the requested line are the instructions solc generated for it;
+/// spans that only contain the line are enclosing ranges such as the whole-contract span
+/// attached to the dispatcher preamble.
+fn span_starts_on_line(source: &str, location: &SourceLocation, line: u64) -> bool {
+    line_for_offset(source, location.offset as usize) == line
 }
 
 fn span_intersects_line(source: &str, location: &SourceLocation, line: u64) -> bool {
@@ -3471,6 +3506,93 @@ mod tests {
             multi_contract: false,
             json_events: false,
         }
+    }
+
+    fn instruction_at(pc: u64, offset: u64, length: u64) -> Instruction {
+        Instruction {
+            offset: pc,
+            operation: serde_json::json!({"mnemonic": "JUMPDEST"}),
+            context: Some(serde_json::json!({
+                "code": {"source": {"id": 0}, "range": {"offset": offset, "length": length}}
+            })),
+        }
+    }
+
+    #[test]
+    fn source_breakpoints_prefer_the_span_generated_for_the_line() {
+        // Three source lines; the statement for line 2 starts at byte 10.
+        let source = "contract C {\n  uint x = 1;\n}\n";
+        let line_two_offset = source.find("uint").expect("line two statement") as u64;
+
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: vec![
+                // The dispatcher preamble solc attributes to the whole contract. Its span
+                // intersects every line, so it used to win every source breakpoint.
+                instruction_at(2, 0, source.len() as u64),
+                instruction_at(4, 0, source.len() as u64),
+                // The instruction actually generated for line 2.
+                instruction_at(64, line_two_offset, 11),
+            ],
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let index = TraceSourceIndex {
+            spec: ResolvedContractSpec {
+                address: None,
+                name: "C".to_owned(),
+                debug_dir: PathBuf::from("."),
+            },
+            info,
+            resources: serde_json::Value::Null,
+            functions: Vec::new(),
+            source_contents: BTreeMap::from([(0, source.to_owned())]),
+        };
+
+        let mut trace = TransactionTrace {
+            tx_hash: None,
+            from_addr: "0x1".to_owned(),
+            to_addr: None,
+            value: "0x0".to_owned(),
+            input_data: "0x".to_owned(),
+            gas_used: 0,
+            output: "0x".to_owned(),
+            success: true,
+            error: None,
+            debug_trace_available: true,
+            contract_address: None,
+            backend: None,
+            capabilities: Default::default(),
+            artifacts: Default::default(),
+            steps: Vec::new(),
+        };
+        for pc in [2, 4, 64] {
+            trace.steps.push(soldb_core::TraceStep {
+                pc,
+                op: "JUMPDEST".to_owned(),
+                gas: 0,
+                gas_cost: 0,
+                depth: 0,
+                stack: Vec::new(),
+                memory: None,
+                storage: None,
+                error: None,
+                snapshot: Default::default(),
+            });
+        }
+
+        let target = SourceBreakpointTarget {
+            file: Some("C.sol".to_owned()),
+            line: 2,
+        };
+        let resolved = index
+            .resolve_breakpoint(&target, &trace, 0)
+            .expect("resolve breakpoint");
+
+        assert_eq!(resolved.pc, 64);
+        assert_eq!(resolved.line, 2);
     }
 
     #[test]
