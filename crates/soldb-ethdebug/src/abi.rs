@@ -1,3 +1,12 @@
+//! ABI encoding and function-signature parsing.
+//!
+//! This module turns a human-written signature such as `submitPerson((string,uint256))`
+//! plus its arguments into calldata, and derives the four-byte selector for it. Tuples,
+//! fixed and dynamic arrays, and the elementary value types are supported.
+//!
+//! It also carries the keccak-256 implementation used for selectors and event topics, so
+//! the workspace does not take a hashing dependency for this one purpose.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult};

@@ -1,3 +1,14 @@
+//! Decoding transaction logs against event ABIs.
+//!
+//! An [`EventRegistry`] is built from the event entries of one or more contract ABIs and
+//! keyed by topic hash, so a log can be matched and its indexed and non-indexed
+//! arguments decoded back into typed values.
+//!
+//! Log payloads come from the chain and are not trusted. Offsets and lengths read out of
+//! event data are validated and their arithmetic is checked: an unchecked offset wraps in
+//! release builds and turns into a reversed slice range, and an unchecked length turns
+//! into an unbounded allocation.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

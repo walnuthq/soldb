@@ -1,3 +1,17 @@
+//! Driving `solc` and discovering the ETHDebug artifacts it produces.
+//!
+//! This crate compiles Solidity with debug info enabled, locates the resulting
+//! artifacts, and provides the deploy helpers behind local auto-deploy workflows.
+//!
+//! ETHDebug's command-line surface has changed across compiler releases: older versions
+//! accept `--ethdebug`/`--ethdebug-runtime`, while newer ones expose the same output
+//! through `--experimental --ethdebug-program`/`--ethdebug-program-runtime`/
+//! `--ethdebug-resources`. [`CompilerConfig::compile_with_ethdebug`] probes for that by
+//! trying the configured flags and falling back only when the compiler rejects them as
+//! unrecognised, so a single code path works across versions without a hardcoded cutoff.
+//! Artifact discovery is version-tolerant for the same reason and accepts either the
+//! `ethdebug.json` or the `ethdebug_resources.json` spelling of the resources file.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -1,3 +1,13 @@
+//! The legacy `srcmap` debug format.
+//!
+//! Compilers that predate ETHDebug emit source mappings as a compact `s:l:f:j:m` string
+//! alongside the bytecode, with fields inherited from the previous entry when omitted.
+//! This module parses that format and builds the program-counter index for it, which
+//! requires walking the bytecode so `PUSH` immediates are not mistaken for opcodes.
+//!
+//! This is a fallback path. ETHDebug is the primary source of debug information and
+//! carries strictly more of it; prefer it whenever the compiler can produce it.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

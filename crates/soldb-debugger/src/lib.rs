@@ -1,3 +1,18 @@
+//! Source-level debugging over an execution trace.
+//!
+//! Given a [`soldb_core::TransactionTrace`] and the ETHDebug metadata for the contract
+//! it executed, this crate answers the questions a source-level debugger asks: which
+//! source span a step is at, which function contains a program counter, and which
+//! variables are live there with what values.
+//!
+//! It is frontend-agnostic on purpose. [`variables_for_step`] is what backs both the CLI
+//! REPL's `vars`/`print` commands and the DAP server's variables view, so the terminal
+//! and the editor decode identically.
+//!
+//! Variable values are only as good as the debug info: a location the backend did not
+//! capture decodes to [`DebugValueStatus::Unavailable`], and a value whose declared type
+//! is not decodable is reported as [`DebugValueStatus::Raw`] rather than guessed at.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,15 @@
+//! The interactive debugger's command parser and state machine.
+//!
+//! [`DebuggerCommand::parse`] turns a typed line into a command, and
+//! [`DebuggerState::apply_command`] applies the ones that move the debugger, returning a
+//! [`StepOutcome`] describing what happened.
+//!
+//! This crate performs no I/O: it neither reads stdin nor prints. The frontend owns the
+//! terminal and renders outcomes, which is what makes stepping, breakpoints, and command
+//! parsing testable without a terminal or a node. Commands that need context the state
+//! machine does not have — source-line breakpoints, variable lookups — return `None`
+//! from `apply_command` and are resolved by the frontend against ETHDebug metadata.
+
 use std::collections::BTreeSet;
 
 use soldb_core::{TraceStep, TransactionTrace};

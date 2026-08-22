@@ -1,3 +1,20 @@
+//! The `soldb` command-line interface.
+//!
+//! This binary owns argument parsing, command dispatch, and every piece of
+//! human-readable formatting in the project: the library crates return data and this
+//! layer decides how it looks. That split is what lets the DAP server and the JSON
+//! output reuse the same logic without inheriting terminal behavior.
+//!
+//! Output conventions worth preserving when editing this file:
+//!
+//! - Colors go through the `paint` helpers, which honor `NO_COLOR`, `CLICOLOR_FORCE`,
+//!   and whether stdout is a terminal. Emitting escapes directly breaks the lit tests.
+//! - `--json` and `--json-events` print only their JSON document, so the output stays
+//!   pipeable into `jq`. Progress lines must stay gated on those flags.
+//! - A command that has already rendered a failure returns
+//!   [`soldb_core::SoldbError::AlreadyReported`] so the exit path does not print it
+//!   twice. Failures exit with code 2.
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;

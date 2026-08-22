@@ -1,3 +1,12 @@
+//! The Debug Adapter Protocol server.
+//!
+//! [`DapServer`] holds one debug session and maps DAP requests onto it: launching from a
+//! trace file, an inline trace, or a transaction hash plus RPC URL; setting breakpoints;
+//! reporting stack frames, scopes, and variables; and stepping.
+//!
+//! Source mapping and variable decoding go through `soldb-ethdebug` and `soldb-debugger`
+//! so an editor reports the same values as the terminal debugger.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};

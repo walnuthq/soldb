@@ -1,3 +1,22 @@
+//! Loading and interpreting compiler-generated Solidity debug information.
+//!
+//! This is the metadata half of an ETHDebug-first debugger: it turns `solc` artifacts
+//! into the program-counter, source-location, variable, and ABI lookups the rest of the
+//! workspace needs. Nothing here touches the network.
+//!
+//! - [`metadata`] models ETHDebug artifacts: instructions, their source spans, live
+//!   variable locations, and the `address:name:dir` contract specs used on the command
+//!   line.
+//! - [`source_map`] reads the legacy `srcmap` format, the fallback for compilers that
+//!   predate ETHDebug.
+//! - [`abi`] encodes calldata and parses function signatures, including tuples and
+//!   arrays, and carries the keccak-256 implementation used to derive selectors.
+//! - [`events`] decodes logs against event ABIs.
+//!
+//! Everything decoded here comes from files or from chain data, so it is untrusted:
+//! offsets and lengths read out of an artifact or a log payload are validated rather
+//! than trusted to be in range.
+
 pub mod abi;
 pub mod events;
 pub mod metadata;

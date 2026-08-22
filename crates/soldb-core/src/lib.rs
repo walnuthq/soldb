@@ -1,3 +1,18 @@
+//! Shared vocabulary types for the SolDB workspace.
+//!
+//! Every other crate agrees on the types defined here: [`TransactionTrace`] and its
+//! [`TraceStep`]s are what an execution backend produces and what the debugger, the
+//! serializer, and the frontends consume. This crate deliberately has no soldb
+//! dependencies so that it can stay the single type boundary in the graph.
+//!
+//! These types are also a serialization contract. They round-trip through `serde` into
+//! trace files and into the web-facing JSON document, so adding a field is additive and
+//! needs `#[serde(default)]`, while renaming or removing one is a breaking change.
+//!
+//! [`TraceCapabilities`] describes what the selected backend was actually able to
+//! record. Frontends should branch on those flags rather than on the backend name, so a
+//! new backend does not require changes further up the stack.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,20 @@
+//! Ethereum JSON-RPC transport and the execution backends built on it.
+//!
+//! This is the only crate that talks to a node. It provides the HTTP/HTTPS JSON-RPC
+//! client, transaction and receipt lookups, log retrieval, `debug_traceCall`
+//! simulation, and the two ways of producing an execution trace:
+//!
+//! - the `debug-rpc` backend, which asks the node to replay the transaction through
+//!   `debug_traceTransaction`, and
+//! - the `replay` backend, which reads the state a transaction touched over ordinary
+//!   RPC, re-executes any earlier transactions in the block, and then runs the target
+//!   through REVM with inspectors attached.
+//!
+//! Both backends produce the same [`soldb_core::TransactionTrace`], and each reports
+//! what it was able to capture through `TraceCapabilities` so callers never have to
+//! branch on the backend name. Backend-specific quirks belong here rather than in the
+//! frontends.
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;

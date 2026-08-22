@@ -1,3 +1,14 @@
+//! The web-facing JSON projection of traces and simulations.
+//!
+//! `soldb trace --json` and `soldb simulate --json` are consumed by explorers and web
+//! clients, so the document produced here is a versioned contract rather than a debug
+//! dump. `docs/json.md` is its specification and is updated alongside this module.
+//!
+//! [`WEB_JSON_SCHEMA_VERSION`] increments only for breaking changes; adding a field is
+//! additive. Call artifacts are rebuilt into a nested call tree, and because those
+//! artifacts can be deserialized from a trace file, the reconstruction tolerates parent
+//! links that do not form a tree instead of recursing on a cycle.
+
 use std::collections::BTreeMap;
 
 use serde::Serialize;
