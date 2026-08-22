@@ -2316,16 +2316,16 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     // Hex strings reach us from RPC responses and CLI arguments, so they are not
     // guaranteed to be ASCII. Slicing by byte offset would panic on a multi-byte
     // character whose boundary falls inside a pair; decode over bytes instead.
-    let digits = hex.as_bytes();
-    if !digits.len().is_multiple_of(2) {
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
         return None;
     }
 
-    digits
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = char::from(pair[0]).to_digit(16)?;
-            let low = char::from(pair[1]).to_digit(16)?;
+    pairs
+        .iter()
+        .map(|[high, low]| {
+            let high = char::from(*high).to_digit(16)?;
+            let low = char::from(*low).to_digit(16)?;
             u8::try_from(high * 16 + low).ok()
         })
         .collect()
