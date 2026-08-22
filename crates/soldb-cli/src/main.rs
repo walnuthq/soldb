@@ -29,14 +29,14 @@ use soldb_repl::{
     StepOutcome,
 };
 use soldb_rpc::{RpcLog, TraceBackend};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Display;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -760,26 +760,23 @@ fn print_simulation_interactive_prelude(
     println!("{} {}", dim("=> contract"), function_color(&contract_name));
     if !args.function_args.is_empty() {
         println!("{}", info("Parameters:"));
-        let params = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-            .ok()
-            .and_then(|specs| {
-                specs
-                    .into_iter()
-                    .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
-            })
-            .map(|descriptor| descriptor.params)
-            .unwrap_or_else(|| {
-                args.function_args
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| DecodedCallParam {
-                        name: format!("arg{index}"),
-                        ty: None,
-                        value: value.clone(),
-                        raw: false,
-                    })
-                    .collect()
-            });
+        let params =
+            resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+                .into_iter()
+                .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
+                .map(|descriptor| descriptor.params)
+                .unwrap_or_else(|| {
+                    args.function_args
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| DecodedCallParam {
+                            name: format!("arg{index}"),
+                            ty: None,
+                            value: value.clone(),
+                            raw: false,
+                        })
+                        .collect()
+                });
         for param in params {
             println!(
                 "{} {}",
@@ -796,7 +793,7 @@ fn interactive_trace_source_index(
 ) -> Option<TraceSourceIndex> {
     let contract_address = trace.to_addr.as_ref().or(trace.contract_address.as_ref());
     source_index_for_specs(
-        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).ok()?,
+        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref()),
         contract_address.map(String::as_str),
     )
 }
@@ -806,7 +803,7 @@ fn interactive_simulation_source_index(
     contract_address: &str,
 ) -> Option<TraceSourceIndex> {
     source_index_for_specs(
-        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).ok()?,
+        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref()),
         Some(contract_address),
     )
 }
@@ -823,15 +820,13 @@ fn source_index_for_specs(
                     .as_deref()
                     .is_some_and(|address| address.eq_ignore_ascii_case(contract_address))
             })
-            .find_map(|spec| TraceSourceIndex::load(spec).ok())
+            .find_map(load_source_index)
         {
             return Some(index);
         }
     }
 
-    specs
-        .iter()
-        .find_map(|spec| TraceSourceIndex::load(spec).ok())
+    specs.iter().find_map(load_source_index)
 }
 
 fn run_interactive_debugger(
@@ -1973,7 +1968,7 @@ fn build_trace_call_frames(
     spec: &ResolvedContractSpec,
     fallback: Option<CallDescriptor>,
 ) -> Vec<CallFrame> {
-    let source_index = TraceSourceIndex::load(spec).ok();
+    let source_index = load_source_index(spec);
     let descriptor = source_index
         .as_ref()
         .and_then(|index| index.descriptor_for_calldata(&trace.input_data))
@@ -1988,24 +1983,17 @@ fn build_simulation_call_frames(
     raw_data: &str,
     fallback: Option<CallDescriptor>,
 ) -> Vec<CallFrame> {
-    let source_index = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| {
-            specs
-                .into_iter()
-                .find_map(|spec| TraceSourceIndex::load(&spec).ok())
-        });
+    let source_index =
+        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+            .into_iter()
+            .find_map(|spec| load_source_index(&spec));
     let descriptor = source_index
         .as_ref()
         .and_then(|index| index.descriptor_for_calldata(raw_data))
         .or_else(|| {
-            resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-                .ok()
-                .and_then(|specs| {
-                    specs
-                        .into_iter()
-                        .find_map(|spec| abi_descriptor_for_calldata(&spec, raw_data))
-                })
+            resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+                .into_iter()
+                .find_map(|spec| abi_descriptor_for_calldata(&spec, raw_data))
         })
         .or(fallback);
     build_call_frames(trace, source_index.as_ref(), descriptor)
@@ -2071,8 +2059,7 @@ fn call_descriptor_for_calldata(
     spec: &ResolvedContractSpec,
     calldata: &str,
 ) -> Option<CallDescriptor> {
-    TraceSourceIndex::load(spec)
-        .ok()
+    load_source_index(spec)
         .and_then(|index| index.descriptor_for_calldata(calldata))
         .or_else(|| abi_descriptor_for_calldata(spec, calldata))
 }
@@ -2115,13 +2102,9 @@ fn simulated_call_descriptor(
         });
     }
 
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| {
-            specs
-                .into_iter()
-                .find_map(|spec| call_descriptor_for_calldata(&spec, raw_data))
-        })
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+        .into_iter()
+        .find_map(|spec| call_descriptor_for_calldata(&spec, raw_data))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2780,15 +2763,32 @@ fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
 }
 
 fn trace_event_registry(args: &TraceArgs) -> EventRegistry {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .and_then(event_registry_for_specs)
-        .unwrap_or_default()
+    event_registry_reporting(resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+    ))
 }
 
 fn simulate_event_registry(args: &SimulateArgs) -> EventRegistry {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .and_then(event_registry_for_specs)
-        .unwrap_or_default()
+    event_registry_reporting(resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+    ))
+}
+
+/// Builds the event registry, reporting a failure instead of decoding nothing in silence.
+fn event_registry_reporting(specs: Vec<ResolvedContractSpec>) -> EventRegistry {
+    match event_registry_for_specs(specs) {
+        Ok(registry) => registry,
+        Err(error) => {
+            report_once(
+                format!("events:{error}"),
+                &format!("could not load event ABIs: {error}"),
+                "logs are shown without decoded names or arguments",
+            );
+            EventRegistry::default()
+        }
+    }
 }
 
 fn event_registry_for_specs(specs: Vec<ResolvedContractSpec>) -> SoldbResult<EventRegistry> {
@@ -2825,6 +2825,71 @@ struct ResolvedContractSpec {
     address: Option<String>,
     name: String,
     debug_dir: PathBuf,
+}
+
+/// Loads ETHDebug metadata for a contract spec, reporting a failure instead of hiding it.
+///
+/// The user asked for ETHDebug by naming a directory on the command line. Silently
+/// dropping to a raw opcode view when that directory cannot be read is the worst failure
+/// mode for a debugger whose whole premise is compiler-generated debug info: the symptom
+/// (no source lines) looks identical to a contract that was simply compiled without it.
+///
+/// Reports go to stderr so `--json` output stays pipeable, and each spec is reported only
+/// once because a single run resolves the same spec from several places.
+fn load_source_index(spec: &ResolvedContractSpec) -> Option<TraceSourceIndex> {
+    match TraceSourceIndex::load(spec) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            report_once(
+                format!("ethdebug:{}:{}", spec.name, spec.debug_dir.display()),
+                &format!(
+                    "could not load ETHDebug metadata for `{}` from `{}`: {error}",
+                    spec.name,
+                    spec.debug_dir.display()
+                ),
+                "source lines, variables, and decoded parameters are unavailable for it",
+            );
+            None
+        }
+    }
+}
+
+/// Resolves contract specs, reporting a bad spec instead of continuing with none.
+///
+/// Every caller degrades to "no debug info" on failure, so without this a typo in
+/// `--ethdebug-dir` is indistinguishable from not passing it at all.
+fn resolve_contract_specs_reporting(
+    ethdebug_dirs: &[String],
+    contracts_file: Option<&str>,
+) -> Vec<ResolvedContractSpec> {
+    match resolve_contract_specs(ethdebug_dirs, contracts_file) {
+        Ok(specs) => specs,
+        Err(error) => {
+            report_once(
+                format!("specs:{error}"),
+                &format!("could not resolve the requested contracts: {error}"),
+                "continuing without source-level information for this run",
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Writes a warning and a follow-up note to stderr, at most once per `key`.
+fn report_once(key: String, message: &str, note: &str) {
+    static REPORTED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+    let mut reported = match REPORTED.get_or_init(|| Mutex::new(BTreeSet::new())).lock() {
+        Ok(reported) => reported,
+        // A poisoned lock only means another thread panicked while reporting. Losing
+        // deduplication is better than losing the diagnostic.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !reported.insert(key) {
+        return;
+    }
+    eprintln!("{} {message}", warning("warning:"));
+    eprintln!("{} {note}", dim("note:"));
 }
 
 fn resolve_contract_specs(
@@ -2875,6 +2940,17 @@ fn resolve_ethdebug_spec(spec_text: &str) -> SoldbResult<Vec<ResolvedContractSpe
                 debug_dir: path,
             }]);
         }
+    }
+
+    // Resolving nothing is a failure, not an empty result. The user named this on the
+    // command line; returning zero contracts silently is indistinguishable from having
+    // passed no `--ethdebug-dir` at all, and it is how a mistyped spec turns into a
+    // confusing "no debug info" trace.
+    if loaded.is_empty() {
+        return Err(soldb_core::SoldbError::Message(format!(
+            "no contracts found for `{spec_text}`; expected `<address>:<contract>:<dir>`, \
+             a directory of ETHDebug artifacts, or a contract mapping file"
+        )));
     }
 
     Ok(loaded)
@@ -3081,8 +3157,7 @@ fn trace_web_contracts(
     args: &TraceArgs,
     trace: &TransactionTrace,
 ) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs =
-        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).unwrap_or_default();
+    let specs = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref());
     web_contracts_for_specs(specs, trace, None)
 }
 
@@ -3091,8 +3166,7 @@ fn simulate_web_contracts(
     trace: &TransactionTrace,
     contract_address: &str,
 ) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs =
-        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).unwrap_or_default();
+    let specs = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref());
     web_contracts_for_specs(specs, trace, Some(contract_address))
 }
 
@@ -3132,7 +3206,7 @@ fn web_contracts_for_specs(
 fn web_contract_metadata_for_spec(
     spec: &ResolvedContractSpec,
 ) -> Option<soldb_serializer::WebContractMetadata> {
-    let source_index = TraceSourceIndex::load(spec).ok();
+    let source_index = load_source_index(spec);
     let mut pc_to_source_mappings = BTreeMap::new();
     let mut source_paths = BTreeMap::new();
     let mut sources = BTreeMap::new();
@@ -3177,15 +3251,13 @@ fn normalize_contract_address_key(address: &str) -> String {
 }
 
 fn trace_contract_name(args: &TraceArgs) -> Option<String> {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| specs.into_iter().next().map(|spec| spec.name))
+    trace_contract_spec(args).map(|spec| spec.name)
 }
 
 fn trace_contract_spec(args: &TraceArgs) -> Option<ResolvedContractSpec> {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| specs.into_iter().next())
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+        .into_iter()
+        .next()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3240,9 +3312,10 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
 }
 
 fn simulate_contract_name(args: &SimulateArgs) -> Option<String> {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| specs.into_iter().next().map(|spec| spec.name))
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+        .into_iter()
+        .next()
+        .map(|spec| spec.name)
 }
 
 fn simulate_calldata(args: &SimulateArgs) -> SoldbResult<String> {
@@ -3342,8 +3415,7 @@ fn format_simulated_call(args: &SimulateArgs, function_name: &str) -> String {
 }
 
 fn simulation_source_file(args: &SimulateArgs, contract_name: &str) -> Option<String> {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()?
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
         .into_iter()
         .find(|spec| spec.name == contract_name)
         .and_then(|spec| {
@@ -3377,13 +3449,9 @@ fn simulate_display_function_name(args: &SimulateArgs, calldata: &str) -> String
         return signature.clone();
     }
 
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| {
-            specs
-                .into_iter()
-                .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
-        })
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+        .into_iter()
+        .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
         .map_or_else(|| "raw_data".to_owned(), |descriptor| descriptor.name)
 }
 
