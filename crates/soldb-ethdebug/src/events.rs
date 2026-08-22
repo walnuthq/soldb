@@ -246,7 +246,8 @@ fn decode_param_at(
 ) -> SoldbResult<Value> {
     if event_param_is_dynamic(input)? {
         let relative_offset = read_usize_word(data, head_offset, &input.name)?;
-        return decode_dynamic_param(input, data, base_offset + relative_offset);
+        let offset = checked_offset(base_offset, relative_offset, &input.name)?;
+        return decode_dynamic_param(input, data, offset);
     }
     decode_static_param(input, data, head_offset)
 }
@@ -273,7 +274,8 @@ fn decode_dynamic_param(input: &EventParam, data: &[u8], offset: usize) -> Soldb
             (len, offset, offset)
         } else {
             let len = read_usize_word(data, offset, &input.name)?;
-            (len, offset + 32, offset + 32)
+            let heads_offset = checked_offset(offset, 32, &input.name)?;
+            (len, heads_offset, heads_offset)
         };
         return decode_array_items(&base, len, data, heads_offset, offsets_base);
     }
@@ -312,7 +314,7 @@ fn decode_tuple_components(
     for component in components {
         let head_words = event_param_head_words(component)?;
         values.push(decode_param_at(component, data, offset, tuple_offset)?);
-        offset += head_words * 32;
+        offset = advance_offset(offset, head_words, &component.name)?;
     }
     Ok(Value::Array(values))
 }
@@ -324,12 +326,34 @@ fn decode_array_items(
     heads_offset: usize,
     offsets_base: usize,
 ) -> SoldbResult<Value> {
+    let base_head_words = event_param_head_words(base)?;
+    // `len` is read from the event payload for dynamic arrays, so it is untrusted. Every
+    // element occupies at least its head words inside `data`; reject a length that cannot
+    // possibly fit before reserving anything, otherwise a hostile log reserves gigabytes.
+    let element_head = base_head_words
+        .checked_mul(32)
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            SoldbError::Message(format!(
+                "Event array element '{}' has no decodable width",
+                base.ty
+            ))
+        })?;
+    let available = data.len().saturating_sub(heads_offset);
+    if element_head
+        .checked_mul(len)
+        .is_none_or(|required| required > available)
+    {
+        return Err(SoldbError::Message(format!(
+            "Event array length {len} exceeds the {available} bytes of remaining event data"
+        )));
+    }
+
     let mut offset = heads_offset;
     let mut values = Vec::with_capacity(len);
-    let base_head_words = event_param_head_words(base)?;
     for _ in 0..len {
         values.push(decode_param_at(base, data, offset, offsets_base)?);
-        offset += base_head_words * 32;
+        offset = advance_offset(offset, base_head_words, &base.name)?;
     }
     Ok(Value::Array(values))
 }
@@ -410,14 +434,34 @@ fn is_tuple_param(input: &EventParam) -> bool {
 
 fn read_dynamic_bytes(data: &[u8], offset: usize, label: &str) -> SoldbResult<Vec<u8>> {
     let len = read_usize_word(data, offset, label)?;
-    let start = offset + 32;
-    let end = start + len;
-    if end > data.len() {
-        return Err(SoldbError::Message(format!(
+    // Both `offset` and `len` come from the payload; adding them unchecked wraps in release
+    // and produces a reversed range that panics on slicing.
+    let start = checked_offset(offset, 32, label)?;
+    let end = checked_offset(start, len, label)?;
+    data.get(start..end).map(<[u8]>::to_vec).ok_or_else(|| {
+        SoldbError::Message(format!(
             "Event dynamic bytes for {label} exceed data length"
-        )));
-    }
-    Ok(data[start..end].to_vec())
+        ))
+    })
+}
+
+/// Adds an untrusted ABI delta to an offset, reporting an error instead of overflowing.
+fn checked_offset(base: usize, delta: usize, label: &str) -> SoldbResult<usize> {
+    base.checked_add(delta).ok_or_else(|| {
+        SoldbError::Message(format!(
+            "Event offset for {label} overflows the address space"
+        ))
+    })
+}
+
+/// Advances a head cursor by `words` ABI words, reporting an error instead of overflowing.
+fn advance_offset(offset: usize, words: usize, label: &str) -> SoldbResult<usize> {
+    let advance = words.checked_mul(32).ok_or_else(|| {
+        SoldbError::Message(format!(
+            "Event head width for {label} overflows the address space"
+        ))
+    })?;
+    checked_offset(offset, advance, label)
 }
 
 fn read_usize_word(data: &[u8], offset: usize, label: &str) -> SoldbResult<usize> {
@@ -440,7 +484,7 @@ fn read_word_hex(data: &[u8], offset: usize) -> SoldbResult<String> {
 }
 
 fn read_word(data: &[u8], offset: usize) -> SoldbResult<&[u8]> {
-    let end = offset + 32;
+    let end = checked_offset(offset, 32, "ABI word")?;
     data.get(offset..end)
         .ok_or_else(|| SoldbError::Message("Event data is missing an ABI word".to_owned()))
 }
@@ -558,6 +602,65 @@ mod tests {
             ]
         }
     ]"#;
+
+    const BLOB_ABI: &str = r#"[
+        {
+            "type": "event",
+            "name": "Blob",
+            "inputs": [{"name": "payload", "type": "bytes", "indexed": false}]
+        }
+    ]"#;
+
+    const NUMBERS_ABI: &str = r#"[
+        {
+            "type": "event",
+            "name": "Numbers",
+            "inputs": [{"name": "values", "type": "uint256[]", "indexed": false}]
+        }
+    ]"#;
+
+    fn registry_for(abi: &str) -> (EventRegistry, String) {
+        let events = parse_event_abis(abi).expect("parse abi");
+        let topic = event_topic(&events[0]);
+        let mut registry = EventRegistry::default();
+        registry
+            .insert(None, events[0].clone())
+            .expect("insert event");
+        (registry, topic)
+    }
+
+    #[test]
+    fn rejects_dynamic_length_that_overflows_the_offset() {
+        let (registry, topic) = registry_for(BLOB_ABI);
+        // The head word points at offset 32, where the length word is `u64::MAX`. Adding
+        // that to the data start used to overflow: a panic in debug, and in release a
+        // wrapped end offset that produced a reversed slice range.
+        let data = format!("0x{:064x}{}{}", 32u64, "0".repeat(48), "f".repeat(16));
+
+        assert!(registry.decode_log(&[topic], &data).is_none());
+    }
+
+    #[test]
+    fn rejects_array_length_larger_than_the_event_data() {
+        let (registry, topic) = registry_for(NUMBERS_ABI);
+        // A one-element payload that claims to hold 2^40 elements. Reserving that many
+        // `Value`s up front is an immediate multi-terabyte allocation.
+        let data = format!("0x{:064x}{:064x}", 32u64, 1u64 << 40);
+
+        assert!(registry.decode_log(&[topic], &data).is_none());
+    }
+
+    #[test]
+    fn decodes_a_well_formed_dynamic_array() {
+        let (registry, topic) = registry_for(NUMBERS_ABI);
+        let data = format!("0x{:064x}{:064x}{:064x}{:064x}", 32u64, 2u64, 7u64, 8u64);
+
+        let decoded = registry
+            .decode_log(&[topic], &data)
+            .expect("decode dynamic array");
+
+        assert_eq!(decoded.args[0].value, json!([7, 8]));
+    }
 
     #[test]
     fn parses_event_abis_from_array() {

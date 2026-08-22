@@ -116,7 +116,7 @@ impl DebugSession {
                     && function.declaration_start <= location.offset
                     && location.offset <= function.body_end
             })
-            .min_by_key(|function| function.body_end - function.declaration_start)
+            .min_by_key(|function| function.body_end.saturating_sub(function.declaration_start))
     }
 
     #[must_use]

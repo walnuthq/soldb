@@ -2228,24 +2228,36 @@ fn parse_b256(value: &str) -> SoldbResult<B256> {
 }
 
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+    // Hex strings reach us from RPC responses and CLI arguments, so they are not
+    // guaranteed to be ASCII. Slicing by byte offset would panic on a multi-byte
+    // character whose boundary falls inside a pair; decode over bytes instead.
+    let digits = hex.as_bytes();
+    if !digits.len().is_multiple_of(2) {
         return None;
     }
 
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).ok())
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
+            u8::try_from(high * 16 + low).ok()
+        })
         .collect()
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
+    // Fill an ASCII byte buffer and validate it once. `String::push` re-runs UTF-8
+    // encoding for every character, which is measurable when the replay inspector encodes
+    // the whole of EVM memory.
+    let mut encoded = Vec::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        encoded.push(HEX[usize::from(byte >> 4)]);
+        encoded.push(HEX[usize::from(byte & 0x0f)]);
     }
-    encoded
+    // `HEX` holds only ASCII, so the buffer is valid UTF-8 by construction.
+    String::from_utf8(encoded).expect("hex digits are ASCII")
 }
 
 fn bytes_to_prefixed_hex(bytes: &[u8]) -> String {

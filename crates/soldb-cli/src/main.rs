@@ -1604,7 +1604,7 @@ impl TraceSourceIndex {
                     && function.declaration_start <= location.offset
                     && location.offset <= function.body_end
             })
-            .min_by_key(|function| function.body_end - function.declaration_start)
+            .min_by_key(|function| function.body_end.saturating_sub(function.declaration_start))
     }
 
     fn descriptor_for_calldata(&self, calldata: &str) -> Option<CallDescriptor> {
@@ -3397,11 +3397,17 @@ fn format_snapshot_state(snapshot: &soldb_core::StepSnapshot) -> String {
 }
 
 fn shorten_hex(value: &str) -> String {
-    if value.len() > 10 && value.starts_with("0x") {
-        format!("0x{}...", &value[2..6])
-    } else {
-        value.to_owned()
+    // Stack and memory words come straight from the node, so they are not guaranteed to be
+    // ASCII hex. Take characters rather than byte offsets: `&value[2..6]` panics when byte
+    // 6 lands inside a multi-byte character.
+    let Some(digits) = value.strip_prefix("0x") else {
+        return value.to_owned();
+    };
+    if value.len() <= 10 {
+        return value.to_owned();
     }
+    let head = digits.chars().take(4).collect::<String>();
+    format!("0x{head}...")
 }
 
 #[cfg(test)]
@@ -3593,6 +3599,22 @@ mod tests {
 
         assert_eq!(resolved.pc, 64);
         assert_eq!(resolved.line, 2);
+    }
+
+    #[test]
+    fn shortening_hex_handles_non_ascii_values() {
+        // Trace values are whatever the node sent us. Slicing bytes 2..6 panicked when a
+        // multi-byte character straddled byte 6.
+        assert_eq!(
+            shorten_hex("0x\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}"),
+            "0x\u{20ac}\u{20ac}\u{20ac}\u{20ac}..."
+        );
+        assert_eq!(shorten_hex("0x1234"), "0x1234");
+        assert_eq!(shorten_hex("not hex at all"), "not hex at all");
+        assert_eq!(
+            shorten_hex("0x00000000000000000000000000000000000000000000000000000000000000ff"),
+            "0x0000..."
+        );
     }
 
     #[test]
