@@ -377,10 +377,11 @@ fn main() -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // `AlreadyReported` means the command has already rendered the failure, so printing
+        // here would duplicate it.
+        Err(soldb_core::SoldbError::AlreadyReported) => ExitCode::from(2),
         Err(error) => {
-            if !error.to_string().is_empty() {
-                eprintln!("{error}");
-            }
+            eprintln!("{error}");
             ExitCode::from(2)
         }
     }
@@ -613,7 +614,7 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
                 }))
                 .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?
             );
-            return Err(soldb_core::SoldbError::Message(String::new()));
+            return Err(soldb_core::SoldbError::AlreadyReported);
         }
         Err(error) => return Err(error),
     };
@@ -651,14 +652,14 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
         Ok(calldata) => calldata,
         Err(error) if args.json => {
             print_json_command_error("SimulationError", &error.to_string(), None)?;
-            return Err(soldb_core::SoldbError::Message(String::new()));
+            return Err(soldb_core::SoldbError::AlreadyReported);
         }
         Err(error) => return Err(error),
     };
     if let Err(message) = validate_simulate_value(&args.value) {
         if args.json {
             print_json_command_error("InvalidValue", &message, Some(&args.value))?;
-            return Err(soldb_core::SoldbError::Message(String::new()));
+            return Err(soldb_core::SoldbError::AlreadyReported);
         }
         return Err(soldb_core::SoldbError::Message(message));
     }
@@ -1191,7 +1192,7 @@ fn list_events_command(args: &ListEventsArgs) -> SoldbResult<()> {
         Ok(logs) => logs,
         Err(error) if args.json_events => {
             print_json_command_error("TransactionReceiptError", &error.to_string(), None)?;
-            return Err(soldb_core::SoldbError::Message(String::new()));
+            return Err(soldb_core::SoldbError::AlreadyReported);
         }
         Err(error) => return Err(error),
     };

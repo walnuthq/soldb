@@ -20,8 +20,16 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SoldbError {
+    /// A failure described by a human-readable message.
     #[error("{0}")]
     Message(String),
+    /// The failure was already rendered for the user, typically as a JSON error document
+    /// on a `--json` code path. Callers must exit non-zero without printing anything else.
+    ///
+    /// This exists so the exit path never has to inspect error *text* to decide whether a
+    /// message was already shown.
+    #[error("")]
+    AlreadyReported,
 }
 
 pub type SoldbResult<T> = Result<T, SoldbError>;
