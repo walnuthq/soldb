@@ -266,6 +266,15 @@ Run the full local test target:
 make test
 ```
 
+CI additionally runs the lit suite against `solc` built from the
+[Solidity development branch](https://github.com/argotorg/solidity), where ETHDebug output
+changes first. That job is non-blocking and also runs on a daily schedule. To reproduce it
+locally, point the runner at your own build:
+
+```bash
+./test/run-tests.sh SOLC_PATH=/path/to/solidity/build/solc/solc
+```
+
 ### Coverage
 
 Line coverage is enforced at 80% in CI.
