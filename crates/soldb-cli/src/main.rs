@@ -1,3 +1,20 @@
+//! The `soldb` command-line interface.
+//!
+//! This binary owns argument parsing, command dispatch, and every piece of
+//! human-readable formatting in the project: the library crates return data and this
+//! layer decides how it looks. That split is what lets the DAP server and the JSON
+//! output reuse the same logic without inheriting terminal behavior.
+//!
+//! Output conventions worth preserving when editing this file:
+//!
+//! - Colors go through the `paint` helpers, which honor `NO_COLOR`, `CLICOLOR_FORCE`,
+//!   and whether stdout is a terminal. Emitting escapes directly breaks the lit tests.
+//! - `--json` and `--json-events` print only their JSON document, so the output stays
+//!   pipeable into `jq`. Progress lines must stay gated on those flags.
+//! - A command that has already rendered a failure returns
+//!   [`soldb_core::SoldbError::AlreadyReported`] so the exit path does not print it
+//!   twice. Failures exit with code 2.
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
@@ -12,14 +29,14 @@ use soldb_repl::{
     StepOutcome,
 };
 use soldb_rpc::{RpcLog, TraceBackend};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Display;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -360,10 +377,11 @@ fn main() -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // `AlreadyReported` means the command has already rendered the failure, so printing
+        // here would duplicate it.
+        Err(soldb_core::SoldbError::AlreadyReported) => ExitCode::from(2),
         Err(error) => {
-            if !error.to_string().is_empty() {
-                eprintln!("{error}");
-            }
+            eprintln!("{error}");
             ExitCode::from(2)
         }
     }
@@ -596,7 +614,7 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
                 }))
                 .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?
             );
-            return Err(soldb_core::SoldbError::Message(String::new()));
+            return Err(soldb_core::SoldbError::AlreadyReported);
         }
         Err(error) => return Err(error),
     };
@@ -634,14 +652,14 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
         Ok(calldata) => calldata,
         Err(error) if args.json => {
             print_json_command_error("SimulationError", &error.to_string(), None)?;
-            return Err(soldb_core::SoldbError::Message(String::new()));
+            return Err(soldb_core::SoldbError::AlreadyReported);
         }
         Err(error) => return Err(error),
     };
     if let Err(message) = validate_simulate_value(&args.value) {
         if args.json {
             print_json_command_error("InvalidValue", &message, Some(&args.value))?;
-            return Err(soldb_core::SoldbError::Message(String::new()));
+            return Err(soldb_core::SoldbError::AlreadyReported);
         }
         return Err(soldb_core::SoldbError::Message(message));
     }
@@ -742,26 +760,23 @@ fn print_simulation_interactive_prelude(
     println!("{} {}", dim("=> contract"), function_color(&contract_name));
     if !args.function_args.is_empty() {
         println!("{}", info("Parameters:"));
-        let params = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-            .ok()
-            .and_then(|specs| {
-                specs
-                    .into_iter()
-                    .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
-            })
-            .map(|descriptor| descriptor.params)
-            .unwrap_or_else(|| {
-                args.function_args
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| DecodedCallParam {
-                        name: format!("arg{index}"),
-                        ty: None,
-                        value: value.clone(),
-                        raw: false,
-                    })
-                    .collect()
-            });
+        let params =
+            resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+                .into_iter()
+                .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
+                .map(|descriptor| descriptor.params)
+                .unwrap_or_else(|| {
+                    args.function_args
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| DecodedCallParam {
+                            name: format!("arg{index}"),
+                            ty: None,
+                            value: value.clone(),
+                            raw: false,
+                        })
+                        .collect()
+                });
         for param in params {
             println!(
                 "{} {}",
@@ -778,7 +793,7 @@ fn interactive_trace_source_index(
 ) -> Option<TraceSourceIndex> {
     let contract_address = trace.to_addr.as_ref().or(trace.contract_address.as_ref());
     source_index_for_specs(
-        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).ok()?,
+        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref()),
         contract_address.map(String::as_str),
     )
 }
@@ -788,7 +803,7 @@ fn interactive_simulation_source_index(
     contract_address: &str,
 ) -> Option<TraceSourceIndex> {
     source_index_for_specs(
-        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).ok()?,
+        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref()),
         Some(contract_address),
     )
 }
@@ -805,15 +820,13 @@ fn source_index_for_specs(
                     .as_deref()
                     .is_some_and(|address| address.eq_ignore_ascii_case(contract_address))
             })
-            .find_map(|spec| TraceSourceIndex::load(spec).ok())
+            .find_map(load_source_index)
         {
             return Some(index);
         }
     }
 
-    specs
-        .iter()
-        .find_map(|spec| TraceSourceIndex::load(spec).ok())
+    specs.iter().find_map(load_source_index)
 }
 
 fn run_interactive_debugger(
@@ -888,6 +901,17 @@ fn run_interactive_debugger(
             DebuggerCommand::Info(DebuggerInfoCommand::Resources { json }) => {
                 if let Err(error) = print_debugger_resources(source_index.as_ref(), json) {
                     println!("{} {}", warning("Could not print resources:"), error);
+                }
+            }
+            DebuggerCommand::Vars => {
+                print_debugger_variables(&state, source_index.as_ref(), None);
+            }
+            DebuggerCommand::Print(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    println!("{} print <variable>", warning("Usage:"));
+                } else {
+                    print_debugger_variables(&state, source_index.as_ref(), Some(name));
                 }
             }
             DebuggerCommand::Unknown(command) => {
@@ -1085,8 +1109,9 @@ fn print_current_debugger_step(state: &DebuggerState) {
         number_color(step.pc),
         opcode_color(&step.op)
     );
-    if !step.stack.is_empty() {
-        println!("{} {}", info("Stack:"), format_stack(&step.stack));
+    let stack = step.snapshot_ref().stack;
+    if !stack.is_empty() {
+        println!("{} {}", info("Stack:"), format_stack(stack));
     }
 }
 
@@ -1154,15 +1179,90 @@ fn print_step_outcome(
     }
 }
 
+/// Prints the source variables ETHDebug reports as live at the current program counter.
+///
+/// With `filter` set, only the variable of that name is printed. This is the terminal
+/// counterpart of the DAP `variables` request; both go through
+/// `soldb_debugger::variables_for_step` so the two frontends decode identically.
+fn print_debugger_variables(
+    state: &DebuggerState,
+    source_index: Option<&TraceSourceIndex>,
+    filter: Option<&str>,
+) {
+    let Some(index) = source_index else {
+        println!(
+            "{} no ETHDebug metadata is loaded; start the session with `--ethdebug-dir <address>:<contract>:<dir>`",
+            warning("Cannot read variables:")
+        );
+        return;
+    };
+    let Some(trace) = state.trace() else {
+        println!("{} no trace is loaded", warning("Cannot read variables:"));
+        return;
+    };
+    let Some(step) = state.current_step_data() else {
+        println!(
+            "{} step {} is outside the loaded trace",
+            warning("Cannot read variables:"),
+            state.current_step
+        );
+        return;
+    };
+
+    let variables = soldb_debugger::variables_for_step(trace, &index.info, step);
+    let selected = variables
+        .iter()
+        .filter(|variable| filter.is_none_or(|name| variable.name == name))
+        .collect::<Vec<_>>();
+
+    if selected.is_empty() {
+        match filter {
+            Some(name) => println!(
+                "{} `{name}` is not in scope at PC {}",
+                warning("No such variable:"),
+                number_color(step.pc)
+            ),
+            None => println!(
+                "{} no variables in scope at PC {}",
+                dim("Variables:"),
+                number_color(step.pc)
+            ),
+        }
+        return;
+    }
+
+    for variable in selected {
+        let value = match variable.value.status {
+            soldb_debugger::DebugValueStatus::Unavailable => warning(&variable.value.display),
+            _ => success(&variable.value.display),
+        };
+        println!(
+            "{} {} = {} {}",
+            info(&variable.ty),
+            bold(&variable.name),
+            value,
+            dim(format!(
+                "[{}+{}]",
+                variable.location.kind, variable.location.offset
+            ))
+        );
+    }
+}
+
 fn print_debugger_help(topic: Option<&str>) {
     match topic {
         Some("mode") => println!("mode source|asm - switch display mode"),
         Some("info") => println!("info resources [--json] - print loaded ETHDebug resources"),
+        Some("vars" | "locals" | "print") => {
+            println!("vars - print every source variable live at the current PC");
+            println!("print <variable> - print one source variable by name");
+        }
         Some(topic) => println!("No help for {topic}"),
         None => {
             println!("Commands: next, nexti, step, continue, goto <step>");
             println!("          break <pc>|<file>:<line>|line <line>");
             println!("          clear <pc>|<file>:<line>|line <line>");
+            println!("          vars, print <variable>");
             println!("          info resources [--json]");
             println!("          mode source|asm, help, quit");
         }
@@ -1174,7 +1274,7 @@ fn list_events_command(args: &ListEventsArgs) -> SoldbResult<()> {
         Ok(logs) => logs,
         Err(error) if args.json_events => {
             print_json_command_error("TransactionReceiptError", &error.to_string(), None)?;
-            return Err(soldb_core::SoldbError::Message(String::new()));
+            return Err(soldb_core::SoldbError::AlreadyReported);
         }
         Err(error) => return Err(error),
     };
@@ -1203,7 +1303,7 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
         if !matches!(step.op.as_str(), "CALL" | "DELEGATECALL" | "STATICCALL") {
             continue;
         }
-        let Some(address_word) = call_target_stack_word(&step.stack) else {
+        let Some(address_word) = call_target_stack_word(step.snapshot_ref().stack) else {
             continue;
         };
         let Some(address) = extract_address_from_stack_word(address_word) else {
@@ -1343,15 +1443,15 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
     };
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
-        let snapshot = step.normalized_snapshot();
+        let snapshot = step.snapshot_ref();
         println!(
             "{} | {} | {} | {} | {} | {}",
             number_color(format!("{index:>4}")),
             number_color(format!("{:>4}", step.pc)),
             opcode_color(format!("{:<14}", step.op)),
             success(format!("{:>8}", step.gas)),
-            format_stack(&snapshot.stack),
-            format_snapshot_state(&snapshot)
+            format_stack(snapshot.stack),
+            format_snapshot_state(snapshot)
         );
     }
 }
@@ -1384,15 +1484,15 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_
     };
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
-        let snapshot = step.normalized_snapshot();
+        let snapshot = step.snapshot_ref();
         println!(
             "{} | {} | {} | {} | {} | {}",
             number_color(format!("{index:>4}")),
             number_color(format!("{:>4}", step.pc)),
             opcode_color(format!("{:<14}", step.op)),
             success(format!("{:>8}", step.gas)),
-            format_stack(&snapshot.stack),
-            format_snapshot_state(&snapshot)
+            format_stack(snapshot.stack),
+            format_snapshot_state(snapshot)
         );
     }
 }
@@ -1587,7 +1687,7 @@ impl TraceSourceIndex {
                     && function.declaration_start <= location.offset
                     && location.offset <= function.body_end
             })
-            .min_by_key(|function| function.body_end - function.declaration_start)
+            .min_by_key(|function| function.body_end.saturating_sub(function.declaration_start))
     }
 
     fn descriptor_for_calldata(&self, calldata: &str) -> Option<CallDescriptor> {
@@ -1607,7 +1707,12 @@ impl TraceSourceIndex {
         current_step: usize,
     ) -> Result<ResolvedSourceBreakpoint, String> {
         let source_ids = self.resolve_source_ids(target)?;
-        let mut candidates = Vec::<ResolvedSourceBreakpoint>::new();
+        // Rank every instruction whose source span touches the line. A span that *begins*
+        // on the line describes code generated for that line; a span that merely contains
+        // it can be an enclosing range. solc attributes the dispatcher preamble to the
+        // whole contract, and that range intersects every line, so ranking is what keeps
+        // `break File.sol:N` from resolving to the contract's first instruction for any N.
+        let mut ranked = Vec::<(bool, u64, ResolvedSourceBreakpoint)>::new();
 
         for source_id in source_ids {
             let Some(source) = self.source_contents.get(&source_id) else {
@@ -1631,20 +1736,38 @@ impl TraceSourceIndex {
                     .get(&source_id)
                     .cloned()
                     .unwrap_or_else(|| format!("source:{source_id}"));
-                candidates.push(ResolvedSourceBreakpoint {
-                    pc: instruction.offset,
-                    path,
-                    line: target.line,
-                });
+                ranked.push((
+                    span_starts_on_line(source, &location, target.line),
+                    location.length,
+                    ResolvedSourceBreakpoint {
+                        pc: instruction.offset,
+                        path,
+                        line: target.line,
+                    },
+                ));
             }
         }
 
-        if candidates.is_empty() {
+        let Some(&(starts_on_line, narrowest, _)) = ranked
+            .iter()
+            .min_by_key(|(starts_on_line, length, _)| (!*starts_on_line, *length))
+        else {
             return Err(match &target.file {
                 Some(file) => format!("no instruction maps to {file}:{}", target.line),
                 None => format!("no instruction maps to line {}", target.line),
             });
-        }
+        };
+
+        // Keep every instruction generated for the line. When nothing starts on the line
+        // the target sits inside a multi-line construct, so keep only the tightest spans
+        // and let wider enclosing ranges lose.
+        let candidates = ranked
+            .into_iter()
+            .filter(|(candidate_starts, length, _)| {
+                *candidate_starts == starts_on_line && (starts_on_line || *length == narrowest)
+            })
+            .map(|(_, _, candidate)| candidate)
+            .collect::<Vec<_>>();
 
         for step in trace.steps.iter().skip(current_step.saturating_add(1)) {
             if let Some(candidate) = candidates
@@ -1666,10 +1789,13 @@ impl TraceSourceIndex {
             }
         }
 
-        Ok(candidates
+        candidates
             .into_iter()
             .min_by_key(|candidate| candidate.pc)
-            .expect("candidates are non-empty"))
+            .ok_or_else(|| match &target.file {
+                Some(file) => format!("no instruction maps to {file}:{}", target.line),
+                None => format!("no instruction maps to line {}", target.line),
+            })
     }
 
     fn resolve_source_ids(&self, target: &SourceBreakpointTarget) -> Result<Vec<u64>, String> {
@@ -1708,6 +1834,15 @@ fn source_path_matches(source_path: &str, requested: &str) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == requested)
+}
+
+/// Reports whether an ETHDebug source span begins on `line`.
+///
+/// Spans that begin on the requested line are the instructions solc generated for it;
+/// spans that only contain the line are enclosing ranges such as the whole-contract span
+/// attached to the dispatcher preamble.
+fn span_starts_on_line(source: &str, location: &SourceLocation, line: u64) -> bool {
+    line_for_offset(source, location.offset as usize) == line
 }
 
 fn span_intersects_line(source: &str, location: &SourceLocation, line: u64) -> bool {
@@ -1833,7 +1968,7 @@ fn build_trace_call_frames(
     spec: &ResolvedContractSpec,
     fallback: Option<CallDescriptor>,
 ) -> Vec<CallFrame> {
-    let source_index = TraceSourceIndex::load(spec).ok();
+    let source_index = load_source_index(spec);
     let descriptor = source_index
         .as_ref()
         .and_then(|index| index.descriptor_for_calldata(&trace.input_data))
@@ -1848,24 +1983,17 @@ fn build_simulation_call_frames(
     raw_data: &str,
     fallback: Option<CallDescriptor>,
 ) -> Vec<CallFrame> {
-    let source_index = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| {
-            specs
-                .into_iter()
-                .find_map(|spec| TraceSourceIndex::load(&spec).ok())
-        });
+    let source_index =
+        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+            .into_iter()
+            .find_map(|spec| load_source_index(&spec));
     let descriptor = source_index
         .as_ref()
         .and_then(|index| index.descriptor_for_calldata(raw_data))
         .or_else(|| {
-            resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-                .ok()
-                .and_then(|specs| {
-                    specs
-                        .into_iter()
-                        .find_map(|spec| abi_descriptor_for_calldata(&spec, raw_data))
-                })
+            resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+                .into_iter()
+                .find_map(|spec| abi_descriptor_for_calldata(&spec, raw_data))
         })
         .or(fallback);
     build_call_frames(trace, source_index.as_ref(), descriptor)
@@ -1892,7 +2020,7 @@ fn build_call_frames(
                 source_params: function.params.clone(),
                 source_path: index.info.sources.get(&function.source_id).cloned(),
                 source_line: Some(function.declaration_line),
-                raw_stack: step.stack.clone(),
+                raw_stack: step.snapshot_ref().stack.to_vec(),
                 internal: false,
             });
         }
@@ -1931,8 +2059,7 @@ fn call_descriptor_for_calldata(
     spec: &ResolvedContractSpec,
     calldata: &str,
 ) -> Option<CallDescriptor> {
-    TraceSourceIndex::load(spec)
-        .ok()
+    load_source_index(spec)
         .and_then(|index| index.descriptor_for_calldata(calldata))
         .or_else(|| abi_descriptor_for_calldata(spec, calldata))
 }
@@ -1975,13 +2102,9 @@ fn simulated_call_descriptor(
         });
     }
 
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| {
-            specs
-                .into_iter()
-                .find_map(|spec| call_descriptor_for_calldata(&spec, raw_data))
-        })
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+        .into_iter()
+        .find_map(|spec| call_descriptor_for_calldata(&spec, raw_data))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2640,15 +2763,32 @@ fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
 }
 
 fn trace_event_registry(args: &TraceArgs) -> EventRegistry {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .and_then(event_registry_for_specs)
-        .unwrap_or_default()
+    event_registry_reporting(resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+    ))
 }
 
 fn simulate_event_registry(args: &SimulateArgs) -> EventRegistry {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .and_then(event_registry_for_specs)
-        .unwrap_or_default()
+    event_registry_reporting(resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+    ))
+}
+
+/// Builds the event registry, reporting a failure instead of decoding nothing in silence.
+fn event_registry_reporting(specs: Vec<ResolvedContractSpec>) -> EventRegistry {
+    match event_registry_for_specs(specs) {
+        Ok(registry) => registry,
+        Err(error) => {
+            report_once(
+                format!("events:{error}"),
+                &format!("could not load event ABIs: {error}"),
+                "logs are shown without decoded names or arguments",
+            );
+            EventRegistry::default()
+        }
+    }
 }
 
 fn event_registry_for_specs(specs: Vec<ResolvedContractSpec>) -> SoldbResult<EventRegistry> {
@@ -2685,6 +2825,71 @@ struct ResolvedContractSpec {
     address: Option<String>,
     name: String,
     debug_dir: PathBuf,
+}
+
+/// Loads ETHDebug metadata for a contract spec, reporting a failure instead of hiding it.
+///
+/// The user asked for ETHDebug by naming a directory on the command line. Silently
+/// dropping to a raw opcode view when that directory cannot be read is the worst failure
+/// mode for a debugger whose whole premise is compiler-generated debug info: the symptom
+/// (no source lines) looks identical to a contract that was simply compiled without it.
+///
+/// Reports go to stderr so `--json` output stays pipeable, and each spec is reported only
+/// once because a single run resolves the same spec from several places.
+fn load_source_index(spec: &ResolvedContractSpec) -> Option<TraceSourceIndex> {
+    match TraceSourceIndex::load(spec) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            report_once(
+                format!("ethdebug:{}:{}", spec.name, spec.debug_dir.display()),
+                &format!(
+                    "could not load ETHDebug metadata for `{}` from `{}`: {error}",
+                    spec.name,
+                    spec.debug_dir.display()
+                ),
+                "source lines, variables, and decoded parameters are unavailable for it",
+            );
+            None
+        }
+    }
+}
+
+/// Resolves contract specs, reporting a bad spec instead of continuing with none.
+///
+/// Every caller degrades to "no debug info" on failure, so without this a typo in
+/// `--ethdebug-dir` is indistinguishable from not passing it at all.
+fn resolve_contract_specs_reporting(
+    ethdebug_dirs: &[String],
+    contracts_file: Option<&str>,
+) -> Vec<ResolvedContractSpec> {
+    match resolve_contract_specs(ethdebug_dirs, contracts_file) {
+        Ok(specs) => specs,
+        Err(error) => {
+            report_once(
+                format!("specs:{error}"),
+                &format!("could not resolve the requested contracts: {error}"),
+                "continuing without source-level information for this run",
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Writes a warning and a follow-up note to stderr, at most once per `key`.
+fn report_once(key: String, message: &str, note: &str) {
+    static REPORTED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+    let mut reported = match REPORTED.get_or_init(|| Mutex::new(BTreeSet::new())).lock() {
+        Ok(reported) => reported,
+        // A poisoned lock only means another thread panicked while reporting. Losing
+        // deduplication is better than losing the diagnostic.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !reported.insert(key) {
+        return;
+    }
+    eprintln!("{} {message}", warning("warning:"));
+    eprintln!("{} {note}", dim("note:"));
 }
 
 fn resolve_contract_specs(
@@ -2735,6 +2940,17 @@ fn resolve_ethdebug_spec(spec_text: &str) -> SoldbResult<Vec<ResolvedContractSpe
                 debug_dir: path,
             }]);
         }
+    }
+
+    // Resolving nothing is a failure, not an empty result. The user named this on the
+    // command line; returning zero contracts silently is indistinguishable from having
+    // passed no `--ethdebug-dir` at all, and it is how a mistyped spec turns into a
+    // confusing "no debug info" trace.
+    if loaded.is_empty() {
+        return Err(soldb_core::SoldbError::Message(format!(
+            "no contracts found for `{spec_text}`; expected `<address>:<contract>:<dir>`, \
+             a directory of ETHDebug artifacts, or a contract mapping file"
+        )));
     }
 
     Ok(loaded)
@@ -2941,8 +3157,7 @@ fn trace_web_contracts(
     args: &TraceArgs,
     trace: &TransactionTrace,
 ) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs =
-        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).unwrap_or_default();
+    let specs = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref());
     web_contracts_for_specs(specs, trace, None)
 }
 
@@ -2951,8 +3166,7 @@ fn simulate_web_contracts(
     trace: &TransactionTrace,
     contract_address: &str,
 ) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs =
-        resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref()).unwrap_or_default();
+    let specs = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref());
     web_contracts_for_specs(specs, trace, Some(contract_address))
 }
 
@@ -2992,7 +3206,7 @@ fn web_contracts_for_specs(
 fn web_contract_metadata_for_spec(
     spec: &ResolvedContractSpec,
 ) -> Option<soldb_serializer::WebContractMetadata> {
-    let source_index = TraceSourceIndex::load(spec).ok();
+    let source_index = load_source_index(spec);
     let mut pc_to_source_mappings = BTreeMap::new();
     let mut source_paths = BTreeMap::new();
     let mut sources = BTreeMap::new();
@@ -3037,15 +3251,13 @@ fn normalize_contract_address_key(address: &str) -> String {
 }
 
 fn trace_contract_name(args: &TraceArgs) -> Option<String> {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| specs.into_iter().next().map(|spec| spec.name))
+    trace_contract_spec(args).map(|spec| spec.name)
 }
 
 fn trace_contract_spec(args: &TraceArgs) -> Option<ResolvedContractSpec> {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| specs.into_iter().next())
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+        .into_iter()
+        .next()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3100,9 +3312,10 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
 }
 
 fn simulate_contract_name(args: &SimulateArgs) -> Option<String> {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| specs.into_iter().next().map(|spec| spec.name))
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+        .into_iter()
+        .next()
+        .map(|spec| spec.name)
 }
 
 fn simulate_calldata(args: &SimulateArgs) -> SoldbResult<String> {
@@ -3202,8 +3415,7 @@ fn format_simulated_call(args: &SimulateArgs, function_name: &str) -> String {
 }
 
 fn simulation_source_file(args: &SimulateArgs, contract_name: &str) -> Option<String> {
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()?
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
         .into_iter()
         .find(|spec| spec.name == contract_name)
         .and_then(|spec| {
@@ -3237,13 +3449,9 @@ fn simulate_display_function_name(args: &SimulateArgs, calldata: &str) -> String
         return signature.clone();
     }
 
-    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
-        .ok()
-        .and_then(|specs| {
-            specs
-                .into_iter()
-                .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
-        })
+    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+        .into_iter()
+        .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
         .map_or_else(|| "raw_data".to_owned(), |descriptor| descriptor.name)
 }
 
@@ -3324,9 +3532,9 @@ fn format_stack(stack: &[String]) -> String {
     items.join(" ")
 }
 
-fn format_snapshot_state(snapshot: &soldb_core::StepSnapshot) -> String {
+fn format_snapshot_state(snapshot: soldb_core::StepSnapshotRef<'_>) -> String {
     let mut items = Vec::new();
-    if let Some(memory) = &snapshot.memory {
+    if let Some(memory) = snapshot.memory {
         if !memory.is_empty() {
             items.push(format!("mem={}b", memory.len() / 2));
         }
@@ -3345,11 +3553,17 @@ fn format_snapshot_state(snapshot: &soldb_core::StepSnapshot) -> String {
 }
 
 fn shorten_hex(value: &str) -> String {
-    if value.len() > 10 && value.starts_with("0x") {
-        format!("0x{}...", &value[2..6])
-    } else {
-        value.to_owned()
+    // Stack and memory words come straight from the node, so they are not guaranteed to be
+    // ASCII hex. Take characters rather than byte offsets: `&value[2..6]` panics when byte
+    // 6 lands inside a multi-byte character.
+    let Some(digits) = value.strip_prefix("0x") else {
+        return value.to_owned();
+    };
+    if value.len() <= 10 {
+        return value.to_owned();
     }
+    let head = digits.chars().take(4).collect::<String>();
+    format!("0x{head}...")
 }
 
 #[cfg(test)]
@@ -3454,6 +3668,109 @@ mod tests {
             multi_contract: false,
             json_events: false,
         }
+    }
+
+    fn instruction_at(pc: u64, offset: u64, length: u64) -> Instruction {
+        Instruction {
+            offset: pc,
+            operation: serde_json::json!({"mnemonic": "JUMPDEST"}),
+            context: Some(serde_json::json!({
+                "code": {"source": {"id": 0}, "range": {"offset": offset, "length": length}}
+            })),
+        }
+    }
+
+    #[test]
+    fn source_breakpoints_prefer_the_span_generated_for_the_line() {
+        // Three source lines; the statement for line 2 starts at byte 10.
+        let source = "contract C {\n  uint x = 1;\n}\n";
+        let line_two_offset = source.find("uint").expect("line two statement") as u64;
+
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: vec![
+                // The dispatcher preamble solc attributes to the whole contract. Its span
+                // intersects every line, so it used to win every source breakpoint.
+                instruction_at(2, 0, source.len() as u64),
+                instruction_at(4, 0, source.len() as u64),
+                // The instruction actually generated for line 2.
+                instruction_at(64, line_two_offset, 11),
+            ],
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let index = TraceSourceIndex {
+            spec: ResolvedContractSpec {
+                address: None,
+                name: "C".to_owned(),
+                debug_dir: PathBuf::from("."),
+            },
+            info,
+            resources: serde_json::Value::Null,
+            functions: Vec::new(),
+            source_contents: BTreeMap::from([(0, source.to_owned())]),
+        };
+
+        let mut trace = TransactionTrace {
+            tx_hash: None,
+            from_addr: "0x1".to_owned(),
+            to_addr: None,
+            value: "0x0".to_owned(),
+            input_data: "0x".to_owned(),
+            gas_used: 0,
+            output: "0x".to_owned(),
+            success: true,
+            error: None,
+            debug_trace_available: true,
+            contract_address: None,
+            backend: None,
+            capabilities: Default::default(),
+            artifacts: Default::default(),
+            steps: Vec::new(),
+        };
+        for pc in [2, 4, 64] {
+            trace.steps.push(soldb_core::TraceStep {
+                pc,
+                op: "JUMPDEST".to_owned(),
+                gas: 0,
+                gas_cost: 0,
+                depth: 0,
+                stack: Vec::new(),
+                memory: None,
+                storage: None,
+                error: None,
+                snapshot: Default::default(),
+            });
+        }
+
+        let target = SourceBreakpointTarget {
+            file: Some("C.sol".to_owned()),
+            line: 2,
+        };
+        let resolved = index
+            .resolve_breakpoint(&target, &trace, 0)
+            .expect("resolve breakpoint");
+
+        assert_eq!(resolved.pc, 64);
+        assert_eq!(resolved.line, 2);
+    }
+
+    #[test]
+    fn shortening_hex_handles_non_ascii_values() {
+        // Trace values are whatever the node sent us. Slicing bytes 2..6 panicked when a
+        // multi-byte character straddled byte 6.
+        assert_eq!(
+            shorten_hex("0x\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}"),
+            "0x\u{20ac}\u{20ac}\u{20ac}\u{20ac}..."
+        );
+        assert_eq!(shorten_hex("0x1234"), "0x1234");
+        assert_eq!(shorten_hex("not hex at all"), "not hex at all");
+        assert_eq!(
+            shorten_hex("0x00000000000000000000000000000000000000000000000000000000000000ff"),
+            "0x0000..."
+        );
     }
 
     #[test]

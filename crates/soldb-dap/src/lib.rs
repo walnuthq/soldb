@@ -1,3 +1,14 @@
+//! Debug Adapter Protocol support for editor integrations.
+//!
+//! This crate contains the DAP wire layer — `Content-Length` framing, request and
+//! response bodies — and, in [`server`], the adapter that maps DAP requests onto a
+//! SolDB debug session: breakpoints, stack frames, scopes, variables, and stepping.
+//!
+//! A session is launched from a trace file, an inline trace, or a transaction hash plus
+//! an RPC URL. Source mapping and variable decoding come from `soldb-ethdebug` and
+//! `soldb-debugger`, the same path the terminal debugger uses, so an editor and the CLI
+//! report the same values.
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 

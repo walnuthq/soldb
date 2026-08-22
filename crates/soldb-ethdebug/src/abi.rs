@@ -1,3 +1,12 @@
+//! ABI encoding and function-signature parsing.
+//!
+//! This module turns a human-written signature such as `submitPerson((string,uint256))`
+//! plus its arguments into calldata, and derives the four-byte selector for it. Tuples,
+//! fixed and dynamic arrays, and the elementary value types are supported.
+//!
+//! It also carries the keccak-256 implementation used for selectors and event topics, so
+//! the workspace does not take a hashing dependency for this one purpose.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult};
@@ -155,14 +164,13 @@ pub fn function_selector(signature: &str) -> SoldbResult<[u8; 4]> {
 pub fn keccak256(input: &[u8]) -> [u8; 32] {
     const RATE: usize = 136;
     let mut state = [0_u64; 25];
-    let mut chunks = input.chunks_exact(RATE);
+    let (blocks, remainder) = input.as_chunks::<RATE>();
 
-    for block in &mut chunks {
+    for block in blocks {
         absorb_block(&mut state, block);
         keccak_f1600(&mut state);
     }
 
-    let remainder = chunks.remainder();
     let mut final_block = [0_u8; RATE];
     final_block[..remainder.len()].copy_from_slice(remainder);
     final_block[remainder.len()] ^= 0x01;
@@ -594,8 +602,8 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 fn absorb_block(state: &mut [u64; 25], block: &[u8]) {
-    for (lane, chunk) in block.chunks_exact(8).enumerate() {
-        state[lane] ^= u64::from_le_bytes(chunk.try_into().expect("8-byte lane"));
+    for (lane, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
+        state[lane] ^= u64::from_le_bytes(*chunk);
     }
 }
 
@@ -761,6 +769,48 @@ mod tests {
                 .as_ref()),
             "7cf5dab0"
         );
+    }
+
+    #[test]
+    fn hashes_inputs_spanning_the_keccak_rate() {
+        // The absorb loop consumes 136-byte blocks, so the cases that matter sit either
+        // side of that boundary. Nothing else here reaches it: the existing vectors are a
+        // few dozen bytes at most, which leaves the multi-block path untested.
+        // Expected digests come from `cast keccak`.
+        fn pattern(len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|index| u8::try_from((index * 7 + 3) % 256).expect("value fits a byte"))
+                .collect()
+        }
+
+        for (len, expected) in [
+            (
+                135,
+                "00ef96af9cf4b24c7f269d922294444a197d0a33638c2e56634c57e892103a8f",
+            ),
+            (
+                136,
+                "742061bcad767ed4c4f5883b1dcb1aad11afdcc140dc469d953759b127b9f9ed",
+            ),
+            (
+                137,
+                "e3371f61e770abf254c34239c3b0099ad90594507415bc81dd0a10b9692bbf2a",
+            ),
+            (
+                272,
+                "ac141fd7b0a0ffcd2e967254d508da3ec616596493c36fa304425647d90e6de5",
+            ),
+            (
+                300,
+                "fa75f2293be9f9a14dcdeeff53f7b91ff6a2b1331b13886e69077ab1cf8252a9",
+            ),
+        ] {
+            assert_eq!(
+                hex(keccak256(&pattern(len)).as_ref()),
+                expected,
+                "len {len}"
+            );
+        }
     }
 
     #[test]

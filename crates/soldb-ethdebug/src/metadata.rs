@@ -1,3 +1,14 @@
+//! ETHDebug artifact model: instructions, source spans, and variable locations.
+//!
+//! An ETHDebug runtime artifact is a list of instructions, each carrying its program
+//! counter and a `context` describing the source range it was generated from. Mapping a
+//! program counter back to Solidity means finding its instruction and reading that span.
+//!
+//! Spans nest: a compiler attaches a whole-contract range to dispatcher and preamble
+//! instructions, so a span containing a given line is not the same thing as a span
+//! generated for it. Callers that resolve a source line to a program counter must rank
+//! candidates accordingly rather than taking the first intersecting span.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

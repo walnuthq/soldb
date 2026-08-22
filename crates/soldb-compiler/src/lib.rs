@@ -1,3 +1,17 @@
+//! Driving `solc` and discovering the ETHDebug artifacts it produces.
+//!
+//! This crate compiles Solidity with debug info enabled, locates the resulting
+//! artifacts, and provides the deploy helpers behind local auto-deploy workflows.
+//!
+//! ETHDebug's command-line surface has changed across compiler releases: older versions
+//! accept `--ethdebug`/`--ethdebug-runtime`, while newer ones expose the same output
+//! through `--experimental --ethdebug-program`/`--ethdebug-program-runtime`/
+//! `--ethdebug-resources`. [`CompilerConfig::compile_with_ethdebug`] probes for that by
+//! trying the configured flags and falling back only when the compiler rejects them as
+//! unrecognised, so a single code path works across versions without a hardcoded cutoff.
+//! Artifact discovery is version-tolerant for the same reason and accepts either the
+//! `ethdebug.json` or the `ethdebug_resources.json` spelling of the resources file.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -508,7 +522,12 @@ fn extract_solc_version(output: &str) -> Option<String> {
 }
 
 fn version_supports_ethdebug(version: &str) -> bool {
-    let parts = version
+    // Development builds report a prerelease suffix, for example
+    // `0.8.37-develop.2026.8.22`. Only the leading `major.minor.patch` is the version;
+    // parsing `37-develop` as a component fails and would reject the compiler outright —
+    // and a development build is exactly where new ETHDebug output appears first.
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let parts = core
         .split('.')
         .map(str::parse::<u64>)
         .collect::<Result<Vec<_>, _>>();
@@ -665,7 +684,9 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{auto_deploy, dual_compile, AutoDeployConfig, CompilerConfig};
+    use super::{
+        auto_deploy, dual_compile, version_supports_ethdebug, AutoDeployConfig, CompilerConfig,
+    };
     use serde_json::json;
 
     #[test]
@@ -715,6 +736,37 @@ mod tests {
         assert!(new_info.supported);
         assert!(!old_info.supported);
         assert_eq!(old_info.version.as_deref(), Some("0.8.28"));
+    }
+
+    #[test]
+    fn accepts_prerelease_solc_versions() {
+        // Development builds of the compiler report a prerelease suffix. They are where new
+        // ETHDebug output lands first, so the version gate has to read past the suffix
+        // rather than treat `37-develop` as a version component.
+        assert!(version_supports_ethdebug("0.8.37-develop.2026.8.22"));
+        assert!(version_supports_ethdebug("0.8.29-nightly.2025.4.1"));
+        assert!(version_supports_ethdebug("0.9.0-develop"));
+        assert!(!version_supports_ethdebug("0.8.28-develop.2025.1.1"));
+        assert!(!version_supports_ethdebug("not-a-version"));
+
+        // Release versions keep working unchanged.
+        assert!(version_supports_ethdebug("0.8.31"));
+        assert!(!version_supports_ethdebug("0.8.16"));
+    }
+
+    #[test]
+    fn reports_the_full_prerelease_version_string() {
+        let temp = temp_dir("prerelease-version");
+        let solc = fake_solc(&temp, "0.8.37-develop.2026.8.22", false);
+
+        let info = CompilerConfig {
+            solc_path: solc.to_string_lossy().into_owned(),
+            ..CompilerConfig::default()
+        }
+        .verify_solc_version();
+
+        assert!(info.supported, "develop builds support ETHDebug");
+        assert_eq!(info.version.as_deref(), Some("0.8.37-develop.2026.8.22"));
     }
 
     #[test]

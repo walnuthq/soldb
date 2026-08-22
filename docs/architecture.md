@@ -55,20 +55,30 @@ PC 123 → TestContract.sol:39:15 (line 39, column 15)
 - `Contract_ethdebug.json` - Constructor debug info
 - `Contract_ethdebug-runtime.json` - Runtime debug info with instruction mappings
 
-Each instruction entry contains:
+Each instruction entry contains its program counter (`offset`), its operation, and a
+`context` naming the source range it was generated from:
+
 ```json
 {
-  "opcode": "PUSH1",
-  "value": "0x4",
+  "offset": 5,
+  "operation": {
+    "mnemonic": "PUSH1",
+    "arguments": ["0x04"]
+  },
   "context": {
-    "source": {
-      "id": 0,
-      "offset": 523,
-      "length": 1
+    "code": {
+      "source": {"id": 0},
+      "range": {"offset": 144, "length": 2771}
     }
   }
 }
 ```
+
+Source ranges nest. The compiler attaches a whole-contract range to dispatcher and
+preamble instructions, so a range that contains a given line is not necessarily a range
+generated for it. Resolving a source line to a program counter therefore prefers
+instructions whose range *begins* on that line, falling back to the narrowest range that
+merely intersects it.
 
 ### 4. Function Call Analysis
 

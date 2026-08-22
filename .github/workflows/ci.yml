@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The solc development branch moves without us, so check against it on a schedule as
+  # well as per pull request.
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
 
 env:
   FOUNDRY_VERSION: v1.0.0
@@ -130,6 +135,169 @@ jobs:
             cat anvil.log
             exit 1
           fi
+
+          RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh
+
+  lit-solc-develop:
+    # Forward-looking compatibility run against the Solidity development branch, where
+    # ETHDebug output is still taking shape - variable emission in particular lands there
+    # before it reaches any release, and it is what the debugger's `vars` and `print`
+    # commands read.
+    #
+    # Deliberately non-blocking: `develop` is a moving target we do not control, so a break
+    # there is an early warning for us, not a reason to hold up a soldb pull request. When
+    # this job goes red, read it before assuming the fault is ours.
+    name: lit (solc develop)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      - name: Resolve the solc develop commit
+        id: solc-develop
+        run: |
+          set -euo pipefail
+          commit="$(git ls-remote https://github.com/argotorg/solidity.git refs/heads/develop | cut -f1)"
+          if [ -z "$commit" ]; then
+            echo "Could not resolve argotorg/solidity develop" >&2
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Testing against argotorg/solidity@$commit"
+
+      - name: Restore the cached solc build
+        id: solc-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/solc-develop
+          key: solc-develop-${{ runner.os }}-${{ steps.solc-develop.outputs.commit }}
+
+      - name: Restore the compiler ccache
+        if: steps.solc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: solc-develop-ccache-${{ runner.os }}-${{ steps.solc-develop.outputs.commit }}
+          restore-keys: solc-develop-ccache-${{ runner.os }}-
+
+      - name: Install compiler build dependencies
+        if: steps.solc-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache cmake ninja-build \
+            libboost-filesystem-dev libboost-program-options-dev \
+            libboost-system-dev libboost-test-dev
+
+      - name: Build solc from develop
+        if: steps.solc-cache.outputs.cache-hit != 'true'
+        env:
+          SOLC_COMMIT: ${{ steps.solc-develop.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git init solidity
+          cd solidity
+          git remote add origin https://github.com/argotorg/solidity.git
+          git fetch --depth 1 origin "$SOLC_COMMIT"
+          git checkout --detach FETCH_HEAD
+          # Only the submodules the compiler links against; the others are test-only.
+          git submodule update --init --depth 1 \
+            deps/nlohmann-json deps/range-v3 deps/fmtlib
+          # Build the compiler binary alone. PEDANTIC=OFF keeps a warning newly introduced
+          # on develop from failing the build, which would tell us nothing about soldb.
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DPEDANTIC=OFF \
+            -DTESTS=OFF \
+            -DTOOLS=OFF \
+            -DSTRICT_Z3_VERSION=OFF
+          cmake --build build --target solc
+          mkdir -p "$HOME/.local/bin"
+          install -m 755 build/solc/solc "$HOME/.local/bin/solc-develop"
+
+      - name: Install system test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq llvm
+          LLVM_BIN="$(dirname "$(find /usr/lib/llvm-* -name FileCheck | sort -V | tail -1)")"
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
+
+      - name: Install lit
+        run: python -m pip install lit
+
+      - name: Select the Solidity compilers
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          # The legacy source-map test pins 0.8.16, which predates ETHDebug entirely.
+          curl -fsSL \
+            -o "$HOME/.local/bin/solc-0.8.16" \
+            https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.16+commit.07a7930e
+          echo "1632786c6c1f856a4a899232ec975a12f305118f43cce90e724ed0b2eebfeee1  $HOME/.local/bin/solc-0.8.16" | sha256sum -c -
+          chmod +x "$HOME/.local/bin/solc-0.8.16"
+          # Some tests invoke bare `solc`, so point it at the development build.
+          ln -sf "$HOME/.local/bin/solc-develop" "$HOME/.local/bin/solc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "SOLC_PATH=$HOME/.local/bin/solc-develop" >> "$GITHUB_ENV"
+
+      - name: Report the ETHDebug output this build produces
+        run: |
+          set -euo pipefail
+          solc --version
+          # Informational, never a gate. `vars` and `print` in the debugger read ETHDebug
+          # variable locations, so record whether this build emits them yet.
+          out="$(mktemp -d)"
+          "$SOLC_PATH" --via-ir --debug-info ethdebug --experimental \
+            --ethdebug-program --ethdebug-program-runtime --ethdebug-resources \
+            --bin --abi --overwrite -o "$out" examples/Counter.sol > /dev/null 2>&1 \
+            || "$SOLC_PATH" --via-ir --debug-info ethdebug \
+              --ethdebug --ethdebug-runtime \
+              --bin --abi --overwrite -o "$out" examples/Counter.sol > /dev/null 2>&1 \
+            || echo "ETHDebug compilation failed with both flag generations"
+          runtime="$out/Counter_ethdebug-runtime.json"
+          if [ ! -f "$runtime" ]; then
+            echo "ETHDebug runtime artifact: not produced"
+          elif jq -e '[.instructions[]?.context?.variables?, .variables?] | flatten | map(select(. != null)) | length > 0' "$runtime" > /dev/null 2>&1; then
+            echo "ETHDebug variable locations: PRESENT - the debugger can decode locals"
+          else
+            echo "ETHDebug variable locations: not emitted by this build yet"
+          fi
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build Rust binaries
+        run: cargo build --bin soldb --bin soldb-dap-server
+
+      - name: Run lit tests
+        run: |
+          set -euo pipefail
+          anvil --steps-tracing --host 127.0.0.1 --port 8545 > anvil.log 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID"' EXIT
+
+          for _ in {1..30}; do
+            if curl -fsS \
+              -X POST \
+              -H "Content-Type: application/json" \
+              --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+              http://127.0.0.1:8545 > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
 
           RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh
 

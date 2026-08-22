@@ -1,0 +1,28 @@
+# Test that ETHDebug load failures are reported instead of silently degrading
+# REQUIRES: soldb
+#
+# Note: avoid the bare word `not` surrounded by non-word characters anywhere in this file.
+# lit substitutes it with LLVM's `not` binary, and `missing-ethdebug` below is deliberately
+# spelled without it.
+
+# A directory that holds no ETHDebug artifacts is reported, not silently ignored. The user
+# asked for ETHDebug by naming the directory, so "no source lines" must not look identical
+# to a contract compiled without debug info.
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{project_root}/test/missing-ethdebug 2>&1 >/dev/null --rpc %{rpc_url} | FileCheck %s --check-prefix=MISSING
+
+# MISSING: warning: could not load ETHDebug metadata for `TestContract`
+# MISSING: note: source lines, variables, and decoded parameters are unavailable
+
+# A spec that resolves to no contract at all is reported too.
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{project_root}/test/missing-ethdebug 2>&1 >/dev/null --rpc %{rpc_url} | FileCheck %s --check-prefix=UNRESOLVED
+
+# UNRESOLVED: warning: could not resolve the requested contracts
+# UNRESOLVED-SAME: no contracts found for
+
+# The report goes to stderr, so `--json` still emits one valid document on stdout.
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{project_root}/test/missing-ethdebug --rpc %{rpc_url} --json 2>/dev/null | jq -e '.schemaVersion == 1 and (.steps | length) > 0' > /dev/null
+
+# A healthy ETHDebug directory reports nothing at all.
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} 2>&1 >/dev/null --rpc %{rpc_url} | FileCheck %s --check-prefix=QUIET --allow-empty
+
+# QUIET-NOT: warning:

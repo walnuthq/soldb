@@ -1,3 +1,12 @@
+//! The Debug Adapter Protocol server.
+//!
+//! [`DapServer`] holds one debug session and maps DAP requests onto it: launching from a
+//! trace file, an inline trace, or a transaction hash plus RPC URL; setting breakpoints;
+//! reporting stack frames, scopes, and variables; and stepping.
+//!
+//! Source mapping and variable decoding go through `soldb-ethdebug` and `soldb-debugger`
+//! so an editor reports the same values as the terminal debugger.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -359,7 +368,7 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        step.normalized_snapshot()
+        step.snapshot_ref()
             .stack
             .iter()
             .enumerate()
@@ -373,7 +382,7 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        let Some(memory) = step.normalized_snapshot().memory else {
+        let Some(memory) = step.snapshot_ref().memory else {
             return Vec::new();
         };
         if memory.is_empty() {
@@ -397,7 +406,7 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        let snapshot = step.normalized_snapshot();
+        let snapshot = step.snapshot_ref();
         let mut variables = snapshot
             .storage
             .iter()
@@ -447,14 +456,14 @@ impl DapServer {
                     .parse::<usize>()
                     .ok();
                 index
-                    .and_then(|index| step.normalized_snapshot().stack.get(index).cloned())
+                    .and_then(|index| step.snapshot_ref().stack.get(index).cloned())
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
             expression if expression.starts_with("storage[") && expression.ends_with(']') => {
                 let slot = expression
                     .trim_start_matches("storage[")
                     .trim_end_matches(']');
-                step.normalized_snapshot()
+                step.snapshot_ref()
                     .storage
                     .get(slot)
                     .cloned()

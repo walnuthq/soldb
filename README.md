@@ -75,9 +75,9 @@ soldb trace <tx_hash> --ethdebug-dir <contract_address>:<contract_name>:./out --
 
 Inside REPL:
 ```
-(soldb) break TestContract.sol:42
-(soldb) next
-(soldb) print balance
+soldb> break TestContract.sol:42
+soldb> next
+soldb> print balance
 ```
 
 ---
@@ -116,9 +116,9 @@ soldb simulate <contract_address> "increment(uint256)" 5     --from <sender_addr
 
 Inside REPL:
 ```
-(soldb) break TestContract.sol:38
-(soldb) step
-(soldb) vars
+soldb> break TestContract.sol:38
+soldb> step
+soldb> vars
 ```
 
 ---
@@ -126,6 +126,8 @@ Inside REPL:
 ## Features
 
 - ETHDebug-first source debugging built around compiler-generated `solc --debug-info ethdebug` metadata
+- Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
+  server, decoded from ETHDebug variable locations
 - Full transaction traces with internal calls & decoded parameters
 - Transaction simulation with arbitrary calldata (including structs & tuples)
 - Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations
@@ -262,6 +264,15 @@ Run lit end-to-end CLI tests:
 Run the full local test target:
 ```bash
 make test
+```
+
+CI additionally runs the lit suite against `solc` built from the
+[Solidity development branch](https://github.com/argotorg/solidity), where ETHDebug output
+changes first. That job is non-blocking and also runs on a daily schedule. To reproduce it
+locally, point the runner at your own build:
+
+```bash
+./test/run-tests.sh SOLC_PATH=/path/to/solidity/build/solc/solc
 ```
 
 ### Coverage

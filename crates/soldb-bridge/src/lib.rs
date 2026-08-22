@@ -1,3 +1,13 @@
+//! The cross-environment debugging bridge.
+//!
+//! Ethereum transactions increasingly span execution environments. This crate defines
+//! the protocol that lets a non-EVM debugger attach to the same trace and call-stack
+//! model SolDB uses for Solidity, along with the contract registry, the trace store, and
+//! the HTTP server that hosts them. Stylus is the first integrated environment; others
+//! follow the same shape.
+//!
+//! [`PROTOCOL_VERSION`] is the wire version peers negotiate against.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};

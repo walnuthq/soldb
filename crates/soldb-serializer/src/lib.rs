@@ -1,4 +1,15 @@
-use std::collections::BTreeMap;
+//! The web-facing JSON projection of traces and simulations.
+//!
+//! `soldb trace --json` and `soldb simulate --json` are consumed by explorers and web
+//! clients, so the document produced here is a versioned contract rather than a debug
+//! dump. `docs/json.md` is its specification and is updated alongside this module.
+//!
+//! [`WEB_JSON_SCHEMA_VERSION`] increments only for breaking changes; adding a field is
+//! additive. Call artifacts are rebuilt into a nested call tree, and because those
+//! artifacts can be deserialized from a trace file, the reconstruction tolerates parent
+//! links that do not form a tree instead of recursing on a cycle.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use serde_json::json;
@@ -93,8 +104,8 @@ fn web_steps(trace: &TransactionTrace) -> Vec<serde_json::Value> {
                 "gas": step.gas,
                 "gasCost": step.gas_cost,
                 "depth": step.depth,
-                "stack": step.stack,
-                "snapshot": step.normalized_snapshot(),
+                "stack": step.snapshot_ref().stack,
+                "snapshot": step.snapshot_ref(),
             })
         })
         .collect()
@@ -197,23 +208,29 @@ fn trace_call_from_artifacts(trace: &TransactionTrace) -> Option<TraceCallWeb> {
         .into_iter()
         .map(|node| (node.call_id, node))
         .collect::<BTreeMap<_, _>>();
-    Some(build_trace_call_node(root_id, &by_id))
+    build_trace_call_node(root_id, &by_id, &mut BTreeSet::new())
 }
 
-fn build_trace_call_node(call_id: u64, by_id: &BTreeMap<u64, ArtifactCallNode>) -> TraceCallWeb {
-    let node = by_id
-        .get(&call_id)
-        .expect("trace call tree references a missing node");
-    let child_ids = by_id
+fn build_trace_call_node(
+    call_id: u64,
+    by_id: &BTreeMap<u64, ArtifactCallNode>,
+    visited: &mut BTreeSet<u64>,
+) -> Option<TraceCallWeb> {
+    // Call artifacts are deserialized from backend output and from trace files handed to
+    // the DAP server, so the parent links are not guaranteed to form a tree. Refuse to
+    // revisit a call: a cycle would otherwise recurse until the stack overflows, which is
+    // not something a caller can catch.
+    if !visited.insert(call_id) {
+        return None;
+    }
+    let node = by_id.get(&call_id)?;
+    let calls = by_id
         .values()
         .filter(|candidate| candidate.parent_call_id == Some(call_id))
-        .map(|candidate| candidate.call_id)
+        .filter_map(|candidate| build_trace_call_node(candidate.call_id, by_id, visited))
         .collect::<Vec<_>>();
-    let calls = child_ids
-        .iter()
-        .map(|child_id| build_trace_call_node(*child_id, by_id))
-        .collect();
-    TraceCallWeb {
+    let child_ids = calls.iter().map(|child| child.call_id).collect::<Vec<_>>();
+    Some(TraceCallWeb {
         ty: node.ty.clone(),
         call_id: node.call_id,
         parent_call_id: node.parent_call_id,
@@ -228,7 +245,7 @@ fn build_trace_call_node(call_id: u64, by_id: &BTreeMap<u64, ArtifactCallNode>) 
         output: node.output.clone(),
         is_reverted_frame: node.is_reverted_frame,
         calls,
-    }
+    })
 }
 
 fn artifact_call_nodes(trace: &TransactionTrace) -> Vec<ArtifactCallNode> {
@@ -412,6 +429,50 @@ mod tests {
         assert_eq!(value["schemaVersion"], 1);
         assert_eq!(value["traceCall"]["functionName"], "raw_data");
         assert_eq!(value["steps"][0]["traceCallIndex"], 0);
+    }
+
+    fn call_node(id: usize, parent_id: Option<usize>) -> ExecutionCall {
+        ExecutionCall {
+            id,
+            parent_id,
+            depth: 0,
+            entry_step: None,
+            exit_step: None,
+            call_type: "call".to_owned(),
+            from: "0x1".to_owned(),
+            to: "0x2".to_owned(),
+            bytecode_address: "0x2".to_owned(),
+            value: "0x0".to_owned(),
+            input: "0x".to_owned(),
+            gas_limit: 0,
+            gas_used: None,
+            output: None,
+            success: Some(true),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn cyclic_artifact_calls_do_not_recurse_forever() {
+        // A trace file whose call parents form a cycle used to recurse until the stack
+        // overflowed, which aborts the process instead of surfacing an error.
+        let mut trace = sample_trace();
+        trace.artifacts = TraceArtifacts {
+            calls: vec![call_node(0, Some(1)), call_node(1, Some(0))],
+            ..Default::default()
+        };
+
+        let json = trace_to_web_json(&trace).expect("serialize cyclic trace");
+        let value = serde_json::from_str::<serde_json::Value>(&json).expect("valid json");
+
+        assert_eq!(value["traceCall"]["callId"], 0);
+        assert_eq!(value["traceCall"]["calls"][0]["callId"], 1);
+        assert_eq!(
+            value["traceCall"]["calls"][0]["calls"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
     }
 
     #[test]
