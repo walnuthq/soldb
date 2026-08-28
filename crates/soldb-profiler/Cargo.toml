@@ -1,5 +1,5 @@
 [package]
-name = "soldb-ethdebug"
+name = "soldb-profiler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,10 +9,12 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-revm-bytecode = { version = "9.0", default-features = false, features = ["std"] }
 serde.workspace = true
-serde_json.workspace = true
 soldb-core = { path = "../soldb-core" }
+soldb-ethdebug = { path = "../soldb-ethdebug" }
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

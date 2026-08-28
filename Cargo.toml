@@ -7,6 +7,7 @@ members = [
     "crates/soldb-debugger",
     "crates/soldb-dap",
     "crates/soldb-ethdebug",
+    "crates/soldb-profiler",
     "crates/soldb-repl",
     "crates/soldb-rpc",
     "crates/soldb-serializer",

@@ -15,11 +15,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceLocation {
     pub source_id: u64,
     pub offset: u64,
     pub length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FunctionIdentity {
+    pub identifier: Option<String>,
+    pub declaration: Option<SourceLocation>,
+    pub activation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FunctionExit {
+    Return,
+    Revert,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,15 +68,89 @@ impl Instruction {
 
     #[must_use]
     pub fn source_location(&self) -> Option<SourceLocation> {
-        let code = self.context.as_ref()?.get("code")?;
-        let source_id = code.get("source")?.get("id")?.as_u64()?;
-        let range = code.get("range")?;
-        Some(SourceLocation {
-            source_id,
-            offset: range.get("offset")?.as_u64()?,
-            length: range.get("length")?.as_u64()?,
-        })
+        let mut locations = self.source_locations();
+        (locations.len() == 1).then(|| locations.remove(0))
     }
+
+    /// Returns every source alternative attached to this instruction.
+    #[must_use]
+    pub fn source_locations(&self) -> Vec<SourceLocation> {
+        let mut locations = Vec::new();
+        if let Some(context) = &self.context {
+            collect_source_locations(context, &mut locations);
+        }
+        locations
+    }
+
+    /// Returns every possible function invocation attached to this instruction.
+    #[must_use]
+    pub fn function_invocations(&self) -> Vec<FunctionIdentity> {
+        let mut functions = Vec::new();
+        if let Some(context) = &self.context {
+            collect_function_invocations(context, &mut functions);
+        }
+        functions
+    }
+
+    /// Returns the function exit attached to this instruction.
+    #[must_use]
+    pub fn function_exit(&self) -> Option<FunctionExit> {
+        let context = self.context.as_ref()?;
+        if context.get("return").is_some() {
+            Some(FunctionExit::Return)
+        } else if context.get("revert").is_some() {
+            Some(FunctionExit::Revert)
+        } else {
+            None
+        }
+    }
+}
+
+fn collect_source_locations(context: &Value, locations: &mut Vec<SourceLocation>) {
+    if let Some(location) = context.get("code").and_then(parse_source_location) {
+        if !locations.contains(&location) {
+            locations.push(location);
+        }
+    }
+    if let Some(pick) = context.get("pick").and_then(Value::as_array) {
+        for alternative in pick {
+            collect_source_locations(alternative, locations);
+        }
+    }
+}
+
+fn collect_function_invocations(context: &Value, functions: &mut Vec<FunctionIdentity>) {
+    if let Some(invoke) = context.get("invoke") {
+        let function = FunctionIdentity {
+            identifier: invoke
+                .get("identifier")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            declaration: invoke.get("declaration").and_then(parse_source_location),
+            activation: invoke
+                .get("activation")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
+        if !functions.contains(&function) {
+            functions.push(function);
+        }
+    }
+    if let Some(pick) = context.get("pick").and_then(Value::as_array) {
+        for alternative in pick {
+            collect_function_invocations(alternative, functions);
+        }
+    }
+}
+
+fn parse_source_location(value: &Value) -> Option<SourceLocation> {
+    let source_id = value.get("source")?.get("id")?.as_u64()?;
+    let range = value.get("range")?;
+    Some(SourceLocation {
+        source_id,
+        offset: range.get("offset")?.as_u64()?,
+        length: range.get("length")?.as_u64()?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +436,62 @@ mod tests {
         assert_eq!(source_location.source_id, 7);
         assert_eq!(source_location.offset, 20);
         assert_eq!(source_location.length, 4);
+    }
+
+    #[test]
+    fn extracts_source_picks_and_function_events() {
+        let invoke: Instruction = serde_json::from_value(json!({
+            "offset": 12,
+            "operation": {"mnemonic": "JUMPDEST"},
+            "context": {
+                "invoke": {
+                    "identifier": "calculate",
+                    "declaration": {
+                        "source": {"id": 7},
+                        "range": {"offset": 100, "length": 80}
+                    },
+                    "jump": true
+                }
+            }
+        }))
+        .expect("invoke instruction");
+        let shared: Instruction = serde_json::from_value(json!({
+            "offset": 13,
+            "operation": {"mnemonic": "SSTORE"},
+            "context": {
+                "pick": [
+                    {"code": {
+                        "source": {"id": 7},
+                        "range": {"offset": 20, "length": 4}
+                    }},
+                    {"code": {
+                        "source": {"id": 7},
+                        "range": {"offset": 140, "length": 4}
+                    }}
+                ]
+            }
+        }))
+        .expect("shared instruction");
+        let returned: Instruction = serde_json::from_value(json!({
+            "offset": 14,
+            "operation": {"mnemonic": "STOP"},
+            "context": {"return": {}}
+        }))
+        .expect("return instruction");
+
+        let function = invoke.function_invocations().remove(0);
+        assert_eq!(function.identifier.as_deref(), Some("calculate"));
+        assert_eq!(function.declaration.map(|range| range.offset), Some(100));
+        assert_eq!(shared.source_location(), None);
+        assert_eq!(
+            shared
+                .source_locations()
+                .into_iter()
+                .map(|location| location.offset)
+                .collect::<Vec<_>>(),
+            [20, 140]
+        );
+        assert_eq!(returned.function_exit(), Some(super::FunctionExit::Return));
     }
 
     #[test]

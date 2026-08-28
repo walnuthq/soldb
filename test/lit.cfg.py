@@ -1,5 +1,6 @@
 # -*- Python -*-
 
+import inspect
 import os
 import platform
 import shlex
@@ -14,7 +15,15 @@ import lit.formats
 config.name = 'soldb'
 
 # testFormat: The test format to use to interpret tests.
-config.test_format = lit.formats.ShTest(True)
+#
+# The suite uses shell variables and command substitution, which lit's
+# internal shell does not implement. LLVM 23 requires an explicit opt-in to
+# keep using the external shell, while older releases do not accept the new
+# keyword argument.
+sh_test_options = {}
+if 'force_execute_external' in inspect.signature(lit.formats.ShTest).parameters:
+    sh_test_options['force_execute_external'] = True
+config.test_format = lit.formats.ShTest(True, **sh_test_options)
 
 # suffixes: A list of file extensions to treat as test files.
 config.suffixes = ['.test']

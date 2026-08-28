@@ -2,6 +2,12 @@ cache/
 dist/
 target/
 rust-coverage.xml
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+__pycache__/
+*.egg-info/
 examples/debug/
 examples/debug*/
 examples/out*/

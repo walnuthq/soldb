@@ -30,6 +30,7 @@ fn help_and_version_are_served_by_rust_cli() {
     let stdout = String::from_utf8(help.stdout).expect("utf8 help");
     assert!(stdout.contains("SolDB - Ethereum transaction analysis tool"));
     assert!(stdout.contains("trace"));
+    assert!(stdout.contains("profile"));
     assert!(stdout.contains("simulate"));
     assert!(stdout.contains("list-events"));
 
@@ -40,6 +41,175 @@ fn help_and_version_are_served_by_rust_cli() {
     assert!(version.status.success());
     let stdout = String::from_utf8(version.stdout).expect("utf8 version");
     assert!(stdout.contains("soldb 0.1.0"));
+}
+
+#[test]
+fn profile_trace_file_writes_json_and_flamegraphs() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/profile");
+    let trace = fixture.join("trace.json");
+    let output_dir = temp_dir("profile-output");
+    let folded = output_dir.join("profile.folded");
+    let flamegraph = output_dir.join("profile.svg");
+    let spec = format!(
+        "0x000000000000000000000000000000000000cafe:Counter:{}",
+        fixture.display()
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "profile",
+            "--trace-file",
+            trace.to_str().expect("trace path"),
+            "--ethdebug-dir",
+            &spec,
+            "--folded",
+            folded.to_str().expect("folded path"),
+            "--flamegraph",
+            flamegraph.to_str().expect("flamegraph path"),
+        ])
+        .output()
+        .expect("run profile");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("profile stdout");
+    assert!(stdout.contains("EVM Gas Profile"));
+    assert!(stdout.contains("Counter::add"));
+    assert!(stdout.contains("Unmapped execution gas: 100"));
+    assert!(fs::read_to_string(&folded)
+        .expect("folded stacks")
+        .contains("Counter::add"));
+    assert!(fs::read_to_string(&flamegraph)
+        .expect("flame graph")
+        .contains("<svg"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "profile",
+            "--trace-file",
+            trace.to_str().expect("trace path"),
+            "--ethdebug-dir",
+            &spec,
+            "--json",
+        ])
+        .output()
+        .expect("run JSON profile");
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("profile JSON");
+    assert_eq!(report["schemaVersion"], 1);
+    assert_eq!(report["totals"]["stepGas"], 108);
+    assert_eq!(report["totals"]["sourceGas"], 8);
+    assert_eq!(report["functions"][0]["function"], "add");
+}
+
+#[test]
+fn profile_accepts_legacy_combined_source_maps() {
+    let dir = temp_dir("profile-source-map");
+    let source = "contract Counter {}\n";
+    fs::write(dir.join("Counter.sol"), source).expect("write source");
+    fs::write(
+        dir.join("combined.json"),
+        json!({
+            "version": "0.8.36+commit.test",
+            "sourceList": ["Counter.sol"],
+            "contracts": {
+                "Counter.sol:Counter": {
+                    "bin-runtime": "00",
+                    "srcmap-runtime": format!("0:{}:0", source.len()),
+                    "abi": []
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write combined JSON");
+    let trace = dir.join("trace.json");
+    fs::write(
+        &trace,
+        json!({
+            "tx_hash": "0xabc",
+            "from_addr": "0x1",
+            "to_addr": "0x000000000000000000000000000000000000cafe",
+            "value": "0x0",
+            "input_data": "0x",
+            "gas_used": 7,
+            "output": "0x",
+            "success": true,
+            "error": null,
+            "debug_trace_available": true,
+            "contract_address": null,
+            "backend": "replay",
+            "steps": [{
+                "pc": 0,
+                "op": "STOP",
+                "gas": 7,
+                "gas_cost": 7,
+                "depth": 0,
+                "stack": [],
+                "memory": null,
+                "storage": null,
+                "error": null
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write trace");
+    let spec = format!(
+        "0x000000000000000000000000000000000000cafe:Counter:{}",
+        dir.display()
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "profile",
+            "--trace-file",
+            trace.to_str().expect("trace path"),
+            "--ethdebug-dir",
+            &spec,
+            "--json",
+        ])
+        .output()
+        .expect("run source-map profile");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("profile JSON");
+    assert_eq!(report["totals"]["sourceGas"], 7);
+    assert_eq!(report["sourceLines"][0]["source"], "Counter.sol");
+    assert_eq!(report["sourceLines"][0]["line"], 1);
+    assert_eq!(report["functions"][0]["function"], "<contract>");
+}
+
+#[test]
+fn profile_json_reports_invalid_trace_files_once() {
+    let dir = temp_dir("profile-invalid");
+    let trace = dir.join("trace.json");
+    fs::write(&trace, "not JSON").expect("write invalid trace");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "profile",
+            "--trace-file",
+            trace.to_str().expect("trace path"),
+            "--json",
+        ])
+        .output()
+        .expect("run profile");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).expect("error JSON");
+    assert_eq!(error["error"], true);
+    assert_eq!(error["type"], "ProfileError");
+    assert!(error["message"]
+        .as_str()
+        .expect("error message")
+        .contains("invalid transaction trace"));
 }
 
 #[test]

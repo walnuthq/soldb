@@ -8,7 +8,7 @@
 # Legacy format uses srcmap-runtime
 # CHECK: srcmap-runtime
 # CHECK: Contract: TestContract
-# CHECK: Compiler: solc 0.8.16
+# CHECK: Compiler version: 0.8.16
 
 # Check for the call hierarchy with increment function (legacy format - basic structure only)
 # CHECK: #0 TestContract::runtime_dispatcher

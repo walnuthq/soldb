@@ -213,8 +213,8 @@ soldb> b contracts/Counter.sol:7
 Aliases: `b line <line>`
 
 Set a source-line breakpoint without naming a file. This works only when the
-loaded ETHDebug metadata has a single source file; otherwise SolDB asks for the
-explicit `<file>:<line>` form.
+loaded compiler debug metadata has a single source file; otherwise SolDB asks
+for the explicit `<file>:<line>` form.
 
 ```text
 soldb> break line 7

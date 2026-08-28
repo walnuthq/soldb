@@ -91,10 +91,11 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | `soldb-repl` | core |
 | `soldb-serializer` | core |
 | `soldb-debugger` | core, ethdebug |
+| `soldb-profiler` | core, debugger, ethdebug |
 | `soldb-bridge` | core, rpc |
 | `soldb-compiler` | core, ethdebug, rpc |
 | `soldb-dap` | core, ethdebug, rpc, repl, debugger |
-| `soldb-cli` | core, ethdebug, rpc, repl, debugger, serializer, compiler, bridge |
+| `soldb-cli` | core, ethdebug, rpc, repl, debugger, profiler, serializer, compiler, bridge |
 
 `soldb-debugger` is the shared frontend model, and both `soldb-cli` and `soldb-dap` go
 through it for variable decoding so the terminal and an editor report the same values.
@@ -115,6 +116,8 @@ new frontend logic that both would want belongs there.
   node.
 - **soldb-debugger**: source-step, function, and variable decoding over a
   `TransactionTrace` plus `EthdebugInfo`. Frontend-agnostic; shared by CLI, REPL, and DAP.
+- **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
+  programs. Frontend-agnostic; returns tables and folded stacks without printing or I/O.
 - **soldb-repl**: the interactive debugger *state machine* — breakpoints, stepping,
   display mode. It owns no I/O; the CLI drives it and prints. Keep it that way, because
   it is what makes REPL behavior unit-testable without a terminal.

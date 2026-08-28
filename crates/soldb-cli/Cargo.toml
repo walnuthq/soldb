@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+inferno = { version = "0.12", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 soldb-bridge = { path = "../soldb-bridge" }
@@ -18,6 +19,7 @@ soldb-compiler = { path = "../soldb-compiler" }
 soldb-core = { path = "../soldb-core" }
 soldb-debugger = { path = "../soldb-debugger" }
 soldb-ethdebug = { path = "../soldb-ethdebug" }
+soldb-profiler = { path = "../soldb-profiler" }
 soldb-repl = { path = "../soldb-repl" }
 soldb-rpc = { path = "../soldb-rpc" }
 soldb-serializer = { path = "../soldb-serializer" }

@@ -7,6 +7,7 @@ This directory contains the test infrastructure for SolDB.
 ```
 test/
 ├── trace/           # Trace command tests (lit + FileCheck)
+├── profile/         # Offline and RPC gas-profile tests
 ├── simulate/        # Simulate command tests (lit + FileCheck)
 ├── events/          # Events command tests (lit + FileCheck)
 ├── cli/             # CLI command and validation tests (lit + FileCheck)
@@ -40,6 +41,12 @@ Tests for the `soldb simulate` command:
 - **missing-function-signature.test**: Required signature validation
 - **raw-data-argument-error.test**: Raw calldata argument validation
 - **wrong-argument-count.test**: ABI-backed argument count validation
+
+### Profile Tests (`test/profile/`)
+
+- **offline-profile.test**: Source attribution, JSON, folded stacks, and SVG
+  flame graph generation from a captured trace
+- **replay-profile.test**: Dynamic gas attribution through local REVM replay
 
 ### Events Tests (`test/events/`)
 
@@ -83,6 +90,9 @@ cd test
 ```bash
 # Run only trace tests
 ./run-tests.sh --trace-only
+
+# Run only profile tests
+./run-tests.sh --profile-only
 
 # Run only simulate tests
 ./run-tests.sh --simulate-only
