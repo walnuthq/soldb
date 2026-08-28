@@ -15,8 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
-use soldb_debugger::{parse_source_functions, SourceFunction};
-use soldb_ethdebug::EthdebugInfo;
+use soldb_ethdebug::{EthdebugInfo, FunctionExit, FunctionIdentity, SourceLocation};
 
 const PROFILE_SCHEMA_VERSION: u32 = 1;
 
@@ -48,7 +47,7 @@ pub struct ProfileProgram {
     info: EthdebugInfo,
     source_contents: BTreeMap<u64, String>,
     source_indexes: HashMap<u64, SourceTextIndex>,
-    functions: Vec<SourceFunction>,
+    functions: Vec<ProfileFunction>,
     pc_contexts: HashMap<u64, ProgramCounterContext>,
 }
 
@@ -67,57 +66,44 @@ impl ProfileProgram {
                 ))
             })?;
         let contract_name = info.contract_name.clone();
-        let functions = source_contents
-            .iter()
-            .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
-            .collect::<Vec<_>>();
         let source_indexes = source_contents
             .iter()
             .map(|(source_id, source)| (*source_id, SourceTextIndex::new(source)))
             .collect::<HashMap<_, _>>();
         let mut pc_contexts = HashMap::with_capacity(info.instructions.len());
+        let mut functions = Vec::new();
+        let mut function_indexes = HashMap::new();
 
         for instruction in &info.instructions {
-            let source = instruction.source_location().and_then(|location| {
-                let end = location.offset.checked_add(location.length)?;
-                if source_indexes
-                    .get(&location.source_id)
-                    .is_some_and(|index| end > index.len)
-                {
-                    return None;
-                }
-                let position = source_indexes
-                    .get(&location.source_id)
-                    .and_then(|index| index.position(location.offset));
-                Some(IndexedSource {
-                    source_id: location.source_id,
-                    offset: location.offset,
-                    length: location.length,
-                    line: position.map(|position| position.0),
-                    column: position.map(|position| position.1),
+            let sources = instruction
+                .source_locations()
+                .into_iter()
+                .filter_map(|location| index_source_location(&source_indexes, location))
+                .collect();
+            let invokes = instruction
+                .function_invocations()
+                .into_iter()
+                .map(|identity| {
+                    if let Some(index) = function_indexes.get(&identity).copied() {
+                        index
+                    } else {
+                        let index = functions.len();
+                        functions.push(ProfileFunction {
+                            identity: identity.clone(),
+                        });
+                        function_indexes.insert(identity, index);
+                        index
+                    }
                 })
-            });
-            let function = source.as_ref().and_then(|source| {
-                functions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, function)| {
-                        function.source_id == source.source_id
-                            && function.declaration_start <= source.offset
-                            && source.offset <= function.body_end
-                    })
-                    .min_by_key(|(_, function)| {
-                        function.body_end.saturating_sub(function.declaration_start)
-                    })
-                    .map(|(index, _)| index)
-            });
+                .collect();
             if pc_contexts
                 .insert(
                     instruction.offset,
                     ProgramCounterContext {
                         opcode: instruction.mnemonic().map(str::to_owned),
-                        source,
-                        function,
+                        sources,
+                        invokes,
+                        exit: instruction.function_exit(),
                     },
                 )
                 .is_some()
@@ -154,6 +140,56 @@ impl ProfileProgram {
     #[must_use]
     pub fn environment(&self) -> ProgramEnvironment {
         self.environment
+    }
+
+    fn source_for_function(
+        &self,
+        context: &ProgramCounterContext,
+        function: Option<usize>,
+    ) -> Option<IndexedSource> {
+        if let [source] = context.sources.as_slice() {
+            return Some(*source);
+        }
+        let declaration = function
+            .and_then(|function| self.functions.get(function))
+            .and_then(|function| function.identity.declaration.as_ref())?;
+        let mut matches = context
+            .sources
+            .iter()
+            .copied()
+            .filter(|source| source.is_within(declaration));
+        let source = matches.next()?;
+        matches.next().is_none().then_some(source)
+    }
+}
+
+fn index_source_location(
+    source_indexes: &HashMap<u64, SourceTextIndex>,
+    location: SourceLocation,
+) -> Option<IndexedSource> {
+    let end = location.offset.checked_add(location.length)?;
+    let index = source_indexes.get(&location.source_id)?;
+    if end > index.len {
+        return None;
+    }
+    let position = index.position(location.offset);
+    Some(IndexedSource {
+        source_id: location.source_id,
+        offset: location.offset,
+        length: location.length,
+        line: position.map(|position| position.0),
+        column: position.map(|position| position.1),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ProfileFunction {
+    identity: FunctionIdentity,
+}
+
+impl ProfileFunction {
+    fn name(&self) -> &str {
+        self.identity.identifier.as_deref().unwrap_or("<anonymous>")
     }
 }
 
@@ -327,6 +363,10 @@ pub fn profile_transaction(
     let mut frame_cursor = FrameCursor::new(events);
     let mut paths = vec![Vec::new()];
     let mut current_path = 0;
+    let mut function_stacks = HashMap::<FunctionFrameKey, Vec<usize>>::new();
+    let mut function_paths = vec![Vec::new()];
+    let mut function_path_lookup = HashMap::from([(Vec::new(), 0)]);
+    let mut function_path_ids = HashMap::<FunctionFrameKey, usize>::new();
 
     let mut step_metrics = Metrics::default();
     let mut program_metrics = Metrics::default();
@@ -350,18 +390,20 @@ pub fn profile_transaction(
             .or_default()
             .add(step.gas_cost, "opcode gas")?;
 
-        let active_frame = frame_cursor.current(&frames, step.depth);
-        let program_index = active_frame.and_then(|frame| frame.program).or_else(|| {
-            (active_frame.is_none() && step.depth == root_depth)
-                .then_some(root_program)
-                .flatten()
-        });
+        let active_frame = frame_cursor.current_index(&frames, step.depth);
+        let program_index = active_frame
+            .and_then(|frame| frames[frame].program)
+            .or_else(|| {
+                (active_frame.is_none() && step.depth == root_depth)
+                    .then_some(root_program)
+                    .flatten()
+            });
         let Some(program_index) = program_index else {
             folded
                 .entry(FoldedKey {
                     path: current_path,
                     program: None,
-                    function: None,
+                    function_path: 0,
                     source: None,
                     unmapped_depth: Some(step.depth),
                 })
@@ -377,6 +419,15 @@ pub fn profile_transaction(
                 .as_deref()
                 .is_none_or(|opcode| opcode.eq_ignore_ascii_case(&step.op))
         });
+        let function_frame = active_frame.map_or(
+            FunctionFrameKey::Root(step.depth),
+            FunctionFrameKey::External,
+        );
+        let function = function_stacks
+            .get(&function_frame)
+            .and_then(|stack| stack.last().copied());
+        let function_path = function_path_ids.get(&function_frame).copied().unwrap_or(0);
+        let source = context.and_then(|context| program.source_for_function(context, function));
         program_metrics.add(step.gas_cost, "program gas")?;
         contracts
             .entry(program_index)
@@ -385,24 +436,20 @@ pub fn profile_transaction(
 
         let function_key = FunctionKey {
             program: program_index,
-            function: context.and_then(|context| context.function),
-            has_source: context
-                .and_then(|context| context.source.as_ref())
-                .is_some(),
+            function,
+            has_source: function.is_none() && source.is_some(),
         };
         functions
             .entry(function_key)
             .or_default()
             .add(step.gas_cost, "function gas")?;
 
-        let source_key = context
-            .and_then(|context| context.source.as_ref())
-            .map(|source| FlameSourceKey {
-                source_id: source.source_id,
-                line: source.line,
-                offset: source.line.is_none().then_some(source.offset),
-            });
-        if let Some(source) = context.and_then(|context| context.source.as_ref()) {
+        let source_key = source.map(|source| FlameSourceKey {
+            source_id: source.source_id,
+            line: source.line,
+            offset: source.line.is_none().then_some(source.offset),
+        });
+        if let Some(source) = source {
             source_metrics.add(step.gas_cost, "source gas")?;
             if let Some(line) = source.line {
                 source_lines
@@ -420,6 +467,8 @@ pub fn profile_transaction(
             .entry(HotspotKey {
                 program: program_index,
                 pc: step.pc,
+                function,
+                source,
             })
             .or_insert_with(|| HotspotMetrics {
                 opcode: step.op.as_str(),
@@ -433,12 +482,30 @@ pub fn profile_transaction(
             .entry(FoldedKey {
                 path: current_path,
                 program: Some(program_index),
-                function: context.and_then(|context| context.function),
+                function_path,
                 source: source_key,
                 unmapped_depth: None,
             })
             .or_default()
             .add(step.gas_cost, "folded-stack gas")?;
+
+        if let Some(function) = context.and_then(|context| match context.invokes.as_slice() {
+            [function] => Some(*function),
+            _ => None,
+        }) {
+            let stack = function_stacks.entry(function_frame).or_default();
+            stack.push(function);
+            let path = intern_function_path(stack, &mut function_paths, &mut function_path_lookup);
+            function_path_ids.insert(function_frame, path);
+        }
+        if context.and_then(|context| context.exit).is_some() {
+            if let Some(stack) = function_stacks.get_mut(&function_frame) {
+                stack.pop();
+                let path =
+                    intern_function_path(stack, &mut function_paths, &mut function_path_lookup);
+                function_path_ids.insert(function_frame, path);
+            }
+        }
     }
 
     let contract_rows = contract_rows(programs, contracts);
@@ -446,7 +513,15 @@ pub fn profile_transaction(
     let source_line_rows = source_line_rows(programs, source_lines);
     let opcode_rows = opcode_rows(opcodes);
     let hotspot_rows = hotspot_rows(programs, hotspots);
-    let folded_stacks = folded_rows(programs, &frames, &paths, &root_label, root_program, folded)?;
+    let folded_stacks = folded_rows(
+        programs,
+        &frames,
+        &paths,
+        &function_paths,
+        &root_label,
+        root_program,
+        folded,
+    )?;
     let unmapped_gas = step_metrics
         .gas
         .checked_sub(program_metrics.gas)
@@ -488,17 +563,33 @@ pub fn profile_transaction(
 #[derive(Debug, Clone)]
 struct ProgramCounterContext {
     opcode: Option<String>,
-    source: Option<IndexedSource>,
-    function: Option<usize>,
+    sources: Vec<IndexedSource>,
+    invokes: Vec<usize>,
+    exit: Option<FunctionExit>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct IndexedSource {
     source_id: u64,
     offset: u64,
     length: u64,
     line: Option<u64>,
     column: Option<u64>,
+}
+
+impl IndexedSource {
+    fn is_within(self, declaration: &SourceLocation) -> bool {
+        if self.source_id != declaration.source_id || self.offset < declaration.offset {
+            return false;
+        }
+        match (
+            self.offset.checked_add(self.length),
+            declaration.offset.checked_add(declaration.length),
+        ) {
+            (Some(end), Some(declaration_end)) => end <= declaration_end,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -769,17 +860,34 @@ impl FrameCursor {
         }
     }
 
-    fn current<'a>(
-        &self,
-        frames: &'a [ExecutionFrame],
-        step_depth: u64,
-    ) -> Option<&'a ExecutionFrame> {
+    fn current_index(&self, frames: &[ExecutionFrame], step_depth: u64) -> Option<usize> {
         self.active
             .iter()
             .rev()
-            .map(|frame| &frames[*frame])
-            .find(|frame| frame.depth == step_depth)
+            .copied()
+            .find(|frame| frames[*frame].depth == step_depth)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FunctionFrameKey {
+    Root(u64),
+    External(usize),
+}
+
+fn intern_function_path(
+    stack: &[usize],
+    paths: &mut Vec<Vec<usize>>,
+    lookup: &mut HashMap<Vec<usize>, usize>,
+) -> usize {
+    if let Some(path) = lookup.get(stack).copied() {
+        return path;
+    }
+    let path = paths.len();
+    let stack = stack.to_vec();
+    paths.push(stack.clone());
+    lookup.insert(stack, path);
+    path
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -800,6 +908,8 @@ struct SourceLineKey {
 struct HotspotKey {
     program: usize,
     pc: u64,
+    function: Option<usize>,
+    source: Option<IndexedSource>,
 }
 
 #[derive(Debug)]
@@ -820,7 +930,7 @@ struct FlameSourceKey {
 struct FoldedKey {
     path: usize,
     program: Option<usize>,
-    function: Option<usize>,
+    function_path: usize,
     source: Option<FlameSourceKey>,
     unmapped_depth: Option<u64>,
 }
@@ -855,13 +965,14 @@ fn function_rows(
         .map(|(key, metrics)| {
             let program = &programs[key.program];
             let function = key.function.map(|function| &program.functions[function]);
-            let source_id = function.map(|function| function.source_id);
+            let declaration = function.and_then(|function| function.identity.declaration.as_ref());
+            let source_id = declaration.map(|declaration| declaration.source_id);
             let source = source_id.and_then(|source_id| program.info.sources.get(&source_id));
-            let line = function.and_then(|function| {
+            let line = declaration.and_then(|declaration| {
                 program
                     .source_indexes
-                    .get(&function.source_id)
-                    .and_then(|index| index.position(function.declaration_start))
+                    .get(&declaration.source_id)
+                    .and_then(|index| index.position(declaration.offset))
                     .map(|position| position.0)
             });
             FunctionProfile {
@@ -876,7 +987,7 @@ fn function_rows(
                             "<no source>".to_owned()
                         }
                     },
-                    |function| function.name.clone(),
+                    |function| function.name().to_owned(),
                 ),
                 source: source.cloned(),
                 line,
@@ -958,22 +1069,22 @@ fn hotspot_rows(
         .into_iter()
         .map(|(key, hotspot)| {
             let program = &programs[key.program];
-            let context = hotspot
-                .context_matches
-                .then(|| program.pc_contexts.get(&key.pc))
-                .flatten();
             InstructionProfile {
                 address: program.address.clone(),
                 contract: program.contract_name.clone(),
                 environment: program.environment,
                 pc: key.pc,
                 opcode: hotspot.opcode.to_owned(),
-                function: context
-                    .and_then(|context| context.function)
-                    .map(|function| program.functions[function].name.clone()),
-                source: context
-                    .and_then(|context| context.source.as_ref())
-                    .and_then(|source| profile_source_location(program, source)),
+                function: hotspot
+                    .context_matches
+                    .then_some(key.function)
+                    .flatten()
+                    .map(|function| program.functions[function].name().to_owned()),
+                source: hotspot
+                    .context_matches
+                    .then_some(key.source)
+                    .flatten()
+                    .and_then(|source| profile_source_location(program, &source)),
                 gas: hotspot.metrics.gas,
                 hits: hotspot.metrics.hits,
             }
@@ -1007,6 +1118,7 @@ fn folded_rows(
     programs: &[ProfileProgram],
     frames: &[ExecutionFrame],
     paths: &[Vec<usize>],
+    function_paths: &[Vec<usize>],
     root_label: &str,
     root_program: Option<usize>,
     metrics: HashMap<FoldedKey, Metrics>,
@@ -1034,15 +1146,21 @@ fn folded_rows(
             if root_program != Some(program_index) && !path_has_program {
                 labels.push(program_name);
             }
-            labels.push(key.function.map_or_else(
-                || format!("{}::<generated>", program.contract_name),
-                |function| {
+            let functions = function_paths
+                .get(key.function_path)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if functions.is_empty() {
+                labels.push(format!("{}::<generated>", program.contract_name));
+            } else {
+                labels.extend(functions.iter().map(|&function| {
                     format!(
                         "{}::{}",
-                        program.contract_name, program.functions[function].name
+                        program.contract_name,
+                        program.functions[function].name()
                     )
-                },
-            ));
+                }));
+            }
             if let Some(source) = key.source {
                 let path = program
                     .info
@@ -1128,12 +1246,13 @@ mod tests {
         let source =
             "contract Counter {\n    function add() external {\n        uint x = 1;\n    }\n}\n";
         let offset = source.find("uint x").expect("statement offset") as u64;
-        let program = program(
+        let program = program_with_function(
             Some("0xCAFE"),
             "Counter",
             "call",
             source,
             &[(0, "PUSH1", offset), (2, "ADD", offset)],
+            "add",
         );
         let trace = trace(
             Some("0xcafe"),
@@ -1154,6 +1273,99 @@ mod tests {
         assert_eq!(report.hotspots[0].pc, 2);
         assert!(report.folded_text().contains("Counter::add"));
         assert!(report.folded_text().contains("Counter.sol:3"));
+    }
+
+    #[test]
+    fn resolves_shared_code_from_function_context() {
+        let source = "contract Shared {\n    function add() external { total = 1; }\n    function calculate() external { total = 1; }\n}\n";
+        let add_statement = source.find("total = 1").expect("add statement") as u64;
+        let calculate_declaration = source.find("function calculate").expect("declaration") as u64;
+        let calculate_statement = source
+            .get(calculate_declaration as usize..)
+            .and_then(|tail| tail.find("total = 1"))
+            .map(|offset| calculate_declaration + offset as u64)
+            .expect("calculate statement");
+        let declaration_length = source.len() as u64 - calculate_declaration;
+        let instructions = vec![
+            Instruction {
+                offset: 0,
+                operation: json!({"mnemonic": "JUMPDEST"}),
+                context: Some(json!({
+                    "invoke": {
+                        "identifier": "calculate",
+                        "declaration": {
+                            "source": {"id": 0},
+                            "range": {
+                                "offset": calculate_declaration,
+                                "length": declaration_length
+                            }
+                        },
+                        "jump": true
+                    }
+                })),
+            },
+            Instruction {
+                offset: 1,
+                operation: json!({"mnemonic": "SSTORE"}),
+                context: Some(json!({
+                    "pick": [
+                        {"code": {
+                            "source": {"id": 0},
+                            "range": {"offset": add_statement, "length": 10}
+                        }},
+                        {"code": {
+                            "source": {"id": 0},
+                            "range": {"offset": calculate_statement, "length": 10}
+                        }}
+                    ]
+                })),
+            },
+            Instruction {
+                offset: 2,
+                operation: json!({"mnemonic": "STOP"}),
+                context: Some(json!({"return": {}})),
+            },
+        ];
+        let program = ProfileProgram::new(
+            Some("0x1".to_owned()),
+            EthdebugInfo {
+                compilation: json!({}),
+                contract_name: "Shared".to_owned(),
+                environment: "call".to_owned(),
+                instructions,
+                sources: BTreeMap::from([(0, "Shared.sol".to_owned())]),
+                variable_locations: BTreeMap::new(),
+            },
+            BTreeMap::from([(0, source.to_owned())]),
+        )
+        .expect("profile program");
+        let trace = trace(
+            Some("0x1"),
+            vec![
+                step(0, "JUMPDEST", 1, 0),
+                step(1, "SSTORE", 100, 0),
+                step(2, "STOP", 0, 0),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[program]).expect("profile");
+
+        assert!(report
+            .functions
+            .iter()
+            .any(|row| row.function == "calculate" && row.gas == 100));
+        let hotspot = report
+            .hotspots
+            .iter()
+            .find(|row| row.pc == 1)
+            .expect("shared hotspot");
+        assert_eq!(hotspot.function.as_deref(), Some("calculate"));
+        assert_eq!(
+            hotspot.source.as_ref().map(|source| source.offset),
+            Some(calculate_statement)
+        );
+        assert!(!report.folded_text().contains("Shared::add"));
+        assert!(report.folded_text().contains("Shared::calculate"));
     }
 
     #[test]
@@ -1430,17 +1642,62 @@ mod tests {
         source: &str,
         instructions: &[(u64, &str, u64)],
     ) -> ProfileProgram {
+        make_program(address, name, environment, source, instructions, None)
+    }
+
+    fn program_with_function(
+        address: Option<&str>,
+        name: &str,
+        environment: &str,
+        source: &str,
+        instructions: &[(u64, &str, u64)],
+        function: &str,
+    ) -> ProfileProgram {
+        make_program(
+            address,
+            name,
+            environment,
+            source,
+            instructions,
+            Some(function),
+        )
+    }
+
+    fn make_program(
+        address: Option<&str>,
+        name: &str,
+        environment: &str,
+        source: &str,
+        instructions: &[(u64, &str, u64)],
+        function: Option<&str>,
+    ) -> ProfileProgram {
         let instructions = instructions
             .iter()
-            .map(|(pc, opcode, offset)| Instruction {
-                offset: *pc,
-                operation: json!({"mnemonic": opcode}),
-                context: Some(json!({
+            .enumerate()
+            .map(|(index, (pc, opcode, offset))| {
+                let mut context = json!({
                     "code": {
                         "source": {"id": 0},
                         "range": {"offset": offset, "length": 1}
                     }
-                })),
+                });
+                if index == 0 {
+                    if let Some(function) = function {
+                        context["invoke"] = json!({
+                            "identifier": function,
+                            "declaration": {
+                                "source": {"id": 0},
+                                "range": {"offset": 0, "length": source.len()}
+                            },
+                            "jump": true
+                        });
+                    }
+                }
+                Instruction {
+                    offset: *pc,
+                    operation: json!({"mnemonic": opcode}),
+                    context: Some(context),
+                }
             })
             .collect();
         ProfileProgram::new(

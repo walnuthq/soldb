@@ -2678,7 +2678,6 @@ dependencies = [
  "serde",
  "serde_json",
  "soldb-core",
- "soldb-debugger",
  "soldb-ethdebug",
 ]
 

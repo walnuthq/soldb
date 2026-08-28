@@ -11,7 +11,6 @@ doctest = false
 [dependencies]
 serde.workspace = true
 soldb-core = { path = "../soldb-core" }
-soldb-debugger = { path = "../soldb-debugger" }
 soldb-ethdebug = { path = "../soldb-ethdebug" }
 
 [dev-dependencies]
