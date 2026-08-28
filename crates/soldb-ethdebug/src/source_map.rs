@@ -351,16 +351,16 @@ fn decode_bytecode(
     bytecode_field: &str,
 ) -> SoldbResult<Vec<u8>> {
     let bytecode = bytecode.strip_prefix("0x").unwrap_or(bytecode);
-    if !bytecode.len().is_multiple_of(2) {
+    let (byte_pairs, remainder) = bytecode.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(SoldbError::Message(format!(
             "`{bytecode_field}` for `{contract_name}` in `{}` has an odd number of hex digits",
             artifact_path.display()
         )));
     }
 
-    bytecode
-        .as_bytes()
-        .chunks_exact(2)
+    byte_pairs
+        .iter()
         .map(|digits| {
             let high = decode_hex_digit(digits[0]);
             let low = decode_hex_digit(digits[1]);
