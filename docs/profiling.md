@@ -1,9 +1,9 @@
 # Gas profiling
 
-`soldb profile` combines an execution trace with compiler-generated ETHDebug
+`soldb profile` combines an execution trace with compiler-generated debug
 programs. The trace supplies executed program counters and dynamic opcode costs;
-ETHDebug supplies the contract, function, source range, and line associated with
-each instruction.
+the debug artifact supplies the source range associated with each instruction.
+ETHDebug also supplies compiler-authored function identities.
 
 Solar can emit the required resources plus creation and runtime programs directly:
 
@@ -14,6 +14,19 @@ solar -g --out-dir out Contract.sol
 The loader accepts Solar's source-qualified artifact names, such as
 `Contract_sol_Contract_ethdebug-runtime.json`, as well as solc's
 `Contract_ethdebug-runtime.json` spelling.
+
+When ETHDebug is unavailable, the loader accepts `srcmap` and `srcmap-runtime`
+from `combined.json`. The artifact must also contain `bin` and `bin-runtime`,
+because decoding PUSH widths is required to translate instruction indexes into
+program counters. With Solar, use:
+
+```console
+solar -g source-maps --emit=abi,bin,bin-runtime --out-dir out Contract.sol
+```
+
+Legacy source maps preserve exact PC-to-source attribution. They do not contain
+variable locations or unambiguous function identities, so profiles report their
+function bucket as `<contract>` instead of inferring one from source text.
 
 ## Profile a local transaction
 
@@ -38,7 +51,7 @@ The report separates:
 - transaction gas used, as reported by the transaction receipt;
 - traced instruction gas, the sum of per-step `gas_cost` values;
 - gas attributed to a known creation or runtime program;
-- gas attributed to an ETHDebug source range; and
+- gas attributed to a compiler-provided source range; and
 - gas deliberately left unmapped because the executing program was unknown.
 
 Transaction gas and traced instruction gas are separate quantities. Intrinsic
@@ -72,8 +85,9 @@ soldb profile <tx-hash> \
 
 Each sample is weighted by dynamic gas, not wall-clock time. Frames include the
 external call path when the backend provides it, followed by the current contract,
-function, and source line. ETHDebug does not yet describe every optimized internal
-call transition, so the graph does not invent an internal Solidity call stack.
+function, and source line. If debug metadata does not describe an optimized
+internal call transition, the graph does not invent an internal Solidity call
+stack.
 
 ## Multi-contract transactions
 

@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
+use soldb_ethdebug::SourceMapEnvironment;
 use soldb_profiler::{profile_transaction, ProfileProgram, ProfileReport, ProgramEnvironment};
 
 use crate::{
-    bold, dim, error_color, find_creation_ethdebug, find_runtime_ethdebug, function_color, info,
-    number_color, opcode_color, print_json, print_json_command_error, resolve_contract_specs,
-    separator, success, TraceBackendArg, TraceSourceIndex,
+    bold, dim, error_color, function_color, info, number_color, opcode_color, print_json,
+    print_json_command_error, resolve_contract_specs, separator, success, TraceBackendArg,
+    TraceSourceIndex,
 };
 
 #[derive(Debug, Args)]
@@ -116,8 +117,9 @@ fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Ve
             )));
         }
         let mut loaded = false;
-        if let Some(path) = find_runtime_ethdebug(&spec.debug_dir, &spec.name) {
-            let index = TraceSourceIndex::load_program(&spec, &path, "call")?;
+        if let Some(index) =
+            TraceSourceIndex::load_environment(&spec, SourceMapEnvironment::Runtime)?
+        {
             let address = spec
                 .address
                 .clone()
@@ -129,8 +131,9 @@ fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Ve
             )?);
             loaded = true;
         }
-        if let Some(path) = find_creation_ethdebug(&spec.debug_dir, &spec.name) {
-            let index = TraceSourceIndex::load_program(&spec, &path, "create")?;
+        if let Some(index) =
+            TraceSourceIndex::load_environment(&spec, SourceMapEnvironment::Creation)?
+        {
             let address = spec.address.clone().or_else(|| {
                 single_spec
                     .then(|| trace.contract_address.clone())
@@ -145,7 +148,7 @@ fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Ve
         }
         if !loaded {
             return Err(SoldbError::Message(format!(
-                "no ETHDebug program for `{}` found in `{}`",
+                "no ETHDebug or legacy source-map program for `{}` found in `{}`",
                 spec.name,
                 spec.debug_dir.display()
             )));
@@ -269,7 +272,7 @@ fn print_contracts(report: &ProfileReport, top: usize) {
         );
     }
     if report.contracts.is_empty() {
-        println!("{}", dim("No execution steps matched an ETHDebug program"));
+        println!("{}", dim("No execution steps matched a debug program"));
     }
 }
 
@@ -362,7 +365,7 @@ fn print_hotspots(report: &ProfileReport, top: usize) {
         );
     }
     if report.hotspots.is_empty() {
-        println!("{}", dim("No instructions matched an ETHDebug program"));
+        println!("{}", dim("No instructions matched a debug program"));
     }
 }
 
@@ -385,7 +388,25 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{percent, truncate_text};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use serde_json::json;
+    use soldb_core::{TraceStep, TransactionTrace};
+
+    use super::{load_programs, percent, truncate_text, ProfileArgs};
+    use crate::TraceBackendArg;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("soldb-profile-{label}-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn formats_percentages_and_unicode_text() {
@@ -393,5 +414,74 @@ mod tests {
         assert_eq!(percent(0, 0), "0.00%");
         assert_eq!(truncate_text("aébc", 2), "aé…");
         assert_eq!(truncate_text("short", 8), "short");
+    }
+
+    #[test]
+    fn profiles_programs_loaded_from_legacy_source_maps() {
+        let dir = temp_dir("legacy-source-map");
+        let source = "contract Counter {}\n";
+        fs::write(dir.join("Counter.sol"), source).expect("write source");
+        fs::write(
+            dir.join("combined.json"),
+            json!({
+                "sourceList": ["Counter.sol"],
+                "contracts": {
+                    "Counter.sol:Counter": {
+                        "bin-runtime": "00",
+                        "srcmap-runtime": format!("0:{}:0", source.len())
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined JSON");
+        let args = ProfileArgs {
+            tx_hash: None,
+            trace_file: None,
+            backend: TraceBackendArg::Replay,
+            ethdebug_dir: vec![format!("0x2:Counter:{}", dir.display())],
+            contracts: None,
+            rpc: String::new(),
+            top: 20,
+            json: false,
+            folded: None,
+            flamegraph: None,
+        };
+        let trace = TransactionTrace {
+            tx_hash: Some("0xabc".to_owned()),
+            from_addr: "0x1".to_owned(),
+            to_addr: Some("0x2".to_owned()),
+            value: "0x0".to_owned(),
+            input_data: "0x".to_owned(),
+            gas_used: 3,
+            output: "0x".to_owned(),
+            success: true,
+            error: None,
+            debug_trace_available: true,
+            contract_address: None,
+            backend: Some("replay".to_owned()),
+            capabilities: Default::default(),
+            artifacts: Default::default(),
+            steps: vec![TraceStep {
+                pc: 0,
+                op: "STOP".to_owned(),
+                gas: 3,
+                gas_cost: 3,
+                depth: 0,
+                stack: Vec::new(),
+                memory: None,
+                storage: None,
+                error: None,
+                snapshot: Default::default(),
+            }],
+        };
+
+        let programs = load_programs(&args, &trace).expect("load legacy profile program");
+        let report = soldb_profiler::profile_transaction(&trace, &programs).expect("profile");
+
+        assert_eq!(programs.len(), 1);
+        assert_eq!(report.totals.source_gas, 3);
+        assert_eq!(report.source_lines[0].source, "Counter.sol");
+        assert_eq!(report.source_lines[0].line, 1);
     }
 }

@@ -6,7 +6,7 @@
 
 > **Note**: SolDB is in public beta; expect ongoing changes and occasional inaccuracies.  
 
-> **Note**: SolDB relies on ETHDebug metadata. Complete, accurate debug info implies better breakpoints/stepping/variable views; incomplete info can cause gaps or inconsistencies.
+> **Note**: SolDB relies on compiler-generated debug metadata. ETHDebug gives the richest breakpoints, stepping, and variable views; legacy source maps provide source-level fallback.
 
 SolDB is an open-source, ETHDebug-first, LLDB-style debugger for Solidity and the EVM.
 
@@ -36,6 +36,10 @@ Compile your contracts with ETHDebug (Solidity 0.8.29+):
 ```bash
 solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime --bin --abi --overwrite -o out examples/Counter.sol
 ```
+
+Legacy source maps are also accepted. For example, compile with Solar using
+`-g source-maps --emit=abi,bin,bin-runtime --out-dir out`; SolDB reads
+`combined.json` when ETHDebug programs are absent.
 
 Trace a transaction:
 ```bash
@@ -138,8 +142,9 @@ soldb> vars
 ## Gas Profiling
 
 `soldb profile` attributes dynamic EVM gas to contracts, functions, source
-lines, opcodes, and instructions using compiler-generated ETHDebug metadata. It
-can also generate an interactive flame graph.
+lines, opcodes, and instructions using compiler-generated debug metadata. It
+can also generate an interactive flame graph. Legacy source maps retain exact
+source-line attribution but do not carry ETHDebug function identities.
 
 ![SolDB gas profile flame graph](docs/assets/profile.png)
 
@@ -149,7 +154,7 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
 
 ## Features
 
-- ETHDebug-first source debugging built around compiler-generated `solc --debug-info ethdebug` metadata
+- ETHDebug-first source debugging with legacy `srcmap`/`srcmap-runtime` fallback
 - Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
   server, decoded from ETHDebug variable locations
 - Full transaction traces with internal calls & decoded parameters
@@ -187,7 +192,13 @@ flowchart TD
     profiler --> profile_outputs["tables / JSON / flame graph"]
 ```
 
-SolDB relies on compiler-generated debug information. Compile with `solc` ETHDebug output enabled, then pass the generated artifact directory with `--ethdebug-dir <address>:<contract>:<dir>`. SolDB uses that metadata to map low-level EVM execution back to Solidity source, functions, variables, and ABI values. The debugger-side ETHDebug contract is documented in [docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
+SolDB relies on compiler-generated debug information. Pass an ETHDebug or
+legacy combined-JSON artifact directory with
+`--ethdebug-dir <address>:<contract>:<dir>`. ETHDebug provides source,
+function, variable, and ABI context; legacy source maps provide PC-to-source
+mapping and ABI data without inventing the missing metadata. The debugger-side
+ETHDebug contract is documented in
+[docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
 
 The `--json` output for `trace` and `simulate` is versioned for web and explorer integrations. See [docs/json.md](docs/json.md) for the current schema, capability flags, replay artifacts, and compatibility rules.
 

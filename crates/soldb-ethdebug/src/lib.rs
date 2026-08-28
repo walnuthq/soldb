@@ -7,8 +7,8 @@
 //! - [`metadata`] models ETHDebug artifacts: instructions, their source spans, live
 //!   variable locations, and the `address:name:dir` contract specs used on the command
 //!   line.
-//! - [`source_map`] reads the legacy `srcmap` format, the fallback for compilers that
-//!   predate ETHDebug.
+//! - [`source_map`] reads the legacy `srcmap` format for compiler and tooling
+//!   interoperability when ETHDebug programs are unavailable.
 //! - [`abi`] encodes calldata and parses function signatures, including tuples and
 //!   arrays, and carries the keccak-256 implementation used to derive selectors.
 //! - [`events`] decodes logs against event ABIs.
@@ -37,5 +37,6 @@ pub use metadata::{
     Instruction, SourceLocation, VariableLocation,
 };
 pub use source_map::{
-    build_pc_to_instruction_map, is_legacy_compiler, parse_srcmap, SourceMapEntry, SourceMapInfo,
+    build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, parse_srcmap,
+    SourceMapEntry, SourceMapEnvironment, SourceMapInfo, SourceMapProgram,
 };

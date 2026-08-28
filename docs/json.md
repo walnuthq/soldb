@@ -117,6 +117,6 @@ Current schema:
 - `backend` identifies the execution backend: `debug-rpc`, `replay`, or another future backend name.
 - `capabilities` describes which data is actually available from the selected backend.
 - `artifacts` carries backend-level data that is not tied to one opcode step, including replay calls, contract creations, logs, account changes, gas details, and revert data.
-- `contracts` is populated from `--ethdebug-dir`/`--contracts` when available. `pcToSourceMappings` uses the `offset:length:sourceId` format generated from ETHDebug instruction locations, `sourcePaths` and `sources` are keyed by source ID, `debugAvailable` is true when ETHDebug source locations were loaded, and `abi` is copied from the compiled artifact.
+- `contracts` is populated from `--ethdebug-dir`/`--contracts` when available. `pcToSourceMappings` uses the `offset:length:sourceId` format generated from ETHDebug instruction locations or legacy source maps, `sourcePaths` and `sources` are keyed by source ID, `debugAvailable` is true when compiler-provided source locations were loaded, and `abi` is copied from the compiled artifact.
 
 Clients should treat unknown fields as additive and should prefer capability flags over backend names when deciding whether a view can be shown.

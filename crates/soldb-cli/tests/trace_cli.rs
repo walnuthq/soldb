@@ -105,6 +105,87 @@ fn profile_trace_file_writes_json_and_flamegraphs() {
 }
 
 #[test]
+fn profile_accepts_legacy_combined_source_maps() {
+    let dir = temp_dir("profile-source-map");
+    let source = "contract Counter {}\n";
+    fs::write(dir.join("Counter.sol"), source).expect("write source");
+    fs::write(
+        dir.join("combined.json"),
+        json!({
+            "version": "0.8.36+commit.test",
+            "sourceList": ["Counter.sol"],
+            "contracts": {
+                "Counter.sol:Counter": {
+                    "bin-runtime": "00",
+                    "srcmap-runtime": format!("0:{}:0", source.len()),
+                    "abi": []
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write combined JSON");
+    let trace = dir.join("trace.json");
+    fs::write(
+        &trace,
+        json!({
+            "tx_hash": "0xabc",
+            "from_addr": "0x1",
+            "to_addr": "0x000000000000000000000000000000000000cafe",
+            "value": "0x0",
+            "input_data": "0x",
+            "gas_used": 7,
+            "output": "0x",
+            "success": true,
+            "error": null,
+            "debug_trace_available": true,
+            "contract_address": null,
+            "backend": "replay",
+            "steps": [{
+                "pc": 0,
+                "op": "STOP",
+                "gas": 7,
+                "gas_cost": 7,
+                "depth": 0,
+                "stack": [],
+                "memory": null,
+                "storage": null,
+                "error": null
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write trace");
+    let spec = format!(
+        "0x000000000000000000000000000000000000cafe:Counter:{}",
+        dir.display()
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "profile",
+            "--trace-file",
+            trace.to_str().expect("trace path"),
+            "--ethdebug-dir",
+            &spec,
+            "--json",
+        ])
+        .output()
+        .expect("run source-map profile");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("profile JSON");
+    assert_eq!(report["totals"]["sourceGas"], 7);
+    assert_eq!(report["sourceLines"][0]["source"], "Counter.sol");
+    assert_eq!(report["sourceLines"][0]["line"], 1);
+    assert_eq!(report["functions"][0]["function"], "<contract>");
+}
+
+#[test]
 fn profile_json_reports_invalid_trace_files_once() {
     let dir = temp_dir("profile-invalid");
     let trace = dir.join("trace.json");

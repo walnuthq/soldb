@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
-use soldb_ethdebug::{parse_variable_locations, EthdebugInfo, Instruction};
+use soldb_ethdebug::{
+    load_source_map_program, parse_variable_locations, EthdebugInfo, Instruction,
+    SourceMapEnvironment,
+};
 use soldb_repl::{DebuggerState, StepOutcome};
 use soldb_rpc::trace_transaction;
 
@@ -611,9 +614,35 @@ struct SourceIndex {
 
 impl SourceIndex {
     fn load(root: &Path, contract_name: Option<String>) -> SoldbResult<Self> {
-        let metadata = read_json(find_ethdebug_metadata(root)?)?;
-        let runtime_path = find_runtime_ethdebug(root, contract_name.as_deref())?;
-        let runtime = read_json(&runtime_path)?;
+        let metadata_path = find_ethdebug_metadata(root);
+        let runtime_path = find_runtime_ethdebug(root, contract_name.as_deref());
+        if let (Ok(metadata_path), Ok(runtime_path)) = (metadata_path, runtime_path) {
+            return Self::load_ethdebug(root, contract_name, &metadata_path, &runtime_path);
+        }
+
+        let name = contract_name.unwrap_or_default();
+        let program = load_source_map_program(root, &name, SourceMapEnvironment::Runtime)?
+            .ok_or_else(|| {
+                SoldbError::Message(format!(
+                    "no ETHDebug or legacy runtime source map found in `{}`",
+                    root.display()
+                ))
+            })?;
+        let positions = build_positions(root, &program.info);
+        Ok(Self {
+            info: program.info,
+            positions,
+        })
+    }
+
+    fn load_ethdebug(
+        root: &Path,
+        contract_name: Option<String>,
+        metadata_path: &Path,
+        runtime_path: &Path,
+    ) -> SoldbResult<Self> {
+        let metadata = read_json(metadata_path)?;
+        let runtime = read_json(runtime_path)?;
         let instructions = runtime
             .get("instructions")
             .cloned()
@@ -753,9 +782,10 @@ fn build_positions(root: &Path, info: &EthdebugInfo) -> BTreeMap<u64, SourcePosi
         .filter_map(|instruction| {
             let location = instruction.source_location()?;
             let source_path = info.sources.get(&location.source_id)?.clone();
-            let content = source_cache
-                .entry(source_path.clone())
-                .or_insert_with(|| read_source(root, &source_path));
+            let content = source_cache.entry(source_path.clone()).or_insert_with(|| {
+                read_compilation_source(&info.compilation, location.source_id)
+                    .unwrap_or_else(|| read_source(root, &source_path))
+            });
             let (line, column) = line_column(content, location.offset);
             let path = display_source_path(root, &source_path);
             Some((
@@ -769,6 +799,21 @@ fn build_positions(root: &Path, info: &EthdebugInfo) -> BTreeMap<u64, SourcePosi
             ))
         })
         .collect()
+}
+
+fn read_compilation_source(compilation: &Value, source_id: u64) -> Option<String> {
+    compilation
+        .get("sources")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|source| source.get("id").and_then(Value::as_u64) == Some(source_id))
+        .and_then(|source| {
+            source
+                .get("contents")
+                .or_else(|| source.get("content"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
 }
 
 fn read_source(root: &Path, source_path: &str) -> String {
@@ -993,6 +1038,57 @@ mod tests {
             messages[0].body.as_ref().expect("body")["variables"][0]["value"],
             "42"
         );
+    }
+
+    #[test]
+    fn maps_legacy_source_maps_to_stack_frames() {
+        let temp = temp_dir("soldb-dap-source-map");
+        std::fs::create_dir_all(&temp).expect("create temp");
+        let source =
+            "contract Counter {\n  function set(uint256 x) public {\n    value = x;\n  }\n}\n";
+        let statement_offset = source.find("value = x").expect("statement offset");
+        std::fs::write(temp.join("Counter.sol"), source).expect("write source");
+        std::fs::write(
+            temp.join("combined.json"),
+            json!({
+                "sourceList": ["Counter.sol"],
+                "contracts": {
+                    "Counter.sol:Counter": {
+                        "bin-runtime": "60010000",
+                        "srcmap-runtime": format!(
+                            "{statement_offset}:9:0:-:0;{statement_offset}:9:0;\
+                             {statement_offset}:9:0"
+                        )
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined JSON");
+        let trace_file = temp.join("trace.json");
+        std::fs::write(
+            &trace_file,
+            serde_json::to_string(&sample_trace()).expect("trace JSON"),
+        )
+        .expect("write trace");
+
+        let mut server = DapServer::new();
+        let launch = DapMessage::request(
+            1,
+            "launch",
+            Some(json!({
+                "traceFile": trace_file.display().to_string(),
+                "ethdebugDir": temp.display().to_string(),
+                "contractName": "Counter"
+            })),
+        );
+        assert_eq!(server.handle_message(&launch)[0].success, Some(true));
+
+        let stack_trace = DapMessage::request(2, "stackTrace", None);
+        let messages = server.handle_message(&stack_trace);
+        let frame = &messages[0].body.as_ref().expect("body")["stackFrames"][0];
+        assert_eq!(frame["source"]["name"], "Counter.sol");
+        assert_eq!(frame["line"], 3);
     }
 
     #[test]

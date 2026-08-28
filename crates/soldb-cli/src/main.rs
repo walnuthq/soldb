@@ -22,9 +22,9 @@ use serde::Serialize;
 use serde_json::json;
 use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace};
 use soldb_ethdebug::{
-    encode_function_call, function_selector, parse_ethdebug_spec, parse_event_abis,
-    parse_signature, parse_variable_locations, DecodedEvent, EthdebugInfo, EventRegistry,
-    Instruction, SourceLocation,
+    encode_function_call, function_selector, load_source_map_program, parse_ethdebug_spec,
+    parse_event_abis, parse_signature, parse_variable_locations, DecodedEvent, EthdebugInfo,
+    EventRegistry, Instruction, SourceLocation, SourceMapEnvironment,
 };
 use soldb_repl::{
     BreakpointTarget, DebuggerCommand, DebuggerInfoCommand, DebuggerState, SourceBreakpointTarget,
@@ -136,7 +136,7 @@ enum Command {
     Bridge(BridgeArgs),
     #[command(about = "Compile Solidity contracts with ETHDebug artifacts")]
     Compile(CompileArgs),
-    #[command(about = "Inspect ETHDebug metadata")]
+    #[command(about = "Inspect compiler debug metadata")]
     Info(InfoArgs),
     #[command(name = "list-contracts", about = "List all contracts in the project")]
     ListContracts(ListContractsArgs),
@@ -976,7 +976,7 @@ fn handle_break_command(
             let Some(source_index) = source_index else {
                 println!(
                     "{}",
-                    warning("Source breakpoints require ETHDebug metadata.")
+                    warning("Source breakpoints require compiler debug metadata.")
                 );
                 return;
             };
@@ -1019,7 +1019,7 @@ fn handle_clear_command(
             let Some(source_index) = source_index else {
                 println!(
                     "{}",
-                    warning("Source breakpoints require ETHDebug metadata.")
+                    warning("Source breakpoints require compiler debug metadata.")
                 );
                 return;
             };
@@ -1349,8 +1349,17 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
     }
     print_trace_backend_details(trace);
     println!("{} {}", info("Contract:"), function_color(&spec.name));
-    if let Some(compiler) = metadata.compiler_version {
-        println!("{} solc {}", info("Compiler:"), number_color(compiler));
+    if let Some(version) = metadata.compiler_version {
+        if let Some(name) = metadata.compiler_name {
+            println!(
+                "{} {} {}",
+                info("Compiler:"),
+                bold(name),
+                number_color(version)
+            );
+        } else {
+            println!("{} {}", info("Compiler version:"), number_color(version));
+        }
     }
     println!("{} {}", info("Gas used:"), success(trace.gas_used));
     let status = if trace.success {
@@ -1622,13 +1631,43 @@ struct TraceSourceIndex {
 
 impl TraceSourceIndex {
     fn load(spec: &ResolvedContractSpec) -> SoldbResult<Self> {
-        let runtime_path = find_runtime_ethdebug(&spec.debug_dir, &spec.name).ok_or_else(|| {
+        Self::load_environment(spec, SourceMapEnvironment::Runtime)?.ok_or_else(|| {
             soldb_core::SoldbError::Message(format!(
-                "No ETHDebug runtime file found in {}",
+                "no ETHDebug or legacy runtime source map found in `{}`",
                 spec.debug_dir.display()
             ))
-        })?;
-        Self::load_program(spec, &runtime_path, "call")
+        })
+    }
+
+    fn load_environment(
+        spec: &ResolvedContractSpec,
+        environment: SourceMapEnvironment,
+    ) -> SoldbResult<Option<Self>> {
+        let (program_path, environment_name) = match environment {
+            SourceMapEnvironment::Creation => (
+                find_creation_ethdebug(&spec.debug_dir, &spec.name),
+                "create",
+            ),
+            SourceMapEnvironment::Runtime => {
+                (find_runtime_ethdebug(&spec.debug_dir, &spec.name), "call")
+            }
+        };
+        if let Some(program_path) = program_path {
+            return Self::load_program(spec, &program_path, environment_name).map(Some);
+        }
+
+        let Some(program) = load_source_map_program(&spec.debug_dir, &spec.name, environment)?
+        else {
+            return Ok(None);
+        };
+        Self::from_debug_info(
+            spec,
+            program.info,
+            program.resources,
+            program.source_contents,
+            false,
+        )
+        .map(Some)
     }
 
     fn load_program(
@@ -1673,14 +1712,30 @@ impl TraceSourceIndex {
             variable_locations,
         };
 
+        Self::from_debug_info(spec, info, resources, BTreeMap::new(), true)
+    }
+
+    fn from_debug_info(
+        spec: &ResolvedContractSpec,
+        info: EthdebugInfo,
+        resources: serde_json::Value,
+        mut source_contents: BTreeMap<u64, String>,
+        parse_source_declarations: bool,
+    ) -> SoldbResult<Self> {
         let mut functions = Vec::new();
-        let mut source_contents = BTreeMap::new();
         for (source_id, source_path) in &info.sources {
-            if let Some(source) = read_compilation_source(&info.compilation, *source_id)
-                .or_else(|| read_debug_source(&spec.debug_dir, source_path))
+            if !source_contents.contains_key(source_id) {
+                if let Some(source) = read_compilation_source(&info.compilation, *source_id)
+                    .or_else(|| read_debug_source(&spec.debug_dir, source_path))
+                {
+                    source_contents.insert(*source_id, source);
+                }
+            }
+            if let Some(source) = source_contents
+                .get(source_id)
+                .filter(|_| parse_source_declarations)
             {
-                functions.extend(parse_source_functions(*source_id, &source));
-                source_contents.insert(*source_id, source);
+                functions.extend(parse_source_functions(*source_id, source));
             }
         }
 
@@ -2881,7 +2936,7 @@ fn load_source_index(spec: &ResolvedContractSpec) -> Option<TraceSourceIndex> {
             report_once(
                 format!("ethdebug:{}:{}", spec.name, spec.debug_dir.display()),
                 &format!(
-                    "could not load ETHDebug metadata for `{}` from `{}`: {error}",
+                    "could not load debug metadata for `{}` from `{}`: {error}",
                     spec.name,
                     spec.debug_dir.display()
                 ),
@@ -3109,7 +3164,9 @@ fn find_debug_dir_for_contract(base_dir: &Path, contract_name: &str) -> PathBuf 
     ];
     candidates
         .into_iter()
-        .find(|candidate| find_ethdebug_metadata(candidate).is_some())
+        .find(|candidate| {
+            find_ethdebug_metadata(candidate).is_some() || candidate.join("combined.json").exists()
+        })
         .unwrap_or_else(|| base_dir.to_path_buf())
 }
 
@@ -3135,7 +3192,19 @@ fn infer_contract_name_from_dir(path: &Path) -> Option<String> {
                 .map(str::to_owned);
         }
     }
-    None
+
+    let combined = read_json_file(&path.join("combined.json")).ok()?;
+    let contracts = combined.get("contracts")?.as_object()?;
+    if contracts.len() != 1 {
+        return None;
+    }
+    let contract = contracts.keys().next()?;
+    Some(
+        contract
+            .rsplit_once(':')
+            .map_or(contract.as_str(), |(_, name)| name)
+            .to_owned(),
+    )
 }
 
 fn read_json_file(path: &Path) -> SoldbResult<serde_json::Value> {
@@ -3148,14 +3217,12 @@ fn read_json_file(path: &Path) -> SoldbResult<serde_json::Value> {
 }
 
 fn ethdebug_resources_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<serde_json::Value> {
-    let path = find_ethdebug_metadata(&spec.debug_dir).ok_or_else(|| {
-        soldb_core::SoldbError::Message(format!(
-            "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
-            spec.debug_dir.display()
-        ))
-    })?;
-    let metadata = read_json_file(&path)?;
-    ethdebug_resources_from_metadata(&path, &metadata)
+    if let Some(path) = find_ethdebug_metadata(&spec.debug_dir) {
+        let metadata = read_json_file(&path)?;
+        return ethdebug_resources_from_metadata(&path, &metadata);
+    }
+
+    TraceSourceIndex::load(spec).map(|index| index.resources)
 }
 
 fn ethdebug_resources_from_metadata(
@@ -3249,7 +3316,7 @@ fn web_contract_metadata_for_spec(
     let mut source_paths = BTreeMap::new();
     let mut sources = BTreeMap::new();
 
-    if let Some(source_index) = source_index {
+    if let Some(source_index) = &source_index {
         for instruction in &source_index.info.instructions {
             let Some(location) = instruction.source_location() else {
                 continue;
@@ -3264,7 +3331,11 @@ fn web_contract_metadata_for_spec(
         }
         for (source_id, source_path) in &source_index.info.sources {
             source_paths.insert(*source_id, source_path.clone());
-            let source = read_debug_source(&spec.debug_dir, source_path)
+            let source = source_index
+                .source_contents
+                .get(source_id)
+                .cloned()
+                .or_else(|| read_debug_source(&spec.debug_dir, source_path))
                 .unwrap_or_else(|| source_path.clone());
             sources.insert(*source_id, source);
         }
@@ -3301,12 +3372,13 @@ fn trace_contract_spec(args: &TraceArgs) -> Option<ResolvedContractSpec> {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct TraceDebugMetadata {
     is_legacy: bool,
+    compiler_name: Option<String>,
     compiler_version: Option<String>,
 }
 
 fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
     let combined_json = spec.debug_dir.join("combined.json");
-    if combined_json.exists() {
+    if find_ethdebug_metadata(&spec.debug_dir).is_none() && combined_json.exists() {
         let version = read_json_file(&combined_json)
             .ok()
             .and_then(|value| {
@@ -3323,20 +3395,29 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
             });
         return TraceDebugMetadata {
             is_legacy: true,
+            compiler_name: None,
             compiler_version: version,
         };
     }
 
-    let compiler_version = find_ethdebug_metadata(&spec.debug_dir)
+    let compiler = find_ethdebug_metadata(&spec.debug_dir)
         .and_then(|ethdebug_json| read_json_file(&ethdebug_json).ok())
         .and_then(|value| {
             value
                 .get("compilation")
                 .and_then(|compilation| compilation.get("compiler"))
-                .and_then(|compiler| compiler.get("version"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+                .cloned()
+        });
+    let compiler_name = compiler
+        .as_ref()
+        .and_then(|compiler| compiler.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let compiler_version = compiler
+        .as_ref()
+        .and_then(|compiler| compiler.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
         .map(|version| {
             version
                 .split_once('+')
@@ -3345,6 +3426,7 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
         });
     TraceDebugMetadata {
         is_legacy: false,
+        compiler_name,
         compiler_version,
     }
 }
@@ -3906,6 +3988,100 @@ contract Counter {
             format_raw_stack(&frames[1].raw_stack),
             "[0] 0x00000000000000000000000000000000000000000000000000000000000000aa [1] 0x00000000000000000000000000000000000000000000000000000000000000bb [2] 0x0000000000000000000000000000000000000000000000000000000000000004"
         );
+    }
+
+    #[test]
+    fn loads_legacy_source_maps_for_source_debugging() {
+        let dir = temp_dir("legacy-source-debugging");
+        let source = "contract Counter {\n    function set(uint256 value) external {}\n}\n";
+        let set_offset = source.find("function set").expect("set offset");
+        fs::write(dir.join("Counter.sol"), source).expect("write source");
+        fs::write(
+            dir.join("combined.json"),
+            json!({
+                "version": "0.8.36+commit.test",
+                "sourceList": ["Counter.sol"],
+                "contracts": {
+                    "Counter.sol:Counter": {
+                        "bin-runtime": "60015b",
+                        "srcmap-runtime": format!(
+                            "0:{}:0:-:0;{set_offset}:12:0",
+                            source.len()
+                        )
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined JSON");
+        let spec = ResolvedContractSpec {
+            address: Some("0x2".to_owned()),
+            name: "Counter".to_owned(),
+            debug_dir: dir,
+        };
+
+        let index = TraceSourceIndex::load(&spec).expect("load legacy source map");
+        assert_eq!(
+            index.info.source_info(2),
+            Some(("Counter.sol", set_offset as u64, 12))
+        );
+        assert!(index.function_at_pc(2).is_none());
+
+        let trace = transaction_trace(
+            "0x".to_owned(),
+            vec![trace_step(0, &[]), trace_step(2, &[])],
+        );
+        let breakpoint = index
+            .resolve_breakpoint(
+                &SourceBreakpointTarget {
+                    file: Some("Counter.sol".to_owned()),
+                    line: 2,
+                },
+                &trace,
+                0,
+            )
+            .expect("resolve source-map breakpoint");
+        assert_eq!(breakpoint.pc, 2);
+
+        let web = web_contract_metadata_for_spec(&spec).expect("web metadata");
+        let expected_mapping = format!("{set_offset}:12:0");
+        assert_eq!(
+            web.pc_to_source_mappings.get(&2).map(String::as_str),
+            Some(expected_mapping.as_str())
+        );
+        assert_eq!(web.sources.get(&0).map(String::as_str), Some(source));
+
+        fs::write(
+            spec.debug_dir.join("ethdebug.json"),
+            json!({
+                "compilation": {
+                    "sources": [{"id": 0, "path": "Counter.sol"}]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write ETHDebug metadata");
+        fs::write(
+            spec.debug_dir.join("Counter_ethdebug-runtime.json"),
+            json!({
+                "instructions": [{
+                    "offset": 7,
+                    "operation": {"mnemonic": "STOP"},
+                    "context": {
+                        "code": {
+                            "source": {"id": 0},
+                            "range": {"offset": 0, "length": 1}
+                        }
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write ETHDebug program");
+
+        let preferred = TraceSourceIndex::load(&spec).expect("prefer ETHDebug");
+        assert!(preferred.info.instruction_at_pc(7).is_some());
+        assert!(preferred.info.instruction_at_pc(2).is_none());
     }
 
     #[test]
