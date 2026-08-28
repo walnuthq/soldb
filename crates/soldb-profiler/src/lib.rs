@@ -1209,7 +1209,7 @@ fn program_label(program: &ProfileProgram) -> String {
 fn normalize_address(address: &str) -> String {
     let address = address.trim();
     if address.starts_with("0x") || address.starts_with("0X") {
-        format!("0x{}", &address[2..].to_ascii_lowercase())
+        format!("0x{}", address[2..].to_ascii_lowercase())
     } else {
         format!("0x{}", address.to_ascii_lowercase())
     }
