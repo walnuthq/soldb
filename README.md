@@ -47,6 +47,18 @@ Force the replay backend when you want to avoid `debug_traceTransaction`:
 soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
 
+Profile dynamic gas by contract, function, and source line, with an optional
+interactive SVG flame graph:
+
+```bash
+soldb profile <tx_hash> --backend replay \
+  --ethdebug-dir <contract_address>:<contract_name>:./out \
+  --rpc http://localhost:8545 --flamegraph profile.svg
+```
+
+See [docs/profiling.md](docs/profiling.md) for captured traces, folded stacks,
+multi-contract attribution, and the reusable library API.
+
 ---
 
 ## Example: Debugging a Transaction
@@ -129,6 +141,8 @@ soldb> vars
 - Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
   server, decoded from ETHDebug variable locations
 - Full transaction traces with internal calls & decoded parameters
+- Dynamic gas profiles by contract, function, source line, opcode, and instruction
+- Folded-stack and interactive SVG flame graph output
 - Transaction simulation with arbitrary calldata (including structs & tuples)
 - Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations
 - HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and normal-RPC replay for local Anvil transactions
@@ -143,7 +157,7 @@ flowchart TD
     contracts["Solidity contracts"] --> solc["solc<br/>--debug-info ethdebug<br/>--ethdebug --ethdebug-runtime"]
     solc --> artifacts["ETHDebug + ABI artifacts"]
 
-    cli["soldb trace / simulate"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]
+    cli["soldb trace / simulate / profile"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]
     artifacts --> metadata
 
     cli --> selector["soldb-rpc<br/>backend selector"]
@@ -156,6 +170,9 @@ flowchart TD
     opcode_trace --> enriched
     debugger --> enriched["source lines<br/>call frames<br/>decoded values"]
     enriched --> outputs["CLI / JSON / REPL / DAP"]
+    opcode_trace --> profiler["soldb-profiler<br/>gas aggregation"]
+    metadata --> profiler
+    profiler --> profile_outputs["tables / JSON / flame graph"]
 ```
 
 SolDB relies on compiler-generated debug information. Compile with `solc` ETHDebug output enabled, then pass the generated artifact directory with `--ethdebug-dir <address>:<contract>:<dir>`. SolDB uses that metadata to map low-level EVM execution back to Solidity source, functions, variables, and ABI values. The debugger-side ETHDebug contract is documented in [docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
@@ -185,6 +202,7 @@ soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contra
 - `crates/soldb-rpc`: JSON-RPC transport, debug-RPC backend, replay backend, transaction simulation, and event log retrieval.
 - `crates/soldb-ethdebug`: ETHDebug metadata loading, ABI helpers, source mapping, event decoding, and call-frame enrichment.
 - `crates/soldb-debugger`: reusable source-step, function, and variable decoding model shared by frontends.
+- `crates/soldb-profiler`: reusable gas attribution and folded-stack model over traces and ETHDebug programs.
 - `crates/soldb-repl`: interactive debugger state and REPL commands.
 - `crates/soldb-serializer`: JSON/web-facing trace and simulation serialization, including nested call trees and ETHDebug source metadata.
 - `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.

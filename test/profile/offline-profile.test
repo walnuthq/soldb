@@ -1,0 +1,22 @@
+# Profile a captured trace with Solar-style ETHDebug artifact names
+# REQUIRES: soldb
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --top 2 --folded %t.folded --flamegraph %t.svg 2>&1 | FileCheck %s
+# RUN: test -s %t.folded
+# RUN: grep -q 'Counter::add' %t.folded
+# RUN: test -s %t.svg
+# RUN: grep -q '<svg' %t.svg
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --json | jq '{stepGas: .totals.stepGas, sourceGas: .totals.sourceGas, unmappedGas: .totals.unmappedGas, function: .functions[0].function}' | FileCheck %s --check-prefix=JSON
+
+# CHECK: EVM Gas Profile
+# CHECK: Traced instruction gas: 108 across 3 steps
+# CHECK: Source-attributed gas: 8 (7.41%)
+# CHECK: Unmapped execution gas: 100 (92.59%)
+# CHECK: Counter::add Counter.sol:2
+# CHECK: Counter.sol:3
+# CHECK: Folded stacks:
+# CHECK: Flame graph:
+
+# JSON: "stepGas": 108
+# JSON: "sourceGas": 8
+# JSON: "unmappedGas": 100
+# JSON: "function": "add"

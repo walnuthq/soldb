@@ -1,0 +1,36 @@
+{
+  "compilation": {
+    "id": "profile-fixture"
+  },
+  "contract": {
+    "name": "Counter"
+  },
+  "environment": "call",
+  "instructions": [
+    {
+      "offset": 0,
+      "operation": {
+        "mnemonic": "PUSH1",
+        "arguments": ["0x01"]
+      },
+      "context": {
+        "code": {
+          "source": {"id": 0},
+          "range": {"offset": 57, "length": 13}
+        }
+      }
+    },
+    {
+      "offset": 2,
+      "operation": {
+        "mnemonic": "ADD"
+      },
+      "context": {
+        "code": {
+          "source": {"id": 0},
+          "range": {"offset": 57, "length": 13}
+        }
+      }
+    }
+  ]
+}

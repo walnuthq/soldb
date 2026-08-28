@@ -1,0 +1,21 @@
+[package]
+name = "soldb-profiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+soldb-core = { path = "../soldb-core" }
+soldb-debugger = { path = "../soldb-debugger" }
+soldb-ethdebug = { path = "../soldb-ethdebug" }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

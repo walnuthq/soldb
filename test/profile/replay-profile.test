@@ -1,0 +1,15 @@
+# Profile an automined Anvil transaction through the local REVM replay backend
+# REQUIRES: soldb
+# RUN: %soldb profile %{test_tx} --backend replay --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --top 5 2>&1 | FileCheck %s
+
+# CHECK: EVM Gas Profile
+# CHECK: Backend: replay
+# CHECK: Status: SUCCESS
+# CHECK: Transaction gas used:
+# CHECK: Program-attributed gas:
+# CHECK: Contracts
+# CHECK: TestContract (call)
+# CHECK: Functions
+# CHECK: Hot source lines
+# CHECK: Opcodes
+# CHECK: Hot instructions

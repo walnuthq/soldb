@@ -15,6 +15,8 @@
 //!   [`soldb_core::SoldbError::AlreadyReported`] so the exit path does not print it
 //!   twice. Failures exit with code 2.
 
+mod profile;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
@@ -37,6 +39,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Mutex, OnceLock};
+
+use profile::ProfileArgs;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -143,6 +147,8 @@ enum Command {
     ListEvents(ListEventsArgs),
     #[command(about = "Trace and debug an Ethereum transaction")]
     Trace(TraceArgs),
+    #[command(about = "Profile gas by contract, function, and source line")]
+    Profile(ProfileArgs),
     #[command(about = "Simulate and debug an Ethereum transaction")]
     Simulate(SimulateArgs),
 }
@@ -367,6 +373,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Trace(args) => trace_command(&args),
+        Command::Profile(args) => profile::command(&args),
         Command::Simulate(args) => simulate_command(&args),
         Command::ListEvents(args) => list_events_command(&args),
         Command::ListContracts(args) => list_contracts_command(&args),
@@ -1615,23 +1622,31 @@ struct TraceSourceIndex {
 
 impl TraceSourceIndex {
     fn load(spec: &ResolvedContractSpec) -> SoldbResult<Self> {
-        let metadata_path = find_ethdebug_metadata(&spec.debug_dir).ok_or_else(|| {
-            soldb_core::SoldbError::Message(format!(
-                "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
-                spec.debug_dir.display()
-            ))
-        })?;
         let runtime_path = find_runtime_ethdebug(&spec.debug_dir, &spec.name).ok_or_else(|| {
             soldb_core::SoldbError::Message(format!(
                 "No ETHDebug runtime file found in {}",
                 spec.debug_dir.display()
             ))
         })?;
+        Self::load_program(spec, &runtime_path, "call")
+    }
+
+    fn load_program(
+        spec: &ResolvedContractSpec,
+        program_path: &Path,
+        environment: &str,
+    ) -> SoldbResult<Self> {
+        let metadata_path = find_ethdebug_metadata(&spec.debug_dir).ok_or_else(|| {
+            soldb_core::SoldbError::Message(format!(
+                "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
+                spec.debug_dir.display()
+            ))
+        })?;
 
         let metadata = read_json_file(&metadata_path)?;
-        let runtime = read_json_file(&runtime_path)?;
+        let program = read_json_file(program_path)?;
         let resources = ethdebug_resources_from_metadata(&metadata_path, &metadata)?;
-        let instructions = runtime
+        let instructions = program
             .get("instructions")
             .cloned()
             .map(serde_json::from_value::<Vec<Instruction>>)
@@ -1639,7 +1654,7 @@ impl TraceSourceIndex {
             .map_err(|error| {
                 soldb_core::SoldbError::Message(format!(
                     "Invalid instructions in {}: {error}",
-                    runtime_path.display()
+                    program_path.display()
                 ))
             })?
             .unwrap_or_default();
@@ -1648,11 +1663,11 @@ impl TraceSourceIndex {
             .cloned()
             .unwrap_or_else(|| metadata.clone());
         let sources = parse_compilation_sources(&compilation);
-        let variable_locations = parse_variable_locations(&runtime)?;
+        let variable_locations = parse_variable_locations(&program)?;
         let info = EthdebugInfo {
             compilation,
             contract_name: spec.name.clone(),
-            environment: "runtime".to_owned(),
+            environment: environment.to_owned(),
             instructions,
             sources,
             variable_locations,
@@ -2361,20 +2376,43 @@ fn find_ethdebug_metadata(root: &Path) -> Option<PathBuf> {
 }
 
 fn find_runtime_ethdebug(root: &Path, contract_name: &str) -> Option<PathBuf> {
-    let named = root.join(format!("{contract_name}_ethdebug-runtime.json"));
+    find_program_ethdebug(root, contract_name, "_ethdebug-runtime.json")
+}
+
+fn find_creation_ethdebug(root: &Path, contract_name: &str) -> Option<PathBuf> {
+    find_program_ethdebug(root, contract_name, "_ethdebug.json")
+}
+
+fn find_program_ethdebug(root: &Path, contract_name: &str, suffix: &str) -> Option<PathBuf> {
+    let named = root.join(format!("{contract_name}{suffix}"));
     if named.exists() {
         return Some(named);
     }
 
-    fs::read_dir(root)
+    let mut candidates = fs::read_dir(root)
         .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| {
+        .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with("_ethdebug-runtime.json"))
+                .is_some_and(|name| name.ends_with(suffix))
         })
+        .collect::<Vec<_>>();
+    candidates.sort();
+
+    let contract_suffix = format!("_{contract_name}{suffix}");
+    let mut matching = candidates.iter().filter(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&contract_suffix))
+    });
+    let matched = matching.next().cloned();
+    if matched.is_some() && matching.next().is_none() {
+        return matched;
+    }
+
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 fn parse_compilation_sources(compilation: &serde_json::Value) -> BTreeMap<u64, String> {

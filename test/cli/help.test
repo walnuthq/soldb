@@ -3,6 +3,7 @@
 # RUN: %soldb --help 2>&1 | FileCheck %s --check-prefix=MAIN
 # RUN: %soldb --version 2>&1 | FileCheck %s --check-prefix=VERSION
 # RUN: %soldb trace --help 2>&1 | FileCheck %s --check-prefix=TRACE
+# RUN: %soldb profile --help 2>&1 | FileCheck %s --check-prefix=PROFILE
 # RUN: %soldb simulate --help 2>&1 | FileCheck %s --check-prefix=SIMULATE
 # RUN: %soldb list-events --help 2>&1 | FileCheck %s --check-prefix=EVENTS
 # RUN: %soldb list-contracts --help 2>&1 | FileCheck %s --check-prefix=CONTRACTS
@@ -13,6 +14,7 @@
 # MAIN-DAG: list-contracts
 # MAIN-DAG: list-events
 # MAIN-DAG: trace
+# MAIN-DAG: profile
 # MAIN-DAG: simulate
 
 # VERSION: 0.1.0
@@ -23,6 +25,15 @@
 # TRACE-DAG: --multi-contract
 # TRACE-DAG: --rpc
 # TRACE-DAG: --json
+
+# PROFILE-DAG: Usage:
+# PROFILE-DAG: TX_HASH
+# PROFILE-DAG: --trace-file
+# PROFILE-DAG: --backend
+# PROFILE-DAG: --ethdebug-dir
+# PROFILE-DAG: --json
+# PROFILE-DAG: --folded
+# PROFILE-DAG: --flamegraph
 
 # SIMULATE-DAG: Usage:
 # SIMULATE-DAG: --from

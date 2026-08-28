@@ -141,6 +141,18 @@ The system analyzes the execution trace to reconstruct function calls:
 └─────────────────────────────────────────┘
 ```
 
+### 6. Gas Profiling
+
+`soldb-profiler` is a frontend-independent consumer of `TransactionTrace` and
+ETHDebug programs. It indexes each program once, attributes dynamic `gas_cost`
+samples by bytecode address and creation/runtime environment, and returns sorted
+contract, function, source-line, opcode, and instruction tables. It also returns
+gas-weighted folded stacks for flame graph renderers.
+
+The RPC backend is not part of the profiler. The CLI can fetch and replay a mined
+transaction, while another integration such as Foundry can provide the same core
+trace type directly from its local executor.
+
 ## Key Implementation Details
 
 ### Transaction Loading (`soldb-rpc`)
