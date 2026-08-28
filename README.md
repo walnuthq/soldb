@@ -135,6 +135,18 @@ soldb> vars
 
 ---
 
+## Gas Profiling
+
+`soldb profile` attributes dynamic EVM gas to contracts, functions, source
+lines, opcodes, and instructions using compiler-generated ETHDebug metadata. It
+can also generate an interactive flame graph.
+
+![SolDB gas profile flame graph](docs/assets/profile.png)
+
+See the [profiling guide](docs/profiling.md) for usage and integration details.
+
+---
+
 ## Features
 
 - ETHDebug-first source debugging built around compiler-generated `solc --debug-info ethdebug` metadata
