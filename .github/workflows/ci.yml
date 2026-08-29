@@ -11,6 +11,10 @@ on:
     - cron: "0 5 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   FOUNDRY_VERSION: v1.0.0
 
