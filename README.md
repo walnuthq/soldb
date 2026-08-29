@@ -161,7 +161,7 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
 - Dynamic gas profiles by contract, function, source line, opcode, and instruction
 - Folded-stack and interactive SVG flame graph output
 - Transaction simulation with arbitrary calldata (including structs & tuples)
-- Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations
+- Interactive LLDB-like REPL (`step`, `next`, `break`, `continue`, etc.) – works for both transactions and simulations
 - HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and normal-RPC replay for local Anvil transactions
 - Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
 
