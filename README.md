@@ -96,6 +96,8 @@ soldb> next
 soldb> print balance
 ```
 
+See [docs/commands.md](docs/commands.md) for the full list of REPL commands.
+
 ---
 
 ## Example: Simulating a Contract Call
