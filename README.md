@@ -1,7 +1,7 @@
 # SolDB – ETHDebug-First Solidity Debugger
 
 [![CI](https://github.com/walnuthq/soldb/actions/workflows/ci.yml/badge.svg)](https://github.com/walnuthq/soldb/actions/workflows/ci.yml)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: GPL v3 or MIT](https://img.shields.io/badge/License-GPLv3%20or%20MIT-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 
 > **Note**: SolDB is in public beta; expect ongoing changes and occasional inaccuracies.  
@@ -329,9 +329,12 @@ make coverage
 
 ## License
 
-SolDB is licensed under the GNU General Public License v3.0 (GPL-3.0), the same license used by Solidity and other Ethereum Foundation projects.
+SolDB is dual-licensed under the GNU General Public License v3.0 or the MIT
+license, at your option: use, redistribute, and modify it under the terms of
+either one. Unless you state otherwise, contributions you submit are
+dual-licensed the same way.
 
-📄 [Full license](./LICENSE.md)
+📄 [GPL-3.0](./LICENSE.md) · [MIT](./LICENSE-MIT.md)
 
 ## Community & Support
 💬 Join our Telegram: [@walnut_soldb](https://t.me/walnut_soldb)
