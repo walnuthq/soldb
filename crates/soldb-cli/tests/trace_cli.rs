@@ -40,7 +40,7 @@ fn help_and_version_are_served_by_rust_cli() {
         .expect("run soldb version");
     assert!(version.status.success());
     let stdout = String::from_utf8(version.stdout).expect("utf8 version");
-    assert!(stdout.contains("soldb 0.1.0"));
+    assert!(stdout.contains(concat!("soldb ", env!("CARGO_PKG_VERSION"))));
 }
 
 #[test]
