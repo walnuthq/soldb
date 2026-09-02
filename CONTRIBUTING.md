@@ -24,4 +24,4 @@ Open an issue at https://github.com/walnuthq/soldb/issues.
 
 ## Questions
 
-Telegram: [@walnut_soldb](https://t.me/walnut_soldb) · Email: hi@walnut.dev
+Email: hi@walnut.dev

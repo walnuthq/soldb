@@ -342,5 +342,4 @@ dual-licensed the same way.
 📄 [GPL-3.0](./LICENSE.md) · [MIT](./LICENSE-MIT.md)
 
 ## Community & Support
-💬 Join our Telegram: [@walnut_soldb](https://t.me/walnut_soldb)
 📬 Email: hi@walnut.dev
