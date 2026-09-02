@@ -17,7 +17,7 @@
 # MAIN-DAG: profile
 # MAIN-DAG: simulate
 
-# VERSION: 0.1.0
+# VERSION: soldb {{[0-9]+\.[0-9]+\.[0-9]+}}
 
 # TRACE-DAG: Usage:
 # TRACE-DAG: TX_HASH
