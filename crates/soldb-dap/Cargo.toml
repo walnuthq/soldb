@@ -2,8 +2,13 @@
 name = "soldb-dap"
 version.workspace = true
 edition.workspace = true
+description = "Debug Adapter Protocol server for SolDB, the ETHDebug-first Solidity debugger"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["development-tools::debugging", "command-line-utilities"]
 
 [lib]
 doctest = false
@@ -11,11 +16,11 @@ doctest = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-soldb-core = { path = "../soldb-core" }
-soldb-debugger = { path = "../soldb-debugger" }
-soldb-ethdebug = { path = "../soldb-ethdebug" }
-soldb-repl = { path = "../soldb-repl" }
-soldb-rpc = { path = "../soldb-rpc" }
+soldb-core.workspace = true
+soldb-debugger.workspace = true
+soldb-ethdebug.workspace = true
+soldb-repl.workspace = true
+soldb-rpc.workspace = true
 
 [[bin]]
 name = "soldb-dap-server"

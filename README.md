@@ -19,12 +19,17 @@ SolDB is an open-source, ETHDebug-first, LLDB-style debugger for Solidity and th
 
 Install SolDB:
 ```bash
-cargo install --git https://github.com/walnuthq/soldb.git soldb-cli
+cargo install soldb
 ```
 
 Optional debug-adapter binary:
 ```bash
-cargo install --git https://github.com/walnuthq/soldb.git soldb-dap
+cargo install soldb-dap
+```
+
+To track the development branch instead, install from git:
+```bash
+cargo install --git https://github.com/walnuthq/soldb.git soldb
 ```
 
 Run against a local node (Anvil):

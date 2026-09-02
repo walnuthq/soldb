@@ -86,16 +86,19 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | crate | depends on |
 | --- | --- |
 | `soldb-core` | *(nothing)* |
-| `soldb-ethdebug` | core |
+| `soldb-ethdebug` | core, `revm-bytecode` |
 | `soldb-rpc` | core, `revm` |
 | `soldb-repl` | core |
 | `soldb-serializer` | core |
 | `soldb-debugger` | core, ethdebug |
-| `soldb-profiler` | core, debugger, ethdebug |
+| `soldb-profiler` | core, ethdebug |
 | `soldb-bridge` | core, rpc |
 | `soldb-compiler` | core, ethdebug, rpc |
 | `soldb-dap` | core, ethdebug, rpc, repl, debugger |
-| `soldb-cli` | core, ethdebug, rpc, repl, debugger, profiler, serializer, compiler, bridge |
+| `soldb-cli` | core, ethdebug, rpc, repl, debugger, profiler, serializer, compiler, bridge, `inferno` |
+
+The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
+`cargo install soldb`; the directory keeps the `soldb-cli` name to match its siblings.
 
 `soldb-debugger` is the shared frontend model, and both `soldb-cli` and `soldb-dap` go
 through it for variable decoding so the terminal and an editor report the same values.
