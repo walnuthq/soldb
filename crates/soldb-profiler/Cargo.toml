@@ -2,16 +2,21 @@
 name = "soldb-profiler"
 version.workspace = true
 edition.workspace = true
+description = "Gas attribution and folded-stack profiling over SolDB transaction traces"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
 serde.workspace = true
-soldb-core = { path = "../soldb-core" }
-soldb-ethdebug = { path = "../soldb-ethdebug" }
+soldb-core.workspace = true
+soldb-ethdebug.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

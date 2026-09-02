@@ -2,8 +2,13 @@
 name = "soldb-rpc"
 version.workspace = true
 edition.workspace = true
+description = "JSON-RPC and REVM replay backends that produce SolDB transaction traces"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 doctest = false
@@ -11,7 +16,7 @@ doctest = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-soldb-core = { path = "../soldb-core" }
+soldb-core.workspace = true
 revm = { version = "36.0", default-features = false, features = [
     "std",
     "serde",

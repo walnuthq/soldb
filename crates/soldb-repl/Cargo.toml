@@ -2,14 +2,19 @@
 name = "soldb-repl"
 version.workspace = true
 edition.workspace = true
+description = "Interactive debugger state machine (breakpoints, stepping, display modes) for SolDB"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-soldb-core = { path = "../soldb-core" }
+soldb-core.workspace = true
 
 [lints]
 workspace = true

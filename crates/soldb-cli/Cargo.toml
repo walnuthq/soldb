@@ -1,9 +1,17 @@
 [package]
-name = "soldb-cli"
+name = "soldb"
 version.workspace = true
 edition.workspace = true
+description = "An ETHDebug-first, LLDB-style debugger for Solidity and the EVM"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["development-tools::debugging", "command-line-utilities"]
+# The integration tests read fixtures from `test/` at the repository root, which
+# is outside the published package.
+exclude = ["tests"]
 
 [[bin]]
 name = "soldb"
@@ -14,15 +22,15 @@ clap.workspace = true
 inferno = { version = "0.12", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
-soldb-bridge = { path = "../soldb-bridge" }
-soldb-compiler = { path = "../soldb-compiler" }
-soldb-core = { path = "../soldb-core" }
-soldb-debugger = { path = "../soldb-debugger" }
-soldb-ethdebug = { path = "../soldb-ethdebug" }
-soldb-profiler = { path = "../soldb-profiler" }
-soldb-repl = { path = "../soldb-repl" }
-soldb-rpc = { path = "../soldb-rpc" }
-soldb-serializer = { path = "../soldb-serializer" }
+soldb-bridge.workspace = true
+soldb-compiler.workspace = true
+soldb-core.workspace = true
+soldb-debugger.workspace = true
+soldb-ethdebug.workspace = true
+soldb-profiler.workspace = true
+soldb-repl.workspace = true
+soldb-rpc.workspace = true
+soldb-serializer.workspace = true
 
 [lints]
 workspace = true

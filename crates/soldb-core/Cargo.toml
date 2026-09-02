@@ -2,8 +2,13 @@
 name = "soldb-core"
 version.workspace = true
 edition.workspace = true
+description = "Shared trace, snapshot, capability, and error types for SolDB, the ETHDebug-first Solidity debugger"
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 doctest = false
