@@ -15,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-only OR MIT"
 repository = "https://github.com/walnuthq/soldb"
@@ -29,16 +29,16 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-soldb-bridge = { path = "crates/soldb-bridge", version = "0.1.0" }
-soldb-compiler = { path = "crates/soldb-compiler", version = "0.1.0" }
-soldb-core = { path = "crates/soldb-core", version = "0.1.0" }
-soldb-dap = { path = "crates/soldb-dap", version = "0.1.0" }
-soldb-debugger = { path = "crates/soldb-debugger", version = "0.1.0" }
-soldb-ethdebug = { path = "crates/soldb-ethdebug", version = "0.1.0" }
-soldb-profiler = { path = "crates/soldb-profiler", version = "0.1.0" }
-soldb-repl = { path = "crates/soldb-repl", version = "0.1.0" }
-soldb-rpc = { path = "crates/soldb-rpc", version = "0.1.0" }
-soldb-serializer = { path = "crates/soldb-serializer", version = "0.1.0" }
+soldb-bridge = { path = "crates/soldb-bridge", version = "0.2.0" }
+soldb-compiler = { path = "crates/soldb-compiler", version = "0.2.0" }
+soldb-core = { path = "crates/soldb-core", version = "0.2.0" }
+soldb-dap = { path = "crates/soldb-dap", version = "0.2.0" }
+soldb-debugger = { path = "crates/soldb-debugger", version = "0.2.0" }
+soldb-ethdebug = { path = "crates/soldb-ethdebug", version = "0.2.0" }
+soldb-profiler = { path = "crates/soldb-profiler", version = "0.2.0" }
+soldb-repl = { path = "crates/soldb-repl", version = "0.2.0" }
+soldb-rpc = { path = "crates/soldb-rpc", version = "0.2.0" }
+soldb-serializer = { path = "crates/soldb-serializer", version = "0.2.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
