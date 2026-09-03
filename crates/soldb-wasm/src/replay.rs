@@ -17,15 +17,21 @@
 //! [`Replay::export_state`] returns exactly the state the replay depended on, which a
 //! host can keep, share, or feed back through [`Replay::provide_state`] to replay the
 //! same transaction in one round with no node at all.
+//!
+//! [`Replay::prepare_call`] drives the same loop for a call that was never mined: the
+//! chain as it stood at a block becomes the fork the call runs on, on top of the block
+//! or inside it at a transaction index, which is what stepping through an `eth_call`
+//! on a fork needs.
 
 use std::collections::BTreeSet;
 
 use serde::Serialize;
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
 use soldb_rpc::{
-    replay_prefix_with_state, replay_target_with_state, replay_transaction_trace,
-    PrefetchedReplayState, ReplayInputs, ReplayPrefix, RpcBlockWithTransactions, RpcReceipt,
-    RpcTransaction, StateBatch, StateRequest,
+    replay_prefix_with_state, replay_simulation_trace, replay_target_with_state,
+    replay_transaction_trace, PrefetchedReplayState, ReplayInputs, ReplayPrefix,
+    RpcBlockWithTransactions, RpcReceipt, RpcTransaction, SimulateCallRequest, StateBatch,
+    StateRequest,
 };
 
 use crate::pipeline::{parse_json, to_json, Trace};
@@ -45,12 +51,20 @@ pub enum ReplayStatus {
     },
 }
 
+/// What a replay produces a trace of.
+#[derive(Debug)]
+enum ReplayTarget {
+    Transaction { receipt: RpcReceipt },
+    Call { request: SimulateCallRequest },
+}
+
 /// A replay in progress: the inputs, the state supplied so far, the block prefix once
 /// it ran clean, and the result once a run completes.
 #[derive(Debug)]
 pub struct Replay {
     inputs: ReplayInputs,
-    receipt: RpcReceipt,
+    /// The mined transaction's receipt, or the call being simulated.
+    target: ReplayTarget,
     state: PrefetchedReplayState,
     /// The prefix's state, kept from the first round in which the prefix read nothing
     /// missing. Later rounds run the target over it instead of re-executing the prefix.
@@ -79,10 +93,54 @@ impl Replay {
             parse_json::<RpcBlockWithTransactions>("`eth_getBlockByNumber` result", block_json)?;
         let chain_id = parse_chain_id(chain_id)?;
         let inputs = ReplayInputs::new(transaction, block, chain_id)?;
+        Self::over(inputs, ReplayTarget::Transaction { receipt })
+    }
+
+    /// Prepares a call against the chain as it stood at the block in `block_json`, the
+    /// `result` of `eth_getBlockByNumber`, whose `number` names the fork point. With
+    /// `tx_index` the call runs inside that block after the transactions before the
+    /// index, which then must be full objects; without it, on top of the block. `value`
+    /// accepts the same forms as `soldb simulate --value`.
+    pub fn prepare_call(
+        from: &str,
+        to: &str,
+        calldata: &str,
+        value: &str,
+        block_json: &str,
+        chain_id: &str,
+        tx_index: Option<u64>,
+    ) -> SoldbResult<Self> {
+        let block =
+            parse_json::<RpcBlockWithTransactions>("`eth_getBlockByNumber` result", block_json)?;
+        let block_number = block
+            .header
+            .number
+            .as_deref()
+            .ok_or_else(|| {
+                SoldbError::Message(
+                    "the block has no `number`; pass the `eth_getBlockByNumber` result whole"
+                        .to_owned(),
+                )
+            })
+            .and_then(parse_chain_id)?;
+        let chain_id = parse_chain_id(chain_id)?;
+        let request = SimulateCallRequest {
+            from_addr: from.to_owned(),
+            to_addr: to.to_owned(),
+            calldata: calldata.to_owned(),
+            value: value.to_owned(),
+            block: Some(block_number),
+            tx_index,
+        };
+        let inputs = ReplayInputs::for_call(&request, block, block_number, chain_id)?;
+        Self::over(inputs, ReplayTarget::Call { request })
+    }
+
+    fn over(inputs: ReplayInputs, target: ReplayTarget) -> SoldbResult<Self> {
         let state = PrefetchedReplayState::for_inputs(&inputs)?;
         Ok(Self {
             inputs,
-            receipt,
+            target,
             state,
             prefix: None,
             prefix_reads: BTreeSet::new(),
@@ -157,11 +215,14 @@ impl Replay {
             .cloned()
             .chain(self.state.reads())
             .collect();
-        self.trace = Some(replay_transaction_trace(
-            self.inputs.transaction().clone(),
-            self.receipt.clone(),
-            &debug_result,
-        )?);
+        self.trace = Some(match &self.target {
+            ReplayTarget::Transaction { receipt } => replay_transaction_trace(
+                self.inputs.transaction().clone(),
+                receipt.clone(),
+                &debug_result,
+            )?,
+            ReplayTarget::Call { request } => replay_simulation_trace(request, &debug_result)?,
+        });
         Ok(ReplayStatus::Complete)
     }
 
@@ -289,10 +350,9 @@ mod tests {
 
     /// The host side of the loop: answers the requests in `status` out of `world`.
     fn answer(world: &Value, status: &ReplayStatus) -> String {
-        let ReplayStatus::NeedsState { block, requests } = status else {
+        let ReplayStatus::NeedsState { requests, .. } = status else {
             panic!("nothing to answer");
         };
-        assert_eq!(block, "0x0", "state is read at the parent block");
         let empty_account = json!({"balance": "0x0", "nonce": "0x0", "code": "0x"});
         let mut batch = json!({"accounts": {}, "storage": {}, "blockHashes": {}});
         for request in requests {
@@ -576,6 +636,150 @@ mod tests {
         let error = replay.export_state().expect_err("not complete");
         assert!(error.to_string().contains("not completed"), "{error}");
         assert!(!replay.prefix_cached());
+    }
+
+    fn block_with_number(transactions: Vec<Value>) -> String {
+        json!({
+            "number": "0x1",
+            "hash": format!("0x{}", "11".repeat(32)),
+            "timestamp": "0x64",
+            "gasLimit": "0x1c9c380",
+            "baseFeePerGas": "0x0",
+            "mixHash": format!("0x{}", "33".repeat(32)),
+            "transactions": transactions
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn simulates_a_call_on_top_of_a_block_as_a_fork() {
+        // No transaction objects are needed when nothing runs before the call.
+        let mut replay = Replay::prepare_call(
+            SENDER,
+            COUNTER,
+            "0x",
+            "0",
+            &block_with_number(vec![json!("0xaaa")]),
+            "31337",
+            None,
+        )
+        .expect("prepared");
+        let ReplayStatus::NeedsState { block, requests } = replay.status() else {
+            panic!("needs state first");
+        };
+        assert_eq!(
+            block, "0x1",
+            "a call on top of the block reads its final state"
+        );
+        assert!(requests.contains(&StateRequest::Account {
+            address: SENDER.to_owned()
+        }));
+
+        // The sender's nonce is whatever it is: a call carries none.
+        let mut world = world();
+        world["accounts"][SENDER]["nonce"] = json!("0x9");
+        assert_eq!(drive(&world, &mut replay), 2);
+        let trace = replay.finish().expect("trace");
+        let summary = trace.summary();
+        assert_eq!(summary.backend.as_deref(), Some("replay"));
+        assert_eq!(summary.tx_hash, None);
+        assert_eq!(summary.from, SENDER);
+        assert_eq!(summary.to.as_deref(), Some(COUNTER));
+        assert!(summary.success);
+        assert_eq!(summary.step_count, 10);
+        let sstore: Value =
+            serde_json::from_str(&trace.step_json(8).expect("step").expect("in range"))
+                .expect("step");
+        assert_eq!(sstore["snapshot"]["storage"]["0x0"], "0x2a");
+        let document: Value = serde_json::from_str(
+            &trace
+                .to_simulation_web_json("increment", None)
+                .expect("doc"),
+        )
+        .expect("document");
+        assert_eq!(document["backend"], "replay");
+        assert_eq!(document["function_name"], "increment");
+    }
+
+    #[test]
+    fn simulates_a_call_inside_a_block_after_its_earlier_transactions() {
+        let mut replay = Replay::prepare_call(
+            SENDER,
+            COUNTER,
+            "0x",
+            "0",
+            &block_with_number(vec![transaction()]),
+            "0x7a69",
+            Some(1),
+        )
+        .expect("prepared");
+        let ReplayStatus::NeedsState { block, .. } = replay.status() else {
+            panic!("needs state first");
+        };
+        assert_eq!(
+            block, "0x0",
+            "inside the block, state comes from the parent"
+        );
+
+        drive(&world(), &mut replay);
+        assert!(replay.prefix_cached());
+        let trace = replay.finish().expect("trace");
+        let sstore: Value =
+            serde_json::from_str(&trace.step_json(8).expect("step").expect("in range"))
+                .expect("step");
+        // The mined increment ran first, so the call writes 0x2b.
+        assert_eq!(sstore["snapshot"]["storage"]["0x0"], "0x2b");
+    }
+
+    #[test]
+    fn prepare_call_names_what_it_cannot_use() {
+        let block_without_number =
+            json!({"timestamp": "0x64", "gasLimit": "0x1", "transactions": []}).to_string();
+        let error = Replay::prepare_call(
+            SENDER,
+            COUNTER,
+            "0x",
+            "0",
+            &block_without_number,
+            "0x1",
+            None,
+        )
+        .expect_err("no number");
+        assert!(error.to_string().contains("`number`"), "{error}");
+
+        let error = Replay::prepare_call(
+            SENDER,
+            COUNTER,
+            "0x",
+            "0",
+            &block_with_number(vec![json!("0xaaa")]),
+            "0x7a69",
+            Some(1),
+        )
+        .expect_err("hash-only block cannot host a call inside it");
+        assert!(
+            error.to_string().contains("full transaction objects"),
+            "{error}"
+        );
+
+        let error = Replay::prepare_call(SENDER, COUNTER, "0x", "0", "nope", "0x1", None)
+            .expect_err("block JSON");
+        assert!(
+            error.to_string().contains("`eth_getBlockByNumber` result"),
+            "{error}"
+        );
+
+        let error = Replay::prepare_call(
+            SENDER,
+            COUNTER,
+            "0x",
+            "lots",
+            &block_with_number(vec![]),
+            "0x1",
+            None,
+        )
+        .expect_err("value");
+        assert!(error.to_string().contains("lots"), "{error}");
     }
 
     #[test]

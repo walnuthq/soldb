@@ -71,6 +71,59 @@ soldb> continue
 soldb> c
 ```
 
+## Reverse Stepping
+
+The trace is a complete recording of every instruction with its stack, memory, and
+storage, so the debugger moves backward exactly as it moves forward, from any step,
+including the middle of a transaction. Nothing is re-executed.
+
+### `reverse-next`
+
+Aliases: `rnext`, `rn`
+
+Step back to the previous source step.
+
+```text
+soldb> reverse-next
+soldb> rn
+```
+
+Current implementation note: like `next`, this currently moves one EVM instruction.
+
+### `reverse-nexti`
+
+Aliases: `rnexti`, `rni`, `reverse-stepi`, `rsi`, `back`
+
+Step back one EVM instruction.
+
+```text
+soldb> reverse-nexti
+soldb> back
+```
+
+### `reverse-step`
+
+Aliases: `rstep`, `rs`
+
+Step back into the previous instruction, the mirror of `step`.
+
+### `reverse-continue`
+
+Aliases: `rcontinue`, `rc`
+
+Run backward until the nearest earlier breakpoint, or the first step of the trace.
+
+```text
+soldb> break 42
+soldb> reverse-continue
+Breakpoint hit at step 17, pc 42
+soldb> rc
+Start of trace: step 0
+```
+
+The DAP server exposes the same capability as `stepBack` and `reverseContinue`, so an
+editor's step-back buttons work on a trace too.
+
 ## Navigation
 
 ### `goto <step>`

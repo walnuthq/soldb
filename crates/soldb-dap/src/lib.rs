@@ -136,7 +136,7 @@ pub fn initialize_body(adapter_id: &str) -> Value {
         "adapterID": adapter_id,
         "supportsConfigurationDoneRequest": true,
         "supportsEvaluateForHovers": true,
-        "supportsStepBack": false,
+        "supportsStepBack": true,
         "supportsSetVariable": false,
         "supportsRestartRequest": false,
     })

@@ -187,6 +187,91 @@ fn replays_a_transaction_from_host_supplied_state() {
 
 #[cfg(feature = "replay")]
 #[wasm_bindgen_test]
+fn simulates_a_call_on_a_fork_from_host_supplied_state() {
+    use soldb_wasm::Replay;
+
+    const SENDER: &str = "0x1111111111111111111111111111111111111111";
+    const COUNTER: &str = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+    const COUNTER_CODE: &str = "0x6000405060005460010160005500";
+
+    // A block fetched without transaction objects is enough for a call on top of it.
+    let block = json!({
+        "number": "0x1", "hash": format!("0x{}", "11".repeat(32)), "timestamp": "0x64",
+        "gasLimit": "0x1c9c380", "baseFeePerGas": "0x0",
+        "mixHash": format!("0x{}", "33".repeat(32)), "transactions": ["0xaaa"]
+    });
+    let world = json!({
+        "accounts": {
+            SENDER: {"balance": "0x0", "nonce": "0x7", "code": "0x"},
+            COUNTER: {"balance": "0x0", "nonce": "0x1", "code": COUNTER_CODE}
+        },
+        "storage": {COUNTER: {"0x0": "0x29"}},
+        "blockHashes": {"0": format!("0x{}", "22".repeat(32))}
+    });
+    let mut replay = Replay::prepare_call(
+        SENDER,
+        COUNTER,
+        "0x",
+        "0",
+        &block.to_string(),
+        "31337",
+        None,
+    )
+    .expect("prepared");
+
+    let mut status = parse(&replay.status().expect("status"));
+    let mut runs = 0;
+    while status["status"] != "complete" {
+        assert_eq!(
+            status["block"], "0x1",
+            "state is read at the fork point itself"
+        );
+        let mut batch = json!({"accounts": {}, "storage": {}, "blockHashes": {}});
+        for request in status["requests"].as_array().expect("requests") {
+            match request["kind"].as_str().expect("kind") {
+                "account" => {
+                    let address = request["address"].as_str().expect("address");
+                    batch["accounts"][address] = world["accounts"]
+                        .get(address)
+                        .cloned()
+                        .unwrap_or(json!({"balance": "0x0", "nonce": "0x0", "code": "0x"}));
+                }
+                "storage" => {
+                    let address = request["address"].as_str().expect("address");
+                    let slot = request["slot"].as_str().expect("slot");
+                    if batch["storage"].get(address).is_none() {
+                        batch["storage"][address] = json!({});
+                    }
+                    batch["storage"][address][slot] = world["storage"][address]
+                        .get(slot)
+                        .cloned()
+                        .unwrap_or(json!("0x0"));
+                }
+                "blockHash" => {
+                    let number = request["number"].to_string();
+                    batch["blockHashes"][&number] = world["blockHashes"][&number].clone();
+                }
+                other => panic!("unexpected request kind {other}"),
+            }
+        }
+        replay.provide_state(&batch.to_string()).expect("provide");
+        status = parse(&replay.run().expect("run"));
+        runs += 1;
+        assert!(runs < 10, "did not converge");
+    }
+
+    let trace = replay.finish().expect("trace");
+    let summary = parse(&trace.summary().expect("summary"));
+    assert_eq!(summary["backend"], "replay");
+    assert_eq!(summary["txHash"], Value::Null);
+    assert_eq!(summary["success"], true);
+    assert_eq!(trace.step_count(), 10);
+    let sstore = parse(&trace.step(8).expect("step").expect("in range"));
+    assert_eq!(sstore["snapshot"]["storage"]["0x0"], "0x2a");
+}
+
+#[cfg(feature = "replay")]
+#[wasm_bindgen_test]
 fn replay_surfaces_errors_as_exceptions() {
     use soldb_wasm::Replay;
     assert!(Replay::prepare("{", "{}", "{}", "0x1").is_err());

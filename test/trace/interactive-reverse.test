@@ -1,0 +1,14 @@
+# The interactive debugger steps backward over the recorded trace and rewinds to the start.
+# REQUIRES: soldb
+# RUN: printf 'nexti\nnexti\nreverse-nexti\nback\nback\nnexti\nnexti\nreverse-continue\nquit\n' | %soldb trace %{test_tx} --rpc %{rpc_url} -i 2>&1 | FileCheck %s
+
+# CHECK: Transaction loaded. {{[0-9]+}} steps.
+# CHECK: Step 0/
+# CHECK: Step 1/
+# CHECK: Step 2/
+# CHECK: Step 1/
+# CHECK: Step 0/
+# CHECK: Start of trace at step 0
+# CHECK: Step 1/
+# CHECK: Step 2/
+# CHECK: Start of trace at step 0

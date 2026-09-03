@@ -196,6 +196,34 @@ impl Replay {
             .map_err(js_error)
     }
 
+    /// Prepares a call against the chain as it stood at a block: a fork, without a node
+    /// that can fork. `block_json` is the `result` of `eth_getBlockByNumber` for the fork
+    /// point; with `tx_index` the call runs inside that block after the transactions
+    /// before the index (fetch the block with full transactions), otherwise on top of
+    /// it. The rest of the loop is the same as for a transaction.
+    #[wasm_bindgen(js_name = prepareCall)]
+    pub fn prepare_call(
+        from: &str,
+        to: &str,
+        calldata: &str,
+        value: &str,
+        block_json: &str,
+        chain_id: &str,
+        tx_index: Option<u32>,
+    ) -> Result<Replay, JsError> {
+        replay::Replay::prepare_call(
+            from,
+            to,
+            calldata,
+            value,
+            block_json,
+            chain_id,
+            tx_index.map(u64::from),
+        )
+        .map(|inner| Self { inner })
+        .map_err(js_error)
+    }
+
     /// Where the replay stands, as JSON (see [`replay::ReplayStatus`]): `complete`, or
     /// `needsState` with the `block` to read at and the `requests` to answer.
     pub fn status(&self) -> Result<String, JsError> {

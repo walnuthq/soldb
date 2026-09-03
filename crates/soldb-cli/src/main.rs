@@ -308,6 +308,10 @@ struct SimulateArgs {
     block: Option<u64>,
     #[arg(long)]
     tx_index: Option<u64>,
+    /// Where the call runs: `debug_traceCall` on the node, or a local `replay` over the
+    /// node's state, which works on a node that cannot trace.
+    #[arg(long, value_enum, default_value_t = TraceBackendArg::DebugRpc)]
+    backend: TraceBackendArg,
     #[arg(long, default_value = "0")]
     value: String,
     #[arg(long = "ethdebug-dir", short = 'e')]
@@ -605,11 +609,13 @@ fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
-    let resolved = match soldb_rpc::trace_transaction_with_resolved_backend(
+    let traced = soldb_rpc::trace_transaction_with_resolved_backend(
         &args.rpc,
         &args.tx_hash,
         args.backend.into(),
-    ) {
+    )
+    .map(|resolved| resolved.trace);
+    let trace = match traced {
         Ok(trace) => trace,
         Err(error) if args.json => {
             println!(
@@ -625,7 +631,6 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
         }
         Err(error) => return Err(error),
     };
-    let trace = resolved.trace;
     if args.interactive {
         let source_index = interactive_trace_source_index(args, &trace);
         run_interactive_debugger(trace, "Transaction trace debugger", source_index)?;
@@ -679,7 +684,8 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
         block: args.block,
         tx_index: args.tx_index,
     };
-    let trace = soldb_rpc::simulate_call(&args.rpc_url, &request)?;
+    let trace =
+        soldb_rpc::simulate_call_with_backend(&args.rpc_url, &request, args.backend.into())?;
     let json_function_name = simulate_json_function_name(args, &calldata);
     let display_function_name = simulate_display_function_name(args, &calldata);
 
@@ -1153,6 +1159,10 @@ fn print_step_outcome(
             println!("{} {}", info("End of trace at step"), number_color(step));
             print_current_debugger_step(state);
         }
+        StepOutcome::AtStart { step } => {
+            println!("{} {}", info("Start of trace at step"), number_color(step));
+            print_current_debugger_step(state);
+        }
         StepOutcome::InvalidStep {
             requested,
             max_step,
@@ -1267,6 +1277,9 @@ fn print_debugger_help(topic: Option<&str>) {
         Some(topic) => println!("No help for {topic}"),
         None => {
             println!("Commands: next, nexti, step, continue, goto <step>");
+            println!(
+                "          reverse-next, reverse-nexti (back), reverse-step, reverse-continue"
+            );
             println!("          break <pc>|<file>:<line>|line <line>");
             println!("          clear <pc>|<file>:<line>|line <line>");
             println!("          vars, print <variable>");
@@ -3677,6 +3690,7 @@ mod tests {
 
     fn simulate_args() -> SimulateArgs {
         SimulateArgs {
+            backend: TraceBackendArg::DebugRpc,
             from_addr: "0x1".to_owned(),
             interactive: false,
             contract_address: "0x2".to_owned(),

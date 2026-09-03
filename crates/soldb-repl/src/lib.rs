@@ -55,6 +55,14 @@ pub enum DebuggerCommand {
     NextInstruction,
     Step,
     Continue,
+    /// Step back to the previous source step.
+    ReverseNext,
+    /// Step back one EVM instruction.
+    ReverseNextInstruction,
+    /// Step back into the previous instruction, the mirror of `step`.
+    ReverseStep,
+    /// Run backward until a breakpoint or the first step.
+    ReverseContinue,
     Goto(usize),
     /// List every source variable ETHDebug reports as live at the current program counter.
     Vars,
@@ -93,6 +101,12 @@ impl DebuggerCommand {
             "nexti" | "ni" | "stepi" | "si" => Self::NextInstruction,
             "step" | "s" => Self::Step,
             "continue" | "c" => Self::Continue,
+            "reverse-next" | "rnext" | "rn" => Self::ReverseNext,
+            "reverse-nexti" | "rnexti" | "rni" | "reverse-stepi" | "rsi" | "back" => {
+                Self::ReverseNextInstruction
+            }
+            "reverse-step" | "rstep" | "rs" => Self::ReverseStep,
+            "reverse-continue" | "rcontinue" | "rc" => Self::ReverseContinue,
             "vars" | "locals" => Self::Vars,
             "print" | "p" => Self::Print(rest),
             "goto" => rest
@@ -133,6 +147,10 @@ pub enum StepOutcome {
         pc: u64,
     },
     AtEnd {
+        step: usize,
+    },
+    /// A backward step was asked for at the first step of the trace.
+    AtStart {
         step: usize,
     },
     InvalidStep {
@@ -244,6 +262,50 @@ impl DebuggerState {
         }
     }
 
+    /// Steps back one instruction. The trace is a complete recording, so moving
+    /// backward is as cheap and exact as moving forward.
+    pub fn previous_instruction(&mut self) -> StepOutcome {
+        if self.trace.is_none() {
+            return StepOutcome::NoTrace;
+        }
+        if self.current_step == 0 {
+            return StepOutcome::AtStart { step: 0 };
+        }
+        self.current_step -= 1;
+        self.outcome_for_current_step()
+    }
+
+    pub fn previous_source(&mut self) -> StepOutcome {
+        self.previous_instruction()
+    }
+
+    pub fn reverse_step_into(&mut self) -> StepOutcome {
+        self.previous_instruction()
+    }
+
+    /// Runs backward to the nearest earlier breakpoint, or to the first step.
+    pub fn reverse_continue(&mut self) -> StepOutcome {
+        let Some(trace) = &self.trace else {
+            return StepOutcome::NoTrace;
+        };
+        if self.current_step == 0 {
+            return StepOutcome::AtStart { step: 0 };
+        }
+
+        while self.current_step > 0 {
+            self.current_step -= 1;
+            let step = &trace.steps[self.current_step];
+            if self.breakpoints.contains(&step.pc) {
+                return StepOutcome::BreakpointHit {
+                    step: self.current_step,
+                    pc: step.pc,
+                };
+            }
+        }
+
+        StepOutcome::AtStart { step: 0 }
+    }
+
     pub fn goto_step(&mut self, step: usize) -> StepOutcome {
         let Some(trace) = &self.trace else {
             return StepOutcome::NoTrace;
@@ -277,6 +339,10 @@ impl DebuggerState {
             DebuggerCommand::NextInstruction => Some(self.next_instruction()),
             DebuggerCommand::Step => Some(self.step_into()),
             DebuggerCommand::Continue => Some(self.continue_execution()),
+            DebuggerCommand::ReverseNext => Some(self.previous_source()),
+            DebuggerCommand::ReverseNextInstruction => Some(self.previous_instruction()),
+            DebuggerCommand::ReverseStep => Some(self.reverse_step_into()),
+            DebuggerCommand::ReverseContinue => Some(self.reverse_continue()),
             DebuggerCommand::Goto(step) => Some(self.goto_step(step)),
             DebuggerCommand::Mode(Some(mode)) => Some(self.set_display_mode(mode)),
             DebuggerCommand::Break(BreakpointTarget::Pc(pc)) => Some(self.set_breakpoint(pc)),
@@ -498,6 +564,118 @@ mod tests {
                 max_step: Some(3)
             }
         );
+    }
+
+    #[test]
+    fn parses_reverse_commands_and_aliases() {
+        for alias in ["reverse-next", "rnext", "rn"] {
+            assert_eq!(DebuggerCommand::parse(alias), DebuggerCommand::ReverseNext);
+        }
+        for alias in [
+            "reverse-nexti",
+            "rnexti",
+            "rni",
+            "reverse-stepi",
+            "rsi",
+            "back",
+        ] {
+            assert_eq!(
+                DebuggerCommand::parse(alias),
+                DebuggerCommand::ReverseNextInstruction,
+                "{alias}"
+            );
+        }
+        for alias in ["reverse-step", "rstep", "rs"] {
+            assert_eq!(DebuggerCommand::parse(alias), DebuggerCommand::ReverseStep);
+        }
+        for alias in ["reverse-continue", "rcontinue", "rc", "RC"] {
+            assert_eq!(
+                DebuggerCommand::parse(alias),
+                DebuggerCommand::ReverseContinue
+            );
+        }
+    }
+
+    #[test]
+    fn steps_backward_over_the_recording_like_a_tape() {
+        let mut state = DebuggerState::new();
+        assert_eq!(state.previous_instruction(), StepOutcome::NoTrace);
+        assert_eq!(state.reverse_continue(), StepOutcome::NoTrace);
+
+        state.load_trace(sample_trace());
+        assert_eq!(
+            state.previous_instruction(),
+            StepOutcome::AtStart { step: 0 }
+        );
+
+        // Forward then back lands on the same step every time.
+        state.goto_step(2);
+        assert!(matches!(
+            state.previous_instruction(),
+            StepOutcome::Moved { step: 1, .. }
+        ));
+        assert!(matches!(
+            state.previous_instruction(),
+            StepOutcome::Moved { step: 0, .. }
+        ));
+        assert_eq!(
+            state.previous_instruction(),
+            StepOutcome::AtStart { step: 0 }
+        );
+        assert_eq!(state.current_step, 0);
+
+        // Source-level and step-into reversal mirror their forward stubs.
+        state.goto_step(2);
+        assert!(matches!(
+            state.previous_source(),
+            StepOutcome::Moved { step: 1, .. }
+        ));
+        assert!(matches!(
+            state.reverse_step_into(),
+            StepOutcome::Moved { step: 0, .. }
+        ));
+
+        // Rewinding to any step is a jump; it does not have to walk.
+        assert!(matches!(
+            state.goto_step(2),
+            StepOutcome::Moved { step: 2, .. }
+        ));
+        assert_eq!(
+            state.apply_command(DebuggerCommand::ReverseNextInstruction),
+            Some(StepOutcome::Moved {
+                step: 1,
+                pc: sample_trace().steps[1].pc,
+                op: sample_trace().steps[1].op.clone(),
+            })
+        );
+    }
+
+    #[test]
+    fn reverse_continue_stops_at_earlier_breakpoints_then_the_start() {
+        let mut state = DebuggerState::new();
+        state.load_trace(sample_trace());
+        let last = state.step_count() - 1;
+        state.goto_step(last);
+        let breakpoint_pc = sample_trace().steps[1].pc;
+        state.set_breakpoint(breakpoint_pc);
+
+        assert_eq!(
+            state.reverse_continue(),
+            StepOutcome::BreakpointHit {
+                step: 1,
+                pc: breakpoint_pc
+            }
+        );
+        assert_eq!(state.reverse_continue(), StepOutcome::AtStart { step: 0 });
+        assert_eq!(state.current_step, 0);
+        assert_eq!(
+            state.apply_command(DebuggerCommand::ReverseContinue),
+            Some(StepOutcome::AtStart { step: 0 })
+        );
+
+        // A breakpoint on the current step is not "earlier": it is passed over.
+        state.goto_step(1);
+        assert_eq!(state.reverse_continue(), StepOutcome::AtStart { step: 0 });
     }
 
     #[test]

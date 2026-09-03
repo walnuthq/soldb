@@ -90,6 +90,8 @@ impl DapServer {
             "continue" => self.continue_execution(message),
             "next" | "stepIn" => self.step_instruction(message),
             "stepOut" => self.step_out(message),
+            "stepBack" => self.step_back(message),
+            "reverseContinue" => self.reverse_continue(message),
             "pause" => {
                 let response = self.response(message, true, Some(json!({})), None);
                 let event = self.event(
@@ -302,6 +304,20 @@ impl DapServer {
         vec![response, self.stopped_event(outcome)]
     }
 
+    /// The trace is a complete recording, so stepping back is exact: the previous
+    /// instruction with the machine state it had.
+    fn step_back(&mut self, request: &DapMessage) -> Vec<DapMessage> {
+        let outcome = self.debugger.previous_instruction();
+        let response = self.response(request, true, Some(json!({})), None);
+        vec![response, self.stopped_event(outcome)]
+    }
+
+    fn reverse_continue(&mut self, request: &DapMessage) -> Vec<DapMessage> {
+        let outcome = self.debugger.reverse_continue();
+        let response = self.response(request, true, Some(json!({})), None);
+        vec![response, self.stopped_event(outcome)]
+    }
+
     fn step_out(&mut self, request: &DapMessage) -> Vec<DapMessage> {
         let current_depth = self.debugger.current_step_data().map(|step| step.depth);
         let mut outcome = self.debugger.next_instruction();
@@ -479,6 +495,7 @@ impl DapServer {
         let reason = match outcome {
             StepOutcome::BreakpointHit { .. } => "breakpoint",
             StepOutcome::AtEnd { .. } => "end",
+            StepOutcome::AtStart { .. } => "entry",
             StepOutcome::NoTrace => "pause",
             _ => "step",
         };
@@ -828,6 +845,60 @@ mod tests {
             messages[0].body.as_ref().expect("body")["threads"][0]["id"],
             1
         );
+    }
+
+    #[test]
+    fn steps_back_and_reverse_continues_over_the_recording() {
+        let temp = temp_dir("soldb-dap-reverse");
+        std::fs::create_dir_all(&temp).expect("create temp");
+        let trace_file = temp.join("trace.json");
+        std::fs::write(
+            &trace_file,
+            serde_json::to_string(&sample_trace()).expect("trace json"),
+        )
+        .expect("write trace");
+
+        let mut server = DapServer::new();
+        let initialize = DapMessage::request(1, "initialize", Some(json!({})));
+        let messages = server.handle_message(&initialize);
+        assert_eq!(
+            messages[0].body.as_ref().expect("capabilities")["supportsStepBack"],
+            true
+        );
+        let launch = DapMessage::request(
+            2,
+            "launch",
+            Some(json!({"traceFile": trace_file.display().to_string()})),
+        );
+        server.handle_message(&launch);
+        let frame_name = |server: &mut DapServer, seq: u64| {
+            let stack = server.handle_message(&DapMessage::request(seq, "stackTrace", None));
+            stack[0].body.as_ref().expect("body")["stackFrames"][0]["name"]
+                .as_str()
+                .expect("frame name")
+                .to_owned()
+        };
+
+        // One step forward, one back: the frame names show exactly where we are.
+        server.handle_message(&DapMessage::request(3, "next", None));
+        assert!(frame_name(&mut server, 4).starts_with("step 1:"));
+        let messages = server.handle_message(&DapMessage::request(5, "stepBack", None));
+        assert_eq!(messages[0].success, Some(true));
+        assert_eq!(messages[1].event.as_deref(), Some("stopped"));
+        assert_eq!(messages[1].body.as_ref().expect("body")["reason"], "step");
+        assert!(frame_name(&mut server, 6).starts_with("step 0:"));
+
+        // Reverse-continue runs back to the start when nothing earlier is a breakpoint.
+        server.handle_message(&DapMessage::request(7, "next", None));
+        let request = DapMessage::request(8, "reverseContinue", None);
+        let messages = server.handle_message(&request);
+        assert_eq!(messages[1].body.as_ref().expect("body")["reason"], "entry");
+        assert!(frame_name(&mut server, 9).starts_with("step 0:"));
+
+        // Stepping back at the start stays there and says so.
+        let messages = server.handle_message(&DapMessage::request(10, "stepBack", None));
+        assert_eq!(messages[1].body.as_ref().expect("body")["reason"], "entry");
+        assert!(frame_name(&mut server, 11).starts_with("step 0:"));
     }
 
     #[test]

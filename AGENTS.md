@@ -165,6 +165,9 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
 - Backend-specific quirks stay inside `soldb-rpc` behind `TraceBackend`. Everything above
   it reads `TraceCapabilities` to decide what it can show — never `backend == "replay"`.
   Adding a backend must not require touching the CLI.
+- Stepping is bidirectional. A trace is a complete recording, so `soldb-repl` moves
+  backward (`reverse-*` commands, DAP `stepBack`/`reverseContinue`) by index, never by
+  re-executing. Do not add reverse commands that replay the transaction.
 - ETHDebug parsing stays in `soldb-ethdebug`. If the CLI is indexing into raw ETHDebug
   JSON, the accessor is missing from the metadata layer.
 - `soldb-core` types are a serialization contract with on-disk artifacts and web clients.
@@ -283,8 +286,9 @@ Two layers, with different jobs:
   error messages. Prefer these for anything user-visible.
 - **`test/wasm/replay-live.cjs`** replays a transaction through the replay-capable
   WebAssembly package against a live node and compares it with the node's
-  `debug_traceTransaction`. It needs only `anvil` and Node.js, and the `wasm` CI job runs
-  it; `make wasm-live-test` runs it locally.
+  `debug_traceTransaction`, then simulates a call on the fork and compares it with
+  `debug_traceCall`. It needs only `anvil` and Node.js, and the `wasm` CI job runs it;
+  `make wasm-live-test` runs it locally.
 
 **Backend parity is itself a test target.** `test/trace/replay-*.test` run the same
 transaction through `--backend debug-rpc` and `--backend replay` and diff the opcode

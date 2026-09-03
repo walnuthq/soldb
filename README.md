@@ -223,6 +223,24 @@ soldb trace <tx_hash> --backend debug-rpc --ethdebug-dir <contract_address>:<con
 soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
 
+`simulate` takes the same flag. With `--backend replay` the call is executed locally
+against the chain as it stood at `--block`, on top of that block or, with
+`--tx-index`, inside it after the transactions before that index: a fork of the chain at any
+point, with full stepping, from any node that serves state at that block, whether or not it
+can trace.
+
+```bash
+soldb simulate <contract> "increment(uint256)" 4 --from <address> --backend replay --block 12345 --rpc <url>
+```
+
+### Time Travel
+
+A trace is a complete recording, so the interactive debugger and the DAP server move
+backward as freely as forward: `reverse-nexti` (or `back`), `reverse-next`, `reverse-step`,
+and `reverse-continue` mirror their forward counterparts, `goto <step>` rewinds to any
+instruction, mid-transaction included, and an editor's step-back button works. See
+[docs/commands.md](docs/commands.md).
+
 ### Crates
 
 - `crates/soldb-cli`: command-line interface, output formatting, and command wiring.

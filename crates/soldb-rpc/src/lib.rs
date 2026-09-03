@@ -44,10 +44,11 @@ mod test_support;
 
 #[cfg(feature = "replay")]
 pub use replay::{
-    replay_debug_trace_with_state, replay_prefix_with_state, replay_target_with_state,
-    replay_transaction_trace, AccountState, PrefetchedReplayState, ReplayBackend, ReplayDbError,
-    ReplayInputs, ReplayPrefix, ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction,
-    RpcBlockWithTransactions, RpcReplayStateProvider, StateBatch, StateRequest,
+    replay_debug_trace_with_state, replay_prefix_with_state, replay_simulation_trace,
+    replay_target_with_state, replay_transaction_trace, simulate_call_with_replay, AccountState,
+    PrefetchedReplayState, ReplayBackend, ReplayDbError, ReplayInputs, ReplayPrefix,
+    ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction, RpcBlockWithTransactions,
+    RpcReplayStateProvider, StateBatch, StateRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -701,6 +702,21 @@ pub fn debug_rpc_simulation_trace(
     request: &SimulateCallRequest,
     debug_result: &DebugTraceResult,
 ) -> SoldbResult<TransactionTrace> {
+    simulation_trace(
+        TraceBackend::DebugRpc,
+        debug_rpc_capabilities(debug_result),
+        request,
+        debug_result,
+    )
+}
+
+/// The one place a simulated call becomes a trace, whichever backend executed it.
+pub(crate) fn simulation_trace(
+    backend: TraceBackend,
+    capabilities: TraceCapabilities,
+    request: &SimulateCallRequest,
+    debug_result: &DebugTraceResult,
+) -> SoldbResult<TransactionTrace> {
     let failure = debug_result.failure_message();
     Ok(TransactionTrace {
         tx_hash: None,
@@ -714,8 +730,8 @@ pub fn debug_rpc_simulation_trace(
         error: failure,
         debug_trace_available: true,
         contract_address: None,
-        backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
-        capabilities: debug_rpc_capabilities(debug_result),
+        backend: Some(backend.as_str().to_owned()),
+        capabilities,
         artifacts: {
             let mut artifacts = debug_result.artifacts.clone();
             if artifacts.gas.is_none() {
@@ -902,6 +918,37 @@ pub fn simulate_call(
 ) -> SoldbResult<TransactionTrace> {
     let client = HttpJsonRpcClient::new(rpc_url)?;
     simulate_call_with_client(&client, request)
+}
+
+/// Simulates a call through the chosen backend: `debug_traceCall` on the node, or a
+/// local replay over the node's state for nodes that cannot trace. `Auto` means
+/// `debug_traceCall`, since a call has no mined result to fall back on.
+pub fn simulate_call_with_backend(
+    rpc_url: &str,
+    request: &SimulateCallRequest,
+    backend: TraceBackend,
+) -> SoldbResult<TransactionTrace> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    match backend {
+        TraceBackend::Auto | TraceBackend::DebugRpc => simulate_call_with_client(&client, request),
+        TraceBackend::Replay => replay_simulate_call(&client, request),
+    }
+}
+
+#[cfg(feature = "replay")]
+fn replay_simulate_call(
+    client: &HttpJsonRpcClient,
+    request: &SimulateCallRequest,
+) -> SoldbResult<TransactionTrace> {
+    replay::simulate_call_with_replay(client, request)
+}
+
+#[cfg(not(feature = "replay"))]
+fn replay_simulate_call(
+    _client: &HttpJsonRpcClient,
+    _request: &SimulateCallRequest,
+) -> SoldbResult<TransactionTrace> {
+    Err(replay_unavailable())
 }
 
 pub fn transaction_logs(rpc_url: &str, tx_hash: &str) -> SoldbResult<Vec<RpcLog>> {

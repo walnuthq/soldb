@@ -53,8 +53,9 @@ use soldb_core::{
 use crate::{
     build_transaction_trace, bytes_to_hex, decode_revert_reason, format_quantity,
     format_u256_quantity, hex_to_bytes, normalize_hex_output, parse_quantity, parse_u256_quantity,
-    quantity_is_one, DebugTraceResult, HttpJsonRpcClient, RpcReceipt, RpcTransaction, StructLog,
-    TraceBackend, TraceEnvelope, TransactionTraceBackend,
+    parse_value_quantity, quantity_is_one, DebugTraceResult, HttpJsonRpcClient, RpcReceipt,
+    RpcTransaction, SimulateCallRequest, StructLog, TraceBackend, TraceEnvelope,
+    TransactionTraceBackend,
 };
 
 pub struct ReplayBackend<'a> {
@@ -78,31 +79,33 @@ impl TransactionTraceBackend for ReplayBackend<'_> {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RpcBlockHeader {
     #[serde(default)]
-    hash: Option<String>,
-    timestamp: String,
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub number: Option<String>,
+    pub timestamp: String,
     #[serde(rename = "gasLimit")]
-    gas_limit: String,
+    pub gas_limit: String,
     #[serde(default, rename = "baseFeePerGas")]
-    base_fee_per_gas: Option<String>,
+    pub base_fee_per_gas: Option<String>,
     #[serde(default)]
-    difficulty: Option<String>,
+    pub difficulty: Option<String>,
     #[serde(default, rename = "mixHash")]
-    mix_hash: Option<String>,
+    pub mix_hash: Option<String>,
     #[serde(default, rename = "prevRandao")]
-    prevrandao: Option<String>,
+    pub prevrandao: Option<String>,
     #[serde(default)]
-    miner: Option<String>,
+    pub miner: Option<String>,
     #[serde(default)]
-    beneficiary: Option<String>,
+    pub beneficiary: Option<String>,
 }
 
 /// An `eth_getBlockByNumber(number, true)` response: the header plus every transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RpcBlockWithTransactions {
     #[serde(flatten)]
-    header: RpcBlockHeader,
+    pub header: RpcBlockHeader,
     #[serde(default)]
-    transactions: Vec<RpcBlockTransaction>,
+    pub transactions: Vec<RpcBlockTransaction>,
 }
 
 /// A block's transaction as the node returned it: in full, or as a bare hash when the
@@ -175,6 +178,55 @@ pub fn replay_transaction_trace(
     Ok(build_transaction_trace(envelope, debug_result))
 }
 
+/// Simulates a call by re-executing it locally over state read from the node, for nodes
+/// that do not answer `debug_traceCall`. See [`ReplayInputs::for_call`] for where the
+/// call is placed.
+pub fn simulate_call_with_replay(
+    client: &HttpJsonRpcClient,
+    request: &SimulateCallRequest,
+) -> SoldbResult<TransactionTrace> {
+    let block_number = match request.block {
+        Some(block) => block,
+        None => {
+            let latest = client.request::<String>("eth_blockNumber", json!([]))?;
+            parse_quantity(&latest)?
+        }
+    };
+    let chain_id = client
+        .request::<String>("eth_chainId", json!([]))
+        .and_then(|chain_id| parse_quantity(&chain_id))
+        .map_err(|error| {
+            SoldbError::Message(format!(
+                "Replay backend preflight failed: could not read eth_chainId: {error}"
+            ))
+        })?;
+    let block = client
+        .request::<Option<RpcBlockWithTransactions>>(
+            "eth_getBlockByNumber",
+            json!([format_quantity(block_number), request.tx_index.is_some()]),
+        )?
+        .ok_or_else(|| SoldbError::Message(format!("Block {block_number} not found")))?;
+    let inputs = ReplayInputs::for_call(request, block, block_number, chain_id)?;
+    let provider = RpcReplayStateProvider::new(client.clone(), inputs.parent_block_tag());
+    replay_preflight_parent_state(&provider, inputs.transaction())?;
+    let debug_result = replay_debug_trace_with_state(&inputs, &provider)?;
+    replay_simulation_trace(request, &debug_result)
+}
+
+/// Assembles the trace of a simulated call replayed locally; the replay counterpart of
+/// [`crate::debug_rpc_simulation_trace`].
+pub fn replay_simulation_trace(
+    request: &SimulateCallRequest,
+    debug_result: &DebugTraceResult,
+) -> SoldbResult<TransactionTrace> {
+    crate::simulation_trace(
+        TraceBackend::Replay,
+        replay_capabilities(),
+        request,
+        debug_result,
+    )
+}
+
 fn replay_debug_trace(
     client: &HttpJsonRpcClient,
     tx: &RpcTransaction,
@@ -198,7 +250,13 @@ pub struct ReplayInputs {
     transactions: Vec<RpcTransaction>,
     target_index: usize,
     block_number: u64,
+    /// The block whose state the replay starts from: the parent for a mined transaction
+    /// or a call placed inside a block, the block itself for a call on top of it.
+    state_block: u64,
     chain_id: u64,
+    /// True for a simulated call rather than a mined transaction, which relaxes the
+    /// nonce check the way `eth_call` does.
+    simulation: bool,
 }
 
 impl ReplayInputs {
@@ -224,7 +282,74 @@ impl ReplayInputs {
             transactions,
             target_index,
             block_number,
+            state_block: block_number - 1,
             chain_id,
+            simulation: false,
+        })
+    }
+
+    /// Inputs for simulating a call against the chain as it stood at `block_number`,
+    /// the way `eth_call` and `debug_traceCall` would see it.
+    ///
+    /// With `request.tx_index` set, the call runs inside the block at that position:
+    /// state comes from the parent and the transactions before the index run first, so
+    /// the block must carry full transaction objects. Without it the call runs on top
+    /// of the block's final state and nothing runs first. The call is a synthetic legacy
+    /// transaction with a zero gas price and the block's gas limit; its nonce is not
+    /// checked.
+    pub fn for_call(
+        request: &SimulateCallRequest,
+        block: RpcBlockWithTransactions,
+        block_number: u64,
+        chain_id: u64,
+    ) -> SoldbResult<Self> {
+        let (transactions, target_index, state_block) = match request.tx_index {
+            Some(index) => {
+                if block_number == 0 {
+                    return Err(SoldbError::Message(
+                        "Replay backend cannot use parent state for block 0".to_owned(),
+                    ));
+                }
+                let index = index as usize;
+                let transactions =
+                    replay_full_block_transactions(block_number, &block.transactions)?;
+                if index > transactions.len() {
+                    return Err(SoldbError::Message(format!(
+                        "block {block_number} has {} transactions; cannot simulate at index {index}",
+                        transactions.len()
+                    )));
+                }
+                let prefix = transactions.into_iter().take(index).collect::<Vec<_>>();
+                (prefix, index, block_number - 1)
+            }
+            None => (Vec::new(), 0, block_number),
+        };
+        let gas_limit = parse_quantity(&block.header.gas_limit).unwrap_or(30_000_000);
+        let transaction = RpcTransaction {
+            hash: String::new(),
+            from_addr: request.from_addr.clone(),
+            to: Some(request.to_addr.clone()),
+            value: parse_value_quantity(&request.value)?,
+            input_data: normalize_hex_output(&request.calldata),
+            gas: Some(format_quantity(gas_limit)),
+            gas_price: Some("0x0".to_owned()),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            nonce: None,
+            block_number: Some(format_quantity(block_number)),
+            transaction_index: Some(format_quantity(target_index as u64)),
+            transaction_type: Some("0x0".to_owned()),
+            chain_id: Some(format_quantity(chain_id)),
+        };
+        Ok(Self {
+            transaction,
+            header: block.header,
+            transactions,
+            target_index,
+            block_number,
+            state_block,
+            chain_id,
+            simulation: true,
         })
     }
 
@@ -261,15 +386,48 @@ impl ReplayInputs {
         Self::new(tx.clone(), block, chain_id)
     }
 
-    /// The block whose state the replay starts from: the one before the transaction's.
+    /// The block whose state the replay starts from, as an RPC block tag.
     #[must_use]
     pub fn parent_block_tag(&self) -> String {
-        format_quantity(self.block_number - 1)
+        format_quantity(self.state_block)
     }
 
     #[must_use]
     pub fn transaction(&self) -> &RpcTransaction {
         &self.transaction
+    }
+
+    #[must_use]
+    pub fn header(&self) -> &RpcBlockHeader {
+        &self.header
+    }
+
+    /// The block's transactions up to and including the target for a mined
+    /// transaction; only the ones that run first for a simulated call.
+    #[must_use]
+    pub fn transactions(&self) -> &[RpcTransaction] {
+        &self.transactions
+    }
+
+    #[must_use]
+    pub fn target_index(&self) -> usize {
+        self.target_index
+    }
+
+    #[must_use]
+    pub fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    #[must_use]
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Whether the target is a simulated call rather than a mined transaction.
+    #[must_use]
+    pub fn is_simulation(&self) -> bool {
+        self.simulation
     }
 
     /// The accounts every replay reads before executing a single opcode: senders and
@@ -278,7 +436,8 @@ impl ReplayInputs {
     /// saves one round per transaction.
     pub fn participants(&self) -> SoldbResult<Vec<Address>> {
         let mut participants = Vec::new();
-        for transaction in self.transactions.iter().take(self.target_index + 1) {
+        let prefix = self.transactions.iter().take(self.target_index);
+        for transaction in prefix.chain(std::iter::once(&self.transaction)) {
             participants.push(parse_address(&transaction.from_addr)?);
             if let Some(to) = transaction.to.as_deref() {
                 participants.push(parse_address(to)?);
@@ -480,6 +639,8 @@ fn replay_context<'a, P: ReplayStateProvider>(
             cfg.disable_eip3607 = true;
             cfg.disable_block_gas_limit = true;
             cfg.disable_base_fee = true;
+            // A simulated call carries no meaningful nonce, as with `eth_call`.
+            cfg.disable_nonce_check = inputs.simulation;
         })
 }
 
@@ -1772,15 +1933,16 @@ mod tests {
     use super::{
         account_info_from_rpc, empty_account, parse_address, replay_chain_id,
         replay_debug_trace_with_state, replay_full_block_transactions, replay_prefix_with_state,
-        replay_preflight_parent_state, replay_spec_for_chain, replay_target_index,
-        replay_target_with_state, replay_transaction_trace, AccountState, PrefetchedReplayState,
-        ReplayInputs, ReplayStateDb, ReplayStateProvider, RpcBlockTransaction,
-        RpcBlockWithTransactions, RpcReplayStateProvider, SpecId, StateBatch, StateRequest,
+        replay_preflight_parent_state, replay_simulation_trace, replay_spec_for_chain,
+        replay_target_index, replay_target_with_state, replay_transaction_trace, AccountState,
+        PrefetchedReplayState, ReplayInputs, ReplayStateDb, ReplayStateProvider,
+        RpcBlockTransaction, RpcBlockWithTransactions, RpcReplayStateProvider, SpecId, StateBatch,
+        StateRequest,
     };
     use crate::test_support::{read_http_request, start_trace_server};
     use crate::{
         hex_to_bytes, replay_backend_available, trace_transaction_with_backend, HttpJsonRpcClient,
-        RpcReceipt, RpcTransaction, TraceBackend,
+        RpcReceipt, RpcTransaction, SimulateCallRequest, TraceBackend,
     };
 
     #[test]
@@ -2353,6 +2515,114 @@ mod tests {
         assert_eq!(unknown, StateBatch::default());
         state.clear_reads();
         assert!(state.reads().is_empty());
+    }
+
+    fn counter_call(tx_index: Option<u64>) -> SimulateCallRequest {
+        SimulateCallRequest {
+            from_addr: SENDER.to_owned(),
+            to_addr: COUNTER.to_owned(),
+            calldata: "0x".to_owned(),
+            value: "0".to_owned(),
+            block: Some(1),
+            tx_index,
+        }
+    }
+
+    #[test]
+    fn a_call_on_top_of_a_block_runs_over_its_final_state() {
+        // The block is fetched without transaction objects when nothing has to run first.
+        let block = counter_block(vec![json!("0xaaa")]);
+        let inputs = ReplayInputs::for_call(&counter_call(None), block, 1, 31_337).expect("inputs");
+        assert!(inputs.is_simulation());
+        assert_eq!(
+            inputs.parent_block_tag(),
+            "0x1",
+            "state is read at the block itself"
+        );
+        assert!(inputs.transactions().is_empty());
+        assert_eq!(inputs.target_index(), 0);
+        assert_eq!(inputs.transaction().hash, "");
+        assert_eq!(inputs.transaction().gas_price.as_deref(), Some("0x0"));
+        assert_eq!(inputs.transaction().gas.as_deref(), Some("0x1c9c380"));
+        assert_eq!(
+            inputs.participants().expect("participants"),
+            [
+                parse_address(SENDER).expect("sender"),
+                parse_address(COUNTER).expect("counter"),
+                Address::ZERO,
+            ]
+        );
+
+        // The sender's real nonce is 5; the synthetic call carries none and still runs.
+        let mut world = counter_world();
+        world.accounts.get_mut(SENDER).expect("sender").nonce = "0x5".to_owned();
+        let mut state = PrefetchedReplayState::default();
+        state.provide(&world).expect("world");
+        let result = replay_debug_trace_with_state(&inputs, &state).expect("call");
+        assert!(!result.failed, "{:?}", result.error);
+        assert!(state.missing().is_empty());
+        let steps = result.steps();
+        assert_eq!(steps[4].snapshot.storage["0x0"], "0x29");
+        assert_eq!(steps[8].snapshot.storage["0x0"], "0x2a");
+
+        let trace = replay_simulation_trace(&counter_call(None), &result).expect("trace");
+        assert_eq!(trace.tx_hash, None);
+        assert_eq!(trace.from_addr, SENDER);
+        assert_eq!(trace.to_addr.as_deref(), Some(COUNTER));
+        assert_eq!(trace.value, "0x0");
+        assert_eq!(trace.backend.as_deref(), Some("replay"));
+        assert!(trace.success);
+        assert!(trace.capabilities.storage_diff);
+        assert_eq!(trace.steps.len(), 10);
+    }
+
+    #[test]
+    fn a_call_inside_a_block_sees_the_transactions_before_it() {
+        let first = counter_transaction("0xaaa", "0x0", "0x0");
+        let block = counter_block(vec![serde_json::to_value(&first).expect("tx")]);
+        let inputs =
+            ReplayInputs::for_call(&counter_call(Some(1)), block, 1, 31_337).expect("inputs");
+        assert_eq!(
+            inputs.parent_block_tag(),
+            "0x0",
+            "state is read at the parent"
+        );
+        assert_eq!(inputs.transactions().len(), 1);
+        assert_eq!(inputs.target_index(), 1);
+
+        let result = replay_debug_trace_with_state(&inputs, &fully_supplied_state()).expect("call");
+        assert!(!result.failed, "{:?}", result.error);
+        let steps = result.steps();
+        // The mined increment ran first, so the call reads 0x2a and writes 0x2b.
+        assert_eq!(steps[4].snapshot.storage["0x0"], "0x2a");
+        assert_eq!(steps[8].snapshot.storage["0x0"], "0x2b");
+    }
+
+    #[test]
+    fn call_inputs_reject_what_cannot_be_placed() {
+        let hash_only = counter_block(vec![json!("0xaaa")]);
+        let error = ReplayInputs::for_call(&counter_call(Some(1)), hash_only, 1, 31_337)
+            .expect_err("needs full transactions");
+        assert!(
+            error.to_string().contains("full transaction objects"),
+            "{error}"
+        );
+
+        let block = counter_block(vec![serde_json::to_value(counter_transaction(
+            "0xaaa", "0x0", "0x0",
+        ))
+        .expect("tx")]);
+        let error = ReplayInputs::for_call(&counter_call(Some(3)), block.clone(), 1, 31_337)
+            .expect_err("index past the block");
+        assert!(error.to_string().contains("has 1 transactions"), "{error}");
+
+        let error = ReplayInputs::for_call(&counter_call(Some(0)), block, 0, 31_337)
+            .expect_err("genesis has no parent");
+        assert!(error.to_string().contains("block 0"), "{error}");
+
+        let mut bad_value = counter_call(None);
+        bad_value.value = "lots".to_owned();
+        assert!(ReplayInputs::for_call(&bad_value, counter_block(vec![]), 1, 31_337).is_err());
     }
 
     #[test]

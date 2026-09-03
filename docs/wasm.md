@@ -100,6 +100,7 @@ throw a JavaScript `Error` whose message is the debugger's own error text.
 | `trace.toSimulationWebJson(functionName, contracts?)` | the versioned document for a simulation |
 | `trace.free()` | release the trace; it lives outside the JavaScript heap |
 | `Replay.prepare(transaction, receipt, block, chainId)` | replay-capable package only; see below |
+| `Replay.prepareCall(from, to, calldata, value, block, chainId, txIndex?)` | a call on a fork of the chain at `block`; see below |
 | `replay.exportState()` | the state a completed replay depended on, ready for `provideState` |
 | `replayAvailable()` | whether `Replay` is exported by this build |
 | `version()` | the version the module was built from |
@@ -323,6 +324,20 @@ while (status.status !== "complete") {
 localStorage.setItem(`soldb-replay:${txHash}`, replay.exportState()); // next time: one run, no node
 const trace = replay.finish();
 ```
+
+### Calls on a fork
+
+`Replay.prepareCall(from, to, calldata, value, block, chainId, txIndex?)` drives the same
+loop for a call that was never mined. `block` is the `result` of `eth_getBlockByNumber`
+for the fork point, and its `number` says where the chain is forked. Without `txIndex` the
+call runs on top of that block's final state, so the block can be fetched without
+transaction objects; with it, the call runs inside the block after the transactions before
+that index, which must then be full objects. The call carries no nonce and pays no gas
+price, as with `eth_call`. `finish()` yields a simulation trace, the one
+`toSimulationWebJson` renders, and `exportState()` works the same way. This is how a
+browser steps through an `eth_call` against a fork with nothing but a node that serves
+state at that block. `test/wasm/replay-live.cjs` checks the result against the node's
+`debug_traceCall` step for step.
 
 The node must serve state at the parent block, which for anything but recent blocks
 means an archive-capable endpoint, exactly as for the native backend. That is a property
