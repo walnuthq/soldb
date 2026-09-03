@@ -17,6 +17,7 @@ use soldb_core::{
     ContractCreation, ExecutionCall, SoldbResult, TraceArtifacts, TraceCapabilities,
     TransactionTrace,
 };
+use soldb_ethdebug::EthdebugInfo;
 
 pub const WEB_JSON_SCHEMA_VERSION: u64 = 1;
 
@@ -31,6 +32,65 @@ pub struct WebContractMetadata {
     pub debug_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abi: Option<serde_json::Value>,
+}
+
+impl WebContractMetadata {
+    /// Projects one contract's ETHDebug program into its entry of the `contracts` section.
+    ///
+    /// `pcToSourceMappings` gets `offset:length:sourceId` for every instruction that
+    /// carries a source location. `sources` takes each source's contents from
+    /// `source_contents` and falls back to the source path, so a client can still tell
+    /// which file an id refers to when the contents were not available. `debugAvailable`
+    /// reports whether the program named any sources at all. This is the one place the
+    /// projection is defined, so the CLI and a WebAssembly host emit the same entry from
+    /// the same artifacts.
+    #[must_use]
+    pub fn from_ethdebug(
+        info: &EthdebugInfo,
+        source_contents: &BTreeMap<u64, String>,
+        abi: Option<serde_json::Value>,
+    ) -> Self {
+        let pc_to_source_mappings = info
+            .instructions
+            .iter()
+            .filter_map(|instruction| {
+                let location = instruction.source_location()?;
+                Some((
+                    instruction.offset,
+                    format!(
+                        "{}:{}:{}",
+                        location.offset, location.length, location.source_id
+                    ),
+                ))
+            })
+            .collect();
+        let sources = info
+            .sources
+            .iter()
+            .map(|(source_id, source_path)| {
+                let source = source_contents
+                    .get(source_id)
+                    .cloned()
+                    .unwrap_or_else(|| source_path.clone());
+                (*source_id, source)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        Self {
+            pc_to_source_mappings,
+            source_paths: info.sources.clone(),
+            debug_available: !sources.is_empty(),
+            sources,
+            abi,
+        }
+    }
+
+    /// True when there is nothing to tell a client about the contract: no source
+    /// mappings, no sources, and no ABI. Such an entry is left out of the document.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pc_to_source_mappings.is_empty() && self.sources.is_empty() && self.abi.is_none()
+    }
 }
 
 pub fn trace_to_json(trace: &TransactionTrace) -> SoldbResult<String> {
@@ -383,12 +443,81 @@ struct SimulateWebResponse<'a> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use serde_json::json;
     use soldb_core::{ExecutionCall, TraceArtifacts, TraceStep, TransactionTrace};
+    use soldb_ethdebug::EthdebugInfo;
 
     use super::{
         simulate_to_web_json, trace_to_web_json, trace_to_web_json_with_contracts,
         WebContractMetadata,
     };
+
+    #[test]
+    fn projects_ethdebug_into_contract_metadata() {
+        let metadata = json!({
+            "compilation": {
+                "sources": [
+                    {"id": 0, "path": "Counter.sol"},
+                    {"id": 1, "path": "lib/Math.sol"}
+                ]
+            }
+        });
+        let program = json!({
+            "instructions": [
+                {
+                    "offset": 0,
+                    "operation": {"mnemonic": "PUSH1"},
+                    "context": {"code": {"source": {"id": 0}, "range": {"offset": 4, "length": 8}}}
+                },
+                {"offset": 2, "operation": {"mnemonic": "JUMPDEST"}},
+                {
+                    "offset": 3,
+                    "operation": {"mnemonic": "PUSH1"},
+                    "context": {"code": {"source": {"id": 1}, "range": {"offset": 20, "length": 2}}}
+                }
+            ]
+        });
+        let info =
+            EthdebugInfo::from_artifacts("Counter", "runtime", &metadata, &program).expect("info");
+        let sources = BTreeMap::from([(0, "contract Counter {}".to_owned())]);
+        let abi = json!([{"type": "function", "name": "increment"}]);
+
+        let web = WebContractMetadata::from_ethdebug(&info, &sources, Some(abi.clone()));
+
+        assert_eq!(
+            web.pc_to_source_mappings,
+            BTreeMap::from([(0, "4:8:0".to_owned()), (3, "20:2:1".to_owned())])
+        );
+        assert_eq!(web.source_paths, info.sources);
+        // A source without contents falls back to its path so the id still resolves.
+        assert_eq!(
+            web.sources,
+            BTreeMap::from([
+                (0, "contract Counter {}".to_owned()),
+                (1, "lib/Math.sol".to_owned())
+            ])
+        );
+        assert!(web.debug_available);
+        assert_eq!(web.abi, Some(abi));
+        assert!(!web.is_empty());
+    }
+
+    #[test]
+    fn contract_metadata_without_debug_info_is_empty_unless_it_has_an_abi() {
+        let info =
+            EthdebugInfo::from_artifacts("Bare", "runtime", &json!({}), &json!({})).expect("info");
+
+        let empty = WebContractMetadata::from_ethdebug(&info, &BTreeMap::new(), None);
+        assert!(empty.is_empty());
+        assert!(!empty.debug_available);
+        assert!(empty.source_paths.is_empty());
+
+        let with_abi = WebContractMetadata::from_ethdebug(&info, &BTreeMap::new(), Some(json!([])));
+        assert!(!with_abi.is_empty());
+        assert!(!with_abi.debug_available);
+
+        assert!(WebContractMetadata::default().is_empty());
+    }
 
     #[test]
     fn serializes_trace_to_web_shape() {

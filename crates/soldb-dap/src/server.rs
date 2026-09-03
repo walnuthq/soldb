@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
 use soldb_ethdebug::{
-    load_source_map_program, parse_variable_locations, EthdebugInfo, Instruction,
-    SourceMapEnvironment,
+    load_source_map_program, read_compilation_source, EthdebugInfo, SourceMapEnvironment,
 };
 use soldb_repl::{DebuggerState, StepOutcome};
 use soldb_rpc::trace_transaction;
@@ -643,24 +642,6 @@ impl SourceIndex {
     ) -> SoldbResult<Self> {
         let metadata = read_json(metadata_path)?;
         let runtime = read_json(runtime_path)?;
-        let instructions = runtime
-            .get("instructions")
-            .cloned()
-            .map(serde_json::from_value::<Vec<Instruction>>)
-            .transpose()
-            .map_err(|error| {
-                SoldbError::Message(format!(
-                    "Invalid instructions in {}: {error}",
-                    runtime_path.display()
-                ))
-            })?
-            .unwrap_or_default();
-        let compilation = metadata
-            .get("compilation")
-            .cloned()
-            .unwrap_or_else(|| metadata.clone());
-        let sources = parse_sources(&compilation);
-        let variable_locations = parse_variable_locations(&runtime)?;
         let inferred_name = contract_name.unwrap_or_else(|| {
             runtime_path
                 .file_name()
@@ -670,14 +651,8 @@ impl SourceIndex {
                 .to_owned()
         });
 
-        let info = EthdebugInfo {
-            compilation,
-            contract_name: inferred_name,
-            environment: "runtime".to_owned(),
-            instructions,
-            sources,
-            variable_locations,
-        };
+        let info = EthdebugInfo::from_artifacts(&inferred_name, "runtime", &metadata, &runtime)
+            .map_err(|error| SoldbError::Message(format!("{}: {error}", runtime_path.display())))?;
         let positions = build_positions(root, &info);
         Ok(Self { info, positions })
     }
@@ -760,21 +735,6 @@ fn find_runtime_ethdebug(root: &Path, contract_name: Option<&str>) -> SoldbResul
         })
 }
 
-fn parse_sources(compilation: &Value) -> BTreeMap<u64, String> {
-    compilation
-        .get("sources")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|source| {
-            Some((
-                source.get("id")?.as_u64()?,
-                source.get("path")?.as_str()?.to_owned(),
-            ))
-        })
-        .collect()
-}
-
 fn build_positions(root: &Path, info: &EthdebugInfo) -> BTreeMap<u64, SourcePosition> {
     let mut source_cache = BTreeMap::<String, String>::new();
     info.instructions
@@ -799,21 +759,6 @@ fn build_positions(root: &Path, info: &EthdebugInfo) -> BTreeMap<u64, SourcePosi
             ))
         })
         .collect()
-}
-
-fn read_compilation_source(compilation: &Value, source_id: u64) -> Option<String> {
-    compilation
-        .get("sources")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|source| source.get("id").and_then(Value::as_u64) == Some(source_id))
-        .and_then(|source| {
-            source
-                .get("contents")
-                .or_else(|| source.get("content"))
-                .and_then(Value::as_str)
-        })
-        .map(str::to_owned)
 }
 
 fn read_source(root: &Path, source_path: &str) -> String {

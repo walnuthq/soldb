@@ -8,7 +8,8 @@ SolDB is an ETHDebug-first, LLDB-style debugger for Solidity and the EVM, writte
 Rust. It maps EVM execution back to Solidity source using compiler-generated debug
 information, and exposes that as a CLI (`trace`, `simulate`, `list-events`,
 `list-contracts`, `bridge`), an interactive REPL, a versioned JSON document for web
-clients, and a DAP server for editors.
+clients, a DAP server for editors, and a WebAssembly module for browser and Node.js
+hosts.
 
 Two premises drive most design decisions:
 
@@ -37,6 +38,8 @@ cargo clippy --workspace --all-targets -- -D warnings   # Lint (CI gate)
 cargo llvm-cov --workspace --all-targets --fail-under-lines 80   # Coverage gate
 ./test/run-tests.sh                                     # lit/FileCheck end-to-end suite
 make test                                               # cargo test + lit
+make wasm-check                                         # clippy on wasm32-unknown-unknown (CI gate)
+make wasm && make wasm-test                             # wasm-pack build + Node.js smoke tests (CI gate)
 cargo run --bin soldb -- trace <tx> --rpc http://127.0.0.1:8545  # Run the CLI
 ```
 
@@ -89,13 +92,14 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | `soldb-ethdebug` | core, `revm-bytecode` |
 | `soldb-rpc` | core, `revm` |
 | `soldb-repl` | core |
-| `soldb-serializer` | core |
+| `soldb-serializer` | core, ethdebug |
 | `soldb-debugger` | core, ethdebug |
 | `soldb-profiler` | core, ethdebug |
 | `soldb-bridge` | core, rpc |
 | `soldb-compiler` | core, ethdebug, rpc |
 | `soldb-dap` | core, ethdebug, rpc, repl, debugger |
 | `soldb-cli` | core, ethdebug, rpc, repl, debugger, profiler, serializer, compiler, bridge, `inferno` |
+| `soldb-wasm` | core, ethdebug, rpc, debugger, serializer, `wasm-bindgen` |
 
 The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
 `cargo install soldb`; the directory keeps the `soldb-cli` name to match its siblings.
@@ -124,14 +128,19 @@ new frontend logic that both would want belongs there.
 - **soldb-repl**: the interactive debugger *state machine* — breakpoints, stepping,
   display mode. It owns no I/O; the CLI drives it and prints. Keep it that way, because
   it is what makes REPL behavior unit-testable without a terminal.
-- **soldb-serializer**: the versioned web/JSON projection of traces and simulations.
+- **soldb-serializer**: the versioned web/JSON projection of traces and simulations,
+  including the per-contract `contracts` entry built from `EthdebugInfo`.
 - **soldb-compiler**: `solc` invocation, ETHDebug artifact discovery, deploy helpers.
 - **soldb-bridge**: cross-VM bridge protocol and server (Stylus today).
 - **soldb-dap**: Debug Adapter Protocol server for editors.
 - **soldb-cli**: argument parsing, command dispatch, and *all* human-readable formatting.
+- **soldb-wasm**: `wasm-bindgen` exports over the library crates for browser and Node.js
+  hosts. JSON strings in, JSON strings out; the behavior lives in its `pipeline` module
+  and is tested natively. `publish = false`: it ships through `wasm-pack`, not crates.io.
 
 Pipeline: `tx hash -> backend (debug-rpc | replay) -> TransactionTrace -> ETHDebug
-enrichment -> call frames + source steps + decoded values -> CLI text | JSON | REPL | DAP`.
+enrichment -> call frames + source steps + decoded values -> CLI text | JSON | REPL | DAP
+| WASM`.
 
 ### Layering Rules
 
@@ -146,6 +155,14 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
 - `soldb-core` types are a serialization contract with on-disk artifacts and web clients.
   Adding a field is additive and needs `#[serde(default)]`; renaming or removing one is a
   breaking change (see JSON Output Contract).
+- The crates listed in `WASM_CRATES` in the `Makefile` must keep building for
+  `wasm32-unknown-unknown`; the `wasm` CI job lints them on that target and runs the
+  `soldb-wasm` package build and tests. `std::net`, `std::process`, and `std::fs` compile
+  there but fail at runtime, so a WebAssembly host does the I/O and hands results over as
+  strings: nothing reachable from a `soldb-wasm` export may open a socket, spawn a
+  process, or read a file. Check a new dependency in one of those crates with
+  `make wasm-check` before proposing it. `soldb-rpc` selects `getrandom`'s `js` backend
+  for that target only because REVM's `k256` needs it to link. See `docs/wasm.md`.
 
 ### Big Files
 

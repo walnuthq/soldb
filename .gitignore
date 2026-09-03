@@ -1,6 +1,8 @@
 cache/
 dist/
 target/
+# wasm-pack output for the WebAssembly bindings.
+crates/soldb-wasm/pkg/
 rust-coverage.xml
 .coverage
 .coverage.*

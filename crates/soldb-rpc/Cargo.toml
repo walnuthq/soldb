@@ -25,5 +25,12 @@ revm = { version = "36.0", default-features = false, features = [
     "optional_no_base_fee",
 ] }
 
+# `revm` reaches `getrandom` through `k256`, and `getrandom` 0.2 refuses to build for
+# `wasm32-unknown-unknown` unless its `js` backend is selected. Nothing in this crate
+# draws randomness; the dependency exists only to pick that backend so the REVM replay
+# path links in a browser or Node.js host.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [lints]
 workspace = true

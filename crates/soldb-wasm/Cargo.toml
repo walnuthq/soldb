@@ -1,0 +1,34 @@
+[package]
+name = "soldb-wasm"
+version.workspace = true
+edition.workspace = true
+description = "WebAssembly bindings for SolDB: build traces, run debug sessions, and emit the web JSON document in a browser or Node.js host"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories = ["development-tools::debugging", "wasm"]
+# Distributed as an npm package built by `wasm-pack`, not through crates.io. The
+# release workflow publishes the workspace and relies on this flag to skip the crate.
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+soldb-core.workspace = true
+soldb-debugger.workspace = true
+soldb-ethdebug.workspace = true
+soldb-rpc.workspace = true
+soldb-serializer.workspace = true
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[lints]
+workspace = true

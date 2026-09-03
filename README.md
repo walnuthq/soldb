@@ -236,6 +236,7 @@ soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contra
 - `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.
 - `crates/soldb-bridge`: bridge server for cross-environment Solidity<>Stylus debugging.
 - `crates/soldb-dap`: Debug Adapter Protocol server for editor integrations.
+- `crates/soldb-wasm`: WebAssembly bindings that build traces, run source-level debug sessions, and emit the web JSON document in a browser or Node.js host.
 
 ---
 
@@ -329,6 +330,21 @@ Line coverage is enforced at 80% in CI.
 cargo llvm-cov --workspace --all-targets --fail-under-lines 80
 make coverage
 ```
+
+### WebAssembly
+
+The library crates build for `wasm32-unknown-unknown`, and `crates/soldb-wasm` packages
+them for a browser or Node.js host with `wasm-pack`:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+make wasm         # crates/soldb-wasm/pkg
+make wasm-test    # bindings smoke tests under Node.js
+```
+
+See [docs/wasm.md](docs/wasm.md) for the API, what runs in WebAssembly and what stays
+native, and how CI checks the build.
 
 ---
 

@@ -1,4 +1,10 @@
-.PHONY: help install dev test coverage rust-test lit-test test-setup test-deploy clean
+.PHONY: help install dev test coverage rust-test lit-test wasm-check wasm wasm-test test-setup test-deploy clean
+
+# Crates that must keep building for the WebAssembly target. The binaries, `soldb-compiler`
+# (spawns `solc`), and `soldb-bridge` (a TCP server) are host-only by design. CI runs the
+# same targets, so this list is the single place to extend. See docs/wasm.md.
+WASM_TARGET = wasm32-unknown-unknown
+WASM_CRATES = soldb-core soldb-ethdebug soldb-debugger soldb-profiler soldb-repl soldb-serializer soldb-rpc soldb-wasm
 
 help:
 	@echo "SolDB - Build and Distribution"
@@ -10,6 +16,9 @@ help:
 	@echo "  make coverage       Run Rust coverage and LIT tests"
 	@echo "  make rust-test      Run Rust workspace tests"
 	@echo "  make lit-test       Run LIT tests"
+	@echo "  make wasm-check     Lint the WebAssembly-capable crates for wasm32-unknown-unknown"
+	@echo "  make wasm           Build the soldb-wasm package with wasm-pack"
+	@echo "  make wasm-test      Run the soldb-wasm tests under Node.js"
 	@echo "  make test-setup     Setup and verify test environment"
 	@echo "  make test-deploy    Deploy test contracts"
 	@echo "  make clean          Clean build artifacts"
@@ -34,6 +43,15 @@ rust-test:
 
 lit-test:
 	./test/run-tests.sh
+
+wasm-check:
+	cargo clippy --target $(WASM_TARGET) $(addprefix -p ,$(WASM_CRATES)) -- -D warnings
+
+wasm:
+	wasm-pack build crates/soldb-wasm --target web
+
+wasm-test:
+	wasm-pack test --node crates/soldb-wasm
 
 test-setup:
 	./test/test-setup.sh

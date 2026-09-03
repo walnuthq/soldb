@@ -772,6 +772,81 @@ pub fn build_transaction_trace(
     }
 }
 
+/// Assembles the `debug-rpc` trace of a mined transaction from the node's responses to
+/// `eth_getTransactionByHash`, `eth_getTransactionReceipt`, and `debug_traceTransaction`.
+///
+/// This is the whole of the `debug-rpc` backend once the three requests have been
+/// answered, so a host that fetches them itself, such as a WebAssembly client, produces
+/// the identical trace to [`trace_transaction_with_client`].
+pub fn debug_rpc_transaction_trace(
+    tx: RpcTransaction,
+    receipt: RpcReceipt,
+    debug_result: &DebugTraceResult,
+) -> SoldbResult<TransactionTrace> {
+    let envelope = TraceEnvelope {
+        tx_hash: Some(tx.hash),
+        from_addr: tx.from_addr,
+        to_addr: tx.to,
+        value: tx.value,
+        input_data: normalize_hex_output(&tx.input_data),
+        gas_used: parse_quantity(&receipt.gas_used)?,
+        success: receipt.status.as_deref().is_none_or(quantity_is_one),
+        contract_address: receipt.contract_address,
+        debug_trace_available: true,
+        debug_error: None,
+        backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
+        capabilities: debug_rpc_capabilities(debug_result),
+    };
+    let mut trace = build_transaction_trace(envelope, debug_result);
+    if !receipt.logs.is_empty() && trace.artifacts.logs.is_empty() {
+        trace.artifacts.logs = receipt_logs_to_artifacts(&receipt.logs);
+        trace.capabilities.logs = true;
+    }
+    Ok(trace)
+}
+
+/// Assembles the trace of a simulated call from the request that was sent and the node's
+/// `debug_traceCall` response.
+///
+/// The request's `block` and `tx_index` only shape the RPC call, so they do not appear in
+/// the trace. See [`debug_rpc_transaction_trace`] for why this is separate from the
+/// networked [`simulate_call_with_client`].
+pub fn debug_rpc_simulation_trace(
+    request: &SimulateCallRequest,
+    debug_result: &DebugTraceResult,
+) -> SoldbResult<TransactionTrace> {
+    let failure = debug_result.failure_message();
+    Ok(TransactionTrace {
+        tx_hash: None,
+        from_addr: request.from_addr.clone(),
+        to_addr: Some(request.to_addr.clone()),
+        value: parse_value_quantity(&request.value)?,
+        input_data: normalize_hex_output(&request.calldata),
+        gas_used: debug_result.gas.unwrap_or(0),
+        output: normalize_hex_output(&debug_result.return_value),
+        success: failure.is_none(),
+        error: failure,
+        debug_trace_available: true,
+        contract_address: None,
+        backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
+        capabilities: debug_rpc_capabilities(debug_result),
+        artifacts: {
+            let mut artifacts = debug_result.artifacts.clone();
+            if artifacts.gas.is_none() {
+                artifacts.gas = Some(GasSummary {
+                    used: debug_result.gas.unwrap_or(0),
+                    spent: None,
+                    refunded: None,
+                    remaining: None,
+                    limit: None,
+                });
+            }
+            artifacts
+        },
+        steps: debug_result.steps(),
+    })
+}
+
 pub fn trace_transaction(rpc_url: &str, tx_hash: &str) -> SoldbResult<TransactionTrace> {
     let client = HttpJsonRpcClient::new(rpc_url)?;
     trace_transaction_with_client_and_backend(&client, tx_hash, TraceBackend::Auto)
@@ -954,26 +1029,7 @@ pub fn trace_transaction_with_client(
         ]),
     )?;
 
-    let envelope = TraceEnvelope {
-        tx_hash: Some(tx.hash),
-        from_addr: tx.from_addr,
-        to_addr: tx.to,
-        value: tx.value,
-        input_data: normalize_hex_output(&tx.input_data),
-        gas_used: parse_quantity(&receipt.gas_used)?,
-        success: receipt.status.as_deref().is_none_or(quantity_is_one),
-        contract_address: receipt.contract_address,
-        debug_trace_available: true,
-        debug_error: None,
-        backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
-        capabilities: debug_rpc_capabilities(&debug_result),
-    };
-    let mut trace = build_transaction_trace(envelope, &debug_result);
-    if !receipt.logs.is_empty() && trace.artifacts.logs.is_empty() {
-        trace.artifacts.logs = receipt_logs_to_artifacts(&receipt.logs);
-        trace.capabilities.logs = true;
-    }
-    Ok(trace)
+    debug_rpc_transaction_trace(tx, receipt, &debug_result)
 }
 
 pub fn transaction_logs_with_client(
@@ -1014,36 +1070,7 @@ pub fn simulate_call_with_client(
         json!([call_object, block, trace_config]),
     )?;
 
-    let failure = debug_result.failure_message();
-    Ok(TransactionTrace {
-        tx_hash: None,
-        from_addr: request.from_addr.clone(),
-        to_addr: Some(request.to_addr.clone()),
-        value: parse_value_quantity(&request.value)?,
-        input_data: normalize_hex_output(&request.calldata),
-        gas_used: debug_result.gas.unwrap_or(0),
-        output: normalize_hex_output(&debug_result.return_value),
-        success: failure.is_none(),
-        error: failure,
-        debug_trace_available: true,
-        contract_address: None,
-        backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
-        capabilities: debug_rpc_capabilities(&debug_result),
-        artifacts: {
-            let mut artifacts = debug_result.artifacts.clone();
-            if artifacts.gas.is_none() {
-                artifacts.gas = Some(GasSummary {
-                    used: debug_result.gas.unwrap_or(0),
-                    spent: None,
-                    refunded: None,
-                    remaining: None,
-                    limit: None,
-                });
-            }
-            artifacts
-        },
-        steps: debug_result.steps(),
-    })
+    debug_rpc_simulation_trace(request, &debug_result)
 }
 
 fn replay_transaction_with_client(
@@ -2379,17 +2406,177 @@ mod tests {
     use revm::DatabaseRef;
 
     use super::{
-        build_transaction_trace, debug_rpc_capabilities, decode_revert_reason, parse_address,
-        parse_value_quantity, replay_chain_id, replay_full_block_transactions,
-        replay_preflight_parent_state, replay_spec_for_chain, replay_target_index,
-        resolve_trace_backend, simulate_call, trace_transaction, trace_transaction_with_backend,
-        transaction_logs, DebugTraceResult, HttpEndpoint, HttpJsonRpcClient, HttpScheme,
-        RpcBlockTransaction, RpcReplayStateProvider, RpcStateDb, RpcTransaction,
-        SimulateCallRequest, SpecId, StructLog, TraceArtifacts, TraceBackend, TraceCapabilities,
-        TraceEnvelope,
+        build_transaction_trace, debug_rpc_capabilities, debug_rpc_simulation_trace,
+        debug_rpc_transaction_trace, decode_revert_reason, parse_address, parse_value_quantity,
+        replay_chain_id, replay_full_block_transactions, replay_preflight_parent_state,
+        replay_spec_for_chain, replay_target_index, resolve_trace_backend, simulate_call,
+        trace_transaction, trace_transaction_with_backend, transaction_logs, DebugTraceResult,
+        HttpEndpoint, HttpJsonRpcClient, HttpScheme, RpcBlockTransaction, RpcReceipt,
+        RpcReplayStateProvider, RpcStateDb, RpcTransaction, SimulateCallRequest, SpecId, StructLog,
+        TraceArtifacts, TraceBackend, TraceCapabilities, TraceEnvelope,
     };
     use serde_json::{json, Value};
     use soldb_core::TransactionTrace;
+
+    fn canned_debug_result() -> DebugTraceResult {
+        serde_json::from_value(json!({
+            "gas": 21000,
+            "returnValue": "",
+            "structLogs": [
+                {"pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3, "depth": 0, "stack": []},
+                {"pc": 2, "op": "MSTORE", "gas": 97, "gasCost": 3, "depth": 0, "memory": ["aa", "bb"]},
+                {"pc": 3, "op": "STOP", "gas": 94, "gasCost": 0, "depth": 0}
+            ]
+        }))
+        .expect("debug result")
+    }
+
+    #[test]
+    fn debug_rpc_transaction_trace_assembles_the_node_responses() {
+        let tx: RpcTransaction = serde_json::from_value(json!({
+            "hash": "0xabc",
+            "from": "0x1",
+            "to": "0x2",
+            "value": "0x0",
+            "input": "1234"
+        }))
+        .expect("transaction");
+        let receipt: RpcReceipt = serde_json::from_value(json!({
+            "gasUsed": "0x5208",
+            "status": "0x1",
+            "contractAddress": null,
+            "logs": [event_log("0x2", "04"), event_log("0x2", "05")]
+        }))
+        .expect("receipt");
+
+        let trace =
+            debug_rpc_transaction_trace(tx, receipt, &canned_debug_result()).expect("trace");
+
+        assert_eq!(trace.tx_hash.as_deref(), Some("0xabc"));
+        assert_eq!(trace.from_addr, "0x1");
+        assert_eq!(trace.to_addr.as_deref(), Some("0x2"));
+        assert_eq!(trace.input_data, "0x1234");
+        assert_eq!(trace.gas_used, 21000);
+        assert!(trace.success);
+        assert_eq!(trace.error, None);
+        assert!(trace.debug_trace_available);
+        assert_eq!(
+            trace.backend.as_deref(),
+            Some(TraceBackend::DebugRpc.as_str())
+        );
+        assert!(trace.capabilities.opcode_steps);
+        // Receipt logs stand in for the logs `debug_traceTransaction` never returns.
+        assert!(trace.capabilities.logs);
+        assert_eq!(trace.artifacts.logs.len(), 2);
+        assert_eq!(trace.steps.len(), 3);
+        assert_eq!(trace.steps[1].memory.as_deref(), Some("aabb"));
+    }
+
+    #[test]
+    fn debug_rpc_transaction_trace_reports_a_reverted_receipt() {
+        let tx: RpcTransaction = serde_json::from_value(json!({
+            "hash": "0xabc",
+            "from": "0x1",
+            "to": "0x2"
+        }))
+        .expect("transaction");
+        let receipt: RpcReceipt = serde_json::from_value(json!({
+            "gasUsed": "0x5208",
+            "status": "0x0"
+        }))
+        .expect("receipt");
+
+        let trace =
+            debug_rpc_transaction_trace(tx, receipt, &canned_debug_result()).expect("trace");
+
+        assert!(!trace.success);
+        assert!(!trace.capabilities.logs);
+        assert!(trace.artifacts.logs.is_empty());
+    }
+
+    #[test]
+    fn debug_rpc_transaction_trace_rejects_a_malformed_gas_quantity() {
+        let tx: RpcTransaction = serde_json::from_value(json!({
+            "hash": "0xabc",
+            "from": "0x1",
+            "to": "0x2"
+        }))
+        .expect("transaction");
+        let receipt: RpcReceipt = serde_json::from_value(json!({
+            "gasUsed": "not-a-quantity",
+            "status": "0x1"
+        }))
+        .expect("receipt");
+
+        assert!(debug_rpc_transaction_trace(tx, receipt, &canned_debug_result()).is_err());
+    }
+
+    #[test]
+    fn debug_rpc_simulation_trace_carries_the_request_and_the_result() {
+        let request = SimulateCallRequest {
+            from_addr: "0x1".to_owned(),
+            to_addr: "0x2".to_owned(),
+            calldata: "0x1234".to_owned(),
+            value: "0x0".to_owned(),
+            block: Some(7),
+            tx_index: Some(3),
+        };
+        let debug_result: DebugTraceResult = serde_json::from_value(json!({
+            "gas": 42000,
+            "returnValue": "2a",
+            "failed": false,
+            "structLogs": [
+                {"pc": 0, "op": "PUSH1", "gas": 100, "gasCost": 3, "depth": 0, "stack": []},
+                {"pc": 2, "op": "STOP", "gas": 95, "gasCost": 0, "depth": 0}
+            ]
+        }))
+        .expect("debug result");
+
+        let trace = debug_rpc_simulation_trace(&request, &debug_result).expect("trace");
+
+        assert_eq!(trace.tx_hash, None);
+        assert_eq!(trace.from_addr, "0x1");
+        assert_eq!(trace.to_addr.as_deref(), Some("0x2"));
+        assert_eq!(trace.input_data, "0x1234");
+        assert_eq!(trace.output, "0x2a");
+        assert_eq!(trace.gas_used, 42000);
+        assert!(trace.success);
+        assert_eq!(
+            trace.backend.as_deref(),
+            Some(TraceBackend::DebugRpc.as_str())
+        );
+        assert_eq!(
+            trace.artifacts.gas.as_ref().map(|gas| gas.used),
+            Some(42000)
+        );
+        assert_eq!(trace.steps.len(), 2);
+    }
+
+    #[test]
+    fn debug_rpc_simulation_trace_surfaces_the_failure_message() {
+        let request = SimulateCallRequest {
+            from_addr: "0x1".to_owned(),
+            to_addr: "0x2".to_owned(),
+            calldata: "0x".to_owned(),
+            value: "0x0".to_owned(),
+            block: None,
+            tx_index: None,
+        };
+        let debug_result: DebugTraceResult = serde_json::from_value(json!({
+            "failed": true,
+            "returnValue": "",
+            "structLogs": [
+                {"pc": 0, "op": "REVERT", "gas": 100, "gasCost": 0, "depth": 0, "error": "execution reverted"}
+            ]
+        }))
+        .expect("debug result");
+
+        let trace = debug_rpc_simulation_trace(&request, &debug_result).expect("trace");
+
+        assert!(!trace.success);
+        assert!(trace.error.is_some(), "failure must be reported");
+        assert_eq!(trace.gas_used, 0);
+    }
 
     #[test]
     fn storage_diff_capability_matches_the_materialized_steps() {
