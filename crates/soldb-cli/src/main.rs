@@ -1368,7 +1368,7 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
         error_color("REVERTED")
     };
     println!("{} {}", info("Status:"), status);
-    if let Some(error) = &trace.error {
+    if let Some(error) = trace_error_for_display(trace, &spec) {
         println!("{} {}", error_color("Error:"), error_color(error));
     }
     println!();
@@ -1549,7 +1549,7 @@ fn print_simulation_summary(
         error_color("REVERTED")
     };
     println!("{} {}", info("Status:"), status);
-    if let Some(error) = &trace.error {
+    if let Some(error) = simulation_error_for_display(trace, args, &contract_name) {
         println!("{} {}", error_color("Error:"), error_color(error));
     }
     println!();
@@ -2238,6 +2238,79 @@ fn abi_descriptor_for_calldata(
                 })
                 .collect();
             Some(CallDescriptor { name, params })
+        })
+}
+
+fn trace_error_for_display(
+    trace: &TransactionTrace,
+    spec: &ResolvedContractSpec,
+) -> Option<String> {
+    trace
+        .artifacts
+        .revert_data
+        .as_deref()
+        .and_then(|revert_data| abi_error_for_revert_data(spec, revert_data))
+        .or_else(|| trace.error.clone())
+}
+
+fn simulation_error_for_display(
+    trace: &TransactionTrace,
+    args: &SimulateArgs,
+    contract_name: &str,
+) -> Option<String> {
+    resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())
+        .ok()
+        .and_then(|specs| {
+            specs
+                .iter()
+                .find(|spec| spec.name == contract_name)
+                .or_else(|| specs.first())
+                .and_then(|spec| trace_error_for_display(trace, spec))
+        })
+        .or_else(|| trace.error.clone())
+}
+
+fn abi_error_for_revert_data(spec: &ResolvedContractSpec, revert_data: &str) -> Option<String> {
+    let selector = selector_from_calldata(revert_data)?;
+    let entries = abi_entries_for_spec(spec)?;
+    entries
+        .into_iter()
+        .filter(|entry| entry.item_type == "error")
+        .find_map(|entry| {
+            let name = entry.name?;
+            let signature = format!(
+                "{}({})",
+                name,
+                entry
+                    .inputs
+                    .iter()
+                    .map(|input| input.ty.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let error_selector = selector_hex(function_selector(&signature).ok()?);
+            if error_selector != selector {
+                return None;
+            }
+
+            let params = entry
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, input)| {
+                    let name = if input.name.is_empty() {
+                        format!("arg{index}")
+                    } else {
+                        input.name.clone()
+                    };
+                    decode_calldata_word(revert_data, index, &input.ty).map(|word| {
+                        let value_label = if word.raw { "raw = " } else { "= " };
+                        format!("{name} {value_label}{}", word.value)
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            Some(format!("{}({})", name, params.join(", ")))
         })
 }
 
@@ -4146,6 +4219,48 @@ contract Counter {
         );
         assert!(metadata.debug_available);
         assert_eq!(metadata.abi.as_ref().expect("abi")[0]["name"], "set");
+    }
+
+    #[test]
+    fn decodes_custom_error_revert_data_from_abi() {
+        let dir = temp_dir("custom-error-abi");
+        fs::write(
+            dir.join("Vault.abi"),
+            r#"[
+                {
+                    "type": "error",
+                    "name": "InsufficientShares",
+                    "inputs": [
+                        {"name": "user", "type": "address"},
+                        {"name": "has", "type": "uint256"},
+                        {"name": "needs", "type": "uint256"}
+                    ]
+                }
+            ]"#,
+        )
+        .expect("write abi");
+
+        let spec = ResolvedContractSpec {
+            address: None,
+            name: "Vault".to_owned(),
+            debug_dir: dir,
+        };
+        let selector = selector_hex(
+            function_selector("InsufficientShares(address,uint256,uint256)").expect("selector"),
+        );
+        let revert_data = format!(
+            "0x{selector}{user:0>64}{has:0>64x}{needs:0>64x}",
+            user = "70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            has = 12_345_u64,
+            needs = 99_999_u64,
+        );
+
+        assert_eq!(
+            abi_error_for_revert_data(&spec, &revert_data).as_deref(),
+            Some(
+                "InsufficientShares(user = 0x70997970c51812dc3a010c7d01b50e0d17dc79c8, has = 12345, needs = 99999)"
+            )
+        );
     }
 
     #[test]
