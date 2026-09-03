@@ -181,6 +181,50 @@ pub struct EthdebugInfo {
 }
 
 impl EthdebugInfo {
+    /// Builds the debug info for one contract from already-parsed ETHDebug artifacts.
+    ///
+    /// `metadata` is the global resource file (`ethdebug.json` from older compilers,
+    /// `ethdebug_resources.json` from modern ones) and `program` is the contract's
+    /// program artifact (`<Contract>_ethdebug.json` for creation code,
+    /// `<Contract>_ethdebug-runtime.json` for runtime code). Nothing is read from disk
+    /// here, so the CLI, the DAP server, and a WebAssembly host that receives the
+    /// artifacts as strings all build the same value through this one path.
+    ///
+    /// A program without an `instructions` array yields no instructions rather than an
+    /// error; callers that need to know report it as a debug-info gap.
+    pub fn from_artifacts(
+        contract_name: &str,
+        environment: &str,
+        metadata: &Value,
+        program: &Value,
+    ) -> SoldbResult<Self> {
+        let instructions = program
+            .get("instructions")
+            .cloned()
+            .map(serde_json::from_value::<Vec<Instruction>>)
+            .transpose()
+            .map_err(|error| {
+                SoldbError::Message(format!(
+                    "invalid `instructions` in ETHDebug program artifact: {error}"
+                ))
+            })?
+            .unwrap_or_default();
+        let compilation = metadata
+            .get("compilation")
+            .cloned()
+            .unwrap_or_else(|| metadata.clone());
+        let sources = parse_compilation_sources(&compilation);
+        let variable_locations = parse_variable_locations(program)?;
+        Ok(Self {
+            compilation,
+            contract_name: contract_name.to_owned(),
+            environment: environment.to_owned(),
+            instructions,
+            sources,
+            variable_locations,
+        })
+    }
+
     #[must_use]
     pub fn instruction_at_pc(&self, pc: u64) -> Option<&Instruction> {
         self.instructions
@@ -275,6 +319,47 @@ pub fn parse_multi_contract_spec(input: &str) -> SoldbResult<EthdebugSpec> {
         name: None,
         path: input.to_owned(),
     })
+}
+
+/// Maps every source id listed in an ETHDebug `compilation` object to its path.
+///
+/// Entries without a numeric `id` or a string `path` are skipped rather than failing the
+/// whole load, since one malformed source entry should not hide the mapping for the rest.
+#[must_use]
+pub fn parse_compilation_sources(compilation: &Value) -> BTreeMap<u64, String> {
+    compilation
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|source| {
+            Some((
+                source.get("id")?.as_u64()?,
+                source.get("path")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// Returns the contents of a source embedded in an ETHDebug `compilation` object.
+///
+/// Some artifacts inline each source under `contents` (older builds used `content`);
+/// when they do, a frontend can show source without reading the file, which is the only
+/// option for a host without a filesystem.
+#[must_use]
+pub fn read_compilation_source(compilation: &Value, source_id: u64) -> Option<String> {
+    compilation
+        .get("sources")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|source| source.get("id").and_then(Value::as_u64) == Some(source_id))
+        .and_then(|source| {
+            source
+                .get("contents")
+                .or_else(|| source.get("content"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
 }
 
 pub fn parse_variable_locations(
@@ -391,10 +476,129 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        parse_ethdebug_spec, parse_multi_contract_spec, parse_single_contract_spec,
-        parse_variable_locations, EthdebugInfo, Instruction,
+        parse_compilation_sources, parse_ethdebug_spec, parse_multi_contract_spec,
+        parse_single_contract_spec, parse_variable_locations, read_compilation_source,
+        EthdebugInfo, Instruction,
     };
     use serde_json::json;
+
+    #[test]
+    fn reads_sources_embedded_in_the_compilation() {
+        let compilation = json!({
+            "sources": [
+                {"id": 0, "path": "A.sol", "contents": "contract A {}"},
+                {"id": 1, "path": "B.sol", "content": "contract B {}"},
+                {"id": 2, "path": "C.sol"}
+            ]
+        });
+
+        assert_eq!(
+            read_compilation_source(&compilation, 0).as_deref(),
+            Some("contract A {}")
+        );
+        assert_eq!(
+            read_compilation_source(&compilation, 1).as_deref(),
+            Some("contract B {}")
+        );
+        assert_eq!(read_compilation_source(&compilation, 2), None);
+        assert_eq!(read_compilation_source(&compilation, 9), None);
+        assert_eq!(read_compilation_source(&json!({}), 0), None);
+    }
+
+    #[test]
+    fn builds_info_from_parsed_artifacts() {
+        let metadata = json!({
+            "compilation": {
+                "sources": [
+                    {"id": 0, "path": "Counter.sol"},
+                    {"id": 1, "path": "lib/Math.sol"},
+                    {"path": "missing-id.sol"},
+                    {"id": 2}
+                ]
+            },
+            "types": {},
+            "pointers": {}
+        });
+        let program = json!({
+            "instructions": [
+                {
+                    "offset": 0,
+                    "operation": {"mnemonic": "PUSH1", "arguments": ["0x80"]},
+                    "context": {
+                        "code": {"source": {"id": 0}, "range": {"offset": 10, "length": 4}},
+                        "variables": [
+                            {"identifier": "x", "pointer": {"location": "stack", "slot": 0}}
+                        ]
+                    }
+                },
+                {"offset": 2, "operation": {"mnemonic": "STOP"}}
+            ]
+        });
+
+        let info = EthdebugInfo::from_artifacts("Counter", "runtime", &metadata, &program)
+            .expect("artifacts");
+
+        assert_eq!(info.contract_name, "Counter");
+        assert_eq!(info.environment, "runtime");
+        assert_eq!(info.compilation, metadata["compilation"]);
+        assert_eq!(
+            info.sources,
+            BTreeMap::from([
+                (0, "Counter.sol".to_owned()),
+                (1, "lib/Math.sol".to_owned())
+            ])
+        );
+        assert_eq!(info.instructions.len(), 2);
+        assert_eq!(info.source_info(0), Some(("Counter.sol", 10, 4)));
+        assert_eq!(info.variables_at_pc(0).len(), 1);
+        assert!(info.variables_at_pc(2).is_empty());
+    }
+
+    #[test]
+    fn treats_legacy_metadata_without_compilation_wrapper_as_the_compilation() {
+        let metadata = json!({"sources": [{"id": 3, "path": "Legacy.sol"}]});
+        let program = json!({});
+
+        let info = EthdebugInfo::from_artifacts("Legacy", "create", &metadata, &program)
+            .expect("artifacts");
+
+        assert_eq!(info.compilation, metadata);
+        assert_eq!(info.sources, BTreeMap::from([(3, "Legacy.sol".to_owned())]));
+        assert!(info.instructions.is_empty());
+        assert!(info.variable_locations.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_instructions() {
+        let metadata = json!({"compilation": {"sources": []}});
+        let program = json!({"instructions": [{"operation": {"mnemonic": "STOP"}}]});
+
+        let error = EthdebugInfo::from_artifacts("Broken", "runtime", &metadata, &program)
+            .expect_err("missing offset must fail");
+
+        assert!(
+            error.to_string().contains("`instructions`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parses_compilation_sources_skipping_incomplete_entries() {
+        let compilation = json!({
+            "sources": [
+                {"id": 0, "path": "A.sol"},
+                {"id": "1", "path": "B.sol"},
+                {"id": 2, "path": 7},
+                {"id": 3, "path": "D.sol"}
+            ]
+        });
+
+        assert_eq!(
+            parse_compilation_sources(&compilation),
+            BTreeMap::from([(0, "A.sol".to_owned()), (3, "D.sol".to_owned())])
+        );
+        assert!(parse_compilation_sources(&json!({})).is_empty());
+    }
 
     #[test]
     fn parses_single_and_multi_contract_specs() {

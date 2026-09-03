@@ -13,6 +13,7 @@ on:
 
 env:
   FOUNDRY_VERSION: v1.0.0
+  WASM_PACK_VERSION: 0.15.0
 
 jobs:
   rust:
@@ -34,6 +35,72 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
+
+  wasm:
+    # The library crates and the `soldb-wasm` bindings must keep building for
+    # `wasm32-unknown-unknown`. Linting on the target catches code that only compiles
+    # natively, and `soldb-rpc` and `soldb-wasm` are checked without the `replay` feature,
+    # the configuration the lean package links; `wasm-pack` then produces both packages a
+    # browser or Node.js host loads, each is held to its size budget, and the binding
+    # tests run under Node.js with and without replay. Finally a transaction on a local
+    # anvil is replayed through the package with real RPC calls. The crate list and the
+    # budgets live in the Makefile so this job and a local `make wasm-check` / `make wasm`
+    # cannot drift apart. See docs/wasm.md.
+    name: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
+          rustup default stable
+
+      - name: Restore wasm-pack
+        id: wasm-pack-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: wasm-pack-${{ runner.os }}-${{ env.WASM_PACK_VERSION }}
+
+      - name: Install wasm-pack
+        if: steps.wasm-pack-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-pack --locked --version "$WASM_PACK_VERSION"
+
+      - name: Check the WebAssembly-capable crates
+        run: make wasm-check
+
+      - name: Build both WebAssembly packages and check their size budgets
+        run: make wasm
+
+      - name: Run the WebAssembly tests
+        run: make wasm-test
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+
+      # The one check that needs a chain: replay a real transaction through the package
+      # with real RPC calls and compare it with the node's `debug_traceTransaction`.
+      - name: Replay a live transaction through the package
+        run: |
+          set -euo pipefail
+          anvil --steps-tracing --host 127.0.0.1 --port 8545 > anvil.log 2>&1 &
+          ANVIL_PID=$!
+          trap 'kill "$ANVIL_PID"' EXIT
+
+          for _ in {1..30}; do
+            if curl -fsS \
+              -X POST \
+              -H "Content-Type: application/json" \
+              --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+              http://127.0.0.1:8545 > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          RPC_URL=http://127.0.0.1:8545 make wasm-live-test
 
   lit:
     name: lit (solc ${{ matrix.solc.version }})

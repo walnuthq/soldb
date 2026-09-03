@@ -23,8 +23,8 @@ use serde_json::json;
 use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace};
 use soldb_ethdebug::{
     encode_function_call, function_selector, load_source_map_program, parse_ethdebug_spec,
-    parse_event_abis, parse_signature, parse_variable_locations, DecodedEvent, EthdebugInfo,
-    EventRegistry, Instruction, SourceLocation, SourceMapEnvironment,
+    parse_event_abis, parse_signature, read_compilation_source, DecodedEvent, EthdebugInfo,
+    EventRegistry, SourceLocation, SourceMapEnvironment,
 };
 use soldb_repl::{
     BreakpointTarget, DebuggerCommand, DebuggerInfoCommand, DebuggerState, SourceBreakpointTarget,
@@ -1685,32 +1685,10 @@ impl TraceSourceIndex {
         let metadata = read_json_file(&metadata_path)?;
         let program = read_json_file(program_path)?;
         let resources = ethdebug_resources_from_metadata(&metadata_path, &metadata)?;
-        let instructions = program
-            .get("instructions")
-            .cloned()
-            .map(serde_json::from_value::<Vec<Instruction>>)
-            .transpose()
+        let info = EthdebugInfo::from_artifacts(&spec.name, environment, &metadata, &program)
             .map_err(|error| {
-                soldb_core::SoldbError::Message(format!(
-                    "Invalid instructions in {}: {error}",
-                    program_path.display()
-                ))
-            })?
-            .unwrap_or_default();
-        let compilation = metadata
-            .get("compilation")
-            .cloned()
-            .unwrap_or_else(|| metadata.clone());
-        let sources = parse_compilation_sources(&compilation);
-        let variable_locations = parse_variable_locations(&program)?;
-        let info = EthdebugInfo {
-            compilation,
-            contract_name: spec.name.clone(),
-            environment: environment.to_owned(),
-            instructions,
-            sources,
-            variable_locations,
-        };
+                soldb_core::SoldbError::Message(format!("{}: {error}", program_path.display()))
+            })?;
 
         Self::from_debug_info(spec, info, resources, BTreeMap::new(), true)
     }
@@ -2468,36 +2446,6 @@ fn find_program_ethdebug(root: &Path, contract_name: &str, suffix: &str) -> Opti
     }
 
     (candidates.len() == 1).then(|| candidates.remove(0))
-}
-
-fn parse_compilation_sources(compilation: &serde_json::Value) -> BTreeMap<u64, String> {
-    compilation
-        .get("sources")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|source| {
-            Some((
-                source.get("id")?.as_u64()?,
-                source.get("path")?.as_str()?.to_owned(),
-            ))
-        })
-        .collect()
-}
-
-fn read_compilation_source(compilation: &serde_json::Value, source_id: u64) -> Option<String> {
-    compilation
-        .get("sources")
-        .and_then(serde_json::Value::as_array)?
-        .iter()
-        .find(|source| source.get("id").and_then(serde_json::Value::as_u64) == Some(source_id))
-        .and_then(|source| {
-            source
-                .get("contents")
-                .or_else(|| source.get("content"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(str::to_owned)
 }
 
 fn read_debug_source(root: &Path, source_path: &str) -> Option<String> {
@@ -3311,48 +3259,34 @@ fn web_contracts_for_specs(
 fn web_contract_metadata_for_spec(
     spec: &ResolvedContractSpec,
 ) -> Option<soldb_serializer::WebContractMetadata> {
-    let source_index = load_source_index(spec);
-    let mut pc_to_source_mappings = BTreeMap::new();
-    let mut source_paths = BTreeMap::new();
-    let mut sources = BTreeMap::new();
-
-    if let Some(source_index) = &source_index {
-        for instruction in &source_index.info.instructions {
-            let Some(location) = instruction.source_location() else {
-                continue;
-            };
-            pc_to_source_mappings.insert(
-                instruction.offset,
-                format!(
-                    "{}:{}:{}",
-                    location.offset, location.length, location.source_id
-                ),
-            );
-        }
-        for (source_id, source_path) in &source_index.info.sources {
-            source_paths.insert(*source_id, source_path.clone());
-            let source = source_index
-                .source_contents
-                .get(source_id)
-                .cloned()
-                .or_else(|| read_debug_source(&spec.debug_dir, source_path))
-                .unwrap_or_else(|| source_path.clone());
-            sources.insert(*source_id, source);
-        }
-    }
-
     let abi = abi_value_for_spec(spec);
-    if pc_to_source_mappings.is_empty() && sources.is_empty() && abi.is_none() {
-        return None;
+    let Some(TraceSourceIndex {
+        info,
+        mut source_contents,
+        ..
+    }) = load_source_index(spec)
+    else {
+        let metadata = soldb_serializer::WebContractMetadata {
+            abi,
+            ..Default::default()
+        };
+        return (!metadata.is_empty()).then_some(metadata);
+    };
+
+    // Sources the index did not already hold are read next to the artifacts; the
+    // projection itself falls back to the path for anything still missing.
+    for (source_id, source_path) in &info.sources {
+        if source_contents.contains_key(source_id) {
+            continue;
+        }
+        if let Some(source) = read_debug_source(&spec.debug_dir, source_path) {
+            source_contents.insert(*source_id, source);
+        }
     }
 
-    Some(soldb_serializer::WebContractMetadata {
-        pc_to_source_mappings,
-        source_paths,
-        debug_available: !sources.is_empty(),
-        sources,
-        abi,
-    })
+    let metadata =
+        soldb_serializer::WebContractMetadata::from_ethdebug(&info, &source_contents, abi);
+    (!metadata.is_empty()).then_some(metadata)
 }
 
 fn normalize_contract_address_key(address: &str) -> String {
@@ -3690,6 +3624,7 @@ fn shorten_hex(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use soldb_ethdebug::Instruction;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> PathBuf {
