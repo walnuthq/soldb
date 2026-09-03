@@ -11,11 +11,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::Serialize;
-use serde_json::json;
 use soldb_core::{
-    ContractCreation, ExecutionCall, SoldbResult, TraceArtifacts, TraceCapabilities,
-    TransactionTrace,
+    ContractCreation, ExecutionCall, SoldbResult, StepSnapshotRef, StorageChange, TraceArtifacts,
+    TraceCapabilities, TransactionTrace,
 };
 use soldb_ethdebug::EthdebugInfo;
 
@@ -114,7 +114,7 @@ pub fn trace_to_web_json_with_contracts(
         capabilities: &trace.capabilities,
         artifacts: &trace.artifacts,
         trace_call: trace_call_for_trace(trace),
-        steps: web_steps(trace),
+        steps: WebSteps::new(trace),
         contracts,
     };
 
@@ -139,7 +139,7 @@ pub fn simulate_to_web_json_with_contracts(
         capabilities: &trace.capabilities,
         artifacts: &trace.artifacts,
         trace_call: trace_call_for_simulation(trace, function_name),
-        steps: web_steps(trace),
+        steps: WebSteps::new(trace),
         function_name,
         is_verified: false,
         contracts,
@@ -149,26 +149,119 @@ pub fn simulate_to_web_json_with_contracts(
         .map_err(|err| soldb_core::SoldbError::Message(err.to_string()))
 }
 
-fn web_steps(trace: &TransactionTrace) -> Vec<serde_json::Value> {
-    let ranges = artifact_step_ranges(&trace.artifacts);
-    trace
-        .steps
-        .iter()
-        .enumerate()
-        .map(|(index, step)| {
-            json!({
-                "step": index,
-                "pc": step.pc,
-                "traceCallIndex": trace_call_index_for_step(index, &ranges).unwrap_or(0),
-                "op": step.op,
-                "gas": step.gas,
-                "gasCost": step.gas_cost,
-                "depth": step.depth,
-                "stack": step.snapshot_ref().stack,
-                "snapshot": step.snapshot_ref(),
-            })
+/// The `steps` array of the web document, written straight from the trace.
+///
+/// Serializing borrows each step in turn instead of first copying the whole trace into
+/// a `serde_json::Value` tree, which on a mainnet trace was a second full-size image of
+/// every stack and every memory string held alive until the document was written. The
+/// field order matches the sorted key order the former `json!` construction produced,
+/// so the document is byte-for-byte unchanged; `web_step_matches_the_former_value_shape`
+/// pins that.
+#[derive(Debug)]
+struct WebSteps<'a> {
+    trace: &'a TransactionTrace,
+    ranges: Vec<ArtifactStepRange>,
+}
+
+impl<'a> WebSteps<'a> {
+    fn new(trace: &'a TransactionTrace) -> Self {
+        Self {
+            trace,
+            ranges: artifact_step_ranges(&trace.artifacts),
+        }
+    }
+
+    fn step(&self, index: usize) -> Option<WebStep<'a>> {
+        let step = self.trace.steps.get(index)?;
+        let snapshot = step.snapshot_ref();
+        Some(WebStep {
+            depth: step.depth,
+            gas: step.gas,
+            gas_cost: step.gas_cost,
+            op: &step.op,
+            pc: step.pc,
+            snapshot: WebSnapshot::new(snapshot),
+            stack: snapshot.stack,
+            step: index,
+            trace_call_index: trace_call_index_for_step(index, &self.ranges).unwrap_or(0),
         })
-        .collect()
+    }
+}
+
+impl Serialize for WebSteps<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.trace.steps.len()))?;
+        for index in 0..self.trace.steps.len() {
+            if let Some(step) = self.step(index) {
+                sequence.serialize_element(&step)?;
+            }
+        }
+        sequence.end()
+    }
+}
+
+/// One entry of [`WebSteps`]. Fields are declared in the order they are written.
+#[derive(Debug, Serialize)]
+struct WebStep<'a> {
+    depth: u64,
+    gas: u64,
+    #[serde(rename = "gasCost")]
+    gas_cost: u64,
+    op: &'a str,
+    pc: u64,
+    snapshot: WebSnapshot<'a>,
+    stack: &'a [String],
+    step: usize,
+    #[serde(rename = "traceCallIndex")]
+    trace_call_index: u64,
+}
+
+/// A step's snapshot as the document writes it: the same fields as
+/// [`StepSnapshotRef`], in sorted key order rather than declaration order, because the
+/// former `json!` construction went through a `serde_json::Value` map and sorted them.
+#[derive(Debug, Serialize)]
+struct WebSnapshot<'a> {
+    memory: Option<&'a str>,
+    stack: &'a [String],
+    storage: &'a BTreeMap<String, String>,
+    storage_diff: WebStorageDiff<'a>,
+}
+
+impl<'a> WebSnapshot<'a> {
+    fn new(snapshot: StepSnapshotRef<'a>) -> Self {
+        Self {
+            memory: snapshot.memory,
+            stack: snapshot.stack,
+            storage: snapshot.storage,
+            storage_diff: WebStorageDiff(snapshot.storage_diff),
+        }
+    }
+}
+
+/// The storage diff map, with each change written in sorted key order.
+#[derive(Debug)]
+struct WebStorageDiff<'a>(&'a BTreeMap<String, StorageChange>);
+
+impl Serialize for WebStorageDiff<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (slot, change) in self.0 {
+            map.serialize_entry(
+                slot,
+                &WebStorageChange {
+                    after: change.after.as_deref(),
+                    before: change.before.as_deref(),
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct WebStorageChange<'a> {
+    after: Option<&'a str>,
+    before: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,7 +509,7 @@ struct TraceWebResponse<'a> {
     artifacts: &'a TraceArtifacts,
     #[serde(rename = "traceCall")]
     trace_call: TraceCallWeb,
-    steps: Vec<serde_json::Value>,
+    steps: WebSteps<'a>,
     contracts: BTreeMap<String, WebContractMetadata>,
 }
 
@@ -432,7 +525,7 @@ struct SimulateWebResponse<'a> {
     artifacts: &'a TraceArtifacts,
     #[serde(rename = "traceCall")]
     trace_call: TraceCallWeb,
-    steps: Vec<serde_json::Value>,
+    steps: WebSteps<'a>,
     function_name: &'a str,
     #[serde(rename = "isVerified")]
     is_verified: bool,
@@ -449,8 +542,111 @@ mod tests {
 
     use super::{
         simulate_to_web_json, trace_to_web_json, trace_to_web_json_with_contracts,
-        WebContractMetadata,
+        WebContractMetadata, WebSteps,
     };
+
+    #[test]
+    fn web_step_matches_the_former_value_shape() {
+        // The document used to build each step as a `serde_json::Value` with exactly this
+        // `json!` call. Keys came out sorted, and the streaming struct declares its fields
+        // in that order, so the two must serialize to the same bytes, pretty or compact.
+        let mut trace = sample_trace();
+        // A step read through its snapshot, with storage and a diff in both directions,
+        // and one with nothing captured at all.
+        trace.steps.push(TraceStep {
+            pc: 7,
+            op: "SSTORE".to_owned(),
+            gas: 90,
+            gas_cost: 20_000,
+            depth: 1,
+            stack: Vec::new(),
+            memory: None,
+            storage: None,
+            error: None,
+            snapshot: soldb_core::StepSnapshot {
+                stack: vec!["0x02".to_owned(), "0x01".to_owned()],
+                memory: Some("bb".to_owned()),
+                storage: BTreeMap::from([("0x01".to_owned(), "0x02".to_owned())]),
+                storage_diff: BTreeMap::from([
+                    (
+                        "0x01".to_owned(),
+                        soldb_core::StorageChange {
+                            before: None,
+                            after: Some("0x02".to_owned()),
+                        },
+                    ),
+                    (
+                        "0x00".to_owned(),
+                        soldb_core::StorageChange {
+                            before: Some("0x09".to_owned()),
+                            after: None,
+                        },
+                    ),
+                ]),
+            },
+        });
+        trace.steps.push(TraceStep {
+            pc: 8,
+            op: "STOP".to_owned(),
+            gas: 70,
+            gas_cost: 0,
+            depth: 1,
+            stack: Vec::new(),
+            memory: None,
+            storage: None,
+            error: None,
+            snapshot: Default::default(),
+        });
+        let ranges = super::artifact_step_ranges(&trace.artifacts);
+        let steps = WebSteps::new(&trace);
+        for (index, step) in trace.steps.iter().enumerate() {
+            let former = json!({
+                "step": index,
+                "pc": step.pc,
+                "traceCallIndex": super::trace_call_index_for_step(index, &ranges).unwrap_or(0),
+                "op": step.op,
+                "gas": step.gas,
+                "gasCost": step.gas_cost,
+                "depth": step.depth,
+                "stack": step.snapshot_ref().stack,
+                "snapshot": step.snapshot_ref(),
+            });
+            let streamed = steps.step(index).expect("step");
+            assert_eq!(
+                serde_json::to_string(&streamed).expect("compact"),
+                serde_json::to_string(&former).expect("compact")
+            );
+            assert_eq!(
+                serde_json::to_string_pretty(&streamed).expect("pretty"),
+                serde_json::to_string_pretty(&former).expect("pretty")
+            );
+        }
+        assert!(steps.step(trace.steps.len()).is_none());
+
+        let document: serde_json::Value =
+            serde_json::from_str(&trace_to_web_json(&trace).expect("json")).expect("value");
+        assert_eq!(
+            document["steps"].as_array().map(Vec::len),
+            Some(trace.steps.len())
+        );
+        assert_eq!(
+            serde_json::to_string(&steps).expect("steps"),
+            serde_json::to_string(&document["steps"]).expect("steps")
+        );
+    }
+
+    #[test]
+    fn web_steps_of_an_empty_trace_serialize_to_an_empty_array() {
+        let mut trace = sample_trace();
+        trace.steps.clear();
+        assert_eq!(
+            serde_json::to_string(&WebSteps::new(&trace)).expect("steps"),
+            "[]"
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&trace_to_web_json(&trace).expect("json")).expect("value");
+        assert_eq!(document["steps"], json!([]));
+    }
 
     #[test]
     fn projects_ethdebug_into_contract_metadata() {

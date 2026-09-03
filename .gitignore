@@ -1,8 +1,10 @@
 cache/
 dist/
 target/
-# wasm-pack output for the WebAssembly bindings.
+# wasm-pack output for the WebAssembly bindings, lean and replay-capable.
 crates/soldb-wasm/pkg/
+crates/soldb-wasm/pkg-replay/
+crates/soldb-wasm/pkg-replay-node/
 rust-coverage.xml
 .coverage
 .coverage.*

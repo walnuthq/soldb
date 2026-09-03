@@ -39,7 +39,8 @@ cargo llvm-cov --workspace --all-targets --fail-under-lines 80   # Coverage gate
 ./test/run-tests.sh                                     # lit/FileCheck end-to-end suite
 make test                                               # cargo test + lit
 make wasm-check                                         # clippy on wasm32-unknown-unknown (CI gate)
-make wasm && make wasm-test                             # wasm-pack build + Node.js smoke tests (CI gate)
+make wasm && make wasm-test                             # both wasm-pack packages + Node.js tests (CI gate)
+make wasm-live-test                                     # replay through the package against a live node (CI gate)
 cargo run --bin soldb -- trace <tx> --rpc http://127.0.0.1:8545  # Run the CLI
 ```
 
@@ -90,7 +91,7 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | --- | --- |
 | `soldb-core` | *(nothing)* |
 | `soldb-ethdebug` | core, `revm-bytecode` |
-| `soldb-rpc` | core, `revm` |
+| `soldb-rpc` | core, `ruint`, `revm` (behind the default-on `replay` feature) |
 | `soldb-repl` | core |
 | `soldb-serializer` | core, ethdebug |
 | `soldb-debugger` | core, ethdebug |
@@ -99,7 +100,7 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | `soldb-compiler` | core, ethdebug, rpc |
 | `soldb-dap` | core, ethdebug, rpc, repl, debugger |
 | `soldb-cli` | core, ethdebug, rpc, repl, debugger, profiler, serializer, compiler, bridge, `inferno` |
-| `soldb-wasm` | core, ethdebug, rpc, debugger, serializer, `wasm-bindgen` |
+| `soldb-wasm` | core, ethdebug, rpc (without `replay`), debugger, serializer, `wasm-bindgen` |
 
 The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
 `cargo install soldb`; the directory keeps the `soldb-cli` name to match its siblings.
@@ -120,7 +121,13 @@ new frontend logic that both would want belongs there.
   (`events.rs`). Pure functions over files and bytes; no network.
 - **soldb-rpc**: JSON-RPC transport, the `debug-rpc` backend, the REVM `replay` backend,
   `debug_traceCall` simulation, and log retrieval. This is the only crate that talks to a
-  node.
+  node. The replay backend lives in `replay.rs` behind the `replay` cargo feature (on by
+  default) because it is the only code that links REVM; the crate must keep building and
+  passing its tests with `--no-default-features`, and code that needs REVM goes in that
+  module. Inside it, execution is separate from I/O: `ReplayInputs` gathers what the node
+  says about the transaction and its block, `replay_debug_trace_with_state` runs REVM over
+  any `ReplayStateProvider`, and `PrefetchedReplayState` is the provider a host fills in
+  rounds. Keep network calls out of the execution path.
 - **soldb-debugger**: source-step, function, and variable decoding over a
   `TransactionTrace` plus `EthdebugInfo`. Frontend-agnostic; shared by CLI, REPL, and DAP.
 - **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
@@ -135,8 +142,13 @@ new frontend logic that both would want belongs there.
 - **soldb-dap**: Debug Adapter Protocol server for editors.
 - **soldb-cli**: argument parsing, command dispatch, and *all* human-readable formatting.
 - **soldb-wasm**: `wasm-bindgen` exports over the library crates for browser and Node.js
-  hosts. JSON strings in, JSON strings out; the behavior lives in its `pipeline` module
-  and is tested natively. `publish = false`: it ships through `wasm-pack`, not crates.io.
+  hosts. One handle, `Trace`, holds the parsed trace in WebAssembly memory; inputs and
+  outputs cross the boundary as JSON strings, but the trace is never re-parsed between
+  calls. With its `replay` feature (on by default) it also exports `Replay`, a host-driven
+  REVM replay that reports the state it needs and runs in rounds. The behavior lives in
+  its `pipeline` and `replay` modules and is tested natively. Two packages are built from
+  it: lean (`--no-default-features`, no REVM) and replay-capable. `publish = false`: it
+  ships through `wasm-pack`, not crates.io.
 
 Pipeline: `tx hash -> backend (debug-rpc | replay) -> TransactionTrace -> ETHDebug
 enrichment -> call frames + source steps + decoded values -> CLI text | JSON | REPL | DAP
@@ -156,13 +168,17 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
   Adding a field is additive and needs `#[serde(default)]`; renaming or removing one is a
   breaking change (see JSON Output Contract).
 - The crates listed in `WASM_CRATES` in the `Makefile` must keep building for
-  `wasm32-unknown-unknown`; the `wasm` CI job lints them on that target and runs the
-  `soldb-wasm` package build and tests. `std::net`, `std::process`, and `std::fs` compile
-  there but fail at runtime, so a WebAssembly host does the I/O and hands results over as
-  strings: nothing reachable from a `soldb-wasm` export may open a socket, spawn a
-  process, or read a file. Check a new dependency in one of those crates with
-  `make wasm-check` before proposing it. `soldb-rpc` selects `getrandom`'s `js` backend
-  for that target only because REVM's `k256` needs it to link. See `docs/wasm.md`.
+  `wasm32-unknown-unknown`; the `wasm` CI job lints them on that target, checks
+  `soldb-rpc` without its `replay` feature, and runs the `soldb-wasm` package build and
+  tests. `std::net`, `std::process`, and `std::fs` compile there but fail at runtime, so
+  a WebAssembly host does the I/O and hands results over as strings: nothing reachable
+  from a `soldb-wasm` export may open a socket, spawn a process, or read a file. Check a
+  new dependency in one of those crates with `make wasm-check` before proposing it.
+  `make wasm` builds both packages and fails when either exceeds its budget
+  (`WASM_LEAN_SIZE_BUDGET_BYTES`, `WASM_REPLAY_SIZE_BUDGET_BYTES`); raise a budget
+  deliberately, in the change that explains the growth, never to make CI pass.
+  `soldb-rpc` selects `getrandom`'s `js` backend for that target only because REVM's
+  `k256` needs it to link. See `docs/wasm.md`.
 
 ### Big Files
 
@@ -262,6 +278,10 @@ Two layers, with different jobs:
 - **lit + FileCheck tests** (`test/**/*.test`) cover end-to-end CLI behavior against a
   real node and real solc output: exact rendered output, exit codes, JSON documents,
   error messages. Prefer these for anything user-visible.
+- **`test/wasm/replay-live.cjs`** replays a transaction through the replay-capable
+  WebAssembly package against a live node and compares it with the node's
+  `debug_traceTransaction`. It needs only `anvil` and Node.js, and the `wasm` CI job runs
+  it; `make wasm-live-test` runs it locally.
 
 **Backend parity is itself a test target.** `test/trace/replay-*.test` run the same
 transaction through `--backend debug-rpc` and `--backend replay` and diff the opcode
@@ -459,7 +479,10 @@ Beyond the rule:
 - **Do not materialize a trace to answer a question about it.** `DebugTraceResult::steps`
   builds every `TraceStep`; calling it to compute a flag or a count costs a full second
   copy of the trace. Read the raw `struct_logs` instead, and pin the result against the
-  definition it replaces with a test.
+  definition it replaces with a test. The same applies to writing one out: the web
+  document's `steps` are streamed by `WebSteps` in `soldb-serializer`, one borrowed step
+  at a time, with a test pinning the bytes against the former `json!` shape. Do not
+  reintroduce a `Vec<serde_json::Value>` of steps.
 - **Known cost, not yet addressed:** a `TraceStep` stores its stack, memory, and storage
   twice — once in the flat fields and once in `snapshot` — because both are serialized.
   That duplication dominates peak memory on large traces (a 500k-step trace peaks around

@@ -46,16 +46,28 @@ impl DebugSession {
         ethdebug: EthdebugInfo,
         source_contents: BTreeMap<u64, String>,
     ) -> Self {
-        let functions = source_contents
+        let mut session = Self::new(trace);
+        session.attach_ethdebug(ethdebug, source_contents);
+        session
+    }
+
+    /// Attaches debug info to a session that already holds a trace, replacing whatever
+    /// was attached before.
+    ///
+    /// The trace is left in place rather than rebuilt, so a frontend that keeps a large
+    /// trace resident, such as the WebAssembly module, can add or swap the contract's
+    /// artifacts without copying hundreds of thousands of steps.
+    pub fn attach_ethdebug(
+        &mut self,
+        ethdebug: EthdebugInfo,
+        source_contents: BTreeMap<u64, String>,
+    ) {
+        self.functions = source_contents
             .iter()
             .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
             .collect();
-        Self {
-            trace,
-            ethdebug: Some(ethdebug),
-            source_contents,
-            functions,
-        }
+        self.ethdebug = Some(ethdebug);
+        self.source_contents = source_contents;
     }
 
     #[must_use]
@@ -665,6 +677,68 @@ mod tests {
             step.variables[1].value.status,
             DebugValueStatus::Unavailable
         );
+    }
+
+    #[test]
+    fn attaching_ethdebug_matches_constructing_with_it_and_replaces_prior_info() {
+        let source =
+            "contract Counter {\n  function set(uint256 x) public {\n    value = x;\n  }\n}\n";
+        let offset = source.find("value = x").expect("source offset") as u64;
+        let info = EthdebugInfo {
+            compilation: json!({}),
+            contract_name: "Counter".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: vec![Instruction {
+                offset: 0,
+                operation: json!({"mnemonic": "PUSH1"}),
+                context: Some(json!({
+                    "code": {"source": {"id": 0}, "range": {"offset": offset, "length": 9}}
+                })),
+            }],
+            sources: BTreeMap::from([(0, "Counter.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let source_contents = BTreeMap::from([(0, source.to_owned())]);
+
+        let constructed =
+            DebugSession::with_ethdebug(sample_trace(), info.clone(), source_contents.clone());
+        let mut attached = DebugSession::new(sample_trace());
+        assert!(attached.ethdebug.is_none());
+        assert!(attached.functions.is_empty());
+        attached.attach_ethdebug(info, source_contents);
+
+        assert_eq!(attached, constructed);
+        assert_eq!(attached.functions.len(), 1);
+        assert_eq!(attached.functions[0].name, "set");
+        assert_eq!(
+            attached
+                .step(0)
+                .and_then(|step| step.source)
+                .map(|span| span.line),
+            Some(3)
+        );
+
+        // Attaching again replaces the debug info wholesale rather than merging.
+        let other = EthdebugInfo {
+            compilation: json!({}),
+            contract_name: "Other".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: Vec::new(),
+            sources: BTreeMap::new(),
+            variable_locations: BTreeMap::new(),
+        };
+        attached.attach_ethdebug(other, BTreeMap::new());
+        assert_eq!(
+            attached
+                .ethdebug
+                .as_ref()
+                .map(|info| info.contract_name.as_str()),
+            Some("Other")
+        );
+        assert!(attached.functions.is_empty());
+        assert!(attached.source_contents.is_empty());
+        assert_eq!(attached.step(0).and_then(|step| step.source), None);
+        assert_eq!(attached.trace, sample_trace());
     }
 
     #[test]
