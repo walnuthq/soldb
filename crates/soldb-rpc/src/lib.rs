@@ -44,10 +44,10 @@ mod test_support;
 
 #[cfg(feature = "replay")]
 pub use replay::{
-    replay_debug_trace_with_state, replay_transaction_trace, AccountState, PrefetchedReplayState,
-    ReplayBackend, ReplayDbError, ReplayInputs, ReplayStateProvider, RpcBlockHeader,
-    RpcBlockTransaction, RpcBlockWithTransactions, RpcReplayStateProvider, StateBatch,
-    StateRequest,
+    replay_debug_trace_with_state, replay_prefix_with_state, replay_target_with_state,
+    replay_transaction_trace, AccountState, PrefetchedReplayState, ReplayBackend, ReplayDbError,
+    ReplayInputs, ReplayPrefix, ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction,
+    RpcBlockWithTransactions, RpcReplayStateProvider, StateBatch, StateRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

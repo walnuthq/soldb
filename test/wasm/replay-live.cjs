@@ -110,7 +110,21 @@ async function main() {
     assert(rounds < 10, "the replay did not converge");
   }
   assert(replay.isComplete(), "status says complete but the replay does not");
+  const bundle = replay.exportState();
   const replayed = replay.finish();
+
+  // The exported state replays the same transaction in one run without touching the node.
+  const offline = Replay.prepare(
+    JSON.stringify(transaction),
+    JSON.stringify(receipt),
+    JSON.stringify(block),
+    chainId,
+  );
+  offline.provideState(bundle);
+  assert(JSON.parse(offline.run()).status === "complete", "the exported state did not complete the replay in one run");
+  const offlineTrace = offline.finish();
+  assert(offlineTrace.toJson() === replayed.toJson(), "the offline replay differs from the online one");
+  offlineTrace.free();
 
   // What the module produced.
   const summary = JSON.parse(replayed.summary());
@@ -149,7 +163,8 @@ async function main() {
   traced.free();
   replayed.free();
 
-  console.log(`replayed ${callHash} in ${rounds} run(s) answering ${requests} state request(s); ${replayedOps.length} steps match debug_traceTransaction`);
+  const bundleSize = Buffer.byteLength(bundle);
+  console.log(`replayed ${callHash} in ${rounds} run(s) answering ${requests} state request(s); ${replayedOps.length} steps match debug_traceTransaction; ${bundleSize}-byte state export replays offline`);
 }
 
 main().catch((error) => {

@@ -14,6 +14,11 @@
 //! WebAssembly host, which cannot block on the network, supplies state up front through
 //! [`PrefetchedReplayState`] and repeats the run until nothing is missing.
 //!
+//! Execution itself has two phases. [`replay_prefix_with_state`] runs the transactions
+//! before the target and returns the state they leave behind as a [`ReplayPrefix`];
+//! [`replay_target_with_state`] runs the target over it. A host that repeats runs keeps
+//! the prefix once it ran with nothing missing, so later rounds cost only the target.
+//!
 //! This module is the only part of the crate that links REVM, which is why it sits
 //! behind the `replay` cargo feature.
 
@@ -23,8 +28,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use revm::bytecode::opcode::OpCode;
-use revm::context::{ContextTr, JournalEntry, JournalTr, TxEnv};
-use revm::database::{CacheDB, WrapDatabaseRef};
+use revm::context::{BlockEnv, CfgEnv, ContextTr, Journal, JournalEntry, JournalTr, TxEnv};
+use revm::database::{Cache, CacheDB, WrapDatabaseRef};
 use revm::database_interface::DBErrorMarker;
 use revm::inspector::inspectors::GasInspector;
 use revm::inspector::JournalExt;
@@ -301,85 +306,81 @@ impl ReplayInputs {
 /// Nothing here talks to a node: state comes from the provider, everything else from
 /// `inputs`. With an [`RpcReplayStateProvider`] this is the native backend; with a
 /// [`PrefetchedReplayState`] a host runs it repeatedly until the provider records no
-/// missing state, at which point every value the run used was real.
+/// missing state, at which point every value the run used was real. It is
+/// [`replay_prefix_with_state`] followed by [`replay_target_with_state`].
 pub fn replay_debug_trace_with_state<P: ReplayStateProvider>(
     inputs: &ReplayInputs,
     provider: &P,
 ) -> SoldbResult<DebugTraceResult> {
-    let ReplayInputs {
-        transaction: tx,
-        header,
-        transactions,
-        target_index,
-        block_number,
-        chain_id,
-    } = inputs;
-    let (target_index, block_number, chain_id) = (*target_index, *block_number, *chain_id);
-    let block = header;
-    let block_timestamp = parse_quantity(&block.timestamp).unwrap_or(0);
-    let spec = replay_spec_for_chain(chain_id, block_number, block_timestamp);
+    let prefix = replay_prefix_with_state(inputs, provider)?;
+    replay_target_with_state(inputs, &prefix, provider)
+}
 
-    let state_db = ReplayStateDb::new(provider);
-    let cache_db = CacheDB::new(WrapDatabaseRef(state_db));
-    let mut context = Context::mainnet()
-        .with_db(cache_db)
-        .modify_block_chained(|block_env| {
-            block_env.number = U256::from(block_number);
-            block_env.timestamp = U256::from(block_timestamp);
-            block_env.gas_limit = parse_quantity(&block.gas_limit).unwrap_or(u64::MAX);
-            block_env.basefee = block
-                .base_fee_per_gas
-                .as_deref()
-                .map(parse_quantity)
-                .transpose()
-                .unwrap_or(None)
-                .unwrap_or_default();
-            block_env.difficulty = block
-                .difficulty
-                .as_deref()
-                .map(parse_u256_quantity)
-                .transpose()
-                .unwrap_or(None)
-                .unwrap_or_default();
-            block_env.prevrandao = block
-                .prevrandao
-                .as_deref()
-                .or(block.mix_hash.as_deref())
-                .map(parse_b256)
-                .transpose()
-                .unwrap_or(None);
-            block_env.beneficiary = block
-                .beneficiary
-                .as_deref()
-                .or(block.miner.as_deref())
-                .map(parse_address)
-                .transpose()
-                .unwrap_or(None)
-                .unwrap_or(Address::ZERO);
-        })
-        .modify_cfg_chained(|cfg| {
-            cfg.chain_id = chain_id;
-            cfg.set_spec_and_mainnet_gas_params(spec);
-            cfg.disable_eip3607 = true;
-            cfg.disable_block_gas_limit = true;
-            cfg.disable_base_fee = true;
+/// The state the transactions before the target leave behind, ready to run the target
+/// over.
+///
+/// It holds only what the prefix loaded and wrote, so it is small, and it is plain data:
+/// a host keeps it between rounds and rehydrates it over whatever the provider holds
+/// now. That is sound once the prefix ran with nothing missing, because everything the
+/// prefix read was real and real values do not change; a prefix that read defaults must
+/// be discarded and run again.
+#[derive(Debug, Clone)]
+pub struct ReplayPrefix {
+    cache: Cache,
+}
+
+type ReplayCacheDb<'a, P> = CacheDB<WrapDatabaseRef<ReplayStateDb<'a, P>>>;
+type ReplayContext<'a, P> =
+    Context<BlockEnv, TxEnv, CfgEnv, ReplayCacheDb<'a, P>, Journal<ReplayCacheDb<'a, P>>>;
+
+/// Runs every transaction before the target, committing each, and returns the state
+/// they leave behind. A target at index zero has an empty prefix and runs nothing.
+pub fn replay_prefix_with_state<P: ReplayStateProvider>(
+    inputs: &ReplayInputs,
+    provider: &P,
+) -> SoldbResult<ReplayPrefix> {
+    let cache_db = CacheDB::new(WrapDatabaseRef(ReplayStateDb::new(provider)));
+    if inputs.target_index == 0 {
+        return Ok(ReplayPrefix {
+            cache: cache_db.cache,
         });
-
-    if target_index > 0 {
-        let mut evm = context.build_mainnet();
-        for (index, prior_tx) in transactions.iter().take(target_index).enumerate() {
-            let tx_env = tx_env_from_rpc_transaction(prior_tx, chain_id)?;
-            evm.transact_commit(tx_env).map_err(|error| {
-                SoldbError::Message(format!(
-                    "Replay backend failed while replaying prior block transaction {index} ({}): {error:?}",
-                    prior_tx.hash
-                ))
-            })?;
-        }
-        context = evm.ctx;
     }
 
-    let tx_env = tx_env_from_rpc_transaction(tx, chain_id)?;
+    let context = replay_context(inputs, cache_db);
+    let mut evm = context.build_mainnet();
+    for (index, prior_tx) in inputs
+        .transactions
+        .iter()
+        .take(inputs.target_index)
+        .enumerate()
+    {
+        let tx_env = tx_env_from_rpc_transaction(prior_tx, inputs.chain_id)?;
+        evm.transact_commit(tx_env).map_err(|error| {
+            SoldbError::Message(format!(
+                "Replay backend failed while replaying prior block transaction {index} ({}): {error:?}",
+                prior_tx.hash
+            ))
+        })?;
+    }
+    Ok(ReplayPrefix {
+        cache: evm.ctx.journaled_state.database.cache,
+    })
+}
+
+/// Runs the target transaction over `prefix` with the step inspector attached and
+/// records its execution as a `debug_traceTransaction`-shaped result.
+pub fn replay_target_with_state<P: ReplayStateProvider>(
+    inputs: &ReplayInputs,
+    prefix: &ReplayPrefix,
+    provider: &P,
+) -> SoldbResult<DebugTraceResult> {
+    let cache_db = CacheDB {
+        cache: prefix.cache.clone(),
+        db: WrapDatabaseRef(ReplayStateDb::new(provider)),
+    };
+    let context = replay_context(inputs, cache_db);
+
+    let tx_env = tx_env_from_rpc_transaction(&inputs.transaction, inputs.chain_id)?;
     let mut inspector = ReplayStepInspector::default();
     let mut evm = context.build_mainnet_with_inspector(&mut inspector);
     let result = evm.inspect_one_tx(tx_env).map_err(|error| {
@@ -424,6 +425,62 @@ pub fn replay_debug_trace_with_state<P: ReplayStateProvider>(
         gas: Some(result.gas_used()),
         artifacts,
     })
+}
+
+/// The block and chain configuration both phases execute under.
+fn replay_context<'a, P: ReplayStateProvider>(
+    inputs: &ReplayInputs,
+    cache_db: ReplayCacheDb<'a, P>,
+) -> ReplayContext<'a, P> {
+    let block = &inputs.header;
+    let block_number = inputs.block_number;
+    let chain_id = inputs.chain_id;
+    let block_timestamp = parse_quantity(&block.timestamp).unwrap_or(0);
+    let spec = replay_spec_for_chain(chain_id, block_number, block_timestamp);
+
+    Context::mainnet()
+        .with_db(cache_db)
+        .modify_block_chained(|block_env| {
+            block_env.number = U256::from(block_number);
+            block_env.timestamp = U256::from(block_timestamp);
+            block_env.gas_limit = parse_quantity(&block.gas_limit).unwrap_or(u64::MAX);
+            block_env.basefee = block
+                .base_fee_per_gas
+                .as_deref()
+                .map(parse_quantity)
+                .transpose()
+                .unwrap_or(None)
+                .unwrap_or_default();
+            block_env.difficulty = block
+                .difficulty
+                .as_deref()
+                .map(parse_u256_quantity)
+                .transpose()
+                .unwrap_or(None)
+                .unwrap_or_default();
+            block_env.prevrandao = block
+                .prevrandao
+                .as_deref()
+                .or(block.mix_hash.as_deref())
+                .map(parse_b256)
+                .transpose()
+                .unwrap_or(None);
+            block_env.beneficiary = block
+                .beneficiary
+                .as_deref()
+                .or(block.miner.as_deref())
+                .map(parse_address)
+                .transpose()
+                .unwrap_or(None)
+                .unwrap_or(Address::ZERO);
+        })
+        .modify_cfg_chained(|cfg| {
+            cfg.chain_id = chain_id;
+            cfg.set_spec_and_mainnet_gas_params(spec);
+            cfg.disable_eip3607 = true;
+            cfg.disable_block_gas_limit = true;
+            cfg.disable_base_fee = true;
+        })
 }
 
 fn replay_spec_for_chain(chain_id: u64, block_number: u64, block_timestamp: u64) -> SpecId {
@@ -766,6 +823,7 @@ pub struct PrefetchedReplayState {
     storage: HashMap<(Address, U256), U256>,
     block_hashes: HashMap<u64, B256>,
     missing: RefCell<BTreeSet<StateRequest>>,
+    reads: RefCell<BTreeSet<StateRequest>>,
 }
 
 impl PrefetchedReplayState {
@@ -787,10 +845,81 @@ impl PrefetchedReplayState {
         self.missing.borrow().iter().cloned().collect()
     }
 
-    /// Forgets the recorded reads. Call it before a run so the run reports only what it
+    /// Forgets the recorded misses. Call it before a run so the run reports only what it
     /// still lacks.
     pub fn clear_missing(&self) {
         self.missing.borrow_mut().clear();
+    }
+
+    /// Every read since the last [`PrefetchedReplayState::clear_reads`], answered or not,
+    /// in a stable order and without duplicates. After a run that recorded nothing
+    /// missing, this is exactly the state that run depended on.
+    #[must_use]
+    pub fn reads(&self) -> Vec<StateRequest> {
+        self.reads.borrow().iter().cloned().collect()
+    }
+
+    pub fn clear_reads(&self) {
+        self.reads.borrow_mut().clear();
+    }
+
+    /// The held state behind `requests`, in the form [`PrefetchedReplayState::provide`]
+    /// accepts, so a host can keep it, share it, or replay from it without a node.
+    /// Requests for state not held are left out.
+    #[must_use]
+    pub fn export(&self, requests: &[StateRequest]) -> StateBatch {
+        let mut batch = StateBatch::default();
+        for request in requests {
+            match request {
+                StateRequest::Account { address } => {
+                    let Some(account) = parse_address(address)
+                        .ok()
+                        .and_then(|address| self.accounts.get(&address))
+                    else {
+                        continue;
+                    };
+                    batch.accounts.insert(
+                        address.clone(),
+                        AccountState {
+                            balance: format_u256_quantity(account.balance),
+                            nonce: format_quantity(account.nonce),
+                            code: bytes_to_prefixed_hex(
+                                account
+                                    .code
+                                    .as_ref()
+                                    .map(|code| code.original_bytes())
+                                    .unwrap_or_default()
+                                    .as_ref(),
+                            ),
+                        },
+                    );
+                }
+                StateRequest::Storage { address, slot } => {
+                    let Some(value) = parse_address(address)
+                        .ok()
+                        .zip(parse_u256_quantity(slot).ok())
+                        .and_then(|key| self.storage.get(&key))
+                    else {
+                        continue;
+                    };
+                    batch
+                        .storage
+                        .entry(address.clone())
+                        .or_default()
+                        .insert(slot.clone(), format_u256_quantity(*value));
+                }
+                StateRequest::BlockHash { number } => {
+                    if let Some(hash) = self.block_hashes.get(number) {
+                        batch.block_hashes.insert(*number, b256_hex(*hash));
+                    }
+                }
+            }
+        }
+        batch
+    }
+
+    fn note_read(&self, request: StateRequest) {
+        self.reads.borrow_mut().insert(request);
     }
 
     /// Adds the state in `batch`, replacing anything already held for the same key.
@@ -825,31 +954,37 @@ impl PrefetchedReplayState {
 
 impl ReplayStateProvider for PrefetchedReplayState {
     fn account(&self, address: Address) -> Result<AccountInfo, ReplayDbError> {
+        let request = StateRequest::Account {
+            address: address_hex(address),
+        };
+        self.note_read(request.clone());
         if let Some(account) = self.accounts.get(&address) {
             return Ok(account.clone());
         }
-        self.record(StateRequest::Account {
-            address: address_hex(address),
-        });
+        self.record(request);
         Ok(empty_account())
     }
 
     fn storage(&self, address: Address, index: U256) -> Result<U256, ReplayDbError> {
+        let request = StateRequest::Storage {
+            address: address_hex(address),
+            slot: format_u256_quantity(index),
+        };
+        self.note_read(request.clone());
         if let Some(value) = self.storage.get(&(address, index)) {
             return Ok(*value);
         }
-        self.record(StateRequest::Storage {
-            address: address_hex(address),
-            slot: format_u256_quantity(index),
-        });
+        self.record(request);
         Ok(U256::ZERO)
     }
 
     fn block_hash(&self, number: u64) -> Result<B256, ReplayDbError> {
+        let request = StateRequest::BlockHash { number };
+        self.note_read(request.clone());
         if let Some(hash) = self.block_hashes.get(&number) {
             return Ok(*hash);
         }
-        self.record(StateRequest::BlockHash { number });
+        self.record(request);
         Ok(B256::ZERO)
     }
 }
@@ -1636,11 +1771,11 @@ mod tests {
 
     use super::{
         account_info_from_rpc, empty_account, parse_address, replay_chain_id,
-        replay_debug_trace_with_state, replay_full_block_transactions,
+        replay_debug_trace_with_state, replay_full_block_transactions, replay_prefix_with_state,
         replay_preflight_parent_state, replay_spec_for_chain, replay_target_index,
-        replay_transaction_trace, AccountState, PrefetchedReplayState, ReplayInputs, ReplayStateDb,
-        ReplayStateProvider, RpcBlockTransaction, RpcBlockWithTransactions, RpcReplayStateProvider,
-        SpecId, StateBatch, StateRequest,
+        replay_target_with_state, replay_transaction_trace, AccountState, PrefetchedReplayState,
+        ReplayInputs, ReplayStateDb, ReplayStateProvider, RpcBlockTransaction,
+        RpcBlockWithTransactions, RpcReplayStateProvider, SpecId, StateBatch, StateRequest,
     };
     use crate::test_support::{read_http_request, start_trace_server};
     use crate::{
@@ -1695,9 +1830,18 @@ mod tests {
         ReplayInputs::new(tx, block, 31_337).expect("inputs")
     }
 
-    /// Everything the counter replay can ask for, as a host would have fetched it.
+    /// Everything the counter replay can ask for, as a host would have fetched it,
+    /// including the fee recipient the block leaves at the zero address.
     fn counter_world() -> StateBatch {
         let mut world = StateBatch::default();
+        world.accounts.insert(
+            format!("0x{}", "00".repeat(20)),
+            AccountState {
+                balance: "0x0".to_owned(),
+                nonce: "0x0".to_owned(),
+                code: "0x".to_owned(),
+            },
+        );
         world.accounts.insert(
             SENDER.to_owned(),
             AccountState {
@@ -2099,6 +2243,116 @@ mod tests {
         let unknown = PrefetchedReplayState::default();
         let _ = replay_debug_trace_with_state(&inputs, &unknown);
         assert!(!unknown.missing().is_empty());
+    }
+
+    #[test]
+    fn the_two_phases_match_the_single_run_and_an_empty_prefix_runs_nothing() {
+        let first = counter_transaction("0xaaa", "0x0", "0x0");
+        let target = counter_transaction("0xbbb", "0x1", "0x1");
+        let block = counter_block(vec![
+            serde_json::to_value(&first).expect("tx"),
+            serde_json::to_value(&target).expect("tx"),
+        ]);
+        let inputs = ReplayInputs::new(target, block, 31_337).expect("inputs");
+        let state = fully_supplied_state();
+
+        let prefix = replay_prefix_with_state(&inputs, &state).expect("prefix");
+        let phased = replay_target_with_state(&inputs, &prefix, &state).expect("target");
+        let single = replay_debug_trace_with_state(&inputs, &state).expect("single run");
+        assert_eq!(phased, single);
+        assert_eq!(phased.steps()[8].snapshot.storage["0x0"], "0x2b");
+
+        // A target at index zero has nothing to run first, and reads nothing doing it.
+        let inputs = counter_inputs();
+        let state = fully_supplied_state();
+        let _ = replay_prefix_with_state(&inputs, &state).expect("empty prefix");
+        assert!(state.reads().is_empty());
+    }
+
+    #[test]
+    fn a_kept_prefix_carries_its_state_into_later_target_runs() {
+        let first = counter_transaction("0xaaa", "0x0", "0x0");
+        let target = counter_transaction("0xbbb", "0x1", "0x1");
+        let block = counter_block(vec![
+            serde_json::to_value(&first).expect("tx"),
+            serde_json::to_value(&target).expect("tx"),
+        ]);
+        let inputs = ReplayInputs::new(target, block, 31_337).expect("inputs");
+        let prefix = replay_prefix_with_state(&inputs, &fully_supplied_state()).expect("prefix");
+
+        // Everything the target reads was loaded or written by the prefix, so it runs to
+        // completion over a provider that holds nothing and asks it for nothing.
+        let empty = PrefetchedReplayState::default();
+        let result = replay_target_with_state(&inputs, &prefix, &empty).expect("target");
+        assert!(empty.missing().is_empty(), "{:?}", empty.missing());
+        assert!(!result.failed, "{:?}", result.error);
+        assert_eq!(result.steps()[4].snapshot.storage["0x0"], "0x2a");
+        assert_eq!(result.steps()[8].snapshot.storage["0x0"], "0x2b");
+
+        // The prefix's writes take precedence over the parent-block value the provider
+        // holds, exactly as a continued run would see them.
+        let reference =
+            replay_debug_trace_with_state(&inputs, &fully_supplied_state()).expect("reference");
+        assert_eq!(
+            replay_target_with_state(&inputs, &prefix, &fully_supplied_state()).expect("target"),
+            reference
+        );
+        assert_eq!(result, reference);
+    }
+
+    #[test]
+    fn reads_are_recorded_and_export_replays_without_a_node() {
+        let inputs = counter_inputs();
+        let state = fully_supplied_state();
+        let result = replay_debug_trace_with_state(&inputs, &state).expect("run");
+        assert!(state.missing().is_empty());
+
+        let reads = state.reads();
+        assert_eq!(
+            reads,
+            [
+                StateRequest::Account {
+                    address: format!("0x{}", "00".repeat(20))
+                },
+                StateRequest::Account {
+                    address: SENDER.to_owned()
+                },
+                StateRequest::Account {
+                    address: COUNTER.to_owned()
+                },
+                StateRequest::Storage {
+                    address: COUNTER.to_owned(),
+                    slot: "0x0".to_owned()
+                },
+                StateRequest::BlockHash { number: 0 },
+            ]
+        );
+
+        let exported = state.export(&reads);
+        assert_eq!(exported.accounts[SENDER].balance, "0xde0b6b3a7640000");
+        assert_eq!(exported.accounts[SENDER].nonce, "0x0");
+        assert_eq!(exported.accounts[SENDER].code, "0x");
+        assert_eq!(exported.accounts[COUNTER].code, COUNTER_CODE);
+        assert_eq!(exported.accounts[COUNTER].nonce, "0x1");
+        assert_eq!(exported.storage[COUNTER]["0x0"], "0x29");
+        assert_eq!(exported.block_hashes[&0], format!("0x{}", "22".repeat(32)));
+
+        // The export is a complete witness: a fresh state loaded from it runs with
+        // nothing missing and produces the same result.
+        let mut offline = PrefetchedReplayState::default();
+        offline.provide(&exported).expect("provide export");
+        let again = replay_debug_trace_with_state(&inputs, &offline).expect("offline run");
+        assert!(offline.missing().is_empty());
+        assert_eq!(again, result);
+
+        // Exporting what is not held yields nothing for it, and clearing reads forgets them.
+        let unknown = state.export(&[StateRequest::Storage {
+            address: COUNTER.to_owned(),
+            slot: "0x7".to_owned(),
+        }]);
+        assert_eq!(unknown, StateBatch::default());
+        state.clear_reads();
+        assert!(state.reads().is_empty());
     }
 
     #[test]

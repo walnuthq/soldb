@@ -11,13 +11,21 @@
 //! the one the native `replay` backend produces from the same chain.
 //!
 //! The first status already names the accounts every replay reads, so a host that
-//! answers it before the first run saves a round.
+//! answers it before the first run saves a round. The transactions before the target in
+//! its block run only until they run with nothing missing; from then on their state is
+//! kept and each round re-executes the target alone. Once complete,
+//! [`Replay::export_state`] returns exactly the state the replay depended on, which a
+//! host can keep, share, or feed back through [`Replay::provide_state`] to replay the
+//! same transaction in one round with no node at all.
+
+use std::collections::BTreeSet;
 
 use serde::Serialize;
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
 use soldb_rpc::{
-    replay_debug_trace_with_state, replay_transaction_trace, PrefetchedReplayState, ReplayInputs,
-    RpcBlockWithTransactions, RpcReceipt, RpcTransaction, StateBatch, StateRequest,
+    replay_prefix_with_state, replay_target_with_state, replay_transaction_trace,
+    PrefetchedReplayState, ReplayInputs, ReplayPrefix, RpcBlockWithTransactions, RpcReceipt,
+    RpcTransaction, StateBatch, StateRequest,
 };
 
 use crate::pipeline::{parse_json, to_json, Trace};
@@ -37,13 +45,21 @@ pub enum ReplayStatus {
     },
 }
 
-/// A replay in progress: the inputs, the state supplied so far, and the result once a
-/// run completes.
+/// A replay in progress: the inputs, the state supplied so far, the block prefix once
+/// it ran clean, and the result once a run completes.
 #[derive(Debug)]
 pub struct Replay {
     inputs: ReplayInputs,
     receipt: RpcReceipt,
     state: PrefetchedReplayState,
+    /// The prefix's state, kept from the first round in which the prefix read nothing
+    /// missing. Later rounds run the target over it instead of re-executing the prefix.
+    prefix: Option<ReplayPrefix>,
+    /// What the kept prefix read, so an export covers it even though later rounds never
+    /// read it through the provider again.
+    prefix_reads: BTreeSet<StateRequest>,
+    /// Everything the completed replay depended on.
+    used: BTreeSet<StateRequest>,
     trace: Option<TransactionTrace>,
 }
 
@@ -68,6 +84,9 @@ impl Replay {
             inputs,
             receipt,
             state,
+            prefix: None,
+            prefix_reads: BTreeSet::new(),
+            used: BTreeSet::new(),
             trace: None,
         })
     }
@@ -97,25 +116,83 @@ impl Replay {
     ///
     /// A run that recorded missing state reports it and discards its result, whatever
     /// that result was: with defaults in play a failure proves nothing. An error is
-    /// returned only when a run failed with nothing missing.
+    /// returned only when a run failed with nothing missing. The block prefix is kept
+    /// from the first run in which it read nothing missing, so later runs execute only
+    /// the target; a prefix that read defaults is still used for the round, since the
+    /// target's reads are worth discovering, but is not kept.
     pub fn run(&mut self) -> SoldbResult<ReplayStatus> {
         self.state.clear_missing();
-        let result = replay_debug_trace_with_state(&self.inputs, &self.state);
+        self.state.clear_reads();
+
+        let prefix = match &self.prefix {
+            Some(prefix) => prefix.clone(),
+            None => match replay_prefix_with_state(&self.inputs, &self.state) {
+                Ok(prefix) if self.state.missing().is_empty() => {
+                    self.prefix_reads = self.state.reads().into_iter().collect();
+                    self.prefix = Some(prefix.clone());
+                    prefix
+                }
+                Ok(prefix) => prefix,
+                Err(error) => {
+                    let missing = self.state.missing();
+                    if missing.is_empty() {
+                        return Err(error);
+                    }
+                    self.trace = None;
+                    return Ok(self.needs_state(missing));
+                }
+            },
+        };
+
+        let result = replay_target_with_state(&self.inputs, &prefix, &self.state);
         let missing = self.state.missing();
         if !missing.is_empty() {
             self.trace = None;
-            return Ok(ReplayStatus::NeedsState {
-                block: self.inputs.parent_block_tag(),
-                requests: missing,
-            });
+            return Ok(self.needs_state(missing));
         }
         let debug_result = result?;
+        self.used = self
+            .prefix_reads
+            .iter()
+            .cloned()
+            .chain(self.state.reads())
+            .collect();
         self.trace = Some(replay_transaction_trace(
             self.inputs.transaction().clone(),
             self.receipt.clone(),
             &debug_result,
         )?);
         Ok(ReplayStatus::Complete)
+    }
+
+    fn needs_state(&self, requests: Vec<StateRequest>) -> ReplayStatus {
+        ReplayStatus::NeedsState {
+            block: self.inputs.parent_block_tag(),
+            requests,
+        }
+    }
+
+    /// Whether the block prefix has run with nothing missing and is being reused.
+    #[must_use]
+    pub fn prefix_cached(&self) -> bool {
+        self.prefix.is_some()
+    }
+
+    /// Exactly the parent-block state the completed replay depended on, in the form
+    /// [`Replay::provide_state`] accepts. Feeding it to a new replay of the same
+    /// transaction completes in one run without a node.
+    pub fn export_state(&self) -> SoldbResult<StateBatch> {
+        if self.trace.is_none() {
+            return Err(SoldbError::Message(
+                "the replay has not completed; there is no state to export yet".to_owned(),
+            ));
+        }
+        let used = self.used.iter().cloned().collect::<Vec<_>>();
+        Ok(self.state.export(&used))
+    }
+
+    pub fn export_state_json(&self) -> SoldbResult<String> {
+        to_json(&self.export_state()?)
     }
 
     pub fn run_json(&mut self) -> SoldbResult<String> {
@@ -403,6 +480,102 @@ mod tests {
                 requests: Vec::new()
             }
         );
+    }
+
+    #[test]
+    fn keeps_the_prefix_once_it_ran_clean_and_reuses_it() {
+        // Two increments in one block: the first is the prefix, the second the target.
+        let first = transaction();
+        let mut target = transaction();
+        target["hash"] = json!("0xbbb");
+        target["nonce"] = json!("0x1");
+        target["transactionIndex"] = json!("0x1");
+        let block = json!({
+            "hash": format!("0x{}", "11".repeat(32)),
+            "timestamp": "0x64",
+            "gasLimit": "0x1c9c380",
+            "baseFeePerGas": "0x0",
+            "mixHash": format!("0x{}", "33".repeat(32)),
+            "transactions": [first, target]
+        })
+        .to_string();
+        let mut replay =
+            Replay::prepare(&target.to_string(), &receipt(), &block, "0x7a69").expect("prepared");
+        let world = world();
+
+        // Round one: the accounts are known but the prefix reads the slot and the block
+        // hash it has not been given, so its state is not kept.
+        replay
+            .provide_state(&answer(&world, &replay.status()))
+            .expect("accounts");
+        let status = replay.run().expect("run");
+        assert!(matches!(status, ReplayStatus::NeedsState { .. }));
+        assert!(!replay.prefix_cached());
+
+        // Round two: the prefix runs clean and is kept; the target, which reads only what
+        // the prefix loaded and wrote, completes in the same run.
+        replay
+            .provide_state(&answer(&world, &status))
+            .expect("rest");
+        assert_eq!(replay.run().expect("run"), ReplayStatus::Complete);
+        assert!(replay.prefix_cached());
+
+        // The export covers the prefix's reads even though the final round served them
+        // from the kept prefix, so a fresh replay from it completes in one run.
+        let exported = replay.export_state_json().expect("export");
+        let trace = replay.finish().expect("trace");
+        let mut offline =
+            Replay::prepare(&target.to_string(), &receipt(), &block, "0x7a69").expect("prepared");
+        offline.provide_state(&exported).expect("provide export");
+        assert_eq!(offline.run().expect("run"), ReplayStatus::Complete);
+        assert!(offline.prefix_cached());
+        assert_eq!(
+            offline.finish().expect("trace").to_json().expect("json"),
+            trace.to_json().expect("json")
+        );
+        let sstore: Value =
+            serde_json::from_str(&trace.step_json(8).expect("step").expect("in range"))
+                .expect("step");
+        assert_eq!(sstore["snapshot"]["storage"]["0x0"], "0x2b");
+    }
+
+    #[test]
+    fn exports_exactly_the_state_a_completed_replay_used() {
+        let mut replay = prepared();
+        let world = world();
+        drive(&world, &mut replay);
+
+        let exported = replay.export_state().expect("export");
+        let json: Value =
+            serde_json::from_str(&replay.export_state_json().expect("json")).expect("value");
+        assert_eq!(json["accounts"][SENDER]["balance"], "0xde0b6b3a7640000");
+        assert_eq!(json["accounts"][COUNTER]["code"], COUNTER_CODE);
+        assert_eq!(json["accounts"][ZERO]["nonce"], "0x0");
+        assert_eq!(json["storage"][COUNTER]["0x0"], "0x29");
+        assert_eq!(json["blockHashes"]["0"], format!("0x{}", "22".repeat(32)));
+        assert_eq!(exported.accounts.len(), 3);
+        assert_eq!(exported.storage[COUNTER].len(), 1);
+
+        // Replaying from the export needs no further state and gives the same trace.
+        let trace = replay.finish().expect("trace");
+        let mut offline = prepared();
+        offline
+            .provide_state(&serde_json::to_string(&exported).expect("json"))
+            .expect("provide");
+        assert_eq!(offline.run().expect("run"), ReplayStatus::Complete);
+        assert_eq!(offline.export_state().expect("export again"), exported);
+        assert_eq!(
+            offline.finish().expect("trace").to_json().expect("json"),
+            trace.to_json().expect("json")
+        );
+    }
+
+    #[test]
+    fn export_requires_a_completed_run() {
+        let replay = prepared();
+        let error = replay.export_state().expect_err("not complete");
+        assert!(error.to_string().contains("not completed"), "{error}");
+        assert!(!replay.prefix_cached());
     }
 
     #[test]

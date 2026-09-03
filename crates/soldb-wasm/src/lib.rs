@@ -170,7 +170,9 @@ impl Trace {
 /// `eth_getStorageAt`, and `eth_getBlockByNumber` at the block `status()` names, passes
 /// the results to `provideState()`, and calls `run()`. Missing values default to empty
 /// and are recorded, so a run either completes or reports exactly what it still lacks;
-/// the loop converges in a few rounds. `finish()` then yields the `Trace`.
+/// the loop converges in a few rounds. The transactions before the target in its block
+/// run only until they run clean, after which each round re-executes the target alone.
+/// `finish()` then yields the `Trace`, and `exportState()` the state it depended on.
 #[cfg(feature = "replay")]
 #[wasm_bindgen]
 pub struct Replay {
@@ -219,6 +221,14 @@ impl Replay {
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.inner.is_complete()
+    }
+
+    /// Exactly the parent-block state the completed replay depended on, as the JSON
+    /// `provideState()` accepts. Keep it to replay the same transaction again in one
+    /// run, offline, or share it so someone else can.
+    #[wasm_bindgen(js_name = exportState)]
+    pub fn export_state(&self) -> Result<String, JsError> {
+        self.inner.export_state_json().map_err(js_error)
     }
 
     /// Takes the completed replay as a `Trace`. Consumes this object.

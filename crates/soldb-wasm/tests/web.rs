@@ -158,8 +158,25 @@ fn replays_a_transaction_from_host_supplied_state() {
     assert_eq!(runs, 2);
     assert!(replay.is_complete());
 
+    // The exported state replays the same transaction in one run with nothing fetched.
+    let exported = replay.export_state().expect("export");
+    let mut offline = Replay::prepare(
+        &transaction.to_string(),
+        &receipt.to_string(),
+        &block.to_string(),
+        "0x7a69",
+    )
+    .expect("prepared");
+    offline.provide_state(&exported).expect("provide export");
+    assert_eq!(parse(&offline.run().expect("run"))["status"], "complete");
+    let offline_trace = offline.finish().expect("trace");
+
     let trace = replay.finish().expect("trace");
     assert_eq!(trace.step_count(), 10);
+    assert_eq!(
+        offline_trace.to_json().expect("json"),
+        trace.to_json().expect("json")
+    );
     let summary = parse(&trace.summary().expect("summary"));
     assert_eq!(summary["backend"], "replay");
     assert_eq!(summary["success"], true);

@@ -125,9 +125,11 @@ new frontend logic that both would want belongs there.
   default) because it is the only code that links REVM; the crate must keep building and
   passing its tests with `--no-default-features`, and code that needs REVM goes in that
   module. Inside it, execution is separate from I/O: `ReplayInputs` gathers what the node
-  says about the transaction and its block, `replay_debug_trace_with_state` runs REVM over
-  any `ReplayStateProvider`, and `PrefetchedReplayState` is the provider a host fills in
-  rounds. Keep network calls out of the execution path.
+  says about the transaction and its block, `replay_prefix_with_state` and
+  `replay_target_with_state` run REVM over any `ReplayStateProvider`, and
+  `PrefetchedReplayState` is the provider a host fills in rounds; it records every read so
+  a completed run can export exactly the state it used. A `ReplayPrefix` is reusable only
+  after a run that recorded nothing missing. Keep network calls out of the execution path.
 - **soldb-debugger**: source-step, function, and variable decoding over a
   `TransactionTrace` plus `EthdebugInfo`. Frontend-agnostic; shared by CLI, REPL, and DAP.
 - **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
@@ -145,7 +147,8 @@ new frontend logic that both would want belongs there.
   hosts. One handle, `Trace`, holds the parsed trace in WebAssembly memory; inputs and
   outputs cross the boundary as JSON strings, but the trace is never re-parsed between
   calls. With its `replay` feature (on by default) it also exports `Replay`, a host-driven
-  REVM replay that reports the state it needs and runs in rounds. The behavior lives in
+  REVM replay that reports the state it needs, runs in rounds, keeps the block prefix
+  once it ran clean, and exports the state it used. The behavior lives in
   its `pipeline` and `replay` modules and is tested natively. Two packages are built from
   it: lean (`--no-default-features`, no REVM) and replay-capable. `publish = false`: it
   ships through `wasm-pack`, not crates.io.

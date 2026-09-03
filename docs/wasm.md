@@ -41,7 +41,7 @@ feature:
 | package | output | REVM | size | budget |
 | --- | --- | --- | --- | --- |
 | lean | `crates/soldb-wasm/pkg/` | no | about 360 KB, 150 KB gzipped | 400,000 bytes |
-| replay-capable | `crates/soldb-wasm/pkg-replay/` | yes | about 950 KB, 400 KB gzipped | 1,100,000 bytes |
+| replay-capable | `crates/soldb-wasm/pkg-replay/` | yes | about 960 KB, 400 KB gzipped | 1,100,000 bytes |
 
 Both export `Trace` and `version()`; only the replay-capable one exports `Replay`.
 `replayAvailable()` tells a host which it loaded. Pick the lean package when every node
@@ -100,6 +100,7 @@ throw a JavaScript `Error` whose message is the debugger's own error text.
 | `trace.toSimulationWebJson(functionName, contracts?)` | the versioned document for a simulation |
 | `trace.free()` | release the trace; it lives outside the JavaScript heap |
 | `Replay.prepare(transaction, receipt, block, chainId)` | replay-capable package only; see below |
+| `replay.exportState()` | the state a completed replay depended on, ready for `provideState` |
 | `replayAvailable()` | whether `Replay` is exported by this build |
 | `version()` | the version the module was built from |
 
@@ -227,8 +228,10 @@ package turns that into a loop the host drives:
    node's results verbatim.
 4. `replay.run()` executes and returns the new status: `{"status": "complete"}`, or
    `needsState` with what the run still lacked. Repeat from step 3 until it completes.
-5. `replay.finish()` yields a `Trace` with `backend` set to `replay`, the same one the
-   native backend produces from the same chain. It consumes the `Replay` object.
+5. `replay.exportState()` returns exactly the state the completed replay depended on,
+   in the shape `provideState` accepts, and `replay.finish()` yields a `Trace` with
+   `backend` set to `replay`, the same one the native backend produces from the same
+   chain. `finish` consumes the `Replay` object, so export first.
 
 Missing values are answered with an empty account, a zero slot, or a zero hash and
 recorded, so a run never stops at the first gap: each round discovers everything the
@@ -237,8 +240,15 @@ would not take, but every value used by a round that recorded nothing was real, 
 result is exact. The first status already names the accounts every replay reads, the
 parties to each transaction up to the target and the block's fee recipient, so a host
 that answers it before the first run saves a round; a typical transaction converges in
-two to four rounds. Each round re-executes the block prefix and the target, so the loop
-costs a few REVM runs, not one.
+two to four rounds.
+
+The transactions before the target in its block are not re-executed every round. The
+first time they run with nothing missing, everything they read was real, so the state
+they leave behind is kept and later rounds run the target alone over it. A prefix that
+read defaults is still used for that round, because the target's reads are worth
+discovering, but it is run again next round. For a transaction deep in a busy block this
+removes most of the work: the prefix is paid once, usually in the first round after the
+participants are supplied.
 
 A failure is reported only from a run that recorded nothing missing, because with
 defaults in play a failure proves nothing. A failure with nothing missing is real: the
@@ -259,34 +269,90 @@ const replay = Replay.prepare(
   await rpc("eth_chainId", []),
 );
 
+// One JSON-RPC batch per round: every request in a round is independent.
+const rpcBatch = async (calls) => {
+  const response = await fetch(RPC_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(calls.map(([method, params], id) => ({ jsonrpc: "2.0", id, method, params }))),
+  });
+  const results = new Map((await response.json()).map((entry) => [entry.id, entry]));
+  return calls.map((_, id) => {
+    const { result, error } = results.get(id);
+    if (error) throw new Error(error.message);
+    return result;
+  });
+};
+
 let status = JSON.parse(replay.status());
 while (status.status !== "complete") {
+  const calls = [];
+  const fill = [];
   const batch = { accounts: {}, storage: {}, blockHashes: {} };
   for (const request of status.requests) {
     if (request.kind === "account") {
-      const [balance, nonce, code] = await Promise.all([
-        rpc("eth_getBalance", [request.address, status.block]),
-        rpc("eth_getTransactionCount", [request.address, status.block]),
-        rpc("eth_getCode", [request.address, status.block]),
-      ]);
-      batch.accounts[request.address] = { balance, nonce, code };
+      const at = calls.length;
+      calls.push(
+        ["eth_getBalance", [request.address, status.block]],
+        ["eth_getTransactionCount", [request.address, status.block]],
+        ["eth_getCode", [request.address, status.block]],
+      );
+      fill.push((results) => {
+        batch.accounts[request.address] = { balance: results[at], nonce: results[at + 1], code: results[at + 2] };
+      });
     } else if (request.kind === "storage") {
-      (batch.storage[request.address] ??= {})[request.slot] =
-        await rpc("eth_getStorageAt", [request.address, request.slot, status.block]);
+      const at = calls.length;
+      calls.push(["eth_getStorageAt", [request.address, request.slot, status.block]]);
+      fill.push((results) => {
+        (batch.storage[request.address] ??= {})[request.slot] = results[at];
+      });
     } else if (request.kind === "blockHash") {
-      const block = await rpc("eth_getBlockByNumber", [`0x${request.number.toString(16)}`, false]);
-      batch.blockHashes[request.number] = block.hash;
+      const at = calls.length;
+      calls.push(["eth_getBlockByNumber", [`0x${request.number.toString(16)}`, false]]);
+      fill.push((results) => {
+        batch.blockHashes[request.number] = results[at].hash;
+      });
     }
   }
+  const results = await rpcBatch(calls);
+  for (const apply of fill) apply(results);
   replay.provideState(JSON.stringify(batch));
   status = JSON.parse(replay.run());
 }
 
+localStorage.setItem(`soldb-replay:${txHash}`, replay.exportState()); // next time: one run, no node
 const trace = replay.finish();
 ```
 
 The node must serve state at the parent block, which for anything but recent blocks
-means an archive-capable endpoint, exactly as for the native backend.
+means an archive-capable endpoint, exactly as for the native backend. That is a property
+of replay itself: the state a transaction ran against has to come from somewhere, and a
+node that keeps neither history nor a tracer cannot supply it. What the export changes
+is how often you pay for it.
+
+### Exported state
+
+Once a replay completes, `exportState()` returns the accounts, storage slots, and block
+hashes the run actually read, and nothing else:
+
+```json
+{
+  "accounts": { "0xaddress": { "balance": "0x…", "nonce": "0x…", "code": "0x…" } },
+  "storage": { "0xaddress": { "0x0": "0x29" } },
+  "blockHashes": { "7": "0x…" }
+}
+```
+
+It covers the block prefix's reads too, even when the final round served them from the
+kept prefix. Feeding it to `Replay.prepare` for the same transaction through
+`provideState` completes the replay in one run with no node at all, and produces the
+identical trace. A host can cache it per transaction in the browser, attach it to a bug
+report, check it into a regression test, or hand it to a colleague who has no archive
+access. The live check in `test/wasm/replay-live.cjs` does exactly that round trip: for a
+small contract call the export is under a kilobyte.
+
+Requests within a round are independent, so a host should send them as one JSON-RPC
+batch rather than one call each, as the example below does.
 
 `test/wasm/replay-live.cjs` is this loop as a runnable check: it deploys a small contract
 on the node at `RPC_URL`, calls it, replays that transaction through the Node.js build of
@@ -338,10 +404,12 @@ twiggy top -n 40 target/wasm32-unknown-unknown/release/soldb_wasm.wasm
   touch them.
 - `soldb-rpc` keeps REVM behind its `replay` feature, on by default. Code that needs REVM
   belongs in its `replay` module, and execution stays separate from I/O there:
-  `replay_debug_trace_with_state` runs over any `ReplayStateProvider` and never touches a
-  client, which is what lets the host-driven loop exist. `soldb-rpc` and `soldb-wasm` must
-  keep building and passing their tests with `--no-default-features`, which
-  `make wasm-check` verifies natively and on the target.
+  `replay_prefix_with_state` and `replay_target_with_state` run over any
+  `ReplayStateProvider` and never touch a client, which is what lets the host-driven loop
+  exist. A `ReplayPrefix` may only be reused after a run in which the provider recorded
+  nothing missing; keeping one from a run that read defaults would bake those defaults
+  in. `soldb-rpc` and `soldb-wasm` must keep building and passing their tests with
+  `--no-default-features`, which `make wasm-check` verifies natively and on the target.
 - The web document's `steps` are streamed from the trace by `WebSteps` in
   `soldb-serializer`, one step at a time, rather than copied into a `serde_json::Value`
   tree first. A test pins the output byte-for-byte against the former shape, so a change
