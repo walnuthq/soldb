@@ -94,7 +94,8 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | --- | --- |
 | `soldb-core` | *(nothing)* |
 | `soldb-ethdebug` | core, `revm-bytecode` |
-| `soldb-rpc` | core, `ruint`, `revm` (behind the default-on `replay` feature) |
+| `soldb-evm` | core, `ruint`, `revm` (behind the default-on `replay` feature) |
+| `soldb-rpc` | core, evm |
 | `soldb-repl` | core |
 | `soldb-serializer` | core, ethdebug |
 | `soldb-debugger` | core, ethdebug |
@@ -122,17 +123,26 @@ new frontend logic that both would want belongs there.
 - **soldb-ethdebug**: ETHDebug artifact loading (`metadata.rs`), legacy `srcmap` parsing
   (`source_map.rs`), ABI encode/decode and signature parsing (`abi.rs`), event decoding
   (`events.rs`). Pure functions over files and bytes; no network.
-- **soldb-rpc**: JSON-RPC transport, the `debug-rpc` backend, the REVM `replay` backend,
-  `debug_traceCall` simulation, and log retrieval. This is the only crate that talks to a
-  node. The replay backend lives in `replay.rs` behind the `replay` cargo feature (on by
-  default) because it is the only code that links REVM; the crate must keep building and
-  passing its tests with `--no-default-features`, and code that needs REVM goes in that
-  module. Inside it, execution is separate from I/O: `ReplayInputs` gathers what the node
-  says about the transaction and its block, `replay_prefix_with_state` and
-  `replay_target_with_state` run REVM over any `ReplayStateProvider`, and
-  `PrefetchedReplayState` is the provider a host fills in rounds; it records every read so
-  a completed run can export exactly the state it used. A `ReplayPrefix` is reusable only
-  after a run that recorded nothing missing. Keep network calls out of the execution path.
+- **soldb-evm**: the execution engine, with no I/O. The node data shapes
+  (`RpcTransaction`, `RpcReceipt`, `DebugTraceResult`, the block types) are what JSON-RPC
+  answers deserialize into, wherever they were fetched; `debug_rpc_transaction_trace` and
+  `debug_rpc_simulation_trace` assemble a trace from them, and every backend ends in
+  `build_transaction_trace`. The REVM engine lives in `replay.rs` behind the `replay`
+  cargo feature (on by default) because it is the only code that links REVM; the crate
+  must keep building and passing its tests with `--no-default-features`, and code that
+  needs REVM goes in that module. `ReplayInputs` holds what the node says about the
+  transaction and its block, `replay_prefix_with_state` and `replay_target_with_state`
+  run REVM over any `ReplayStateProvider`, `PrefetchedReplayState` is the provider a host
+  fills in rounds (it records every read so a completed run can export exactly the state
+  it used), and `LocalChain` is the synthetic chain `soldb run` executes on. A
+  `ReplayPrefix` is reusable only after a run that recorded nothing missing. Nothing in
+  this crate may open a socket, spawn a process, or read a file.
+- **soldb-rpc**: the JSON-RPC transport and everything that needs a node: the `debug-rpc`
+  backend, `debug_traceCall` simulation, log retrieval, and the node side of the `replay`
+  backend in its own `replay.rs` (fetching a transaction's inputs, the lazy
+  `RpcReplayStateProvider`, the archive preflight, batch requests), all behind the same
+  `replay` feature, which also turns on the engine's. It re-exports `soldb-evm`'s public
+  surface so frontends see one crate. This is the only crate that talks to a node.
 - **soldb-debugger**: source-step, function, and variable decoding over a
   `TransactionTrace` plus `EthdebugInfo`. Frontend-agnostic; shared by CLI, REPL, and DAP.
 - **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
@@ -178,7 +188,8 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
   breaking change (see JSON Output Contract).
 - The crates listed in `WASM_CRATES` in the `Makefile` must keep building for
   `wasm32-unknown-unknown`; the `wasm` CI job lints them on that target, checks
-  `soldb-rpc` without its `replay` feature, and runs the `soldb-wasm` package build and
+  `soldb-evm` and `soldb-rpc` without their `replay` feature, and runs the `soldb-wasm`
+  package build and
   tests. `std::net`, `std::process`, and `std::fs` compile there but fail at runtime, so
   a WebAssembly host does the I/O and hands results over as strings: nothing reachable
   from a `soldb-wasm` export may open a socket, spawn a process, or read a file. Check a
@@ -186,15 +197,17 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
   `make wasm` builds both packages and fails when either exceeds its budget
   (`WASM_LEAN_SIZE_BUDGET_BYTES`, `WASM_REPLAY_SIZE_BUDGET_BYTES`); raise a budget
   deliberately, in the change that explains the growth, never to make CI pass.
-  `soldb-rpc` selects `getrandom`'s `js` backend for that target only because REVM's
+  `soldb-evm` selects `getrandom`'s `js` backend for that target only because REVM's
   `k256` needs it to link. See `docs/wasm.md`.
 
 ### Big Files
 
-`crates/soldb-cli/src/main.rs` (~4000 lines) and `crates/soldb-rpc/src/lib.rs` (~3200
+`crates/soldb-cli/src/main.rs` (~4000 lines) and `crates/soldb-evm/src/replay.rs` (~2700
 lines) are the two outliers. Prefer adding to a focused module over growing them further;
 when you touch a coherent region of either, splitting that region into its own module is
-a welcome change as long as it is a pure move with no behavior delta.
+a welcome change as long as it is a pure move with no behavior delta. The transport and
+the engine were separated that way: `soldb-rpc` once held both, and the split into
+`soldb-evm` moved code without changing it.
 
 ## ETHDebug Notes
 

@@ -22,7 +22,8 @@ spawn `solc`, listen on sockets, and read the filesystem, none of which a
 | `soldb-profiler` | yes | gas attribution and folded stacks |
 | `soldb-repl` | yes | breakpoint and stepping state machine |
 | `soldb-serializer` | yes | the web JSON document and its per-contract metadata |
-| `soldb-rpc` | yes | transport types and trace assembly in both packages; the REVM backend, behind the `replay` feature, only in the replay-capable one |
+| `soldb-evm` | yes | node data shapes and trace assembly in both packages; the REVM engine, behind the `replay` feature, only in the replay-capable one |
+| `soldb-rpc` | yes | the JSON-RPC transport and the node-backed backends; linked through the bindings' dependency, never called |
 | `soldb-wasm` | yes | the bindings described below |
 | `soldb-cli`, `soldb-dap` | no | terminal and editor frontends |
 | `soldb-compiler` | no | invokes `solc` |
@@ -417,14 +418,15 @@ twiggy top -n 40 target/wasm32-unknown-unknown/release/soldb_wasm.wasm
   operation fails at runtime. That is why `soldb-rpc`'s HTTP transport builds there and
   why the bindings never call it. New code paths reachable from the exports must not
   touch them.
-- `soldb-rpc` keeps REVM behind its `replay` feature, on by default. Code that needs REVM
-  belongs in its `replay` module, and execution stays separate from I/O there:
+- `soldb-evm` keeps REVM behind its `replay` feature, on by default. Code that needs REVM
+  belongs in its `replay` module, and the crate has no I/O at all:
   `replay_prefix_with_state` and `replay_target_with_state` run over any
   `ReplayStateProvider` and never touch a client, which is what lets the host-driven loop
   exist. A `ReplayPrefix` may only be reused after a run in which the provider recorded
   nothing missing; keeping one from a run that read defaults would bake those defaults
-  in. `soldb-rpc` and `soldb-wasm` must keep building and passing their tests with
-  `--no-default-features`, which `make wasm-check` verifies natively and on the target.
+  in. `soldb-evm`, `soldb-rpc`, and `soldb-wasm` must keep building and passing their
+  tests with `--no-default-features`, which `make wasm-check` verifies natively and on
+  the target.
 - The web document's `steps` are streamed from the trace by `WebSteps` in
   `soldb-serializer`, one step at a time, rather than copied into a `serde_json::Value`
   tree first. A test pins the output byte-for-byte against the former shape, so a change

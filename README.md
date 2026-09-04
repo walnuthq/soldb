@@ -184,7 +184,7 @@ flowchart TD
 
     cli --> selector["soldb-rpc<br/>backend selector"]
     selector --> debug_rpc["debug-rpc backend<br/>debug_traceTransaction / debug_traceCall"]
-    selector --> replay["replay backend<br/>normal RPC state -> REVM inspectors"]
+    selector --> replay["replay backend (soldb-evm)<br/>normal RPC state -> REVM inspectors"]
 
     debug_rpc --> opcode_trace["opcode trace"]
     replay --> opcode_trace
@@ -268,7 +268,8 @@ instruction, mid-transaction included, and an editor's step-back button works. S
 
 - `crates/soldb-cli`: command-line interface, output formatting, and command wiring.
 - `crates/soldb-core`: shared error types, trace models, and debugger data structures.
-- `crates/soldb-rpc`: JSON-RPC transport, debug-RPC backend, replay backend, transaction simulation, and event log retrieval.
+- `crates/soldb-evm`: the execution engine: node data shapes, trace assembly, and the REVM replay engine that also runs bytecode on a local chain.
+- `crates/soldb-rpc`: JSON-RPC transport, debug-RPC backend, the node side of the replay backend, transaction simulation, and event log retrieval.
 - `crates/soldb-ethdebug`: ETHDebug metadata loading, ABI helpers, source mapping, event decoding, and call-frame enrichment.
 - `crates/soldb-debugger`: reusable source-step, function, and variable decoding model shared by frontends.
 - `crates/soldb-profiler`: reusable gas attribution and folded-stack model over traces and ETHDebug programs.

@@ -19,6 +19,7 @@ runner infrastructure.
 - `soldb-cli`: command-line parsing and command dispatch.
 - `soldb-core`: shared trace, function-call, and error model.
 - `soldb-ethdebug`: ETHDebug and legacy source-map parsing.
+- `soldb-evm`: node data shapes, trace assembly, and the REVM replay engine.
 - `soldb-rpc`: Ethereum JSON-RPC tracing and simulation.
 - `soldb-serializer`: JSON/web trace serialization.
 - `soldb-repl`: debugger state machine and interactive command loop.

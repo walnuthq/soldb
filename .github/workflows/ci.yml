@@ -39,7 +39,7 @@ jobs:
   wasm:
     # The library crates and the `soldb-wasm` bindings must keep building for
     # `wasm32-unknown-unknown`. Linting on the target catches code that only compiles
-    # natively, and `soldb-rpc` and `soldb-wasm` are checked without the `replay` feature,
+    # natively, and `soldb-evm`, `soldb-rpc`, and `soldb-wasm` are checked without `replay`,
     # the configuration the lean package links; `wasm-pack` then produces both packages a
     # browser or Node.js host loads, each is held to its size budget, and the binding
     # tests run under Node.js with and without replay. Finally a transaction on a local

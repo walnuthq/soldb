@@ -1,0 +1,46 @@
+[package]
+name = "soldb-evm"
+version.workspace = true
+edition.workspace = true
+description = "Execution engine for SolDB traces: node data shapes, trace assembly, and REVM replay"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+default = ["replay"]
+# The REVM replay engine. It is the only part of the crate that links REVM, so a build
+# without it, such as the lean WebAssembly package, keeps the node data shapes and the
+# trace assembly at a fraction of the size.
+replay = ["dep:revm", "dep:getrandom"]
+
+[dependencies]
+# `U256` for wei quantities. This is the same `ruint` type `revm::primitives::U256`
+# re-exports, so the replay engine and the shared quantity helpers never convert.
+ruint = { version = "1.18", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+soldb-core.workspace = true
+revm = { version = "36.0", optional = true, default-features = false, features = [
+    "std",
+    "serde",
+    "optional_eip3607",
+    "optional_block_gas_limit",
+    "optional_no_base_fee",
+] }
+
+# `revm` reaches `getrandom` through `k256`, and `getrandom` 0.2 refuses to build for
+# `wasm32-unknown-unknown` unless its `js` backend is selected. Nothing in this crate
+# draws randomness; the dependency exists only to pick that backend so the REVM replay
+# path links in a browser or Node.js host when the `replay` feature is on there.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"], optional = true }
+
+[lints]
+workspace = true

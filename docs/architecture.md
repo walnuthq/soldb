@@ -24,6 +24,8 @@ Returns step-by-step execution trace
 
 **Key Files:**
 - `crates/soldb-rpc/src/lib.rs` - Handles JSON-RPC communication and trace retrieval
+- `crates/soldb-evm/src/lib.rs` - Node data shapes and trace assembly shared by every backend
+- `crates/soldb-evm/src/replay.rs` - REVM replay engine over supplied state
 - `crates/soldb-cli/src/main.rs` - Wires trace data into user-facing commands
 
 ### 2. Execution Trace Structure
