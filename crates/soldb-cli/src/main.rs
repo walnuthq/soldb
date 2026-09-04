@@ -8,7 +8,10 @@
 //! Output conventions worth preserving when editing this file:
 //!
 //! - Colors go through the `paint` helpers, which honor `NO_COLOR`, `CLICOLOR_FORCE`,
-//!   and whether stdout is a terminal. Emitting escapes directly breaks the lit tests.
+//!   and whether the stream being written to is a terminal — stdout for the result,
+//!   stderr for warnings, decided separately so a redirected log never collects escape
+//!   codes and a warning on a terminal keeps its color when the result is piped away.
+//!   Emitting escapes directly breaks the lit tests.
 //! - `--json` and `--json-events` print only their JSON document, so the output stays
 //!   pipeable into `jq`. Progress lines must stay gated on those flags.
 //! - A command that has already rendered a failure returns
@@ -49,20 +52,56 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn colors_enabled() -> bool {
-    *COLORS_ENABLED.get_or_init(|| {
-        if let Some(force) = env::var_os("CLICOLOR_FORCE") {
-            return force.to_string_lossy() != "0";
+    *COLORS_ENABLED.get_or_init(|| colors_enabled_on(io::stdout().is_terminal()))
+}
+
+/// Whether to color what goes to stderr, which is warnings and the final error.
+///
+/// Decided separately from stdout: piping a trace into a file should not take the color
+/// off a warning still being read on the terminal, and redirecting the warnings into a
+/// log should not fill it with escape codes.
+fn stderr_colors_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| colors_enabled_on(io::stderr().is_terminal()))
+}
+
+fn colors_enabled_on(is_terminal: bool) -> bool {
+    if let Some(force) = env::var_os("CLICOLOR_FORCE") {
+        return force.to_string_lossy() != "0";
+    }
+    if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    is_terminal && env::var("TERM").map_or(true, |term| term != "dumb")
+}
+
+/// Writes a failure to stderr: the first line as the error, and a following `note:` line
+/// styled like the notes `report_once` writes, so the two read the same way.
+fn report_error(message: &str) {
+    let mut lines = message.split('\n');
+    if let Some(first) = lines.next() {
+        eprintln!("{} {first}", paint_stderr("error:", "91"));
+    }
+    for line in lines {
+        match line.strip_prefix("note:") {
+            Some(rest) => eprintln!("{}{rest}", paint_stderr("note:", "2")),
+            None => eprintln!("{line}"),
         }
-        if env::var_os("NO_COLOR").is_some() {
-            return false;
-        }
-        io::stdout().is_terminal() && env::var("TERM").map_or(true, |term| term != "dumb")
-    })
+    }
 }
 
 fn paint(value: impl Display, code: &str) -> String {
+    paint_when(colors_enabled(), value, code)
+}
+
+/// The same, for text written to stderr.
+fn paint_stderr(value: impl Display, code: &str) -> String {
+    paint_when(stderr_colors_enabled(), value, code)
+}
+
+fn paint_when(enabled: bool, value: impl Display, code: &str) -> String {
     let text = value.to_string();
-    if colors_enabled() {
+    if enabled {
         format!("\x1b[{code}m{text}\x1b[0m")
     } else {
         text
@@ -699,7 +738,7 @@ fn main() -> ExitCode {
         // here would duplicate it.
         Err(soldb_core::SoldbError::AlreadyReported) => ExitCode::from(2),
         Err(error) => {
-            eprintln!("{error}");
+            report_error(&error.to_string());
             ExitCode::from(2)
         }
     }
@@ -3518,8 +3557,8 @@ fn report_once(key: String, message: &str, note: &str) {
     if !reported.insert(key) {
         return;
     }
-    eprintln!("{} {message}", warning("warning:"));
-    eprintln!("{} {note}", dim("note:"));
+    eprintln!("{} {message}", paint_stderr("warning:", "93"));
+    eprintln!("{} {note}", paint_stderr("note:", "2"));
 }
 
 fn resolve_contract_specs(
@@ -4215,6 +4254,17 @@ fn shorten_hex(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn paints_only_when_the_stream_is_a_terminal() {
+        // `CLICOLOR_FORCE` and `NO_COLOR` are read from the environment, which the tests
+        // share; the decision itself is what this pins.
+        assert_eq!(super::paint_when(false, "warning:", "93"), "warning:");
+        assert_eq!(
+            super::paint_when(true, "warning:", "93"),
+            "\u{1b}[93mwarning:\u{1b}[0m"
+        );
+    }
     use super::*;
     use serde_json::Value;
     use soldb_ethdebug::{EthdebugInfo, Instruction};
