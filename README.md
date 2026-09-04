@@ -246,6 +246,22 @@ can trace.
 soldb simulate <contract> "increment(uint256)" 4 --from <address> --backend replay --block 12345 --rpc <url>
 ```
 
+### Replay Files
+
+A replay backend run reads a bounded amount of state from the node. `--save-replay` writes
+everything it read, together with the transaction or call, its block, and the chain id, to
+a file, and `soldb replay` reproduces the same trace from that file on any machine with no
+node at all:
+
+```bash
+soldb trace <tx_hash> --backend replay --save-replay bug.json --rpc <url>
+soldb simulate <contract> "increment(uint256)" 4 --from <address> --backend replay --save-replay bug.json --rpc <url>
+soldb replay bug.json --ethdebug-dir <contract_address>:<contract_name>:./out -i
+```
+
+The file is the reproduction: attach it to a bug report and whoever opens it steps
+through the same execution, archive node or not.
+
 ### Running Bytecode Without a Node
 
 `soldb run` debugs compiled bytecode on a chain that exists only for that run. There is no

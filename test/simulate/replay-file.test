@@ -1,0 +1,17 @@
+# A simulated call recorded with `--save-replay` replays from the file with no node and
+# produces the same steps.
+# REQUIRES: soldb
+# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --backend replay --save-replay %t.json --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck --check-prefix=SAVE %s
+
+# SAVE: Saved call to 0x{{[0-9a-f]+}} at block {{[0-9]+}} on chain 31337 with {{[0-9]+}} state item(s) to
+# SAVE: Status: SUCCESS
+
+# RUN: %soldb replay %t.json --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} 2>&1 | FileCheck --check-prefix=REPLAY %s
+
+# REPLAY: Replaying call to 0x{{[0-9a-f]+}} at block {{[0-9]+}} on chain 31337
+# REPLAY: Replayed from {{.*}}; no node involved
+# REPLAY: Status: SUCCESS
+
+# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --backend replay --rpc %{rpc_url} --json | jq -S '.steps' > %t.live.json
+# RUN: %soldb replay %t.json --json | jq -S '.steps' > %t.offline.json
+# RUN: diff %t.live.json %t.offline.json

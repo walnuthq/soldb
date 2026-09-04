@@ -35,8 +35,9 @@ pub use replay::{
     account_info_from_rpc, parse_address, parse_b256, replay_chain_support,
     replay_debug_trace_with_state, replay_prefix_with_state, replay_simulation_trace,
     replay_target_with_state, replay_transaction_trace, AccountState, LocalChain,
-    PrefetchedReplayState, ReplayDbError, ReplayInputs, ReplayPrefix, ReplayStateProvider,
-    RpcBlockHeader, RpcBlockTransaction, RpcBlockWithTransactions, StateBatch, StateRequest,
+    PrefetchedReplayState, ReplayBundle, ReplayBundleTarget, ReplayDbError, ReplayInputs,
+    ReplayPrefix, ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction,
+    RpcBlockWithTransactions, StateBatch, StateRequest, REPLAY_BUNDLE_VERSION,
 };
 #[cfg(feature = "replay")]
 pub use revm::primitives::{Address, B256};
@@ -329,7 +330,8 @@ pub struct TraceEnvelope {
     pub capabilities: TraceCapabilities,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SimulateCallRequest {
     pub from_addr: String,
     pub to_addr: String,

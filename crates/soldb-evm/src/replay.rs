@@ -57,7 +57,7 @@ use crate::{
 };
 
 /// The header fields of an `eth_getBlockByNumber` response that replay reads.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcBlockHeader {
     #[serde(default)]
     pub hash: Option<String>,
@@ -81,7 +81,7 @@ pub struct RpcBlockHeader {
 }
 
 /// An `eth_getBlockByNumber(number, true)` response: the header plus every transaction.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcBlockWithTransactions {
     #[serde(flatten)]
     pub header: RpcBlockHeader,
@@ -91,7 +91,7 @@ pub struct RpcBlockWithTransactions {
 
 /// A block's transaction as the node returned it: in full, or as a bare hash when the
 /// block was requested without transaction objects.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RpcBlockTransaction {
     Full(Box<RpcTransaction>),
@@ -369,6 +369,21 @@ impl ReplayInputs {
             ));
         }
         Ok(block_number)
+    }
+
+    /// The block as a replay needs it: the header, and in full the transactions the
+    /// replay runs. For a mined transaction that is everything up to and including the
+    /// target; for a call, only what runs before it.
+    #[must_use]
+    pub fn block(&self) -> RpcBlockWithTransactions {
+        RpcBlockWithTransactions {
+            header: self.header.clone(),
+            transactions: self
+                .transactions
+                .iter()
+                .map(|transaction| RpcBlockTransaction::Full(Box::new(transaction.clone())))
+                .collect(),
+        }
     }
 
     /// The block whose state the replay starts from, as an RPC block tag.
@@ -1113,6 +1128,213 @@ pub struct StateBatch {
     pub storage: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub block_hashes: BTreeMap<u64, String>,
+}
+
+impl StateBatch {
+    /// Records an account as the node reported it.
+    pub fn insert_account(&mut self, address: Address, info: &AccountInfo) {
+        self.accounts.insert(
+            address_hex(address),
+            AccountState {
+                balance: format_u256_quantity(info.balance),
+                nonce: format_quantity(info.nonce),
+                code: bytes_to_prefixed_hex(
+                    info.code
+                        .as_ref()
+                        .map(|code| code.original_bytes())
+                        .unwrap_or_default()
+                        .as_ref(),
+                ),
+            },
+        );
+    }
+
+    /// Records one storage slot.
+    pub fn insert_storage(&mut self, address: Address, slot: U256, value: U256) {
+        self.storage
+            .entry(address_hex(address))
+            .or_default()
+            .insert(format_u256_quantity(slot), format_u256_quantity(value));
+    }
+
+    /// Records one block hash.
+    pub fn insert_block_hash(&mut self, number: u64, hash: B256) {
+        self.block_hashes.insert(number, b256_hex(hash));
+    }
+
+    /// How many items the batch holds, for reporting.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.accounts.len()
+            + self.storage.values().map(BTreeMap::len).sum::<usize>()
+            + self.block_hashes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The current version of the replay file format. Bump it on a breaking change.
+pub const REPLAY_BUNDLE_VERSION: u32 = 1;
+
+/// Everything a replay read from the node, so the same transaction or call replays with
+/// no node at all: the inputs, and the parent-block state the run read.
+///
+/// A replay that ran to completion over [`RpcReplayStateProvider`] or a host's
+/// [`PrefetchedReplayState`] read exactly this state, so replaying the bundle produces
+/// the same trace. It is what turns a bug into a file that can be sent along.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayBundle {
+    pub version: u32,
+    pub chain_id: u64,
+    /// The block the target ran in, carrying in full the transactions that ran before
+    /// the target, and the target itself for a mined transaction.
+    pub block: RpcBlockWithTransactions,
+    #[serde(flatten)]
+    pub target: ReplayBundleTarget,
+    pub state: StateBatch,
+}
+
+/// What a [`ReplayBundle`] replays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ReplayBundleTarget {
+    /// A mined transaction and its receipt.
+    Transaction {
+        transaction: Box<RpcTransaction>,
+        receipt: Box<RpcReceipt>,
+    },
+    /// A call placed on top of, or inside, the block.
+    Call {
+        request: SimulateCallRequest,
+        block_number: u64,
+    },
+}
+
+impl ReplayBundle {
+    /// Bundles a mined transaction with the state its replay read.
+    #[must_use]
+    pub fn for_transaction(inputs: &ReplayInputs, receipt: RpcReceipt, state: StateBatch) -> Self {
+        Self {
+            version: REPLAY_BUNDLE_VERSION,
+            chain_id: inputs.chain_id(),
+            block: inputs.block(),
+            target: ReplayBundleTarget::Transaction {
+                transaction: Box::new(inputs.transaction().clone()),
+                receipt: Box::new(receipt),
+            },
+            state,
+        }
+    }
+
+    /// Bundles a simulated call with the state its replay read.
+    #[must_use]
+    pub fn for_call(
+        inputs: &ReplayInputs,
+        request: &SimulateCallRequest,
+        state: StateBatch,
+    ) -> Self {
+        Self {
+            version: REPLAY_BUNDLE_VERSION,
+            chain_id: inputs.chain_id(),
+            block: inputs.block(),
+            target: ReplayBundleTarget::Call {
+                request: request.clone(),
+                block_number: inputs.block_number(),
+            },
+            state,
+        }
+    }
+
+    /// The replay inputs the bundle describes, validated the same way a node's answers
+    /// are.
+    pub fn inputs(&self) -> SoldbResult<ReplayInputs> {
+        if self.version != REPLAY_BUNDLE_VERSION {
+            return Err(SoldbError::Message(format!(
+                "unsupported replay file version {}; this build reads version {REPLAY_BUNDLE_VERSION}",
+                self.version
+            )));
+        }
+        match &self.target {
+            ReplayBundleTarget::Transaction { transaction, .. } => ReplayInputs::new(
+                transaction.as_ref().clone(),
+                self.block.clone(),
+                self.chain_id,
+            ),
+            ReplayBundleTarget::Call {
+                request,
+                block_number,
+            } => ReplayInputs::for_call(request, self.block.clone(), *block_number, self.chain_id),
+        }
+    }
+
+    /// Replays the bundle over the state it holds and assembles the trace, exactly as the
+    /// recording run did.
+    pub fn replay(&self) -> SoldbResult<TransactionTrace> {
+        let inputs = self.inputs()?;
+        let mut state = PrefetchedReplayState::default();
+        state.provide(&self.state)?;
+        let result = replay_debug_trace_with_state(&inputs, &state);
+        // Missing state explains a failure better than the failure does: a sender the
+        // file does not hold reads as an empty account, and REVM then reports that it
+        // cannot pay for gas.
+        let missing = state.missing();
+        if let Some(first) = missing.first() {
+            return Err(SoldbError::Message(format!(
+                "the replay file does not hold all the state this replay reads: {} item(s) missing, the first being {}",
+                missing.len(),
+                describe_request(first)
+            )));
+        }
+        let result = result?;
+        match &self.target {
+            ReplayBundleTarget::Transaction {
+                transaction,
+                receipt,
+            } => replay_transaction_trace(
+                transaction.as_ref().clone(),
+                receipt.as_ref().clone(),
+                &result,
+                self.chain_id,
+            ),
+            ReplayBundleTarget::Call { request, .. } => {
+                replay_simulation_trace(request, &result, self.chain_id)
+            }
+        }
+    }
+
+    /// One line saying what the bundle holds.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match &self.target {
+            ReplayBundleTarget::Transaction { transaction, .. } => format!(
+                "transaction {} on chain {} with {} state item(s)",
+                transaction.hash,
+                self.chain_id,
+                self.state.len()
+            ),
+            ReplayBundleTarget::Call {
+                request,
+                block_number,
+            } => format!(
+                "call to {} at block {block_number} on chain {} with {} state item(s)",
+                request.to_addr,
+                self.chain_id,
+                self.state.len()
+            ),
+        }
+    }
+}
+
+fn describe_request(request: &StateRequest) -> String {
+    match request {
+        StateRequest::Account { address } => format!("account {address}"),
+        StateRequest::Storage { address, slot } => format!("storage slot {slot} of {address}"),
+        StateRequest::BlockHash { number } => format!("the hash of block {number}"),
+    }
 }
 
 /// Parent-block state supplied up front, recording every read it cannot answer.
@@ -1861,8 +2083,9 @@ mod tests {
         replay_chain_support, replay_debug_trace_with_state, replay_full_block_transactions,
         replay_prefix_with_state, replay_simulation_trace, replay_spec_for_chain,
         replay_target_index, replay_target_with_state, replay_transaction_trace, AccountState,
-        LocalChain, PrefetchedReplayState, ReplayInputs, ReplayStateProvider, RpcBlockTransaction,
-        RpcBlockWithTransactions, SpecId, StateBatch, StateRequest,
+        LocalChain, PrefetchedReplayState, ReplayBundle, ReplayInputs, ReplayStateProvider,
+        RpcBlockTransaction, RpcBlockWithTransactions, SpecId, StateBatch, StateRequest,
+        REPLAY_BUNDLE_VERSION,
     };
     use crate::{hex_to_bytes, RpcReceipt, RpcTransaction, SimulateCallRequest};
 
@@ -2661,6 +2884,70 @@ mod tests {
         assert!(LocalChain::new()
             .with_storage(COUNTER, "0x0", "nope")
             .is_err());
+    }
+
+    #[test]
+    fn a_replay_bundle_replays_offline_and_round_trips_through_json() {
+        let tx = counter_transaction("0xaaa", "0x0", "0x0");
+        let block = counter_block(vec![serde_json::to_value(&tx).expect("tx")]);
+        let inputs = ReplayInputs::new(tx, block, 31_337).expect("inputs");
+        let state = fully_supplied_state();
+        let result = replay_debug_trace_with_state(&inputs, &state).expect("replay");
+        let receipt: RpcReceipt =
+            serde_json::from_value(json!({"gasUsed": "0x5208", "status": "0x1", "logs": []}))
+                .expect("receipt");
+        let online = replay_transaction_trace(
+            inputs.transaction().clone(),
+            receipt.clone(),
+            &result,
+            31_337,
+        )
+        .expect("trace");
+
+        let bundle = ReplayBundle::for_transaction(&inputs, receipt, state.export(&state.reads()));
+        assert_eq!(bundle.version, REPLAY_BUNDLE_VERSION);
+        assert!(!bundle.state.is_empty());
+        assert!(bundle
+            .describe()
+            .starts_with("transaction 0xaaa on chain 31337"));
+        let json = serde_json::to_string(&bundle).expect("json");
+        assert!(json.contains("\"kind\":\"transaction\""), "{json}");
+        let restored: ReplayBundle = serde_json::from_str(&json).expect("bundle");
+        assert_eq!(restored, bundle);
+        assert_eq!(restored.replay().expect("offline replay"), online);
+
+        // A bundle missing state names the first item it lacks; a newer format is refused.
+        let mut incomplete = bundle.clone();
+        incomplete.state = StateBatch::default();
+        let error = incomplete.replay().expect_err("missing state");
+        assert!(
+            error.to_string().contains("does not hold all the state"),
+            "{error}"
+        );
+        let mut future = bundle;
+        future.version = 99;
+        let error = future.replay().expect_err("future version");
+        assert!(error.to_string().contains("version 99"), "{error}");
+    }
+
+    #[test]
+    fn a_call_bundle_replays_the_call_where_it_was_placed() {
+        let request = counter_call(None);
+        let inputs =
+            ReplayInputs::for_call(&request, counter_block(Vec::new()), 1, 31_337).expect("inputs");
+        let state = fully_supplied_state();
+        let result = replay_debug_trace_with_state(&inputs, &state).expect("replay");
+        let online = replay_simulation_trace(&request, &result, 31_337).expect("trace");
+        let bundle = ReplayBundle::for_call(&inputs, &request, state.export(&state.reads()));
+        assert!(
+            bundle.describe().contains("call to"),
+            "{}",
+            bundle.describe()
+        );
+        let json = serde_json::to_string(&bundle).expect("json");
+        assert!(json.contains("\"kind\":\"call\""), "{json}");
+        let restored: ReplayBundle = serde_json::from_str(&json).expect("bundle");
+        assert_eq!(restored.replay().expect("offline replay"), online);
     }
 
     #[test]

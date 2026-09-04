@@ -47,14 +47,17 @@ mod replay;
 mod test_support;
 
 #[cfg(feature = "replay")]
-pub use replay::{simulate_call_with_replay, ReplayBackend, RpcReplayStateProvider};
+pub use replay::{
+    replay_transaction_recording, simulate_call_with_replay, simulate_call_with_replay_recording,
+    ReplayBackend, RpcReplayStateProvider,
+};
 #[cfg(feature = "replay")]
 pub use soldb_evm::{
     replay_chain_support, replay_debug_trace_with_state, replay_prefix_with_state,
     replay_simulation_trace, replay_target_with_state, replay_transaction_trace, AccountState,
-    LocalChain, PrefetchedReplayState, ReplayDbError, ReplayInputs, ReplayPrefix,
-    ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction, RpcBlockWithTransactions, StateBatch,
-    StateRequest,
+    LocalChain, PrefetchedReplayState, ReplayBundle, ReplayBundleTarget, ReplayDbError,
+    ReplayInputs, ReplayPrefix, ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction,
+    RpcBlockWithTransactions, StateBatch, StateRequest, REPLAY_BUNDLE_VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,6 +498,26 @@ fn replay_simulate_call(
     _request: &SimulateCallRequest,
 ) -> SoldbResult<TransactionTrace> {
     Err(replay_unavailable())
+}
+
+/// Replays a mined transaction and records everything it read into a [`ReplayBundle`].
+#[cfg(feature = "replay")]
+pub fn record_replay(
+    rpc_url: &str,
+    tx_hash: &str,
+) -> SoldbResult<(TransactionTrace, ReplayBundle)> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    replay::replay_transaction_recording(&client, tx_hash)
+}
+
+/// Simulates a call by replay and records everything it read into a [`ReplayBundle`].
+#[cfg(feature = "replay")]
+pub fn record_simulation_replay(
+    rpc_url: &str,
+    request: &SimulateCallRequest,
+) -> SoldbResult<(TransactionTrace, ReplayBundle)> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    replay::simulate_call_with_replay_recording(&client, request)
 }
 
 pub fn transaction_logs(rpc_url: &str, tx_hash: &str) -> SoldbResult<Vec<RpcLog>> {

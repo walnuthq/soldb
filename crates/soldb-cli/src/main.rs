@@ -147,6 +147,10 @@ enum Command {
     ListEvents(ListEventsArgs),
     #[command(about = "Trace and debug an Ethereum transaction")]
     Trace(TraceArgs),
+    #[command(
+        about = "Replay a transaction or call from a file written by --save-replay, with no node"
+    )]
+    Replay(ReplayArgs),
     #[command(about = "Run bytecode on a local chain that exists only for this run, with no node")]
     Run(RunArgs),
     #[command(about = "Profile gas by contract, function, and source line")]
@@ -273,6 +277,10 @@ struct ListEventsArgs {
 #[derive(Debug, Args)]
 struct TraceArgs {
     tx_hash: String,
+    /// Record everything the replay backend reads into FILE, so `soldb replay FILE`
+    /// reproduces this trace with no node. Implies `--backend replay`.
+    #[arg(long, value_name = "FILE")]
+    save_replay: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = TraceBackendArg::Auto)]
     backend: TraceBackendArg,
     #[arg(long = "ethdebug-dir", short = 'e')]
@@ -297,6 +305,39 @@ struct TraceArgs {
     stylus_contracts: Option<String>,
 }
 
+/// What presenting a traced transaction needs, whichever command produced the trace.
+///
+/// `trace` and `replay` share every output path; they differ in where the trace comes
+/// from, so the presentation helpers take this view rather than either command's
+/// arguments.
+#[derive(Debug, Clone)]
+struct TraceView {
+    tx_hash: String,
+    ethdebug_dir: Vec<String>,
+    contracts: Option<String>,
+    max_steps: i64,
+}
+
+impl TraceView {
+    fn for_trace(args: &TraceArgs) -> Self {
+        Self {
+            tx_hash: args.tx_hash.clone(),
+            ethdebug_dir: args.ethdebug_dir.clone(),
+            contracts: args.contracts.clone(),
+            max_steps: args.max_steps,
+        }
+    }
+
+    fn for_replay(args: &ReplayArgs, tx_hash: &str) -> Self {
+        Self {
+            tx_hash: tx_hash.to_owned(),
+            ethdebug_dir: args.ethdebug_dir.clone(),
+            contracts: args.contracts.clone(),
+            max_steps: args.max_steps,
+        }
+    }
+}
+
 /// What presenting a simulated call needs, whichever command produced it.
 ///
 /// `simulate` and `run` share every output path: source mapping, the interactive
@@ -306,6 +347,9 @@ struct TraceArgs {
 struct SimulationView {
     /// The node the call ran against, or `None` for a chain that exists only for the run.
     rpc_url: Option<String>,
+    /// The replay file the call came from, when it did not run against a node or a
+    /// local chain.
+    replayed_from: Option<PathBuf>,
     contract_address: String,
     function_signature: Option<String>,
     function_args: Vec<String>,
@@ -322,6 +366,7 @@ impl SimulationView {
     fn for_simulate(args: &SimulateArgs, contract_address: &str) -> Self {
         Self {
             rpc_url: Some(args.rpc_url.clone()),
+            replayed_from: None,
             contract_address: contract_address.to_owned(),
             function_signature: args.function_signature.clone(),
             function_args: args.function_args.clone(),
@@ -338,6 +383,7 @@ impl SimulationView {
     fn for_run(args: &RunArgs, contract_address: &str) -> Self {
         Self {
             rpc_url: None,
+            replayed_from: None,
             contract_address: contract_address.to_owned(),
             function_signature: args.function_signature.clone(),
             function_args: args.function_args.clone(),
@@ -355,6 +401,50 @@ impl SimulationView {
             max_steps: args.max_steps,
         }
     }
+
+    /// A call replayed from a recording: the request carries the calldata, and the
+    /// presentation flags come from `replay`.
+    fn for_replay(
+        args: &ReplayArgs,
+        request: &soldb_rpc::SimulateCallRequest,
+        file: &Path,
+    ) -> Self {
+        Self {
+            rpc_url: None,
+            replayed_from: Some(file.to_path_buf()),
+            contract_address: request.to_addr.clone(),
+            function_signature: None,
+            function_args: Vec::new(),
+            raw_data: Some(request.calldata.clone()),
+            ethdebug_dir: args.ethdebug_dir.clone(),
+            contracts: args.contracts.clone(),
+            interactive: args.interactive,
+            json: args.json,
+            raw: args.raw,
+            max_steps: args.max_steps,
+        }
+    }
+}
+
+/// Arguments of `soldb replay`: a file written by `--save-replay`, and how to show it.
+#[derive(Debug, Args)]
+struct ReplayArgs {
+    /// A replay file written by `trace --save-replay` or `simulate --save-replay`.
+    file: PathBuf,
+    #[arg(long = "ethdebug-dir", short = 'e')]
+    ethdebug_dir: Vec<String>,
+    #[arg(long, short = 'c')]
+    contracts: Option<String>,
+    #[arg(long)]
+    multi_contract: bool,
+    #[arg(long, short = 'm', default_value_t = 50)]
+    max_steps: i64,
+    #[arg(long, short = 'i')]
+    interactive: bool,
+    #[arg(long)]
+    raw: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -440,6 +530,10 @@ struct SimulateArgs {
     /// node's state, which works on a node that cannot trace.
     #[arg(long, value_enum, default_value_t = TraceBackendArg::DebugRpc)]
     backend: TraceBackendArg,
+    /// Record everything the replay backend reads into FILE, so `soldb replay FILE`
+    /// reproduces this simulation with no node. Implies `--backend replay`.
+    #[arg(long, value_name = "FILE")]
+    save_replay: Option<PathBuf>,
     #[arg(long, default_value = "0")]
     value: String,
     #[arg(long = "ethdebug-dir", short = 'e')]
@@ -505,6 +599,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Trace(args) => trace_command(&args),
+        Command::Replay(args) => replay_command(&args),
         Command::Profile(args) => profile::command(&args),
         Command::Simulate(args) => simulate_command(&args),
         Command::Run(args) => run_command(&args),
@@ -738,12 +833,34 @@ fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
-    let traced = soldb_rpc::trace_transaction_with_resolved_backend(
-        &args.rpc,
-        &args.tx_hash,
-        args.backend.into(),
-    )
-    .map(|resolved| resolved.trace);
+    let traced = match &args.save_replay {
+        Some(file) => {
+            if matches!(args.backend, TraceBackendArg::DebugRpc) {
+                return Err(soldb_core::SoldbError::Message(
+                    "`--save-replay` records the replay backend; drop `--backend debug-rpc`"
+                        .to_owned(),
+                ));
+            }
+            soldb_rpc::record_replay(&args.rpc, &args.tx_hash).and_then(|(trace, bundle)| {
+                write_replay_bundle(file, &bundle)?;
+                if !args.json {
+                    println!(
+                        "{} {} to {}",
+                        info("Saved"),
+                        bundle.describe(),
+                        file.display()
+                    );
+                }
+                Ok(trace)
+            })
+        }
+        None => soldb_rpc::trace_transaction_with_resolved_backend(
+            &args.rpc,
+            &args.tx_hash,
+            args.backend.into(),
+        )
+        .map(|resolved| resolved.trace),
+    };
     let trace = match traced {
         Ok(trace) => trace,
         Err(error) if args.json => {
@@ -760,24 +877,95 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
         }
         Err(error) => return Err(error),
     };
-    if args.interactive {
-        let source_indexes = interactive_trace_source_indexes(args, &trace);
+    present_trace(
+        &TraceView::for_trace(args),
+        trace,
+        args.interactive,
+        args.json,
+        args.raw,
+    )
+}
+
+/// Shows a traced transaction the way the user asked: interactively, as the web
+/// document, as raw steps, or as the summary. Shared by `trace` and `replay`.
+fn present_trace(
+    view: &TraceView,
+    trace: TransactionTrace,
+    interactive: bool,
+    json: bool,
+    raw: bool,
+) -> SoldbResult<()> {
+    if interactive {
+        let source_indexes = interactive_trace_source_indexes(view, &trace);
         run_interactive_debugger(trace, "Transaction trace debugger", source_indexes)?;
-    } else if args.json {
+    } else if json {
         println!(
             "{}",
             soldb_serializer::trace_to_web_json_with_contracts(
                 &trace,
-                trace_web_contracts(args, &trace)
+                trace_web_contracts(view, &trace)
             )?
         );
-    } else if args.raw {
-        print_raw_trace(&trace, args);
+    } else if raw {
+        print_raw_trace(&trace, view);
     } else {
-        print_trace_summary(&trace, args);
+        print_trace_summary(&trace, view);
     }
 
     Ok(())
+}
+
+/// Replays a recording with no node and shows it as `trace` or `simulate` would have.
+fn replay_command(args: &ReplayArgs) -> SoldbResult<()> {
+    let bundle = read_replay_bundle(&args.file)?;
+    if !args.json {
+        println!(
+            "{} {} from {}; no node involved",
+            info("Replaying"),
+            bundle.describe(),
+            args.file.display()
+        );
+    }
+    let trace = bundle.replay()?;
+    match &bundle.target {
+        soldb_rpc::ReplayBundleTarget::Transaction { transaction, .. } => present_trace(
+            &TraceView::for_replay(args, &transaction.hash),
+            trace,
+            args.interactive,
+            args.json,
+            args.raw,
+        ),
+        soldb_rpc::ReplayBundleTarget::Call { request, .. } => {
+            let view = SimulationView::for_replay(args, request, &args.file);
+            present_simulation(&view, trace, None, &request.calldata)
+        }
+    }
+}
+
+fn write_replay_bundle(path: &Path, bundle: &soldb_rpc::ReplayBundle) -> SoldbResult<()> {
+    let json = serde_json::to_string_pretty(bundle)
+        .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?;
+    fs::write(path, json).map_err(|error| {
+        soldb_core::SoldbError::Message(format!(
+            "could not write the replay file `{}`: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_replay_bundle(path: &Path) -> SoldbResult<soldb_rpc::ReplayBundle> {
+    let content = fs::read_to_string(path).map_err(|error| {
+        soldb_core::SoldbError::Message(format!(
+            "could not read the replay file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&content).map_err(|error| {
+        soldb_core::SoldbError::Message(format!(
+            "`{}` is not a replay file written by `--save-replay`: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
@@ -814,8 +1002,26 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
         block: args.block,
         tx_index: args.tx_index,
     };
-    let trace =
-        soldb_rpc::simulate_call_with_backend(&args.rpc_url, &request, args.backend.into())?;
+    let trace = match &args.save_replay {
+        // Recording means replaying, whatever backend the flag names: a call has no
+        // mined result, so replay is the only backend that can be recorded.
+        Some(file) => {
+            let (trace, bundle) = soldb_rpc::record_simulation_replay(&args.rpc_url, &request)?;
+            write_replay_bundle(file, &bundle)?;
+            if !args.json {
+                println!(
+                    "{} {} to {}",
+                    info("Saved"),
+                    bundle.describe(),
+                    file.display()
+                );
+            }
+            trace
+        }
+        None => {
+            soldb_rpc::simulate_call_with_backend(&args.rpc_url, &request, args.backend.into())?
+        }
+    };
     present_simulation(&view, trace, contract_name.as_deref(), &calldata)
 }
 
@@ -1069,7 +1275,7 @@ fn print_simulation_interactive_prelude(
 }
 
 fn interactive_trace_source_indexes(
-    args: &TraceArgs,
+    args: &TraceView,
     trace: &TransactionTrace,
 ) -> Vec<TraceSourceIndex> {
     let contract_address = trace.to_addr.as_ref().or(trace.contract_address.as_ref());
@@ -1797,7 +2003,7 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
     Ok(())
 }
 
-fn print_trace_summary(trace: &TransactionTrace, args: &TraceArgs) {
+fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
     let Some(spec) = trace_contract_spec(args) else {
         print_plain_trace_summary(trace);
         return;
@@ -1896,7 +2102,7 @@ fn print_trace_backend_details(trace: &TransactionTrace) {
     }
 }
 
-fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
+fn print_raw_trace(trace: &TransactionTrace, args: &TraceView) {
     println!(
         "{} {}",
         info("Loading transaction"),
@@ -1991,11 +2197,21 @@ fn print_simulation_summary(
         .or_else(|| simulate_contract_name(args))
         .unwrap_or_else(|| contract_address.to_owned());
     let has_debug_info = !args.ethdebug_dir.is_empty() || args.contracts.is_some();
-    if !has_debug_info {
-        match &args.rpc_url {
-            Some(rpc_url) => println!("{} {}", info("Connecting to RPC:"), address_color(rpc_url)),
-            None => println!("{}", info("Running on a local chain; no node involved")),
+    // Where the call ran is worth a line whenever no node was involved; the node's URL
+    // is only interesting when nothing else identifies the session.
+    match (&args.rpc_url, &args.replayed_from) {
+        (Some(rpc_url), _) if !has_debug_info => {
+            println!("{} {}", info("Connecting to RPC:"), address_color(rpc_url));
         }
+        (Some(_), _) => {}
+        (None, Some(file)) => println!(
+            "{} {}; no node involved",
+            info("Replayed from"),
+            file.display()
+        ),
+        (None, None) => println!("{}", info("Running on a local chain; no node involved")),
+    }
+    if !has_debug_info {
         if let Some(signature) = &args.function_signature {
             println!(
                 "{} {}",
@@ -2764,7 +2980,7 @@ fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
     )?)
 }
 
-fn trace_event_registry(args: &TraceArgs) -> EventRegistry {
+fn trace_event_registry(args: &TraceView) -> EventRegistry {
     event_registry_reporting(resolve_contract_specs_reporting(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
@@ -3146,7 +3362,7 @@ fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::p
 }
 
 fn trace_web_contracts(
-    args: &TraceArgs,
+    args: &TraceView,
     trace: &TransactionTrace,
 ) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
     let specs = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref());
@@ -3221,11 +3437,11 @@ fn normalize_contract_address_key(address: &str) -> String {
     address.to_ascii_lowercase()
 }
 
-fn trace_contract_name(args: &TraceArgs) -> Option<String> {
+fn trace_contract_name(args: &TraceView) -> Option<String> {
     trace_contract_spec(args).map(|spec| spec.name)
 }
 
-fn trace_contract_spec(args: &TraceArgs) -> Option<ResolvedContractSpec> {
+fn trace_contract_spec(args: &TraceView) -> Option<ResolvedContractSpec> {
     resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
         .into_iter()
         .next()
@@ -3607,6 +3823,7 @@ mod tests {
     fn simulate_args() -> SimulateArgs {
         SimulateArgs {
             backend: TraceBackendArg::DebugRpc,
+            save_replay: None,
             from_addr: "0x1".to_owned(),
             interactive: false,
             contract_address: "0x2".to_owned(),
@@ -4287,19 +4504,11 @@ contract Counter {
         assert!(!metadata.is_legacy);
         assert_eq!(metadata.compiler_version.as_deref(), Some("0.8.31"));
 
-        let trace_args = TraceArgs {
+        let trace_args = TraceView {
             tx_hash: "0xabc".to_owned(),
-            backend: TraceBackendArg::DebugRpc,
             ethdebug_dir: vec![format!("0x2:Legacy:{}", dir.display())],
             contracts: None,
-            multi_contract: false,
-            rpc: "http://localhost:8545".to_owned(),
             max_steps: 1,
-            interactive: false,
-            raw: false,
-            json: false,
-            cross_env_bridge: None,
-            stylus_contracts: None,
         };
         let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
         print_plain_trace_summary(&trace);

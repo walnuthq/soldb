@@ -6,8 +6,8 @@ Guidance for AI coding agents working in this repository.
 
 SolDB is an ETHDebug-first, LLDB-style debugger for Solidity and the EVM, written in
 Rust. It maps EVM execution back to Solidity source using compiler-generated debug
-information, and exposes that as a CLI (`trace`, `simulate`, `run`, `list-events`,
-`list-contracts`, `bridge`), an interactive REPL, a versioned JSON document for web
+information, and exposes that as a CLI (`trace`, `simulate`, `run`, `replay`,
+`list-events`, `list-contracts`, `bridge`), an interactive REPL, a versioned JSON document for web
 clients, a DAP server for editors, and a WebAssembly module for browser and Node.js
 hosts.
 
@@ -135,8 +135,10 @@ belongs in `soldb-debugger`, not in a second copy.
   transaction and its block, `replay_prefix_with_state` and `replay_target_with_state`
   run REVM over any `ReplayStateProvider`, `PrefetchedReplayState` is the provider a host
   fills in rounds (it records every read so a completed run can export exactly the state
-  it used), and `LocalChain` is the synthetic chain `soldb run` executes on. A
-  `ReplayPrefix` is reusable only after a run that recorded nothing missing.
+  it used), `LocalChain` is the synthetic chain `soldb run` executes on, and
+  `ReplayBundle` is a completed replay's inputs and state as one serializable value, which
+  `--save-replay` writes and `soldb replay` runs with no node. A `ReplayPrefix` is
+  reusable only after a run that recorded nothing missing.
   `replay_chain_support` decides per chain id whether the engine models the chain,
   runs it under Ethereum rules with a capability note, or refuses it; extend the tables
   there rather than letting an unknown chain replay silently wrong. Nothing in this crate

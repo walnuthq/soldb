@@ -22,9 +22,9 @@ use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
 use soldb_evm::{
     account_info_from_rpc, format_quantity, format_u256_quantity, parse_address, parse_b256,
     parse_quantity, parse_u256_quantity, replay_debug_trace_with_state, replay_simulation_trace,
-    replay_transaction_trace, AccountInfo, Address, DebugTraceResult, ReplayDbError, ReplayInputs,
-    ReplayStateProvider, RpcBlockHeader, RpcBlockWithTransactions, RpcReceipt, RpcTransaction,
-    SimulateCallRequest, B256, U256,
+    replay_transaction_trace, AccountInfo, Address, DebugTraceResult, ReplayBundle, ReplayDbError,
+    ReplayInputs, ReplayStateProvider, RpcBlockHeader, RpcBlockWithTransactions, RpcReceipt,
+    RpcTransaction, SimulateCallRequest, StateBatch, B256, U256,
 };
 
 use crate::{HttpJsonRpcClient, TransactionTraceBackend};
@@ -50,14 +50,7 @@ fn replay_transaction_with_client(
     client: &HttpJsonRpcClient,
     tx_hash: &str,
 ) -> SoldbResult<TransactionTrace> {
-    let tx = client
-        .request::<Option<RpcTransaction>>("eth_getTransactionByHash", json!([tx_hash]))?
-        .ok_or_else(|| SoldbError::Message(format!("Transaction not found: {tx_hash}")))?;
-
-    let receipt = client
-        .request::<Option<RpcReceipt>>("eth_getTransactionReceipt", json!([tx_hash]))?
-        .ok_or_else(|| SoldbError::Message(format!("Transaction receipt not found: {tx_hash}")))?;
-
+    let (tx, receipt) = fetch_transaction_and_receipt(client, tx_hash)?;
     let replayed = replay_debug_trace(client, &tx)?;
     replay_transaction_trace(
         tx,
@@ -67,6 +60,38 @@ fn replay_transaction_with_client(
     )
 }
 
+/// Replays a mined transaction and returns, with the trace, a [`ReplayBundle`] holding
+/// everything the replay read, so the same trace can be produced later with no node.
+pub fn replay_transaction_recording(
+    client: &HttpJsonRpcClient,
+    tx_hash: &str,
+) -> SoldbResult<(TransactionTrace, ReplayBundle)> {
+    let (tx, receipt) = fetch_transaction_and_receipt(client, tx_hash)?;
+    let replayed = replay_debug_trace(client, &tx)?;
+    let trace = replay_transaction_trace(
+        tx,
+        receipt.clone(),
+        &replayed.debug_result,
+        replayed.inputs.chain_id(),
+    )?;
+    let bundle =
+        ReplayBundle::for_transaction(&replayed.inputs, receipt, replayed.provider.export());
+    Ok((trace, bundle))
+}
+
+fn fetch_transaction_and_receipt(
+    client: &HttpJsonRpcClient,
+    tx_hash: &str,
+) -> SoldbResult<(RpcTransaction, RpcReceipt)> {
+    let tx = client
+        .request::<Option<RpcTransaction>>("eth_getTransactionByHash", json!([tx_hash]))?
+        .ok_or_else(|| SoldbError::Message(format!("Transaction not found: {tx_hash}")))?;
+    let receipt = client
+        .request::<Option<RpcReceipt>>("eth_getTransactionReceipt", json!([tx_hash]))?
+        .ok_or_else(|| SoldbError::Message(format!("Transaction receipt not found: {tx_hash}")))?;
+    Ok((tx, receipt))
+}
+
 /// Simulates a call by re-executing it locally over state read from the node, for nodes
 /// that do not answer `debug_traceCall`. See [`ReplayInputs::for_call`] for where the
 /// call is placed.
@@ -74,6 +99,27 @@ pub fn simulate_call_with_replay(
     client: &HttpJsonRpcClient,
     request: &SimulateCallRequest,
 ) -> SoldbResult<TransactionTrace> {
+    let replayed = replay_call(client, request)?;
+    replay_simulation_trace(request, &replayed.debug_result, replayed.inputs.chain_id())
+}
+
+/// Simulates a call by replay and returns, with the trace, a [`ReplayBundle`] holding
+/// everything the replay read.
+pub fn simulate_call_with_replay_recording(
+    client: &HttpJsonRpcClient,
+    request: &SimulateCallRequest,
+) -> SoldbResult<(TransactionTrace, ReplayBundle)> {
+    let replayed = replay_call(client, request)?;
+    let trace =
+        replay_simulation_trace(request, &replayed.debug_result, replayed.inputs.chain_id())?;
+    let bundle = ReplayBundle::for_call(&replayed.inputs, request, replayed.provider.export());
+    Ok((trace, bundle))
+}
+
+fn replay_call(
+    client: &HttpJsonRpcClient,
+    request: &SimulateCallRequest,
+) -> SoldbResult<ReplayedTransaction> {
     let block_number = match request.block {
         Some(block) => block,
         None => {
@@ -99,14 +145,17 @@ pub fn simulate_call_with_replay(
     let provider = RpcReplayStateProvider::new(client.clone(), inputs.parent_block_tag());
     replay_preflight_parent_state(&provider, inputs.transaction())?;
     let debug_result = replay_debug_trace_with_state(&inputs, &provider)?;
-    replay_simulation_trace(request, &debug_result, chain_id)
+    Ok(ReplayedTransaction {
+        inputs,
+        provider,
+        debug_result,
+    })
 }
 
 /// A mined transaction replayed over the node's state: what was fetched, the provider that
 /// read the state, and the execution.
 struct ReplayedTransaction {
     inputs: ReplayInputs,
-    #[allow(dead_code)]
     provider: RpcReplayStateProvider,
     debug_result: DebugTraceResult,
 }
@@ -226,6 +275,25 @@ struct RpcReplayStateProviderInner {
 }
 
 impl RpcReplayStateProvider {
+    /// Everything read so far, as a batch a [`ReplayBundle`] or a
+    /// `PrefetchedReplayState` can replay from. After a completed run this is exactly
+    /// the state the run used.
+    #[must_use]
+    pub fn export(&self) -> StateBatch {
+        let inner = self.inner.borrow();
+        let mut batch = StateBatch::default();
+        for (address, info) in &inner.accounts {
+            batch.insert_account(*address, info);
+        }
+        for ((address, slot), value) in &inner.storage {
+            batch.insert_storage(*address, *slot, *value);
+        }
+        for (number, hash) in &inner.block_hashes {
+            batch.insert_block_hash(*number, *hash);
+        }
+        batch
+    }
+
     #[must_use]
     pub fn new(client: HttpJsonRpcClient, block_tag: String) -> Self {
         Self {
@@ -593,6 +661,19 @@ mod tests {
             provider.block_hash(7).expect("cached block hash"),
             provider.block_hash(7).expect("cached block hash again")
         );
+        // Everything read is exportable, keyed the way a host would supply it.
+        let exported = provider.export();
+        assert_eq!(exported.accounts.len(), 1);
+        assert_eq!(
+            exported
+                .storage
+                .get("0x5fbdb2315678afecb367f032d93f642f64180aa3")
+                .and_then(|slots| slots.get("0x1"))
+                .map(String::as_str),
+            Some("0x2a")
+        );
+        assert_eq!(exported.block_hashes.len(), 1);
+        assert_eq!(exported.len(), 3);
 
         let methods: Vec<String> = rx.try_iter().collect();
         assert_eq!(count_method(&methods, "eth_getBalance"), 1, "{methods:?}");
