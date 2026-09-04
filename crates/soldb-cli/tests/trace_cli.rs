@@ -1418,12 +1418,7 @@ fn decoded_balance_updated_log() -> serde_json::Value {
 }
 
 fn write_balance_updated_abi() -> (PathBuf, String) {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("soldb-cli-abi-{unique}"));
-    fs::create_dir_all(&dir).expect("create abi dir");
+    let dir = temp_dir("abi");
     fs::write(dir.join("TestContract.abi"), BALANCE_UPDATED_ABI).expect("write abi");
     let spec = format!("0x2:TestContract:{}", dir.display());
     (dir, spec)
@@ -1576,11 +1571,19 @@ EOF
 }
 
 fn temp_dir(label: &str) -> PathBuf {
+    // Tests run in parallel and two can read the clock in the same tick, so a counter
+    // keeps the directories apart; one test removing a directory another is using looked
+    // like a flaky decoder.
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("soldb-cli-{label}-{unique}"));
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "soldb-cli-{label}-{}-{unique}-{sequence}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }

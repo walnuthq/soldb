@@ -220,8 +220,11 @@ impl Replay {
                 self.inputs.transaction().clone(),
                 receipt.clone(),
                 &debug_result,
+                self.inputs.chain_id(),
             )?,
-            ReplayTarget::Call { request } => replay_simulation_trace(request, &debug_result)?,
+            ReplayTarget::Call { request } => {
+                replay_simulation_trace(request, &debug_result, self.inputs.chain_id())?
+            }
         });
         Ok(ReplayStatus::Complete)
     }

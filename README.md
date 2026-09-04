@@ -226,7 +226,7 @@ The `trace` command supports three backend modes:
 
 - `auto` (default): tries `debug-rpc` first, then falls back to `replay` when the node reports that `debug_traceTransaction` is unavailable.
 - `debug-rpc`: calls `debug_traceTransaction` and is the fast path for Anvil, Geth, and other debug-capable nodes.
-- `replay`: loads transaction, receipt, parent-block state, bytecode, balances, nonces, and storage through normal Ethereum JSON-RPC, replays prior transactions in the block when needed, then replays the target transaction in REVM with inspectors. It selects the REVM spec from chain/block/timestamp for mainnet, Sepolia, Holesky, and Hoodi; archive-provider hardening and broader cache tuning are next-stage work.
+- `replay`: loads transaction, receipt, parent-block state, bytecode, balances, nonces, and storage through normal Ethereum JSON-RPC, replays prior transactions in the block when needed, then replays the target transaction in REVM with inspectors. It selects the REVM spec from chain/block/timestamp for mainnet, Sepolia, Holesky, and Hoodi. EVM-equivalent chains such as the OP stack, Base, BNB Smart Chain, or Polygon PoS replay under Ethereum rules at the latest fork, and the trace carries a note that their fee and gas accounting is not modelled; chains whose execution differs from the EVM (Arbitrum, zkSync Era, Polygon zkEVM) are refused with a message naming the chain, so a wrong replay never passes for a right one. Archive-provider hardening and broader cache tuning are next-stage work.
 
 Select the backend explicitly:
 

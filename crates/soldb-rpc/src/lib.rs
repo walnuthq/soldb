@@ -50,10 +50,11 @@ mod test_support;
 pub use replay::{simulate_call_with_replay, ReplayBackend, RpcReplayStateProvider};
 #[cfg(feature = "replay")]
 pub use soldb_evm::{
-    replay_debug_trace_with_state, replay_prefix_with_state, replay_simulation_trace,
-    replay_target_with_state, replay_transaction_trace, AccountState, LocalChain,
-    PrefetchedReplayState, ReplayDbError, ReplayInputs, ReplayPrefix, ReplayStateProvider,
-    RpcBlockHeader, RpcBlockTransaction, RpcBlockWithTransactions, StateBatch, StateRequest,
+    replay_chain_support, replay_debug_trace_with_state, replay_prefix_with_state,
+    replay_simulation_trace, replay_target_with_state, replay_transaction_trace, AccountState,
+    LocalChain, PrefetchedReplayState, ReplayDbError, ReplayInputs, ReplayPrefix,
+    ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction, RpcBlockWithTransactions, StateBatch,
+    StateRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

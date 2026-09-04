@@ -98,7 +98,7 @@ pub enum RpcBlockTransaction {
     Hash(String),
 }
 
-fn replay_capabilities() -> TraceCapabilities {
+fn replay_capabilities(chain_id: u64) -> TraceCapabilities {
     TraceCapabilities {
         opcode_steps: true,
         stack: true,
@@ -111,8 +111,86 @@ fn replay_capabilities() -> TraceCapabilities {
         revert_data: true,
         gas_details: true,
         account_changes: true,
-        notes: Vec::new(),
+        notes: replay_chain_support(chain_id).unwrap_or_default(),
     }
+}
+
+/// How the engine relates to a chain.
+///
+/// `Ok(notes)` means the chain executes under the rules the engine implements, with
+/// `notes` naming anything a user should know: a chain it knows only as EVM-equivalent
+/// runs under Ethereum rules at the latest fork, so fee and gas accounting and
+/// chain-specific precompiles are not modelled. `Err` names a chain whose execution
+/// itself differs from the EVM the engine implements, which a replay would get wrong
+/// silently; the node's own tracer is the honest tool there.
+pub fn replay_chain_support(chain_id: u64) -> Result<Vec<String>, String> {
+    if let Some((name, reason)) = unmodelled_chain(chain_id) {
+        return Err(format!(
+            "the replay backend does not model {name} (chain id {chain_id}): {reason}; use `--backend debug-rpc` against a node that can trace"
+        ));
+    }
+    if MODELLED_CHAINS.contains(&chain_id) {
+        return Ok(Vec::new());
+    }
+    Ok(vec![match evm_equivalent_chain(chain_id) {
+        Some(name) => format!(
+            "{name} (chain id {chain_id}) is replayed with Ethereum mainnet rules at the latest fork; its fee and gas accounting and chain-specific precompiles are not modelled, so gas figures may differ from the node"
+        ),
+        None => format!(
+            "chain id {chain_id} is not known to the replay engine; it is replayed with Ethereum mainnet rules at the latest fork"
+        ),
+    }])
+}
+
+/// Chains whose fork schedule the engine selects exactly: Ethereum, its testnets, and
+/// the development chains.
+const MODELLED_CHAINS: [u64; 6] = [1, 11_155_111, 17_000, 560_048, 1_337, 31_337];
+
+/// Chains that execute EVM bytecode under Ethereum rules but account for gas and fees
+/// differently or add precompiles.
+fn evm_equivalent_chain(chain_id: u64) -> Option<&'static str> {
+    Some(match chain_id {
+        10 => "OP Mainnet",
+        11_155_420 => "OP Sepolia",
+        8_453 => "Base",
+        84_532 => "Base Sepolia",
+        7_777_777 => "Zora",
+        34_443 => "Mode",
+        81_457 => "Blast",
+        5_000 => "Mantle",
+        56 => "BNB Smart Chain",
+        97 => "BNB Smart Chain Testnet",
+        137 => "Polygon PoS",
+        80_002 => "Polygon Amoy",
+        43_114 => "Avalanche C-Chain",
+        43_113 => "Avalanche Fuji",
+        100 => "Gnosis",
+        10_200 => "Gnosis Chiado",
+        59_144 => "Linea",
+        59_141 => "Linea Sepolia",
+        534_352 => "Scroll",
+        534_351 => "Scroll Sepolia",
+        42_220 => "Celo",
+        _ => return None,
+    })
+}
+
+/// Chains whose execution the engine cannot reproduce: different bytecode, opcodes, or
+/// precompile behaviour that a replay would get wrong without noticing.
+fn unmodelled_chain(chain_id: u64) -> Option<(&'static str, &'static str)> {
+    const ARBITRUM: &str = "ArbOS adds precompiles and changes gas and some opcode semantics";
+    const ZKSYNC: &str = "it does not execute EVM bytecode";
+    const ZKEVM: &str = "its zkEVM diverges from the EVM in opcodes and precompiles";
+    Some(match chain_id {
+        42_161 => ("Arbitrum One", ARBITRUM),
+        42_170 => ("Arbitrum Nova", ARBITRUM),
+        421_614 => ("Arbitrum Sepolia", ARBITRUM),
+        324 => ("zkSync Era", ZKSYNC),
+        300 => ("zkSync Era Sepolia", ZKSYNC),
+        1_101 => ("Polygon zkEVM", ZKEVM),
+        2_442 => ("Polygon zkEVM Cardona", ZKEVM),
+        _ => return None,
+    })
 }
 
 /// Assembles the `replay` trace of a mined transaction from its RPC transaction, its
@@ -125,6 +203,7 @@ pub fn replay_transaction_trace(
     tx: RpcTransaction,
     receipt: RpcReceipt,
     debug_result: &DebugTraceResult,
+    chain_id: u64,
 ) -> SoldbResult<TransactionTrace> {
     let envelope = TraceEnvelope {
         tx_hash: Some(tx.hash),
@@ -138,7 +217,7 @@ pub fn replay_transaction_trace(
         debug_trace_available: true,
         debug_error: None,
         backend: Some(TraceBackend::Replay.as_str().to_owned()),
-        capabilities: replay_capabilities(),
+        capabilities: replay_capabilities(chain_id),
     };
     Ok(build_transaction_trace(envelope, debug_result))
 }
@@ -148,10 +227,11 @@ pub fn replay_transaction_trace(
 pub fn replay_simulation_trace(
     request: &SimulateCallRequest,
     debug_result: &DebugTraceResult,
+    chain_id: u64,
 ) -> SoldbResult<TransactionTrace> {
     crate::simulation_trace(
         TraceBackend::Replay,
-        replay_capabilities(),
+        replay_capabilities(chain_id),
         request,
         debug_result,
     )
@@ -525,7 +605,8 @@ impl LocalChain {
             contract_address: Some(Self::created_address(&deployment.from_addr, nonce)?),
             logs: Vec::new(),
         };
-        let mut trace = replay_transaction_trace(deployment.clone(), receipt, &result)?;
+        let mut trace =
+            replay_transaction_trace(deployment.clone(), receipt, &result, self.chain_id)?;
         // Nothing was mined, so there is no hash to report.
         trace.tx_hash = None;
         Ok(trace)
@@ -550,7 +631,7 @@ impl LocalChain {
         )?;
         let state = self.state()?;
         let result = replay_debug_trace_with_state(&inputs, &state)?;
-        replay_simulation_trace(&request, &result)
+        replay_simulation_trace(&request, &result, self.chain_id)
     }
 
     /// The synthetic block the run happens in, carrying `transactions` in full.
@@ -625,6 +706,7 @@ pub fn replay_prefix_with_state<P: ReplayStateProvider>(
     inputs: &ReplayInputs,
     provider: &P,
 ) -> SoldbResult<ReplayPrefix> {
+    replay_chain_support(inputs.chain_id).map_err(SoldbError::Message)?;
     let cache_db = CacheDB::new(WrapDatabaseRef(ReplayStateDb::new(provider)));
     if inputs.target_index == 0 {
         return Ok(ReplayPrefix {
@@ -1775,12 +1857,12 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        account_info_from_rpc, empty_account, parse_address, replay_debug_trace_with_state,
-        replay_full_block_transactions, replay_prefix_with_state, replay_simulation_trace,
-        replay_spec_for_chain, replay_target_index, replay_target_with_state,
-        replay_transaction_trace, AccountState, LocalChain, PrefetchedReplayState, ReplayInputs,
-        ReplayStateProvider, RpcBlockTransaction, RpcBlockWithTransactions, SpecId, StateBatch,
-        StateRequest,
+        account_info_from_rpc, empty_account, parse_address, replay_capabilities,
+        replay_chain_support, replay_debug_trace_with_state, replay_full_block_transactions,
+        replay_prefix_with_state, replay_simulation_trace, replay_spec_for_chain,
+        replay_target_index, replay_target_with_state, replay_transaction_trace, AccountState,
+        LocalChain, PrefetchedReplayState, ReplayInputs, ReplayStateProvider, RpcBlockTransaction,
+        RpcBlockWithTransactions, SpecId, StateBatch, StateRequest,
     };
     use crate::{hex_to_bytes, RpcReceipt, RpcTransaction, SimulateCallRequest};
 
@@ -2214,8 +2296,9 @@ mod tests {
             "status": "0x1"
         }))
         .expect("receipt");
-        let trace = replay_transaction_trace(inputs.transaction().clone(), receipt, &result)
-            .expect("trace");
+        let trace =
+            replay_transaction_trace(inputs.transaction().clone(), receipt, &result, 31_337)
+                .expect("trace");
         assert_eq!(trace.backend.as_deref(), Some("replay"));
         assert!(trace.success);
         assert!(trace.capabilities.storage_diff);
@@ -2401,7 +2484,7 @@ mod tests {
         assert_eq!(steps[4].snapshot.storage["0x0"], "0x29");
         assert_eq!(steps[8].snapshot.storage["0x0"], "0x2a");
 
-        let trace = replay_simulation_trace(&counter_call(None), &result).expect("trace");
+        let trace = replay_simulation_trace(&counter_call(None), &result, 31_337).expect("trace");
         assert_eq!(trace.tx_hash, None);
         assert_eq!(trace.from_addr, SENDER);
         assert_eq!(trace.to_addr.as_deref(), Some(COUNTER));
@@ -2578,6 +2661,52 @@ mod tests {
         assert!(LocalChain::new()
             .with_storage(COUNTER, "0x0", "nope")
             .is_err());
+    }
+
+    #[test]
+    fn chain_support_names_what_the_engine_models() {
+        assert_eq!(replay_chain_support(1), Ok(Vec::new()));
+        assert_eq!(replay_chain_support(11_155_111), Ok(Vec::new()));
+        assert_eq!(replay_chain_support(31_337), Ok(Vec::new()));
+
+        let notes = replay_chain_support(10).expect("EVM-equivalent chains run");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("OP Mainnet (chain id 10)"),
+            "{}",
+            notes[0]
+        );
+        assert!(notes[0].contains("gas figures may differ"), "{}", notes[0]);
+        let notes = replay_chain_support(424_242).expect("unknown chains run");
+        assert!(
+            notes[0].contains("chain id 424242 is not known to the replay engine"),
+            "{}",
+            notes[0]
+        );
+
+        let error = replay_chain_support(42_161).expect_err("Arbitrum is refused");
+        assert!(error.contains("Arbitrum One (chain id 42161)"), "{error}");
+        assert!(error.contains("`--backend debug-rpc`"), "{error}");
+        assert!(replay_chain_support(324).is_err());
+        assert!(replay_chain_support(1_101).is_err());
+
+        // The notes travel with the trace so a client can show them.
+        assert!(replay_capabilities(1).notes.is_empty());
+        assert_eq!(replay_capabilities(8_453).notes.len(), 1);
+    }
+
+    #[test]
+    fn unmodelled_chains_are_refused_before_execution() {
+        let tx = counter_transaction("0xaaa", "0x0", "0x0");
+        let block = counter_block(vec![serde_json::to_value(&tx).expect("tx")]);
+        let inputs = ReplayInputs::new(tx, block, 42_161).expect("inputs");
+        let error = replay_debug_trace_with_state(&inputs, &fully_supplied_state())
+            .expect_err("Arbitrum execution is not modelled");
+        assert!(error.to_string().contains("Arbitrum One"), "{error}");
+        assert!(
+            replay_prefix_with_state(&inputs, &fully_supplied_state()).is_err(),
+            "the check guards the first phase a host runs"
+        );
     }
 
     #[test]

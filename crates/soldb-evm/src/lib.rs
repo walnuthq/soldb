@@ -32,11 +32,11 @@ mod replay;
 
 #[cfg(feature = "replay")]
 pub use replay::{
-    account_info_from_rpc, parse_address, parse_b256, replay_debug_trace_with_state,
-    replay_prefix_with_state, replay_simulation_trace, replay_target_with_state,
-    replay_transaction_trace, AccountState, LocalChain, PrefetchedReplayState, ReplayDbError,
-    ReplayInputs, ReplayPrefix, ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction,
-    RpcBlockWithTransactions, StateBatch, StateRequest,
+    account_info_from_rpc, parse_address, parse_b256, replay_chain_support,
+    replay_debug_trace_with_state, replay_prefix_with_state, replay_simulation_trace,
+    replay_target_with_state, replay_transaction_trace, AccountState, LocalChain,
+    PrefetchedReplayState, ReplayDbError, ReplayInputs, ReplayPrefix, ReplayStateProvider,
+    RpcBlockHeader, RpcBlockTransaction, RpcBlockWithTransactions, StateBatch, StateRequest,
 };
 #[cfg(feature = "replay")]
 pub use revm::primitives::{Address, B256};

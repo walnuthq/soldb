@@ -58,8 +58,13 @@ fn replay_transaction_with_client(
         .request::<Option<RpcReceipt>>("eth_getTransactionReceipt", json!([tx_hash]))?
         .ok_or_else(|| SoldbError::Message(format!("Transaction receipt not found: {tx_hash}")))?;
 
-    let debug_result = replay_debug_trace(client, &tx)?;
-    replay_transaction_trace(tx, receipt, &debug_result)
+    let replayed = replay_debug_trace(client, &tx)?;
+    replay_transaction_trace(
+        tx,
+        receipt,
+        &replayed.debug_result,
+        replayed.inputs.chain_id(),
+    )
 }
 
 /// Simulates a call by re-executing it locally over state read from the node, for nodes
@@ -94,17 +99,31 @@ pub fn simulate_call_with_replay(
     let provider = RpcReplayStateProvider::new(client.clone(), inputs.parent_block_tag());
     replay_preflight_parent_state(&provider, inputs.transaction())?;
     let debug_result = replay_debug_trace_with_state(&inputs, &provider)?;
-    replay_simulation_trace(request, &debug_result)
+    replay_simulation_trace(request, &debug_result, chain_id)
+}
+
+/// A mined transaction replayed over the node's state: what was fetched, the provider that
+/// read the state, and the execution.
+struct ReplayedTransaction {
+    inputs: ReplayInputs,
+    #[allow(dead_code)]
+    provider: RpcReplayStateProvider,
+    debug_result: DebugTraceResult,
 }
 
 fn replay_debug_trace(
     client: &HttpJsonRpcClient,
     tx: &RpcTransaction,
-) -> SoldbResult<DebugTraceResult> {
+) -> SoldbResult<ReplayedTransaction> {
     let inputs = fetch_replay_inputs(client, tx)?;
-    let state_provider = RpcReplayStateProvider::new(client.clone(), inputs.parent_block_tag());
-    replay_preflight_parent_state(&state_provider, tx)?;
-    replay_debug_trace_with_state(&inputs, &state_provider)
+    let provider = RpcReplayStateProvider::new(client.clone(), inputs.parent_block_tag());
+    replay_preflight_parent_state(&provider, tx)?;
+    let debug_result = replay_debug_trace_with_state(&inputs, &provider)?;
+    Ok(ReplayedTransaction {
+        inputs,
+        provider,
+        debug_result,
+    })
 }
 
 /// Gathers a mined transaction's replay inputs over RPC: its chain id and the block it

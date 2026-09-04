@@ -136,8 +136,11 @@ belongs in `soldb-debugger`, not in a second copy.
   run REVM over any `ReplayStateProvider`, `PrefetchedReplayState` is the provider a host
   fills in rounds (it records every read so a completed run can export exactly the state
   it used), and `LocalChain` is the synthetic chain `soldb run` executes on. A
-  `ReplayPrefix` is reusable only after a run that recorded nothing missing. Nothing in
-  this crate may open a socket, spawn a process, or read a file.
+  `ReplayPrefix` is reusable only after a run that recorded nothing missing.
+  `replay_chain_support` decides per chain id whether the engine models the chain,
+  runs it under Ethereum rules with a capability note, or refuses it; extend the tables
+  there rather than letting an unknown chain replay silently wrong. Nothing in this crate
+  may open a socket, spawn a process, or read a file.
 - **soldb-rpc**: the JSON-RPC transport and everything that needs a node: the `debug-rpc`
   backend, `debug_traceCall` simulation, log retrieval, and the node side of the `replay`
   backend in its own `replay.rs` (fetching a transaction's inputs, the lazy
