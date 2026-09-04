@@ -19,9 +19,11 @@
 //! backend, and the state provider that reads a node lazily.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use soldb_core::{
     ExecutionLog, GasSummary, SoldbError, SoldbResult, StepSnapshot, StorageChange, TraceArtifacts,
@@ -84,10 +86,14 @@ pub struct StructLog {
     pub depth: u64,
     #[serde(default)]
     pub stack: Vec<String>,
+    /// Memory as the node reports it, in 32-byte words. Shared with the previous log when
+    /// nothing changed, so a payload of hundreds of thousands of steps holds one copy per
+    /// change; see [`DebugTraceResult`].
     #[serde(default)]
-    pub memory: Vec<String>,
+    pub memory: Arc<Vec<String>>,
+    /// Storage as the node reports it, shared with the previous log the same way.
     #[serde(default)]
-    pub storage: BTreeMap<String, String>,
+    pub storage: Arc<BTreeMap<String, String>>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -130,29 +136,20 @@ impl StructLog {
         self.to_trace_step_sharing(previous_storage, None)
     }
 
-    /// Builds a [`TraceStep`] that shares its memory and storage with `previous` when
-    /// this log did not change them.
+    /// Builds a [`TraceStep`] that shares its memory with the previous step when this
+    /// log's memory is the previous log's.
     ///
-    /// `previous` is the log before this one and the step built from it. Memory changes
-    /// on a handful of opcodes and storage only on `SSTORE`, so over a whole trace this
-    /// keeps one copy per change instead of one per step, which is what makes a trace
-    /// of hundreds of thousands of steps fit in memory.
+    /// `previous` is the previous log's memory and the step built from that log. Storage
+    /// is shared by construction: the step takes the log's own `Arc`, which the parser or
+    /// the inspector already shares between logs that did not change it. Memory has to
+    /// be joined into one string, so the joined string is what gets shared here.
     #[must_use]
     pub fn to_trace_step_sharing(
         &self,
         previous_storage: &BTreeMap<String, String>,
-        previous: Option<(&StructLog, &TraceStep)>,
+        previous: Option<(&Arc<Vec<String>>, &TraceStep)>,
     ) -> TraceStep {
-        let memory = match previous {
-            Some((log, step)) if log.memory == self.memory && step.snapshot.memory.is_some() => {
-                step.snapshot.memory.clone()
-            }
-            _ => Some(Arc::from(joined_memory(&self.memory))),
-        };
-        let storage = match previous {
-            Some((log, step)) if log.storage == self.storage => Arc::clone(&step.snapshot.storage),
-            _ => Arc::new(self.storage.clone()),
-        };
+        let memory = self.shared_memory(previous);
         let storage_diff = if self.storage.is_empty() {
             BTreeMap::new()
         } else {
@@ -168,23 +165,27 @@ impl StructLog {
             StepSnapshot {
                 stack: self.stack.clone(),
                 memory,
-                storage,
+                storage: self.shared_storage(previous.map(|(_, step)| step)),
                 storage_diff,
             },
         )
     }
 
+    /// The consuming form of [`StructLog::to_trace_step_sharing`]: the stack and the
+    /// storage move into the step instead of being copied.
     #[must_use]
-    pub fn into_trace_step_with_previous_storage(
+    pub fn into_trace_step_sharing(
         self,
         previous_storage: &BTreeMap<String, String>,
+        previous: Option<(&Arc<Vec<String>>, &TraceStep)>,
     ) -> TraceStep {
+        let memory = self.shared_memory(previous);
+        let storage = self.shared_storage(previous.map(|(_, step)| step));
         let storage_diff = if self.storage.is_empty() {
             BTreeMap::new()
         } else {
             storage_diff(previous_storage, &self.storage)
         };
-        let memory = joined_memory(&self.memory);
         TraceStep::new(
             self.pc,
             self.op,
@@ -192,14 +193,58 @@ impl StructLog {
             self.gas_cost,
             self.depth,
             self.error,
-            StepSnapshot::new(self.stack, Some(memory), self.storage, storage_diff),
+            StepSnapshot {
+                stack: self.stack,
+                memory,
+                storage,
+                storage_diff,
+            },
         )
+    }
+
+    /// The previous step's storage when it equals this log's, which is a pointer check
+    /// when the logs already share it, and the log's own otherwise.
+    fn shared_storage(&self, previous: Option<&TraceStep>) -> Arc<BTreeMap<String, String>> {
+        match previous {
+            Some(step) if step.snapshot.storage == self.storage => {
+                Arc::clone(&step.snapshot.storage)
+            }
+            _ => Arc::clone(&self.storage),
+        }
+    }
+
+    #[must_use]
+    pub fn into_trace_step_with_previous_storage(
+        self,
+        previous_storage: &BTreeMap<String, String>,
+    ) -> TraceStep {
+        self.into_trace_step_sharing(previous_storage, None)
+    }
+
+    fn shared_memory(&self, previous: Option<(&Arc<Vec<String>>, &TraceStep)>) -> Option<Arc<str>> {
+        match previous {
+            Some((words, step)) if *words == self.memory && step.snapshot.memory.is_some() => {
+                step.snapshot.memory.clone()
+            }
+            _ => Some(Arc::from(joined_memory(&self.memory))),
+        }
     }
 }
 
+/// What `debug_traceTransaction` or `debug_traceCall` returned, or what the replay engine
+/// recorded in the same shape.
+///
+/// Reading it from JSON shares each log's memory and storage with the previous log when
+/// they are equal, as it is parsed, so the payload of a large trace costs one copy per
+/// change rather than one per step. [`DebugTraceResult::into_steps`] then builds the
+/// steps while freeing each log, so the logs and the steps are never both whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugTraceResult {
-    #[serde(rename = "structLogs", default)]
+    #[serde(
+        rename = "structLogs",
+        default,
+        deserialize_with = "deserialize_shared_struct_logs"
+    )]
     pub struct_logs: Vec<StructLog>,
     #[serde(rename = "returnValue", default)]
     pub return_value: String,
@@ -263,23 +308,87 @@ pub struct RpcLog {
     pub data: String,
 }
 
+/// Deserializes `structLogs`, sharing each log's memory and storage with the previous log
+/// when they are equal. The comparison is on the values the node sent; a shared `Arc`
+/// then compares by pointer everywhere downstream.
+fn deserialize_shared_struct_logs<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<StructLog>, D::Error> {
+    struct SharedLogs;
+
+    impl<'de> Visitor<'de> for SharedLogs {
+        type Value = Vec<StructLog>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an array of struct logs")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut logs = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(mut log) = seq.next_element::<StructLog>()? {
+                if let Some(previous) = logs.last() {
+                    share_unchanged(previous, &mut log);
+                }
+                logs.push(log);
+            }
+            Ok(logs)
+        }
+    }
+
+    deserializer.deserialize_seq(SharedLogs)
+}
+
+/// Points `log`'s memory and storage at `previous`'s when the values are equal.
+fn share_unchanged(previous: &StructLog, log: &mut StructLog) {
+    if !Arc::ptr_eq(&previous.memory, &log.memory) && *previous.memory == *log.memory {
+        log.memory = Arc::clone(&previous.memory);
+    }
+    if !Arc::ptr_eq(&previous.storage, &log.storage) && *previous.storage == *log.storage {
+        log.storage = Arc::clone(&previous.storage);
+    }
+}
+
 impl DebugTraceResult {
+    /// Builds every step, borrowing the logs. Prefer [`DebugTraceResult::into_steps`]
+    /// when the result is not needed afterwards: it frees each log as its step is built.
     #[must_use]
     pub fn steps(&self) -> Vec<TraceStep> {
         static EMPTY_STORAGE: BTreeMap<String, String> = BTreeMap::new();
 
-        // Borrow the previous log's storage rather than copying it forward, and hand the
-        // previous step on so unchanged memory and storage are shared rather than copied:
-        // this runs once per EVM step, and a trace can have hundreds of thousands of them.
         let mut previous_storage = &EMPTY_STORAGE;
-        let mut previous_log = None::<&StructLog>;
+        let mut previous_memory = None::<&Arc<Vec<String>>>;
         let mut steps = Vec::with_capacity(self.struct_logs.len());
         for log in &self.struct_logs {
-            let previous = previous_log.zip(steps.last());
+            let previous = previous_memory.zip(steps.last());
             let step = log.to_trace_step_sharing(previous_storage, previous);
             steps.push(step);
             previous_storage = &log.storage;
-            previous_log = Some(log);
+            previous_memory = Some(&log.memory);
+        }
+        steps
+    }
+
+    /// Builds every step, consuming the logs so that each one is freed as its step is
+    /// built: the logs and the steps are never both whole, which halves the peak on a
+    /// large trace.
+    #[must_use]
+    pub fn into_steps(self) -> Vec<TraceStep> {
+        let mut steps = Vec::with_capacity(self.struct_logs.len());
+        // The previous log's memory and storage, kept by reference count rather than as
+        // the log itself, which has moved into its step.
+        let mut previous = None::<(Arc<Vec<String>>, Arc<BTreeMap<String, String>>)>;
+        for log in self.struct_logs {
+            let memory = Arc::clone(&log.memory);
+            let storage = Arc::clone(&log.storage);
+            let step = match &previous {
+                Some((previous_memory, previous_storage)) => log.into_trace_step_sharing(
+                    previous_storage,
+                    steps.last().map(|step| (previous_memory, step)),
+                ),
+                None => log.into_trace_step_sharing(&BTreeMap::new(), None),
+            };
+            steps.push(step);
+            previous = Some((memory, storage));
         }
         steps
     }
@@ -356,9 +465,11 @@ pub struct SimulateCallRequest {
     pub tx_index: Option<u64>,
 }
 
+/// The one place every backend's execution becomes a trace. Takes the result by value so
+/// the node's logs are freed as the steps are built.
 pub fn build_transaction_trace(
     envelope: TraceEnvelope,
-    debug_result: &DebugTraceResult,
+    debug_result: DebugTraceResult,
 ) -> TransactionTrace {
     let failure = debug_result.failure_message();
     let success = envelope.success && failure.is_none();
@@ -395,7 +506,7 @@ pub fn build_transaction_trace(
         backend: envelope.backend,
         capabilities: envelope.capabilities,
         artifacts,
-        steps: debug_result.steps(),
+        steps: debug_result.into_steps(),
     }
 }
 
@@ -408,7 +519,7 @@ pub fn build_transaction_trace(
 pub fn debug_rpc_transaction_trace(
     tx: RpcTransaction,
     receipt: RpcReceipt,
-    debug_result: &DebugTraceResult,
+    debug_result: DebugTraceResult,
 ) -> SoldbResult<TransactionTrace> {
     let envelope = TraceEnvelope {
         tx_hash: Some(tx.hash),
@@ -422,7 +533,7 @@ pub fn debug_rpc_transaction_trace(
         debug_trace_available: true,
         debug_error: None,
         backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
-        capabilities: debug_rpc_capabilities(debug_result),
+        capabilities: debug_rpc_capabilities(&debug_result),
     };
     let mut trace = build_transaction_trace(envelope, debug_result);
     if !receipt.logs.is_empty() && trace.artifacts.logs.is_empty() {
@@ -440,14 +551,10 @@ pub fn debug_rpc_transaction_trace(
 /// networked `simulate_call_with_client` in `soldb-rpc`.
 pub fn debug_rpc_simulation_trace(
     request: &SimulateCallRequest,
-    debug_result: &DebugTraceResult,
+    debug_result: DebugTraceResult,
 ) -> SoldbResult<TransactionTrace> {
-    simulation_trace(
-        TraceBackend::DebugRpc,
-        debug_rpc_capabilities(debug_result),
-        request,
-        debug_result,
-    )
+    let capabilities = debug_rpc_capabilities(&debug_result);
+    simulation_trace(TraceBackend::DebugRpc, capabilities, request, debug_result)
 }
 
 /// The one place a simulated call becomes a trace, whichever backend executed it.
@@ -455,7 +562,7 @@ pub(crate) fn simulation_trace(
     backend: TraceBackend,
     capabilities: TraceCapabilities,
     request: &SimulateCallRequest,
-    debug_result: &DebugTraceResult,
+    debug_result: DebugTraceResult,
 ) -> SoldbResult<TransactionTrace> {
     let failure = debug_result.failure_message();
     Ok(TransactionTrace {
@@ -485,7 +592,7 @@ pub(crate) fn simulation_trace(
             }
             artifacts
         },
-        steps: debug_result.steps(),
+        steps: debug_result.into_steps(),
     })
 }
 
@@ -505,7 +612,7 @@ fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
         static EMPTY_STORAGE: BTreeMap<String, String> = BTreeMap::new();
         let mut previous = &EMPTY_STORAGE;
         result.struct_logs.iter().any(|log| {
-            let changed = !log.storage.is_empty() && *previous != log.storage;
+            let changed = !log.storage.is_empty() && *previous != *log.storage;
             previous = &log.storage;
             changed
         })
@@ -764,8 +871,7 @@ mod tests {
         }))
         .expect("receipt");
 
-        let trace =
-            debug_rpc_transaction_trace(tx, receipt, &canned_debug_result()).expect("trace");
+        let trace = debug_rpc_transaction_trace(tx, receipt, canned_debug_result()).expect("trace");
 
         assert_eq!(trace.tx_hash.as_deref(), Some("0xabc"));
         assert_eq!(trace.from_addr, "0x1");
@@ -801,8 +907,7 @@ mod tests {
         }))
         .expect("receipt");
 
-        let trace =
-            debug_rpc_transaction_trace(tx, receipt, &canned_debug_result()).expect("trace");
+        let trace = debug_rpc_transaction_trace(tx, receipt, canned_debug_result()).expect("trace");
 
         assert!(!trace.success);
         assert!(!trace.capabilities.logs);
@@ -823,7 +928,7 @@ mod tests {
         }))
         .expect("receipt");
 
-        assert!(debug_rpc_transaction_trace(tx, receipt, &canned_debug_result()).is_err());
+        assert!(debug_rpc_transaction_trace(tx, receipt, canned_debug_result()).is_err());
     }
 
     #[test]
@@ -847,7 +952,7 @@ mod tests {
         }))
         .expect("debug result");
 
-        let trace = debug_rpc_simulation_trace(&request, &debug_result).expect("trace");
+        let trace = debug_rpc_simulation_trace(&request, debug_result.clone()).expect("trace");
 
         assert_eq!(trace.tx_hash, None);
         assert_eq!(trace.from_addr, "0x1");
@@ -886,7 +991,7 @@ mod tests {
         }))
         .expect("debug result");
 
-        let trace = debug_rpc_simulation_trace(&request, &debug_result).expect("trace");
+        let trace = debug_rpc_simulation_trace(&request, debug_result.clone()).expect("trace");
 
         assert!(!trace.success);
         assert!(trace.error.is_some(), "failure must be reported");
@@ -904,11 +1009,13 @@ mod tests {
             gas_cost: 0,
             depth: 0,
             stack: Vec::new(),
-            memory: Vec::new(),
-            storage: storage
-                .iter()
-                .map(|(slot, value)| ((*slot).to_owned(), (*value).to_owned()))
-                .collect(),
+            memory: Arc::default(),
+            storage: Arc::new(
+                storage
+                    .iter()
+                    .map(|(slot, value)| ((*slot).to_owned(), (*value).to_owned()))
+                    .collect(),
+            ),
             error: None,
         };
 
@@ -965,8 +1072,8 @@ mod tests {
             gas_cost: 0,
             depth: 1,
             stack: Vec::new(),
-            memory: memory.iter().map(|word| (*word).to_owned()).collect(),
-            storage: BTreeMap::from([("0x0".to_owned(), slot_value.to_owned())]),
+            memory: Arc::new(memory.iter().map(|word| (*word).to_owned()).collect()),
+            storage: Arc::new(BTreeMap::from([("0x0".to_owned(), slot_value.to_owned())])),
             error: None,
         };
         let result = DebugTraceResult {
@@ -1016,6 +1123,34 @@ mod tests {
         assert!(steps
             .iter()
             .all(|step| step.stack.is_empty() && step.memory.is_none() && step.storage.is_none()));
+        // Consuming the logs builds the same steps with the same sharing.
+        let consumed = result.clone().into_steps();
+        assert_eq!(consumed, steps);
+        assert!(Arc::ptr_eq(
+            &consumed[0].snapshot.storage,
+            &consumed[1].snapshot.storage
+        ));
+        assert!(Arc::ptr_eq(
+            consumed[0].snapshot.memory.as_ref().expect("memory"),
+            consumed[1].snapshot.memory.as_ref().expect("memory")
+        ));
+        // Parsing the node's payload shares as it reads, so the logs themselves hold one
+        // copy of unchanged memory and storage.
+        let json = serde_json::to_string(&result).expect("json");
+        let parsed: DebugTraceResult = serde_json::from_str(&json).expect("result");
+        assert_eq!(parsed, result);
+        assert!(Arc::ptr_eq(
+            &parsed.struct_logs[0].memory,
+            &parsed.struct_logs[1].memory
+        ));
+        assert!(Arc::ptr_eq(
+            &parsed.struct_logs[0].storage,
+            &parsed.struct_logs[2].storage
+        ));
+        assert!(!Arc::ptr_eq(
+            &parsed.struct_logs[1].memory,
+            &parsed.struct_logs[2].memory
+        ));
     }
 
     #[test]
@@ -1092,7 +1227,7 @@ mod tests {
             capabilities: debug_rpc_capabilities(&result),
         };
 
-        let trace = build_transaction_trace(envelope, &result);
+        let trace = build_transaction_trace(envelope, result.clone());
         assert!(trace.success);
         assert_eq!(trace.output, "0x");
         assert_eq!(trace.backend.as_deref(), Some("debug-rpc"));
@@ -1158,7 +1293,7 @@ mod tests {
             capabilities: TraceCapabilities::default(),
         };
 
-        let trace = build_transaction_trace(envelope, &result);
+        let trace = build_transaction_trace(envelope, result.clone());
         assert!(trace.success);
         assert_eq!(
             trace.error.as_deref(),

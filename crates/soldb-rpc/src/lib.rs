@@ -549,7 +549,7 @@ pub fn trace_transaction_with_client(
         ]),
     )?;
 
-    debug_rpc_transaction_trace(tx, receipt, &debug_result)
+    debug_rpc_transaction_trace(tx, receipt, debug_result)
 }
 
 pub fn transaction_logs_with_client(
@@ -590,7 +590,7 @@ pub fn simulate_call_with_client(
         json!([call_object, block, trace_config]),
     )?;
 
-    debug_rpc_simulation_trace(request, &debug_result)
+    debug_rpc_simulation_trace(request, debug_result)
 }
 
 #[cfg(test)]

@@ -52,12 +52,8 @@ fn replay_transaction_with_client(
 ) -> SoldbResult<TransactionTrace> {
     let (tx, receipt) = fetch_transaction_and_receipt(client, tx_hash)?;
     let replayed = replay_debug_trace(client, &tx)?;
-    replay_transaction_trace(
-        tx,
-        receipt,
-        &replayed.debug_result,
-        replayed.inputs.chain_id(),
-    )
+    let chain_id = replayed.inputs.chain_id();
+    replay_transaction_trace(tx, receipt, replayed.debug_result, chain_id)
 }
 
 /// Replays a mined transaction and returns, with the trace, a [`ReplayBundle`] holding
@@ -68,14 +64,13 @@ pub fn replay_transaction_recording(
 ) -> SoldbResult<(TransactionTrace, ReplayBundle)> {
     let (tx, receipt) = fetch_transaction_and_receipt(client, tx_hash)?;
     let replayed = replay_debug_trace(client, &tx)?;
-    let trace = replay_transaction_trace(
-        tx,
+    let bundle = ReplayBundle::for_transaction(
+        &replayed.inputs,
         receipt.clone(),
-        &replayed.debug_result,
-        replayed.inputs.chain_id(),
-    )?;
-    let bundle =
-        ReplayBundle::for_transaction(&replayed.inputs, receipt, replayed.provider.export());
+        replayed.provider.export(),
+    );
+    let chain_id = replayed.inputs.chain_id();
+    let trace = replay_transaction_trace(tx, receipt, replayed.debug_result, chain_id)?;
     Ok((trace, bundle))
 }
 
@@ -100,7 +95,8 @@ pub fn simulate_call_with_replay(
     request: &SimulateCallRequest,
 ) -> SoldbResult<TransactionTrace> {
     let replayed = replay_call(client, request)?;
-    replay_simulation_trace(request, &replayed.debug_result, replayed.inputs.chain_id())
+    let chain_id = replayed.inputs.chain_id();
+    replay_simulation_trace(request, replayed.debug_result, chain_id)
 }
 
 /// Simulates a call by replay and returns, with the trace, a [`ReplayBundle`] holding
@@ -110,9 +106,9 @@ pub fn simulate_call_with_replay_recording(
     request: &SimulateCallRequest,
 ) -> SoldbResult<(TransactionTrace, ReplayBundle)> {
     let replayed = replay_call(client, request)?;
-    let trace =
-        replay_simulation_trace(request, &replayed.debug_result, replayed.inputs.chain_id())?;
     let bundle = ReplayBundle::for_call(&replayed.inputs, request, replayed.provider.export());
+    let chain_id = replayed.inputs.chain_id();
+    let trace = replay_simulation_trace(request, replayed.debug_result, chain_id)?;
     Ok((trace, bundle))
 }
 

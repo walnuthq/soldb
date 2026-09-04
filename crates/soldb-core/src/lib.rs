@@ -14,8 +14,10 @@
 //! new backend does not require changes further up the stack.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
+use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -323,7 +325,14 @@ pub struct StorageChange {
     pub after: Option<String>,
 }
 
+/// A complete recording of one execution.
+///
+/// Reading one back from JSON shares unchanged memory and storage between consecutive
+/// steps as they are read, so a trace loaded from a file costs what one built by a
+/// backend costs, at its peak as well as afterwards. [`TransactionTrace::share_unchanged_state`]
+/// does the same for a trace assembled by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TransactionTraceRepr")]
 pub struct TransactionTrace {
     pub tx_hash: Option<String>,
     pub from_addr: String,
@@ -343,6 +352,108 @@ pub struct TransactionTrace {
     #[serde(default)]
     pub artifacts: TraceArtifacts,
     pub steps: Vec<TraceStep>,
+}
+
+impl TransactionTrace {
+    /// Makes consecutive steps whose memory or storage is equal share one copy.
+    ///
+    /// Backends build steps that way; a trace deserialized from a file arrives with a
+    /// copy per step, and this pass, linear in the size of the trace, folds them back.
+    pub fn share_unchanged_state(&mut self) {
+        for index in 1..self.steps.len() {
+            let (before, after) = self.steps.split_at_mut(index);
+            share_snapshot(&before[index - 1], &mut after[0]);
+        }
+    }
+}
+
+/// The wire shape of a trace; `From` restores the sharing between steps.
+#[derive(Deserialize)]
+struct TransactionTraceRepr {
+    tx_hash: Option<String>,
+    from_addr: String,
+    to_addr: Option<String>,
+    value: String,
+    input_data: String,
+    gas_used: u64,
+    output: String,
+    success: bool,
+    error: Option<String>,
+    debug_trace_available: bool,
+    contract_address: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    capabilities: TraceCapabilities,
+    #[serde(default)]
+    artifacts: TraceArtifacts,
+    #[serde(deserialize_with = "deserialize_shared_steps")]
+    steps: Vec<TraceStep>,
+}
+
+/// Deserializes the steps, pointing each one's memory and storage at the previous step's
+/// when they are equal, so the duplicates a file carries are never all resident at once.
+fn deserialize_shared_steps<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<TraceStep>, D::Error> {
+    struct SharedSteps;
+
+    impl<'de> Visitor<'de> for SharedSteps {
+        type Value = Vec<TraceStep>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an array of trace steps")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut steps = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(mut step) = seq.next_element::<TraceStep>()? {
+                if let Some(previous) = steps.last() {
+                    share_snapshot(previous, &mut step);
+                }
+                steps.push(step);
+            }
+            Ok(steps)
+        }
+    }
+
+    deserializer.deserialize_seq(SharedSteps)
+}
+
+/// Points `step`'s memory and storage at `previous`'s when the values are equal.
+fn share_snapshot(previous: &TraceStep, step: &mut TraceStep) {
+    let previous = &previous.snapshot;
+    let current = &mut step.snapshot;
+    if let (Some(previous_memory), Some(current_memory)) = (&previous.memory, &current.memory) {
+        if !Arc::ptr_eq(previous_memory, current_memory) && **previous_memory == **current_memory {
+            current.memory = Some(Arc::clone(previous_memory));
+        }
+    }
+    if !Arc::ptr_eq(&previous.storage, &current.storage) && *previous.storage == *current.storage {
+        current.storage = Arc::clone(&previous.storage);
+    }
+}
+
+impl From<TransactionTraceRepr> for TransactionTrace {
+    fn from(repr: TransactionTraceRepr) -> Self {
+        Self {
+            tx_hash: repr.tx_hash,
+            from_addr: repr.from_addr,
+            to_addr: repr.to_addr,
+            value: repr.value,
+            input_data: repr.input_data,
+            gas_used: repr.gas_used,
+            output: repr.output,
+            success: repr.success,
+            error: repr.error,
+            debug_trace_available: repr.debug_trace_available,
+            contract_address: repr.contract_address,
+            backend: repr.backend,
+            capabilities: repr.capabilities,
+            artifacts: repr.artifacts,
+            steps: repr.steps,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -629,6 +740,71 @@ mod tests {
             error: None,
             snapshot: StepSnapshot::default(),
         }
+    }
+
+    #[test]
+    fn reading_a_trace_back_shares_unchanged_state_between_steps() {
+        let snapshot = |memory: &str, slot: &str| {
+            StepSnapshot::new(
+                Vec::new(),
+                Some(memory.to_owned()),
+                BTreeMap::from([("0x0".to_owned(), slot.to_owned())]),
+                BTreeMap::new(),
+            )
+        };
+        let step = |pc: u64, snapshot: StepSnapshot| {
+            TraceStep::new(pc, "PUSH1".to_owned(), 1, 1, 1, None, snapshot)
+        };
+        let trace = TransactionTrace {
+            tx_hash: None,
+            from_addr: "0x1".to_owned(),
+            to_addr: None,
+            value: "0x0".to_owned(),
+            input_data: "0x".to_owned(),
+            gas_used: 0,
+            output: "0x".to_owned(),
+            success: true,
+            error: None,
+            debug_trace_available: true,
+            contract_address: None,
+            backend: None,
+            capabilities: TraceCapabilities::default(),
+            artifacts: TraceArtifacts::default(),
+            steps: vec![
+                step(0, snapshot("aa", "0x1")),
+                step(1, snapshot("aa", "0x1")),
+                step(2, snapshot("bb", "0x1")),
+                step(3, snapshot("bb", "0x2")),
+            ],
+        };
+        let json = serde_json::to_string(&trace).expect("json");
+        let restored: TransactionTrace = serde_json::from_str(&json).expect("trace");
+        assert_eq!(restored, trace);
+        let memory = |index: usize| {
+            restored.steps[index]
+                .snapshot
+                .memory
+                .as_ref()
+                .expect("memory")
+        };
+        assert!(Arc::ptr_eq(memory(0), memory(1)));
+        assert!(!Arc::ptr_eq(memory(1), memory(2)));
+        assert!(Arc::ptr_eq(memory(2), memory(3)));
+        let storage = |index: usize| &restored.steps[index].snapshot.storage;
+        assert!(Arc::ptr_eq(storage(0), storage(2)));
+        assert!(!Arc::ptr_eq(storage(2), storage(3)));
+
+        // The same pass is available for a trace assembled by hand.
+        let mut by_hand = trace.clone();
+        assert!(!Arc::ptr_eq(
+            &by_hand.steps[0].snapshot.storage,
+            &by_hand.steps[1].snapshot.storage
+        ));
+        by_hand.share_unchanged_state();
+        assert!(Arc::ptr_eq(
+            &by_hand.steps[0].snapshot.storage,
+            &by_hand.steps[1].snapshot.storage
+        ));
     }
 
     #[test]

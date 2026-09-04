@@ -536,9 +536,13 @@ Beyond the rule:
   `TraceStep::new` and `StepSnapshot::new`, never by filling the flat fields. Memory and
   storage in a snapshot are `Arc`s, and `DebugTraceResult::steps` hands the previous
   step's on when a log did not change them, so a trace holds one copy per change rather
-  than one per step; keep that sharing when you touch step construction. The remaining
-  duplicate is `DebugTraceResult` itself, whose `StructLog`s mirror the node's payload
-  with memory per step, alive until `steps()` has run.
+  than one per step; keep that sharing when you touch step construction. The node's
+  payload is held the same way: `StructLog` memory and storage are `Arc`s shared with the
+  previous log as `structLogs` is parsed and as the replay inspector records, and
+  `build_transaction_trace` takes the result by value so `into_steps` frees each log as
+  its step is built. A trace read from a file shares as its steps are parsed. Loading a
+  20,000-step, 89 MB file through the DAP server peaks at 114 MB; it peaked at 236 MB
+  when every step held two copies.
 - **PC-to-source lookups should be indexed, not scanned.** Build the PC map once per
   contract (`build_pc_to_instruction_map`) and reuse it; a linear scan per step turns a
   trace walk quadratic.

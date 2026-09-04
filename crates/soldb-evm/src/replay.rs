@@ -26,6 +26,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 use revm::bytecode::opcode::OpCode;
 use revm::context::{BlockEnv, CfgEnv, ContextTr, Journal, JournalEntry, JournalTr, TxEnv};
@@ -202,7 +203,7 @@ fn unmodelled_chain(chain_id: u64) -> Option<(&'static str, &'static str)> {
 pub fn replay_transaction_trace(
     tx: RpcTransaction,
     receipt: RpcReceipt,
-    debug_result: &DebugTraceResult,
+    debug_result: DebugTraceResult,
     chain_id: u64,
 ) -> SoldbResult<TransactionTrace> {
     let envelope = TraceEnvelope {
@@ -226,7 +227,7 @@ pub fn replay_transaction_trace(
 /// [`crate::debug_rpc_simulation_trace`].
 pub fn replay_simulation_trace(
     request: &SimulateCallRequest,
-    debug_result: &DebugTraceResult,
+    debug_result: DebugTraceResult,
     chain_id: u64,
 ) -> SoldbResult<TransactionTrace> {
     crate::simulation_trace(
@@ -621,7 +622,7 @@ impl LocalChain {
             logs: Vec::new(),
         };
         let mut trace =
-            replay_transaction_trace(deployment.clone(), receipt, &result, self.chain_id)?;
+            replay_transaction_trace(deployment.clone(), receipt, result, self.chain_id)?;
         // Nothing was mined, so there is no hash to report.
         trace.tx_hash = None;
         Ok(trace)
@@ -646,7 +647,7 @@ impl LocalChain {
         )?;
         let state = self.state()?;
         let result = replay_debug_trace_with_state(&inputs, &state)?;
-        replay_simulation_trace(&request, &result, self.chain_id)
+        replay_simulation_trace(&request, result, self.chain_id)
     }
 
     /// The synthetic block the run happens in, carrying `transactions` in full.
@@ -1297,11 +1298,11 @@ impl ReplayBundle {
             } => replay_transaction_trace(
                 transaction.as_ref().clone(),
                 receipt.as_ref().clone(),
-                &result,
+                result,
                 self.chain_id,
             ),
             ReplayBundleTarget::Call { request, .. } => {
-                replay_simulation_trace(request, &result, self.chain_id)
+                replay_simulation_trace(request, result, self.chain_id)
             }
         }
     }
@@ -1579,13 +1580,17 @@ struct ReplayStepInspector {
     call_stack: Vec<usize>,
     create_stack: Vec<usize>,
     journal_entries_seen: usize,
-    /// EVM memory as of the last step that changed it, with its hex encoding.
+    /// EVM memory as of the last step that changed it, with its hex encoding as the log
+    /// carries it.
     ///
     /// Most instructions leave memory untouched, but the inspector records memory on every
-    /// step. Without this the encoder runs a full pass over memory per step even when
-    /// nothing moved.
+    /// step. Comparing bytes is what keeps the encoder from running a full pass per step,
+    /// and handing the same `Arc` to every log until memory changes is what keeps the
+    /// logs from holding a copy per step.
     last_memory: Vec<u8>,
-    last_memory_hex: String,
+    last_memory_words: Arc<Vec<String>>,
+    /// The storage every log starts from; a log that touches a slot gets its own map.
+    empty_storage: Arc<BTreeMap<String, String>>,
 }
 
 impl ReplayStepInspector {
@@ -1622,14 +1627,14 @@ where
             if self.last_memory != memory_bytes {
                 self.last_memory.clear();
                 self.last_memory.extend_from_slice(memory_bytes);
-                self.last_memory_hex = bytes_to_hex(memory_bytes);
+                let hex = bytes_to_hex(memory_bytes);
+                self.last_memory_words = Arc::new(if hex.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![hex]
+                });
             }
         }
-        let memory = if self.last_memory_hex.is_empty() {
-            Vec::new()
-        } else {
-            vec![self.last_memory_hex.clone()]
-        };
         self.pending = Some(StructLog {
             pc: interp.bytecode.pc() as u64,
             op,
@@ -1637,8 +1642,8 @@ where
             gas_cost: 0,
             depth: context.journal_mut().depth() as u64,
             stack,
-            memory,
-            storage: BTreeMap::new(),
+            memory: Arc::clone(&self.last_memory_words),
+            storage: Arc::clone(&self.empty_storage),
             error: None,
         });
     }
@@ -1934,7 +1939,7 @@ fn record_replay_storage_touch(log: &mut StructLog, interp: &Interpreter) {
                 .copied()
                 .map(format_u256_quantity)
                 .unwrap_or_else(|| "0x0".to_owned());
-            log.storage.insert(normalize_storage_key(&slot), value);
+            Arc::make_mut(&mut log.storage).insert(normalize_storage_key(&slot), value);
         }
         "SSTORE" => {
             let Some(slot) = log.stack.last().cloned() else {
@@ -1943,7 +1948,7 @@ fn record_replay_storage_touch(log: &mut StructLog, interp: &Interpreter) {
             let Some(value) = log.stack.get(log.stack.len().saturating_sub(2)).cloned() else {
                 return;
             };
-            log.storage
+            Arc::make_mut(&mut log.storage)
                 .insert(normalize_storage_key(&slot), normalize_hex_output(&value));
         }
         _ => {}
@@ -2519,9 +2524,13 @@ mod tests {
             "status": "0x1"
         }))
         .expect("receipt");
-        let trace =
-            replay_transaction_trace(inputs.transaction().clone(), receipt, &result, 31_337)
-                .expect("trace");
+        let trace = replay_transaction_trace(
+            inputs.transaction().clone(),
+            receipt,
+            result.clone(),
+            31_337,
+        )
+        .expect("trace");
         assert_eq!(trace.backend.as_deref(), Some("replay"));
         assert!(trace.success);
         assert!(trace.capabilities.storage_diff);
@@ -2707,7 +2716,8 @@ mod tests {
         assert_eq!(steps[4].snapshot.storage["0x0"], "0x29");
         assert_eq!(steps[8].snapshot.storage["0x0"], "0x2a");
 
-        let trace = replay_simulation_trace(&counter_call(None), &result, 31_337).expect("trace");
+        let trace =
+            replay_simulation_trace(&counter_call(None), result.clone(), 31_337).expect("trace");
         assert_eq!(trace.tx_hash, None);
         assert_eq!(trace.from_addr, SENDER);
         assert_eq!(trace.to_addr.as_deref(), Some(COUNTER));
@@ -2899,7 +2909,7 @@ mod tests {
         let online = replay_transaction_trace(
             inputs.transaction().clone(),
             receipt.clone(),
-            &result,
+            result.clone(),
             31_337,
         )
         .expect("trace");
@@ -2937,7 +2947,7 @@ mod tests {
             ReplayInputs::for_call(&request, counter_block(Vec::new()), 1, 31_337).expect("inputs");
         let state = fully_supplied_state();
         let result = replay_debug_trace_with_state(&inputs, &state).expect("replay");
-        let online = replay_simulation_trace(&request, &result, 31_337).expect("trace");
+        let online = replay_simulation_trace(&request, result.clone(), 31_337).expect("trace");
         let bundle = ReplayBundle::for_call(&inputs, &request, state.export(&state.reads()));
         assert!(
             bundle.describe().contains("call to"),
