@@ -37,8 +37,8 @@ use soldb_ethdebug::{
 };
 
 use crate::{
-    decode_arguments, is_value_type, parse_source_functions, ArgumentLayout, ArgumentOrder,
-    FrameArgument, SourceFunction,
+    decode_arguments, is_value_type, parse_source_functions, readable_parameter, ArgumentLayout,
+    ArgumentOrder, FrameArgument, FrameState, SourceFunction,
 };
 
 const CALL_OPCODES: [&str; 4] = ["CALL", "CALLCODE", "DELEGATECALL", "STATICCALL"];
@@ -1030,7 +1030,7 @@ impl StepMap {
     /// through a dispatcher wrapper that has not decoded them yet. See
     /// [`StepMap::argument_layout`].
     #[must_use]
-    pub fn frame_arguments(&self, frame: &Frame, entry_stack: &[StackWord]) -> Vec<FrameArgument> {
+    pub fn frame_arguments(&self, frame: &Frame, state: FrameState<'_>) -> Vec<FrameArgument> {
         let Some(info) = self.steps.get(frame.entry_step) else {
             return Vec::new();
         };
@@ -1052,7 +1052,7 @@ impl StepMap {
         let Some(layout) = self.argument_layout(location.key.contract) else {
             return Vec::new();
         };
-        decode_arguments(&function.params, entry_stack, layout)
+        decode_arguments(&function.params, state, layout)
     }
 
     #[must_use]
@@ -1460,12 +1460,19 @@ fn prove_argument_layouts(
 }
 
 /// What one frame's entry stack says, given the calldata that selected its function.
+///
+/// Every parameter takes one head word in the calldata and one word on the stack, so the
+/// two line up position by position. Only the value-type positions can be compared — a
+/// reference parameter is a calldata offset in one and a memory pointer in the other —
+/// and that is enough as long as one of them sits at a different depth under the two
+/// orders.
 fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[StackWord]) -> Evidence {
     let count = function.params.len();
     if count == 0 || stack.len() < count {
         return Evidence::Unknown;
     }
-    if !function.params.iter().all(|param| is_value_type(&param.ty)) {
+    // A parameter whose width is uncertain would misalign every position after it.
+    if !function.params.iter().all(readable_parameter) {
         return Evidence::Unknown;
     }
     let signature = format!(
@@ -1499,20 +1506,35 @@ fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[StackWo
     let Some(expected) = expected else {
         return Evidence::Unknown;
     };
+    // The positions whose calldata word is the argument itself, rather than an offset to
+    // it.
+    let checkable = (0..count)
+        .filter(|index| is_value_type(&function.params[*index].ty))
+        .collect::<Vec<_>>();
+    if checkable.is_empty() {
+        return Evidence::Unknown;
+    }
     let matches = |order: ArgumentOrder| {
-        expected.iter().enumerate().all(|(index, word)| {
-            let candidate = &stack[order.word_index(index, count, stack.len())];
-            normalize_word(candidate) == *word
+        checkable.iter().all(|index| {
+            let candidate = &stack[order.word_index(*index, count, stack.len())];
+            normalize_word(candidate) == expected[*index]
         })
     };
+    // A position at the same depth under both orders proves nothing about the order.
+    let distinguishing = checkable.iter().any(|index| {
+        ArgumentOrder::FirstOnTop.word_index(*index, count, stack.len())
+            != ArgumentOrder::LastOnTop.word_index(*index, count, stack.len())
+    });
     let first = matches(ArgumentOrder::FirstOnTop);
     let last = matches(ArgumentOrder::LastOnTop);
     match (first, last) {
-        // Equal words at both ends, or a single parameter: the arguments are on top, but
-        // the order cannot be told apart.
+        // Both orders agree where they could be told apart: the arguments are on top, but
+        // which is which is still open.
         (true, true) => Evidence::TopWords,
-        (true, false) => Evidence::Ordered(ArgumentOrder::FirstOnTop),
-        (false, true) => Evidence::Ordered(ArgumentOrder::LastOnTop),
+        (true, false) if distinguishing => Evidence::Ordered(ArgumentOrder::FirstOnTop),
+        (false, true) if distinguishing => Evidence::Ordered(ArgumentOrder::LastOnTop),
+        // One order matched only because the other was never tested where they differ.
+        (true, false) | (false, true) => Evidence::TopWords,
         // The arguments are not on the entry stack: this is not where they live.
         (false, false) => Evidence::Contradicted,
     }
@@ -1575,6 +1597,8 @@ mod tests {
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
     use soldb_core::Word as StackWord;
+
+    use crate::FrameState;
 
     use super::{
         address_from_word, normalize_address, ArgumentLayout, ArgumentOrder, ContractDebugInfo,
@@ -1806,7 +1830,13 @@ contract P {
         let frames = map.frames(4);
         let inner = frames.first().expect("innermost frame");
         assert_eq!(inner.function_name.as_deref(), Some("total"));
-        let arguments = map.frame_arguments(inner, &first_on_top);
+        let arguments = map.frame_arguments(
+            inner,
+            FrameState {
+                stack: &first_on_top,
+                memory: None,
+            },
+        );
         assert_eq!(
             arguments
                 .iter()
@@ -1827,7 +1857,13 @@ contract P {
             Some(ArgumentLayout::Ordered(ArgumentOrder::LastOnTop))
         );
         let frames = map.frames(4);
-        let arguments = map.frame_arguments(frames.first().expect("frame"), &last_on_top);
+        let arguments = map.frame_arguments(
+            frames.first().expect("frame"),
+            FrameState {
+                stack: &last_on_top,
+                memory: None,
+            },
+        );
         assert_eq!(
             arguments[0].value.display,
             "0x00000000000000000000000000000000000000aa"
@@ -1842,7 +1878,13 @@ contract P {
         assert_eq!(map.argument_layout(0), None);
         let frames = map.frames(4);
         assert!(map
-            .frame_arguments(frames.first().expect("frame"), &first_on_top)
+            .frame_arguments(
+                frames.first().expect("frame"),
+                FrameState {
+                    stack: &first_on_top,
+                    memory: None
+                }
+            )
             .is_empty());
 
         // Without the calldata to compare against, nothing is proven and nothing shown.
@@ -1852,7 +1894,13 @@ contract P {
         assert_eq!(map.argument_layout(0), None);
         let frames = map.frames(4);
         assert!(map
-            .frame_arguments(frames.first().expect("frame"), &first_on_top)
+            .frame_arguments(
+                frames.first().expect("frame"),
+                FrameState {
+                    stack: &first_on_top,
+                    memory: None
+                }
+            )
             .is_empty());
     }
 
@@ -1881,7 +1929,13 @@ contract P {
             .iter()
             .find(|frame| frame.function_name.as_deref() == Some("outer"))
             .expect("outer frame");
-        let arguments = map.frame_arguments(outer, &stack);
+        let arguments = map.frame_arguments(
+            outer,
+            FrameState {
+                stack: &stack,
+                memory: None,
+            },
+        );
         assert_eq!(arguments.len(), 1);
         assert_eq!(arguments[0].name, "a");
         assert_eq!(arguments[0].value.display, "5");

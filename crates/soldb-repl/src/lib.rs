@@ -21,8 +21,8 @@ use std::cell::RefCell;
 use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
 use soldb_debugger::{
     call_target, normalize_address, ChainStorage, Condition, ConditionContext, ContractDebugInfo,
-    Evaluation, Frame, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
-    StorageLayout, StorageTape, StorageWords,
+    Evaluation, Frame, FrameState, ResolvedFunction, ResolvedLine, SourceListing, StepLocation,
+    StepMap, StorageLayout, StorageTape, StorageWords,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,9 @@ pub enum BreakpointTarget {
     Function(String),
     /// A write to one storage slot, given in decimal or hex.
     Storage(String),
+    /// A write to a state variable, named the way `print` names it: `counter`,
+    /// `balances[0xabc…]`, `config.limit`.
+    State(String),
     /// Any `REVERT`, or any step the backend marked as failing.
     Revert,
     /// A call, to one address or to any.
@@ -90,6 +93,12 @@ pub enum BreakpointKind {
     /// Hits on an `SSTORE` to this slot, normalized to lowercase hex without leading
     /// zeros.
     Storage(String),
+    /// The same, for a slot named as a state variable: the path the user wrote and the
+    /// slot the storage layout put it at.
+    StateWrite {
+        path: String,
+        slot: String,
+    },
     Revert,
     /// Hits on a call instruction, to this lowercase address or to any.
     Call(Option<String>),
@@ -128,6 +137,9 @@ impl Breakpoint {
                 .collect::<Vec<_>>()
                 .join(", "),
             BreakpointKind::Storage(slot) => format!("storage slot 0x{slot}"),
+            BreakpointKind::StateWrite { path, slot } => {
+                format!("a write to `{path}` (storage slot 0x{slot})")
+            }
             BreakpointKind::Revert => "revert".to_owned(),
             BreakpointKind::Call(Some(address)) => format!("call to {address}"),
             BreakpointKind::Call(None) => "any call".to_owned(),
@@ -728,6 +740,31 @@ impl DebuggerState {
         }
     }
 
+    /// A state variable's slot, for stopping where it is written.
+    fn resolve_state_target(&self, path: &str) -> Result<BreakpointKind, String> {
+        let map = self.source_map_for("state breakpoints")?;
+        let layouts = map
+            .contracts()
+            .iter()
+            .filter_map(|contract| contract.storage_layout.as_ref());
+        let mut failure = None;
+        for layout in layouts {
+            match layout.resolve(path) {
+                Ok(reference) => {
+                    let slot = soldb_debugger::short_hex(&reference.slot);
+                    return Ok(BreakpointKind::StateWrite {
+                        path: reference.path,
+                        slot: slot.trim_start_matches("0x").to_owned(),
+                    });
+                }
+                Err(error) => failure = Some(error.to_string()),
+            }
+        }
+        Err(failure.unwrap_or_else(|| {
+            "no storage layout is loaded, so state variables cannot be named; compile with `--storage-layout`".to_owned()
+        }))
+    }
+
     fn resolve_target(&self, target: &BreakpointTarget) -> Result<BreakpointKind, String> {
         match target {
             BreakpointTarget::Pc(pc) => Ok(BreakpointKind::Pc(*pc)),
@@ -738,8 +775,20 @@ impl DebuggerState {
             }
             BreakpointTarget::Function(name) => {
                 let map = self.source_map_for("function breakpoints")?;
-                map.resolve_function(name).map(BreakpointKind::Function)
+                match map.resolve_function(name) {
+                    Ok(functions) => Ok(BreakpointKind::Function(functions)),
+                    // A name that is not a function may be a state variable: `break
+                    // counter` stops where the counter is written.
+                    Err(error) => self.resolve_state_target(name).map_err(|state_error| {
+                        if state_error.contains("no storage layout") {
+                            error
+                        } else {
+                            format!("{error}; and {state_error}")
+                        }
+                    }),
+                }
             }
+            BreakpointTarget::State(path) => self.resolve_state_target(path),
             BreakpointTarget::Storage(slot) => normalize_slot(slot)
                 .map(BreakpointKind::Storage)
                 .ok_or_else(|| format!("invalid storage slot `{slot}`; expected decimal or hex")),
@@ -808,7 +857,7 @@ impl DebuggerState {
                         .function_id(step)
                         .is_some_and(|id| functions.iter().any(|function| function.id == id))
             }),
-            BreakpointKind::Storage(slot) => {
+            BreakpointKind::Storage(slot) | BreakpointKind::StateWrite { slot, .. } => {
                 &*trace_step.op == "SSTORE"
                     && trace_step
                         .snapshot_ref()
@@ -902,7 +951,14 @@ impl DebuggerState {
             let Some(entry) = trace.steps.get(frame.entry_step) else {
                 continue;
             };
-            frame.arguments = map.frame_arguments(frame, entry.snapshot_ref().stack);
+            let snapshot = entry.snapshot_ref();
+            frame.arguments = map.frame_arguments(
+                frame,
+                FrameState {
+                    stack: snapshot.stack,
+                    memory: snapshot.memory,
+                },
+            );
         }
         frames
     }
@@ -1102,7 +1158,12 @@ fn parse_breakpoint_target(input: &str) -> Option<BreakpointTarget> {
             if let Some(pc) = parse_u64_arg(input) {
                 return Some(BreakpointTarget::Pc(pc));
             }
-            is_function_name(input).then(|| BreakpointTarget::Function(input.to_owned()))
+            if is_function_name(input) {
+                return Some(BreakpointTarget::Function(input.to_owned()));
+            }
+            // `balances[0xabc…]` and the like: a place in storage, named the way `print`
+            // names it.
+            is_state_path(input).then(|| BreakpointTarget::State(input.to_owned()))
         }
     }
 }
@@ -1121,6 +1182,13 @@ fn split_condition(input: &str) -> (&str, Option<String>) {
         }
         None => (input, None),
     }
+}
+
+/// Whether the text looks like a state variable path: a name followed by any number of
+/// `[key]` and `.member` steps.
+fn is_state_path(input: &str) -> bool {
+    let head = input.split(['[', '.']).next().unwrap_or_default();
+    !head.is_empty() && is_function_name(head) && input.len() > head.len()
 }
 
 fn is_function_name(input: &str) -> bool {
@@ -1584,6 +1652,32 @@ mod tests {
         assert_eq!(state.apply_command(DebuggerCommand::Help(None)), None);
         assert_eq!(state.apply_command(DebuggerCommand::Backtrace), None);
         assert_eq!(state.apply_command(DebuggerCommand::Quit), None);
+    }
+
+    #[test]
+    fn a_state_variable_can_be_named_where_a_slot_would_go() {
+        // `break counter` is parsed as a name; without a layout it stays a function
+        // breakpoint error, and with one it becomes a write to that variable's slot.
+        assert_eq!(
+            DebuggerCommand::parse("break counter"),
+            DebuggerCommand::Break(BreakpointTarget::Function("counter".to_owned()), None)
+        );
+        assert_eq!(
+            DebuggerCommand::parse("break balances[0xabc]"),
+            DebuggerCommand::Break(BreakpointTarget::State("balances[0xabc]".to_owned()), None)
+        );
+        assert_eq!(
+            DebuggerCommand::parse("break config.limit"),
+            DebuggerCommand::Break(BreakpointTarget::Function("config.limit".to_owned()), None)
+        );
+
+        let mut state = DebuggerState::new();
+        state.load_trace(sample_trace());
+        // No debug info at all: the message is about the missing metadata.
+        assert!(matches!(
+            state.set_breakpoint_target(&BreakpointTarget::State("counter".to_owned())),
+            StepOutcome::BreakpointError(message) if message.contains("metadata")
+        ));
     }
 
     #[test]

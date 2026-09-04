@@ -3878,9 +3878,60 @@ fn web_contracts_for_specs(
                         .flatten()
                 })?;
             let metadata = web_contract_metadata_for_spec(&spec)?;
+            let metadata = with_final_state(metadata, &spec, trace, &address);
             Some((normalize_contract_address_key(&address), metadata))
         })
         .collect()
+}
+
+/// Adds the contract's storage layout and its state at the end of the transaction.
+///
+/// A client reading the document gets what the REPL shows: each variable's slot, its
+/// value, and whether that value came from the recording, from a chain, or from neither.
+fn with_final_state(
+    metadata: soldb_serializer::WebContractMetadata,
+    spec: &ResolvedContractSpec,
+    trace: &TransactionTrace,
+    address: &str,
+) -> soldb_serializer::WebContractMetadata {
+    let Some(index) = load_source_index(spec) else {
+        return metadata;
+    };
+    let Some(layout) = index.debug.storage_layout.as_ref() else {
+        return metadata;
+    };
+    let Some(last) = trace.steps.len().checked_sub(1) else {
+        return metadata;
+    };
+    let map = soldb_debugger::StepMap::new(trace, vec![index.debug.clone()]);
+    let tape = soldb_debugger::StorageTape::new(trace, &map);
+    // The account this contract's storage belongs to, rather than whichever frame the
+    // last step happened to be in.
+    let context = (0..trace.steps.len()).find(|step| {
+        map.storage_address(*step)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(address))
+    });
+    let Some(context) = context.and_then(|step| map.storage_context_index(step)) else {
+        return metadata;
+    };
+    let words = tape.at(last, Some(context));
+    let variables = soldb_debugger::state_variables(layout, &words)
+        .into_iter()
+        .map(|variable| soldb_serializer::WebStateVariable {
+            name: variable.name,
+            ty: variable.ty,
+            slot: variable.slot,
+            offset: variable.offset,
+            value: variable.value.display,
+            source: match (variable.value.status, variable.source) {
+                (soldb_debugger::DebugValueStatus::Unavailable, _) => "unknown",
+                (_, soldb_debugger::StateSource::Chain) => "chain",
+                (_, soldb_debugger::StateSource::Trace) => "trace",
+            }
+            .to_owned(),
+        })
+        .collect();
+    metadata.with_state(layout.source.clone(), variables)
 }
 
 fn web_contract_metadata_for_spec(

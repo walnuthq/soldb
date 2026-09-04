@@ -30,6 +30,9 @@ pub struct StorageLayout {
     pub variables: Vec<StorageVariable>,
     /// Types by solc's identifier, such as `t_uint256` or `t_mapping(t_address,t_uint256)`.
     pub types: BTreeMap<String, StorageType>,
+    /// The layout exactly as the compiler wrote it, for handing to a client that decodes
+    /// slots itself.
+    pub source: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,7 +132,11 @@ impl StorageLayout {
             })
             .transpose()?
             .unwrap_or_default();
-        Ok(Self { variables, types })
+        Ok(Self {
+            variables,
+            types,
+            source: value.clone(),
+        })
     }
 
     #[must_use]

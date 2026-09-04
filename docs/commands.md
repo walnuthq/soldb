@@ -195,6 +195,22 @@ soldb> break increment3
 Breakpoint #1 set at function TestContract.increment3 at TestContract.sol:54
 ```
 
+### `break <state variable>`
+
+Stop where a state variable is written, named the way [`print`](#print-variable) names it.
+
+```text
+soldb> break counter
+Breakpoint #1 set at a write to `counter` (storage slot 0x0)
+soldb> break balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]
+soldb> break config.limit
+```
+
+The name is resolved through the storage layout, so it needs artifacts compiled with
+`--storage-layout`; the breakpoint then behaves as `break storage <slot>` on the slot the
+layout gives, and says which variable it is watching. A plain name is tried as a function
+first, and a name that is neither says so.
+
 ### `break storage <slot>`
 
 Stop at an `SSTORE` to a storage slot, given in decimal or hex.
@@ -317,14 +333,29 @@ calldata words with the words on the entry stack settles both whether the parame
 there and which end the first one is at. What that proves for a contract is used for every
 frame of it.
 
-Three things follow. A frame of more than one parameter shows nothing until a call with at
-least two arguments has proven the order, which is why `increment3` above is bare. A
-contract whose public functions are entered through a dispatcher wrapper that has not
-decoded the arguments yet — how solc's legacy pipeline compiles them — shows nothing at
-all, because a frame that disagrees disproves the whole contract. And only value-type
-parameters are shown, since each is exactly one word; a `string`, `bytes`, array, or struct
-parameter is a pointer whose width depends on where it lives, so a function taking one
-reports no arguments rather than a memory offset dressed up as a number.
+Three things follow. A frame shows nothing until the trace has proven where its
+contract's parameters sit, which is why `increment3` above is bare: that transaction
+called only one-parameter functions from outside, and one parameter cannot tell the two
+orders apart. A contract whose public functions are entered through a dispatcher wrapper
+that has not decoded the arguments yet — how solc's legacy pipeline compiles them — shows
+nothing at all, because a frame that disagrees disproves the whole contract. And a
+parameter is only read when it occupies one word: a value, or a pointer.
+
+A pointer is followed. A `memory` argument is read through Solidity's memory layout — a
+`string` or `bytes` is a length then its bytes, an array is a length then one word per
+element — so a frame shows what was passed rather than where it sits:
+
+```text
+#0  sum(values = [7, 8, 9], factor = 3) at MemoryArgs.sol:13
+#1  run(label = "hello", values = [7, 8, 9], factor = 3) at MemoryArgs.sol:9
+```
+
+A `storage` argument shows its slot, and an array whose elements are themselves references
+shows the pointer, since following it would need type information the artifacts do not
+carry. A `calldata` slice of a dynamic type is the one parameter that is *two* words —
+a pointer and a length — and nothing in the trace proves that width the way the calldata
+proves the order, so a function taking one reports no arguments at all rather than words
+that may be misaligned.
 
 Internal frames come from three sources, in this order of trust. Jump markers when the
 artifact carries them: legacy source maps mark every jump into and out of a function, and

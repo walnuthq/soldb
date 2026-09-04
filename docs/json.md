@@ -99,7 +99,19 @@ Current schema:
         "0": "contract Counter { ... }"
       },
       "debugAvailable": true,
-      "abi": []
+      "abi": [],
+      "storageLayout": {
+        "storage": [
+          {"astId": 4, "contract": "Counter.sol:Counter", "label": "total",
+           "offset": 0, "slot": "0", "type": "t_uint256"}
+        ],
+        "types": {
+          "t_uint256": {"encoding": "inplace", "label": "uint256", "numberOfBytes": "32"}
+        }
+      },
+      "stateVariables": [
+        {"name": "total", "type": "uint256", "slot": "0x0", "value": "42", "source": "trace"}
+      ]
     }
   }
 }
@@ -118,5 +130,7 @@ Current schema:
 - `capabilities` describes which data is actually available from the selected backend.
 - `artifacts` carries backend-level data that is not tied to one opcode step, including replay calls, contract creations, logs, account changes, gas details, and revert data.
 - `contracts` is populated from `--ethdebug-dir`/`--contracts` when available. `pcToSourceMappings` uses the `offset:length:sourceId` format generated from ETHDebug instruction locations or legacy source maps, `sourcePaths` and `sources` are keyed by source ID, `debugAvailable` is true when compiler-provided source locations were loaded, and `abi` is copied from the compiled artifact.
+- `storageLayout` is the layout `solc --storage-layout` wrote for the contract, verbatim, so a client can decode any slot of the trace's storage itself. It is absent when the artifacts were compiled without it.
+- `stateVariables` lists each state variable with the value it held when the transaction finished, the slot it lives at, and `offset` when it shares that slot. `source` says where the value came from: `trace` when the transaction itself read or wrote the slot, `chain` when it was read from a node, and `unknown` when neither could say — in which case `value` explains why rather than reporting a zero that was never observed. The array is absent when no layout was loaded.
 
 Clients should treat unknown fields as additive and should prefer capability flags over backend names when deciding whether a view can be shown.

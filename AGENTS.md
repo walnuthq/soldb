@@ -275,7 +275,10 @@ rather than to guess values from the stack. Do not "fix" it by inferring locatio
 
 *State* variables do not depend on that gap: `solc --storage-layout` has always said where
 they live, so `vars` and `print` read them through `StorageLayout` for ETHDebug and legacy
-artifacts alike. That is the line to hold when a piece of debug info is missing — take
+artifacts alike, `break <name>` stops where one is written, and the web document carries
+the layout and the final values. A *memory* value is the same kind of fact: the layout of
+a `string`, `bytes`, or array in memory is the language's, so a frame's memory arguments
+are read through it rather than shown as offsets. That is the line to hold when a piece of debug info is missing — take
 what the compiler does emit, prove what you can from the recording, and say plainly what
 is left.
 

@@ -32,6 +32,38 @@ pub struct WebContractMetadata {
     pub debug_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abi: Option<serde_json::Value>,
+    /// Where the contract's state variables live, as `solc --storage-layout` describes
+    /// them: enough for a client to decode any slot of the trace's storage itself.
+    #[serde(rename = "storageLayout", skip_serializing_if = "Option::is_none")]
+    pub storage_layout: Option<serde_json::Value>,
+    /// Every state variable with the value it held when the transaction finished, and
+    /// the slot it came from. Absent when no layout was loaded.
+    #[serde(
+        rename = "stateVariables",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub state_variables: Vec<WebStateVariable>,
+}
+
+/// One state variable in the document: what it is, where it lives, and what it held at
+/// the end of the transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WebStateVariable {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub slot: String,
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub offset: u64,
+    pub value: String,
+    /// `trace` when the transaction itself read or wrote the slot, `chain` when the value
+    /// came from a node, and `unknown` when neither could say.
+    pub source: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl WebContractMetadata {
@@ -82,14 +114,38 @@ impl WebContractMetadata {
             debug_available: !sources.is_empty(),
             sources,
             abi,
+            storage_layout: None,
+            state_variables: Vec::new(),
         }
     }
 
+    /// Adds the storage layout as solc wrote it, and the state variables a caller
+    /// decoded from it.
+    ///
+    /// The values come from the same reading the REPL does, so a client sees what the
+    /// debugger shows: a slot the transaction touched, a slot answered from a chain, or
+    /// nothing at all rather than a zero that was never observed. The decoding stays in
+    /// the frontend, since this crate is the projection, not the model.
+    #[must_use]
+    pub fn with_state(
+        mut self,
+        storage_layout: serde_json::Value,
+        state_variables: Vec<WebStateVariable>,
+    ) -> Self {
+        self.storage_layout = Some(storage_layout);
+        self.state_variables = state_variables;
+        self
+    }
+
     /// True when there is nothing to tell a client about the contract: no source
-    /// mappings, no sources, and no ABI. Such an entry is left out of the document.
+    /// mappings, no sources, no ABI, and no state. Such an entry is left out of the
+    /// document.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pc_to_source_mappings.is_empty() && self.sources.is_empty() && self.abi.is_none()
+        self.pc_to_source_mappings.is_empty()
+            && self.sources.is_empty()
+            && self.abi.is_none()
+            && self.storage_layout.is_none()
     }
 }
 
@@ -542,7 +598,7 @@ mod tests {
 
     use super::{
         simulate_to_web_json, trace_to_web_json, trace_to_web_json_with_contracts,
-        WebContractMetadata, WebSteps,
+        WebContractMetadata, WebStateVariable, WebSteps,
     };
 
     #[test]
@@ -887,6 +943,47 @@ mod tests {
     }
 
     #[test]
+    fn a_contract_entry_carries_its_layout_and_state() {
+        let layout = serde_json::json!({
+            "storage": [{"astId": 1, "contract": "C.sol:C", "label": "counter",
+                         "offset": 0, "slot": "0", "type": "t_uint256"}],
+            "types": {"t_uint256": {"encoding": "inplace", "label": "uint256",
+                                    "numberOfBytes": "32"}}
+        });
+        let metadata = WebContractMetadata::default().with_state(
+            layout.clone(),
+            vec![
+                WebStateVariable {
+                    name: "counter".to_owned(),
+                    ty: "uint256".to_owned(),
+                    slot: "0x0".to_owned(),
+                    offset: 0,
+                    value: "42".to_owned(),
+                    source: "trace".to_owned(),
+                },
+                WebStateVariable {
+                    name: "owner".to_owned(),
+                    ty: "address".to_owned(),
+                    slot: "0x1".to_owned(),
+                    offset: 1,
+                    value: "<unknown: slot 0x1 has not been read or written yet>".to_owned(),
+                    source: "unknown".to_owned(),
+                },
+            ],
+        );
+        // An entry with state is not empty, even without sources or an ABI.
+        assert!(!metadata.is_empty());
+        let document = serde_json::to_value(&metadata).expect("json");
+        assert_eq!(document["storageLayout"], layout);
+        assert_eq!(document["stateVariables"][0]["value"], "42");
+        assert_eq!(document["stateVariables"][0]["source"], "trace");
+        // A zero offset is left out; a non-zero one is carried.
+        assert!(document["stateVariables"][0].get("offset").is_none());
+        assert_eq!(document["stateVariables"][1]["offset"], 1);
+        assert_eq!(document["stateVariables"][1]["source"], "unknown");
+    }
+
+    #[test]
     fn serializes_contract_debug_payload() {
         let trace = sample_trace();
         let mut contracts = BTreeMap::new();
@@ -900,6 +997,8 @@ mod tests {
                 abi: Some(serde_json::json!([
                     {"type": "function", "name": "set", "inputs": []}
                 ])),
+                storage_layout: None,
+                state_variables: Vec::new(),
             },
         );
 

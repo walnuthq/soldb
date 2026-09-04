@@ -56,3 +56,18 @@
 # RUN: printf 'break TestContract.sol:44 if nosuch > 1\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=UNREADABLE %s
 
 # UNREADABLE: Note: `nosuch > 1` could not be evaluated: no state variable named `nosuch` in the storage layout
+
+# A state variable can be named where a slot number would go: `break counter` stops where
+# the counter is written, and a mapping entry stops where that entry is written.
+# RUN: printf 'break counter\ncontinue\nprint counter\nnexti\nprint counter\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WATCH %s
+
+# WATCH: Breakpoint #1 set at a write to `counter` (storage slot 0x0)
+# WATCH: Breakpoint #1 hit at step {{[0-9]+}}, a write to `counter` (storage slot 0x0)
+# The write takes effect after its step, so the value moves as the debugger steps over it.
+# WATCH: uint256 counter = [[#BEFORE:]] [slot 0x0]
+# WATCH: uint256 counter = [[#BEFORE+4]] [slot 0x0]
+
+# A name that is neither a function nor a state variable says both things it tried.
+# RUN: printf 'break nosuchthing\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=NEITHER %s
+
+# NEITHER: no function named `nosuchthing` in the loaded sources; and no state variable named `nosuchthing` in the storage layout

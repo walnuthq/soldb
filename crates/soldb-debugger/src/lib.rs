@@ -198,7 +198,12 @@ pub struct SourceFunction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceParam {
     pub name: String,
+    /// The type without its data location, such as `uint256` or `string`.
     pub ty: String,
+    /// The data location as declared: `memory`, `calldata`, or `storage`; `None` for a
+    /// value type.
+    #[serde(default)]
+    pub location: Option<String>,
 }
 
 /// One argument of a function frame, as it was on the stack when the frame was entered.
@@ -385,22 +390,35 @@ impl ArgumentOrder {
     }
 }
 
+/// What a frame's arguments are read from: the stack at its entry point, and the memory
+/// a pointer among them refers into.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameState<'a> {
+    pub stack: &'a [StackWord],
+    /// Memory at the entry step, as one unprefixed hex string, when the backend captured
+    /// it.
+    pub memory: Option<&'a str>,
+}
+
 /// The arguments a function was entered with, read off the stack at its entry point.
 ///
-/// Only value-type parameters are read: each takes exactly one word, so the words under
-/// the top of the stack are the arguments themselves. A reference parameter is a pointer
-/// whose width depends on its data location, and reading one as a value would show a
-/// memory offset as if it were a number, so a function that takes one reports nothing.
+/// Every parameter read here occupies exactly one word: a value type is the value, and a
+/// `memory` or `storage` reference is a pointer, which memory's own layout then resolves.
+/// A `calldata` slice of a dynamic type is the exception — it is a pointer *and* a length,
+/// two words, and nothing in the trace proves that width the way the calldata proves the
+/// order — so a function taking one reports no arguments rather than words that may be
+/// misaligned.
 #[must_use]
 pub fn decode_arguments(
     params: &[SourceParam],
-    stack: &[StackWord],
+    state: FrameState<'_>,
     layout: ArgumentLayout,
 ) -> Vec<FrameArgument> {
+    let stack = state.stack;
     if params.is_empty() || stack.len() < params.len() {
         return Vec::new();
     }
-    if !params.iter().all(|param| is_value_type(&param.ty)) {
+    if !params.iter().all(readable_parameter) {
         return Vec::new();
     }
     // One parameter is on top under either order; more than one needs the order proven.
@@ -417,13 +435,13 @@ pub fn decode_arguments(
             FrameArgument {
                 name: param.name.clone(),
                 ty: param.ty.clone(),
-                value: argument_value(&param.ty, word),
+                value: argument_value(param, word, state.memory),
             }
         })
         .collect()
 }
 
-fn argument_value(ty: &str, word: &str) -> DebugValue {
+fn argument_value(param: &SourceParam, word: &str, memory: Option<&str>) -> DebugValue {
     let Ok(parsed) = parse_word(&format!("0x{}", word.trim_start_matches("0x"))) else {
         return DebugValue {
             display: "<unreadable stack word>".to_owned(),
@@ -431,11 +449,158 @@ fn argument_value(ty: &str, word: &str) -> DebugValue {
             status: DebugValueStatus::Unavailable,
         };
     };
-    DebugValue {
-        display: decode_value(value_bytes(&parsed, ty), ty),
-        raw: Some(short_hex(&parsed)),
-        status: DebugValueStatus::Decoded,
+    let raw = Some(short_hex(&parsed));
+    match param.location.as_deref() {
+        Some("memory") => {
+            let pointer = word_as_usize(&parsed);
+            let display = match (pointer, memory) {
+                (Some(pointer), Some(memory)) => read_memory_value(memory, pointer, &param.ty)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "<{} in memory at {}, beyond what this step captured>",
+                            param.ty,
+                            short_hex(&parsed)
+                        )
+                    }),
+                (_, None) => format!(
+                    "<{} in memory at {}; this backend captured no memory>",
+                    param.ty,
+                    short_hex(&parsed)
+                ),
+                (None, _) => format!("<{} at {}>", param.ty, short_hex(&parsed)),
+            };
+            let decoded =
+                display.starts_with('"') || display.starts_with('[') || display.starts_with("0x");
+            DebugValue {
+                display,
+                raw,
+                status: if decoded {
+                    DebugValueStatus::Decoded
+                } else {
+                    DebugValueStatus::Raw
+                },
+            }
+        }
+        Some(location) => DebugValue {
+            display: format!("<{} in {location} at {}>", param.ty, short_hex(&parsed)),
+            raw,
+            status: DebugValueStatus::Raw,
+        },
+        None => DebugValue {
+            display: decode_value(value_bytes(&parsed, &param.ty), &param.ty),
+            raw,
+            status: DebugValueStatus::Decoded,
+        },
     }
+}
+
+/// Whether a parameter is one word the debugger can place: a value, or a pointer.
+pub(crate) fn readable_parameter(param: &SourceParam) -> bool {
+    match param.location.as_deref() {
+        // A `calldata` slice of a dynamic type is two words; see `decode_arguments`.
+        Some("calldata") => !is_dynamic_type(&param.ty),
+        Some(_) => true,
+        None => is_value_type(&param.ty),
+    }
+}
+
+/// Whether a type is stored with a length, rather than a fixed number of words.
+fn is_dynamic_type(ty: &str) -> bool {
+    ty == "string" || ty == "bytes" || ty.ends_with("[]")
+}
+
+/// A value living in memory, read through Solidity's memory layout: a `string` or `bytes`
+/// is a length followed by its bytes, a dynamic array is a length followed by one word
+/// per element, and a fixed-size array is those words with no length.
+///
+/// The layout is the language's, not a guess — the same standing as the storage layout —
+/// but only value-type elements are decoded; anything else is a pointer this does not
+/// follow, and it says so rather than printing an offset as a number.
+fn read_memory_value(memory: &str, pointer: usize, ty: &str) -> Option<String> {
+    if ty == "string" || ty == "bytes" {
+        let length = word_as_usize(&memory_word(memory, pointer)?)?;
+        let bytes = memory_bytes(memory, pointer.checked_add(32)?, length)?;
+        if ty == "string" {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                return Some(format!("{text:?}"));
+            }
+        }
+        return Some(format!("0x{}", hex_of(&bytes)));
+    }
+    let (element, count) = array_shape(ty)?;
+    if !is_value_type(element) {
+        return None;
+    }
+    let (first, count) = match count {
+        // Dynamic: the length is the first word, the elements follow it.
+        None => (
+            pointer.checked_add(32)?,
+            word_as_usize(&memory_word(memory, pointer)?)?,
+        ),
+        Some(count) => (pointer, count),
+    };
+    let shown = count.min(8);
+    let mut parts = Vec::with_capacity(shown);
+    for index in 0..shown {
+        let word = memory_word(memory, first.checked_add(index.checked_mul(32)?)?)?;
+        parts.push(decode_value(value_bytes(&word, element), element));
+    }
+    if count > shown {
+        parts.push(format!("... {} more", count - shown));
+    }
+    Some(format!("[{}]", parts.join(", ")))
+}
+
+/// An array type as its element type and its length: `None` for a dynamic array, which
+/// carries its length in memory.
+fn array_shape(ty: &str) -> Option<(&str, Option<usize>)> {
+    let inner = ty.strip_suffix(']')?;
+    let open = inner.rfind('[')?;
+    let element = inner[..open].trim();
+    let length = &inner[open + 1..];
+    if length.is_empty() {
+        return Some((element, None));
+    }
+    Some((element, Some(length.parse::<usize>().ok()?)))
+}
+
+/// The 32 bytes at `offset` of a memory image, when it reaches that far.
+fn memory_word(memory: &str, offset: usize) -> Option<Word> {
+    let bytes = memory_bytes(memory, offset, 32)?;
+    let mut word = [0_u8; 32];
+    word.copy_from_slice(&bytes);
+    Some(word)
+}
+
+/// `length` bytes at `offset` of a memory image, which is two hex digits per byte.
+fn memory_bytes(memory: &str, offset: usize, length: usize) -> Option<Vec<u8>> {
+    let start = offset.checked_mul(2)?;
+    let end = start.checked_add(length.checked_mul(2)?)?;
+    let digits = memory.get(start..end)?;
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        digits
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("ascii"), 16).expect("hex")
+            })
+            .collect(),
+    )
+}
+
+/// A word as an offset or a length, when it fits one.
+fn word_as_usize(word: &Word) -> Option<usize> {
+    if word[..24].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    usize::try_from(u64::from_be_bytes(word[24..].try_into().expect("8 bytes"))).ok()
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The bytes of a stack word a value of type `ty` occupies: a signed integer is its own
@@ -639,12 +804,16 @@ fn parse_source_params(params: &str) -> Vec<SourceParam> {
             if tokens.last().copied() == Some(name.as_str()) && tokens.len() > 1 {
                 tokens.pop();
             }
+            let location = tokens
+                .iter()
+                .find(|token| matches!(**token, "memory" | "calldata" | "storage"))
+                .map(|token| (*token).to_owned());
             let ty = tokens
                 .into_iter()
                 .filter(|token| !matches!(*token, "memory" | "calldata" | "storage" | "payable"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            (!ty.is_empty()).then_some(SourceParam { name, ty })
+            (!ty.is_empty()).then_some(SourceParam { name, ty, location })
         })
         .collect()
 }
@@ -980,5 +1149,73 @@ mod tests {
                 snapshot: Default::default(),
             }],
         }
+    }
+    /// Solidity memory: a `string` is a length then its bytes; an array is a length then
+    /// one word per element; a fixed-size array is those words with no length.
+    fn memory_image(words: &[&str]) -> String {
+        words
+            .iter()
+            .map(|word| format!("{:0>64}", word.trim_start_matches("0x")))
+            .collect()
+    }
+
+    #[test]
+    fn reads_arguments_that_live_in_memory() {
+        // 0x00: "hello" as a string (length 5), 0x40: [7, 8, 9] as a dynamic array.
+        let memory = memory_image(&[
+            "5",
+            "68656c6c6f000000000000000000000000000000000000000000000000000000",
+            "3",
+            "7",
+            "8",
+            "9",
+        ]);
+        let string_at = |offset: usize| super::read_memory_value(&memory, offset, "string");
+        assert_eq!(string_at(0).as_deref(), Some("\"hello\""));
+        assert_eq!(
+            super::read_memory_value(&memory, 0, "bytes").as_deref(),
+            Some("0x68656c6c6f")
+        );
+        assert_eq!(
+            super::read_memory_value(&memory, 64, "uint256[]").as_deref(),
+            Some("[7, 8, 9]")
+        );
+        // A fixed-size array has no length word: it starts at the pointer.
+        assert_eq!(
+            super::read_memory_value(&memory, 96, "uint256[2]").as_deref(),
+            Some("[7, 8]")
+        );
+        // Beyond what the step captured, and a type whose elements are not values: no
+        // guess, and the caller says where the pointer pointed instead.
+        assert_eq!(super::read_memory_value(&memory, 4096, "string"), None);
+        assert_eq!(super::read_memory_value(&memory, 64, "string[]"), None);
+    }
+
+    #[test]
+    fn a_parameter_is_readable_only_when_its_width_is_known() {
+        let param = |ty: &str, location: Option<&str>| super::SourceParam {
+            name: "x".to_owned(),
+            ty: ty.to_owned(),
+            location: location.map(str::to_owned),
+        };
+        assert!(super::readable_parameter(&param("uint256", None)));
+        assert!(super::readable_parameter(&param("string", Some("memory"))));
+        assert!(super::readable_parameter(&param("Config", Some("storage"))));
+        // One word: a calldata slice of a fixed-size type is a pointer.
+        assert!(super::readable_parameter(&param(
+            "uint256[2]",
+            Some("calldata")
+        )));
+        // Two words, and nothing proves that width: not read.
+        assert!(!super::readable_parameter(&param(
+            "bytes",
+            Some("calldata")
+        )));
+        assert!(!super::readable_parameter(&param(
+            "uint256[]",
+            Some("calldata")
+        )));
+        // A struct by value is not one word of anything the debugger can decode.
+        assert!(!super::readable_parameter(&param("Config", None)));
     }
 }
