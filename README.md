@@ -165,14 +165,19 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
 - Full transaction traces with internal calls & decoded parameters
 - Dynamic gas profiles by contract, function, source line, opcode, and instruction
 - Folded-stack and interactive SVG flame graph output
-- Transaction simulation with arbitrary calldata (including structs & tuples)
-- Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations
-- HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and normal-RPC replay for local Anvil transactions
+- Transaction simulation with arbitrary calldata (including structs & tuples), through
+  `debug_traceCall` or replayed locally as a fork of the chain at any block and transaction index
+- `soldb run`: debug compiled bytecode on a local chain with no node at all
+- Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) that moves backward as well as
+  forward (`reverse-next`, `reverse-continue`, `goto`) – works for transactions, simulations, and runs
+- Debug Adapter Protocol server for editors, step-back included
+- HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and a REVM replay backend for nodes that cannot trace
+- WebAssembly package for browser and Node.js hosts, with host-driven replay
 - Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
 
 ## Architecture
 
-SolDB is split into focused crates so RPC transport, ETHDebug parsing, execution backends, CLI presentation, and interactive debugging can evolve independently.
+SolDB is split into focused crates so the RPC transport, the execution engine, ETHDebug parsing, CLI presentation, and interactive debugging can evolve independently.
 
 ```mermaid
 flowchart TD
@@ -180,18 +185,24 @@ flowchart TD
     solc --> artifacts["ETHDebug + ABI artifacts"]
 
     cli["soldb trace / simulate / profile"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]
+    run["soldb run<br/>compiled bytecode"] --> metadata
+    wasm["soldb-wasm<br/>browser / Node.js host does the RPC"] --> metadata
     artifacts --> metadata
 
-    cli --> selector["soldb-rpc<br/>backend selector"]
+    cli --> selector["soldb-rpc<br/>JSON-RPC transport + backend selector"]
     selector --> debug_rpc["debug-rpc backend<br/>debug_traceTransaction / debug_traceCall"]
-    selector --> replay["replay backend (soldb-evm)<br/>normal RPC state -> REVM inspectors"]
+    selector --> replay["replay backend<br/>node state at the parent block"]
+    run --> local["LocalChain<br/>synthetic block, no node"]
 
-    debug_rpc --> opcode_trace["opcode trace"]
-    replay --> opcode_trace
+    debug_rpc --> engine["soldb-evm<br/>trace assembly + REVM engine"]
+    replay --> engine
+    local --> engine
+    wasm --> engine
+    engine --> opcode_trace["opcode trace<br/>a complete recording"]
     metadata --> debugger["soldb-debugger<br/>source steps + variables"]
     opcode_trace --> enriched
     debugger --> enriched["source lines<br/>call frames<br/>decoded values"]
-    enriched --> outputs["CLI / JSON / REPL / DAP"]
+    enriched --> outputs["CLI / JSON / REPL and DAP, forward and reverse / WASM"]
     opcode_trace --> profiler["soldb-profiler<br/>gas aggregation"]
     metadata --> profiler
     profiler --> profile_outputs["tables / JSON / flame graph"]
