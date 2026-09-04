@@ -49,6 +49,8 @@ pub struct DapServer {
     /// for that source replaces them, as the protocol requires.
     line_breakpoint_ids: BTreeMap<String, Vec<u32>>,
     function_breakpoint_ids: Vec<u32>,
+    /// Whether the console note about inferred frame arguments has been sent.
+    reported_frame_arguments: bool,
     terminated: bool,
 }
 
@@ -72,6 +74,7 @@ impl Default for DapServer {
             pending_function_breakpoints: Vec::new(),
             line_breakpoint_ids: BTreeMap::new(),
             function_breakpoint_ids: Vec::new(),
+            reported_frame_arguments: false,
             terminated: false,
         }
     }
@@ -105,7 +108,7 @@ impl DapServer {
                 Some(threads_body(self.thread_id, "SolDB trace")),
                 None,
             )],
-            "stackTrace" => vec![self.stack_trace(message)],
+            "stackTrace" => self.stack_trace(message),
             "scopes" => vec![self.scopes(message)],
             "variables" => vec![self.variables(message)],
             "evaluate" => vec![self.evaluate(message)],
@@ -371,9 +374,26 @@ impl DapServer {
         self.apply_function_breakpoints(&names);
     }
 
-    fn stack_trace(&mut self, request: &DapMessage) -> DapMessage {
+    /// The call frames, and once per session a console note if any of them carries
+    /// argument values: those are read off the stack using the calling convention this
+    /// trace proved, not reported by the compiler, and the editor should not present them
+    /// as debug info.
+    fn stack_trace(&mut self, request: &DapMessage) -> Vec<DapMessage> {
         let frames = self.stack_frames();
-        self.response(request, true, Some(stack_trace_body(frames)), None)
+        let inferred = frames.iter().any(|frame| frame.name.contains(" = "));
+        let response = self.response(request, true, Some(stack_trace_body(frames)), None);
+        if !inferred || self.reported_frame_arguments {
+            return vec![response];
+        }
+        self.reported_frame_arguments = true;
+        let note = self.event(
+            "output",
+            Some(json!({
+                "category": "console",
+                "output": "soldb: frame arguments are read off the stack, not from compiler-reported variable locations; the calling convention was proved from this trace's calldata\n"
+            })),
+        );
+        vec![response, note]
     }
 
     fn scopes(&mut self, request: &DapMessage) -> DapMessage {

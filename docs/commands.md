@@ -259,7 +259,9 @@ soldb> bt
 ```
 
 A frame shows the arguments it was entered with when the trace has shown where its
-compiler leaves them. Solidity's two code generators disagree — the legacy pipeline pushes
+compiler leaves them. These values are read off the stack, not reported by the compiler,
+and the first backtrace that shows any says so once. When solc emits ETHDebug variable
+locations, those will replace this reading. Solidity's two code generators disagree — the legacy pipeline pushes
 parameters left to right and via-IR right to left — and nothing in the artifacts says which
 produced the code, so SolDB proves it instead of assuming: the first function entered in a
 frame whose calldata is known is the function that calldata selected, so comparing the
@@ -349,9 +351,18 @@ Both commands need the session to be started with
 
 *Local* variables come from the ETHDebug variable information for the current program
 counter, shared with the DAP server's variables view. A compiler only reports them if it
-emits `context.variables` in its ETHDebug output; compilers that do not yet emit it make
-these commands report that nothing is in scope, which is a limitation of the debug info
-rather than of the lookup.
+emits `context.variables` in its ETHDebug output, and no compiler release does yet. When
+the loaded artifact carries no variable locations at all, `vars` and `print` say that,
+rather than reporting an empty scope:
+
+```text
+soldb> vars
+Variables: this artifact carries no ETHDebug variable locations, so locals cannot be shown; the compiler that produced it does not emit them yet
+```
+
+That is a limitation of the debug info, not of the lookup, and it is worth telling apart
+from `no variables in scope at PC …`, which means the compiler did describe variables and
+none of them is live here.
 
 *State* variables come from the storage layout, the `<Contract>_storage.json` (or the
 `storage-layout` entry of a legacy `combined.json`) that `solc --storage-layout` writes.

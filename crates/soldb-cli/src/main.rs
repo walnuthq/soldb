@@ -1772,6 +1772,16 @@ fn print_debugger_backtrace(state: &DebuggerState) {
         println!("{}", warning("No trace loaded."));
         return;
     }
+    if frames.iter().any(|frame| !frame.arguments.is_empty()) {
+        // These values are read off the stack, not reported by the compiler. The order was
+        // proved from this trace, but say so: it is an inference about the whole contract
+        // drawn from the frames the trace happened to contain.
+        report_once(
+            "frame-arguments".to_owned(),
+            "frame arguments are read off the stack, not from compiler-reported variable locations",
+            "the calling convention was proved from this trace's calldata; ETHDebug variable locations will replace this once the compiler emits them",
+        );
+    }
     for (index, frame) in frames.iter().enumerate() {
         let name = frame
             .function_name
@@ -2080,21 +2090,38 @@ fn print_debugger_variables(
         };
         match soldb_debugger::state_value(layout, &words, name) {
             Ok(variable) => print_state(&variable),
-            Err(error) => println!(
-                "{} `{name}` is not in scope at PC {}; {error}",
-                warning("No such variable:"),
-                number_color(step.pc)
-            ),
+            Err(error) => {
+                println!(
+                    "{} `{name}` is not in scope at PC {}; {error}",
+                    warning("No such variable:"),
+                    number_color(step.pc)
+                );
+                if !index.debug.info.has_variable_locations() {
+                    println!(
+                        "{} this artifact carries no ETHDebug variable locations, so a local of that name cannot be looked up; the compiler that produced it does not emit them yet",
+                        dim("note:")
+                    );
+                }
+            }
         }
         return;
     }
 
     if variables.is_empty() {
-        println!(
-            "{} no variables in scope at PC {}",
-            dim("Variables:"),
-            number_color(step.pc)
-        );
+        if index.debug.info.has_variable_locations() {
+            println!(
+                "{} no variables in scope at PC {}",
+                dim("Variables:"),
+                number_color(step.pc)
+            );
+        } else {
+            // The difference matters: the compiler described no variables at all, which is
+            // not the same as none being live here.
+            println!(
+                "{} this artifact carries no ETHDebug variable locations, so locals cannot be shown; the compiler that produced it does not emit them yet",
+                dim("Variables:")
+            );
+        }
     }
     for variable in &variables {
         print_variable(variable);
