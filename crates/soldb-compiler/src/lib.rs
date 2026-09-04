@@ -50,6 +50,7 @@ impl Default for CompilerConfig {
                 "--ethdebug-runtime".to_owned(),
                 "--bin".to_owned(),
                 "--abi".to_owned(),
+                "--storage-layout".to_owned(),
                 "--overwrite".to_owned(),
             ],
             production_flags: vec![

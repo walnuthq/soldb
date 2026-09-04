@@ -1,0 +1,26 @@
+# Reading state variables at a step: the value a slot holds is the most recent word the
+# transaction recorded for it, so `print counter` moves with the `SSTORE`s, and a slot
+# nothing has touched is reported as unknown rather than as zero. The counter's absolute
+# value depends on how many increments this deployment has seen, so what is pinned here is
+# how it changes.
+# REQUIRES: soldb
+# RUN: printf 'break TestContract.sol:30\ncontinue\nvars\nprint counter\nstorage\nbreak storage 0\ncontinue\nnexti\nprint counter\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s
+
+# `increment` has already added its amount to the counter by line 30.
+# CHECK: Breakpoint #1 hit at step {{[0-9]+}}, TestContract.sol:30
+# CHECK: State:
+# CHECK-NEXT: uint256 counter = [[#COUNT:]] [slot 0x0]
+# CHECK-NEXT: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
+# CHECK: uint256 counter = [[#COUNT]] [slot 0x0]
+# The storage view is every slot known at this step, not only the one this opcode touched.
+# CHECK: Storage: {{.*}}0x{{[0-9a-f]+}}
+# CHECK-NEXT: 0x0 = 0x{{[0-9a-f]+}}
+# `increment2` adds the same amount again; the write takes effect after its `SSTORE`.
+# CHECK: Breakpoint #2 hit at step {{[0-9]+}}, storage slot 0x0
+# CHECK: uint256 counter = [[#COUNT+4]] [slot 0x0]
+
+# A mapping entry is read by key, and a key the transaction never touched is unknown.
+# RUN: printf 'print balances\nprint balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=MAPPING %s
+
+# MAPPING: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
+# MAPPING: uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = <unknown: slot 0x{{[0-9a-f]+}} has not been read or written yet>

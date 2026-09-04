@@ -20,8 +20,13 @@ use serde::{Deserialize, Serialize};
 use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
 use soldb_ethdebug::{EthdebugInfo, VariableLocation};
 
+pub mod state;
 pub mod stepping;
 
+pub use soldb_ethdebug::StorageLayout;
+pub use state::{
+    short_hex, state_value, state_variables, StateVariable, StorageTape, StorageWords,
+};
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
     Frame, FunctionId, JumpMarker, LineKey, ResolvedFunction, ResolvedLine, SourceListing,

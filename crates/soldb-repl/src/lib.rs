@@ -19,7 +19,7 @@
 use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
 use soldb_debugger::{
     call_target, normalize_address, ContractDebugInfo, Frame, ResolvedFunction, ResolvedLine,
-    SourceListing, StepLocation, StepMap,
+    SourceListing, StepLocation, StepMap, StorageLayout, StorageTape, StorageWords,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +294,7 @@ pub struct DebuggerState {
     next_breakpoint_id: u32,
     trace: Option<TransactionTrace>,
     step_map: Option<StepMap>,
+    storage_tape: Option<StorageTape>,
 }
 
 impl Default for DebuggerState {
@@ -305,6 +306,7 @@ impl Default for DebuggerState {
             next_breakpoint_id: 1,
             trace: None,
             step_map: None,
+            storage_tape: None,
         }
     }
 }
@@ -317,7 +319,9 @@ impl DebuggerState {
     /// Loads a trace and maps its call structure. Source lines arrive with
     /// [`DebuggerState::attach_debug_info`]; until then stepping is by instruction.
     pub fn load_trace(&mut self, trace: TransactionTrace) {
-        self.step_map = Some(StepMap::new(&trace, Vec::new()));
+        let map = StepMap::new(&trace, Vec::new());
+        self.storage_tape = Some(StorageTape::new(&trace, &map));
+        self.step_map = Some(map);
         self.trace = Some(trace);
         self.current_step = 0;
     }
@@ -326,8 +330,34 @@ impl DebuggerState {
     /// line and function breakpoints, and source locations in frames.
     pub fn attach_debug_info(&mut self, contracts: Vec<ContractDebugInfo>) {
         if let Some(trace) = &self.trace {
-            self.step_map = Some(StepMap::new(trace, contracts));
+            let map = StepMap::new(trace, contracts);
+            self.storage_tape = Some(StorageTape::new(trace, &map));
+            self.step_map = Some(map);
         }
+    }
+
+    /// The storage words known at the current step, in the storage context it runs in.
+    #[must_use]
+    pub fn storage_words(&self) -> Option<StorageWords<'_>> {
+        let map = self.step_map.as_ref()?;
+        Some(self.storage_tape.as_ref()?.at_step(map, self.current_step))
+    }
+
+    /// The account whose storage the current step reads and writes.
+    #[must_use]
+    pub fn storage_address(&self) -> Option<&str> {
+        self.step_map.as_ref()?.storage_address(self.current_step)
+    }
+
+    /// The storage layout of the contract executing at the current step, when it was
+    /// compiled with one.
+    #[must_use]
+    pub fn storage_layout(&self) -> Option<&StorageLayout> {
+        self.step_map
+            .as_ref()?
+            .contract_at_step(self.current_step)?
+            .storage_layout
+            .as_ref()
     }
 
     pub fn trace(&self) -> Option<&TransactionTrace> {

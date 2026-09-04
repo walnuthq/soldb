@@ -20,5 +20,6 @@
 # RUN: printf 'help\nhelp vars\nquit\n' | %soldb trace %{test_tx} --rpc %{rpc_url} -i 2>&1 | FileCheck %s --check-prefix=HELP
 
 # HELP: vars, print <variable>
-# HELP: vars - print every source variable live at the current PC
-# HELP: print <variable> - print one source variable by name
+# HELP: vars - print the variables live at the current PC
+# HELP: print <variable> - print one variable by name
+# HELP: print <state>[<key>]

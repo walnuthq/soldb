@@ -142,6 +142,7 @@ if [ "$USE_ETHDEBUG" = true ]; then
         --ethdebug-runtime
         --bin
         --abi
+        --storage-layout
         --overwrite
         -o "$DEBUG_DIR"
     )
@@ -152,7 +153,7 @@ else
     # Use --combined-json to generate combined.json with srcmap-runtime
     COMPILE_FLAGS=(
         --combined-json
-        bin,bin-runtime,abi,srcmap,srcmap-runtime,metadata
+        bin,bin-runtime,abi,srcmap,srcmap-runtime,metadata,storage-layout
         --overwrite
         -o "$DEBUG_DIR"
     )
@@ -182,6 +183,7 @@ if [ "$USE_ETHDEBUG" = true ] && [ $COMPILE_EXIT_CODE -ne 0 ] && grep -q "unreco
         --ethdebug-resources
         --bin
         --abi
+        --storage-layout
         --overwrite
         -o "$DEBUG_DIR"
     )

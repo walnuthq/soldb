@@ -20,7 +20,7 @@
 # The interactive debugger steps the legacy map by source line, breaks on a function, and
 # lists the frames. solc 0.8.16 attributes its generated code to a source index past the
 # source list; that is unmapped code, not a reason to reject the map.
-# RUN: cd %S/../examples && CONTRACT_ADDR=$(cat out_legacy/deployment.json | jq -r '.address') && TX=$(DEBUG_DIR=out_legacy RPC_URL=%{rpc_url} %S/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && sleep 1 && printf 'next\nnext\nbreak increment2\ncontinue\nbt\nfinish\nquit\n' | %soldb trace $TX --ethdebug-dir $CONTRACT_ADDR:TestContract:%S/../examples/out_legacy --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=INTERACTIVE %s
+# RUN: cd %S/../examples && CONTRACT_ADDR=$(cat out_legacy/deployment.json | jq -r '.address') && TX=$(DEBUG_DIR=out_legacy RPC_URL=%{rpc_url} %S/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && sleep 1 && printf 'next\nnext\nbreak increment2\ncontinue\nbt\nprint counter\nfinish\nquit\n' | %soldb trace $TX --ethdebug-dir $CONTRACT_ADDR:TestContract:%S/../examples/out_legacy --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=INTERACTIVE %s
 
 # INTERACTIVE-NOT: could not load debug metadata
 # INTERACTIVE: TestContract.sol:23 in increment
@@ -29,5 +29,9 @@
 # INTERACTIVE: #0  increment2 at TestContract.sol:39
 # INTERACTIVE-NEXT: #1  increment at TestContract.sol:30
 # INTERACTIVE-NEXT: #2  TestContract at TestContract.sol:8
+# The legacy `--storage-layout` output reads state variables by name, exactly as the
+# ETHDebug path does. The counter's value depends on how many increments this deployment
+# has seen; that it decodes at all is what this pins.
+# INTERACTIVE: uint256 counter = {{[0-9]+}} [slot 0x0]
 # The map's return markers make `finish` exact: back at the call site in increment.
 # INTERACTIVE: TestContract.sol:30 in increment

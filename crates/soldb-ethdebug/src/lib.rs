@@ -22,6 +22,7 @@ pub mod artifacts;
 pub mod events;
 pub mod metadata;
 pub mod source_map;
+pub mod storage_layout;
 
 pub use abi::{
     canonical_abi_input_type, encode_abi_arguments, encode_function_call, function_selector,
@@ -30,7 +31,8 @@ pub use abi::{
 };
 pub use artifacts::{
     contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-    find_program_ethdebug, load_debug_program, read_debug_source, read_json_file, DebugProgram,
+    find_program_ethdebug, load_debug_program, load_storage_layout, read_debug_source,
+    read_json_file, DebugProgram,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,
@@ -44,4 +46,9 @@ pub use metadata::{
 pub use source_map::{
     build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, parse_srcmap,
     SourceMapEntry, SourceMapEnvironment, SourceMapInfo, SourceMapProgram,
+};
+pub use storage_layout::{
+    add_word, decode_value, element_place, mapping_slot, parse_word, word_hex, word_to_decimal,
+    DecodedStorage, StorageEncoding, StorageLayout, StorageMember, StorageRef, StorageType,
+    StorageVariable, Word,
 };

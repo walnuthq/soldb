@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use soldb_core::TransactionTrace;
-use soldb_ethdebug::{EthdebugInfo, FunctionExit, SourceLocation};
+use soldb_ethdebug::{EthdebugInfo, FunctionExit, SourceLocation, StorageLayout};
 
 use crate::{parse_source_functions, SourceFunction};
 
@@ -49,6 +49,9 @@ pub struct ContractDebugInfo {
     pub info: EthdebugInfo,
     pub source_contents: BTreeMap<u64, String>,
     pub functions: Vec<SourceFunction>,
+    /// Where the contract's state variables live, when it was compiled with
+    /// `--storage-layout`.
+    pub storage_layout: Option<StorageLayout>,
     /// Byte offsets at which each line of each source starts.
     line_starts: BTreeMap<u64, Vec<usize>>,
     /// Instruction index by program counter.
@@ -117,10 +120,18 @@ impl ContractDebugInfo {
             info,
             source_contents,
             functions,
+            storage_layout: None,
             line_starts,
             pc_index,
             function_entries,
         }
+    }
+
+    /// Attaches the contract's storage layout, so state variables can be read by name.
+    #[must_use]
+    pub fn with_storage_layout(mut self, storage_layout: Option<StorageLayout>) -> Self {
+        self.storage_layout = storage_layout;
+        self
     }
 
     /// The function whose entry point `pc` is, when it is one.
@@ -407,6 +418,9 @@ struct StepInfo {
     contract: Option<usize>,
     /// Index into the address table, when the executing address is known.
     address: Option<usize>,
+    /// Index into the address table of the account whose storage this step reads and
+    /// writes: the executing address, or the caller's for a `DELEGATECALL`.
+    storage: Option<usize>,
     /// EVM depth, zero at the root.
     evm_depth: u32,
     /// EVM depth plus the inferred internal-function depth, zero at the root.
@@ -425,6 +439,9 @@ pub struct StepMap {
     steps: Vec<StepInfo>,
     addresses: Vec<String>,
     pcs: Vec<u64>,
+    /// Every EVM frame that reverted, as the step it was entered at and the step it
+    /// reverted on, innermost first.
+    reverted: Vec<(usize, usize)>,
 }
 
 /// What the first pass records about a step: its EVM frame and its own span.
@@ -434,6 +451,7 @@ struct FramedStep {
     frame_id: u32,
     contract: Option<usize>,
     address: Option<usize>,
+    storage: Option<usize>,
     location: Option<LocationRef>,
     /// The function this step's program counter is the entry point of.
     entry: Option<usize>,
@@ -445,6 +463,10 @@ struct EvmFrame {
     id: u32,
     contract: Option<usize>,
     address: Option<usize>,
+    /// The account whose storage the frame reads and writes.
+    storage: Option<usize>,
+    /// The step the frame was entered at.
+    entry_step: usize,
 }
 
 /// One internal frame: a function, or a placeholder for a compiler-generated helper
@@ -539,11 +561,15 @@ impl StepMap {
             .or(trace.contract_address.as_deref());
         let root_depth = trace.steps.first().map_or(0, |step| step.depth);
         let mut next_frame_id = 1_u32;
+        let root_storage = root_address.map(&mut intern);
         let mut evm_frames = vec![EvmFrame {
             id: 0,
             contract: contract_for(root_address, true),
-            address: root_address.map(&mut intern),
+            address: root_storage,
+            storage: root_storage,
+            entry_step: 0,
         }];
+        let mut reverted = Vec::new();
         let mut framed = Vec::with_capacity(trace.steps.len());
         for (index, step) in trace.steps.iter().enumerate() {
             let evm_depth = step.depth.saturating_sub(root_depth) as usize;
@@ -551,16 +577,36 @@ impl StepMap {
             while evm_frames.len() <= evm_depth {
                 // A new EVM frame: the callee's code address is on the caller's stack at
                 // the call instruction, the step before this one.
-                let target = (evm_frames.len() == evm_depth)
+                let call = (evm_frames.len() == evm_depth)
                     .then(|| index.checked_sub(1))
-                    .flatten()
-                    .and_then(|caller| call_target(&trace.steps[caller]));
+                    .flatten();
+                let target = call.and_then(|caller| call_target(&trace.steps[caller]));
+                let address = target.as_deref().map(&mut intern);
+                // A `DELEGATECALL` or `CALLCODE` runs the callee's code against the
+                // caller's storage; every other call has the callee's own.
+                let delegated = call.is_some_and(|caller| {
+                    matches!(trace.steps[caller].op.as_str(), "DELEGATECALL" | "CALLCODE")
+                });
+                let storage = if delegated {
+                    evm_frames.last().and_then(|frame| frame.storage)
+                } else {
+                    address
+                };
                 evm_frames.push(EvmFrame {
                     id: next_frame_id,
                     contract: contract_for(target.as_deref(), false),
-                    address: target.as_deref().map(&mut intern),
+                    address,
+                    storage,
+                    entry_step: index,
                 });
                 next_frame_id += 1;
+            }
+            if step.op == "REVERT" || step.error.is_some() {
+                let entry_step = evm_frames
+                    .last()
+                    .expect("the root frame is never popped")
+                    .entry_step;
+                reverted.push((entry_step, index));
             }
             let frame = evm_frames.last().expect("the root frame is never popped");
             let location = frame.contract.and_then(|contract_index| {
@@ -584,6 +630,7 @@ impl StepMap {
                 frame_id: frame.id,
                 contract: frame.contract,
                 address: frame.address,
+                storage: frame.storage,
                 location,
                 entry: contract.and_then(|contract| contract.function_entry_at_pc(step.pc)),
                 marker: contract.map_or(JumpMarker::None, |contract| {
@@ -749,6 +796,7 @@ impl StepMap {
                 key,
                 contract: step.contract,
                 address: step.address,
+                storage: step.storage,
                 evm_depth: step.evm_depth,
                 frame_depth: (evm_depth + internal_total) as u32,
                 frame_entry,
@@ -762,6 +810,7 @@ impl StepMap {
             steps,
             addresses,
             pcs,
+            reverted,
         };
         map.smooth_single_step_excursions();
         map.mark_line_starts();
@@ -839,6 +888,12 @@ impl StepMap {
         &self.contracts
     }
 
+    /// The contract whose code the step executes, when its debug info was loaded.
+    #[must_use]
+    pub fn contract_at_step(&self, step: usize) -> Option<&ContractDebugInfo> {
+        self.contracts.get(self.steps.get(step)?.contract?)
+    }
+
     #[must_use]
     pub fn step_count(&self) -> usize {
         self.steps.len()
@@ -886,6 +941,27 @@ impl StepMap {
     pub fn executing_address(&self, step: usize) -> Option<&str> {
         let index = self.steps.get(step)?.address?;
         self.addresses.get(index).map(String::as_str)
+    }
+
+    /// The account whose storage the step reads and writes: the executing address, or
+    /// the caller's under a `DELEGATECALL`.
+    #[must_use]
+    pub fn storage_address(&self, step: usize) -> Option<&str> {
+        let index = self.storage_context_index(step)?;
+        self.addresses.get(index).map(String::as_str)
+    }
+
+    /// An opaque identifier for that account, for indexing storage by context.
+    #[must_use]
+    pub fn storage_context_index(&self, step: usize) -> Option<usize> {
+        self.steps.get(step)?.storage
+    }
+
+    /// Every EVM frame that reverted, as the step it was entered at and the step it
+    /// reverted on. A frame's writes, and its callees', do not survive it.
+    #[must_use]
+    pub fn reverted_spans(&self) -> &[(usize, usize)] {
+        &self.reverted
     }
 
     #[must_use]

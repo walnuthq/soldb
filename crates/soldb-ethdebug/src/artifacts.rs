@@ -19,6 +19,7 @@ use soldb_core::{SoldbError, SoldbResult};
 
 use crate::metadata::{read_compilation_source, EthdebugInfo};
 use crate::source_map::{load_source_map_program, SourceMapEnvironment};
+use crate::storage_layout::StorageLayout;
 
 /// One contract's debug information as loaded from its artifacts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +31,8 @@ pub struct DebugProgram {
     pub source_contents: BTreeMap<u64, String>,
     /// True when the program came from a legacy `srcmap` rather than ETHDebug.
     pub legacy: bool,
+    /// The contract's storage layout, when it was compiled with `--storage-layout`.
+    pub storage_layout: Option<StorageLayout>,
 }
 
 /// The global ETHDebug resource file in `root`, under either of its names.
@@ -197,11 +200,13 @@ pub fn load_debug_program(
         let info = EthdebugInfo::from_artifacts(&name, environment_name, &metadata, &program)
             .map_err(|error| SoldbError::Message(format!("{}: {error}", program_path.display())))?;
         let source_contents = read_sources(root, &info, BTreeMap::new());
+        let storage_layout = load_storage_layout(root, &info.contract_name)?;
         return Ok(Some(DebugProgram {
             info,
             resources,
             source_contents,
             legacy: false,
+            storage_layout,
         }));
     }
 
@@ -209,12 +214,32 @@ pub fn load_debug_program(
         return Ok(None);
     };
     let source_contents = read_sources(root, &program.info, program.source_contents);
+    let storage_layout = match program.storage_layout {
+        Some(layout) => Some(layout),
+        None => load_storage_layout(root, &program.info.contract_name)?,
+    };
     Ok(Some(DebugProgram {
         info: program.info,
         resources: program.resources,
         source_contents,
         legacy: true,
+        storage_layout,
     }))
+}
+
+/// The `<Contract>_storage.json` that `solc --storage-layout -o <root>` writes, when it
+/// is there. A missing file is not an error: the layout is optional debug information.
+/// An unreadable one is, because the user compiled with it and would otherwise get a
+/// silent "no storage layout" that looks identical to never having asked for it.
+pub fn load_storage_layout(root: &Path, contract_name: &str) -> SoldbResult<Option<StorageLayout>> {
+    let path = root.join(format!("{contract_name}_storage.json"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let value = read_json_file(&path)?;
+    StorageLayout::parse(&value)
+        .map(Some)
+        .map_err(|error| SoldbError::Message(format!("{}: {error}", path.display())))
 }
 
 /// Fills in the source text for every source the program names, from the compilation
@@ -247,7 +272,8 @@ mod tests {
 
     use super::{
         contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-        find_program_ethdebug, load_debug_program, read_debug_source, read_json_file,
+        find_program_ethdebug, load_debug_program, load_storage_layout, read_debug_source,
+        read_json_file,
     };
     use crate::source_map::SourceMapEnvironment;
 
@@ -295,6 +321,8 @@ mod tests {
             Some(source)
         );
         assert!(program.resources.get("compilation").is_some());
+        // No `Counter_storage.json` yet: the layout is optional debug information.
+        assert!(program.storage_layout.is_none());
 
         // No name: the only program in the directory, named after its file.
         let inferred = load_debug_program(&dir, "", SourceMapEnvironment::Runtime)
@@ -329,6 +357,44 @@ mod tests {
             Some(source)
         );
         assert!(read_debug_source(&dir, "Missing.sol").is_none());
+
+        // `solc --storage-layout -o <dir>` writes one file per contract; the loader picks
+        // it up, and a malformed one is an error rather than a silent miss.
+        fs::write(
+            dir.join("Counter_storage.json"),
+            json!({
+                "storage": [{
+                    "astId": 1,
+                    "contract": "Counter.sol:Counter",
+                    "label": "value",
+                    "offset": 0,
+                    "slot": "1",
+                    "type": "t_uint256"
+                }],
+                "types": {"t_uint256": {
+                    "encoding": "inplace",
+                    "label": "uint256",
+                    "numberOfBytes": "32"
+                }}
+            })
+            .to_string(),
+        )
+        .expect("layout");
+        let program = load_debug_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect("load")
+            .expect("present");
+        let layout = program.storage_layout.as_ref().expect("storage layout");
+        assert_eq!(layout.variable("value").expect("value").slot[31], 1);
+        assert!(load_storage_layout(&dir, "Missing")
+            .expect("absent")
+            .is_none());
+        fs::write(dir.join("Counter_storage.json"), "{}").expect("layout");
+        let error = load_debug_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect_err("a storage layout that cannot be read is reported");
+        assert!(
+            error.to_string().contains("Counter_storage.json"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -14,8 +14,9 @@ Pass `--ethdebug-dir <address>:<contract>:<dir>` to load the compiler's debug me
 Source-level stepping, line and function breakpoints, `list`, `vars`, and `print` need it;
 everything else works on the bare trace. ETHDebug artifacts and the legacy `combined.json`
 source maps of pre-ETHDebug compilers both serve: lines, functions, and frames come from
-the map and the source text either way. Only `vars` and `print` need ETHDebug, because
-variable locations exist nowhere else.
+the map and the source text either way. Only *local* variables need ETHDebug, because
+their locations exist nowhere else; state variables are read from the storage layout
+`solc --storage-layout` writes, which pre-ETHDebug compilers emit as well.
 
 The prompt is:
 
@@ -303,8 +304,20 @@ Memory: 96 bytes, showing bytes 64..96
 
 Aliases: `info storage`
 
-Print the contract's storage as captured at the current step, marking slots written at
-this step with their previous value. Says so when the backend did not capture storage.
+Print every storage slot whose value is known at the current step, for the account the
+step's frame writes to — the executing contract, or the caller under a `DELEGATECALL`.
+
+```text
+soldb> storage
+Storage: of 0x5fbdb2315678afecb367f032d93f642f64180aa3
+  0x0 = 0x4
+```
+
+A backend records a slot at the `SLOAD` or `SSTORE` that touches it, so this is every
+slot the transaction has read or written so far, not a full storage dump: SolDB keeps no
+chain state and does not ask a node for slots the trace never mentioned. Slots written at
+this step are marked with their previous value. Says so when the backend captured no
+storage at all.
 
 ### `calldata`
 
@@ -313,43 +326,72 @@ recorded call's input in a nested frame when the backend recorded calls.
 
 ## Variables
 
-Both commands read the ETHDebug variable information for the current program counter, so
-the session must be started with `--ethdebug-dir <address>:<contract>:<dir>`. They share
-their decoding with the DAP server's variables view.
+Both commands need the session to be started with
+`--ethdebug-dir <address>:<contract>:<dir>`, and they read two things from it.
 
-Note that a compiler only reports variables if it emits `context.variables` in its
-ETHDebug output. Compilers that do not yet emit it make these commands report that
-nothing is in scope, which is a limitation of the debug info rather than of the lookup.
+*Local* variables come from the ETHDebug variable information for the current program
+counter, shared with the DAP server's variables view. A compiler only reports them if it
+emits `context.variables` in its ETHDebug output; compilers that do not yet emit it make
+these commands report that nothing is in scope, which is a limitation of the debug info
+rather than of the lookup.
+
+*State* variables come from the storage layout, the `<Contract>_storage.json` (or the
+`storage-layout` entry of a legacy `combined.json`) that `solc --storage-layout` writes.
+`soldb compile` and the test harness pass that flag; for a directory compiled without it,
+SolDB says so instead of guessing where a variable lives. The slot arithmetic behind
+mappings, arrays, and structs is Solidity's own rule, so the values are read, never
+inferred.
 
 ### `vars`
 
 Aliases: `locals`
 
 Print every source variable ETHDebug reports as live at the current program counter, with
-its declared type, decoded value, and the location the value was read from.
+its declared type, decoded value, and the location the value was read from, followed by
+every state variable of the contract with the slot it lives in.
 
 ```text
 soldb> vars
 uint256 amount = 5 [stack+2]
 uint256 oldValue = 0 [stack+1]
+State:
+uint256 counter = 4 [slot 0x0]
+mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
 ```
 
 A value shown as `<unavailable>` means the backend did not capture the stack, memory, or
-storage the variable lives in, not that the variable is unset.
+storage the variable lives in, not that the variable is unset. A state variable shown as
+`<unknown: slot … has not been read or written yet>` means the transaction has not
+touched that slot, so the trace does not say what is there; it does not mean zero.
 
 ### `print <variable>`
 
 Aliases: `p <variable>`
 
-Print one variable by name.
+Print one variable by name: a local ETHDebug reports at this program counter, or a state
+variable, including one place inside it.
 
 ```text
 soldb> print amount
 uint256 amount = 5 [stack+2]
+soldb> print counter
+uint256 counter = 4 [slot 0x0]
+soldb> print balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]
+uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = 25 [slot 0xa3c1…9502]
+soldb> print config.limit
+uint256 config.limit = 99 [slot 0x6]
+soldb> print items[1]
+uint256 items[1] = 9 [slot 0x8a35…d19c]
 ```
 
-If the name is not live at the current program counter, SolDB says so and names the PC it
-looked at, so you can step to a point where the variable is in scope.
+A path is a state variable name followed by any number of `[key]`, `[index]`, and
+`.member` steps: mapping keys are values (`0xabc…`, `42`, `true`, `"name"` for a string
+key), array indices are numbers, and members are declared names. Indexing a mapping or an
+array reports the entry's own slot, so the value can be checked against `storage`.
+
+If the name is not live at the current program counter and names no state variable, SolDB
+says so and names the PC it looked at, so you can step to a point where the variable is in
+scope.
 
 ## Metadata
 
@@ -399,7 +441,7 @@ Stepping: next (n), step (s), nexti (ni), finish (fin), continue (c), goto <step
 Reverse:  reverse-next (rn), reverse-step (rs), reverse-nexti (back), reverse-finish (rfin), reverse-continue (rc)
 Break:    break <pc>|<file>:<line>|line <line>|<function>|storage <slot>|revert|call [<address>]|op <OPCODE>
           clear <target>, delete <n>, info breakpoints
-Inspect:  backtrace (bt), list (l), vars, print <variable>, stack, memory [offset [length]], storage, calldata
+Inspect:  backtrace (bt), list (l), vars, print <variable>|<state>[<key>], stack, memory [offset [length]], storage, calldata
 Other:    info resources [--json], mode source|asm, help <command>, quit
 ```
 

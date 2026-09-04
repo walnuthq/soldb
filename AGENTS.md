@@ -123,7 +123,9 @@ belongs in `soldb-debugger`, not in a second copy.
   agrees on.
 - **soldb-ethdebug**: ETHDebug artifact loading (`metadata.rs`), legacy `srcmap` parsing
   (`source_map.rs`), ABI encode/decode and signature parsing (`abi.rs`), event decoding
-  (`events.rs`). Pure functions over files and bytes; no network.
+  (`events.rs`), and the storage layout (`storage_layout.rs`): where solc put each state
+  variable, the slot arithmetic for mappings, arrays, and structs, and the decoding of a
+  word by its declared type. Pure functions over files and bytes; no network.
 - **soldb-evm**: the execution engine, with no I/O. The node data shapes
   (`RpcTransaction`, `RpcReceipt`, `DebugTraceResult`, the block types) are what JSON-RPC
   answers deserialize into, wherever they were fetched; `debug_rpc_transaction_trace` and
@@ -161,7 +163,11 @@ belongs in `soldb-debugger`, not in a second copy.
   searches behind `next`, `step`, `finish`, their reverse forms,
   line and function breakpoints, and `backtrace`. Compiler-generated helpers carry the
   whole-contract span; the map attributes them to the executing statement and marks them
-  `generated`. All of it is a search over the recording; nothing re-executes.
+  `generated`. `state.rs` reads state variables: `StorageTape` indexes every storage word
+  the trace recorded by the account whose storage it belongs to (a `DELEGATECALL` writes
+  the caller's, which `StepMap::storage_context_index` decides) and by the step it holds
+  from, and drops what a reverted frame wrote; a slot with no record is unknown, never
+  zero. All of it is a search over the recording; nothing re-executes.
 - **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
   programs. Frontend-agnostic; returns tables and folded stacks without printing or I/O.
 - **soldb-repl**: the interactive debugger *state machine* — breakpoints, stepping,
@@ -260,14 +266,29 @@ attributes to the executing statement rather than to the contract's first line.
 
 `EthdebugInfo::variables_at_pc` reads `context.variables` on each instruction (and the
 artifact's top-level `variables` array). Not every compiler release emits either yet —
-solc 0.8.36 does not — so variable inspection legitimately reports nothing in scope on
-those compilers. That is a debug-info gap, and the correct behavior is to say so rather
-than to guess values from the stack. Do not "fix" it by inferring locations.
+solc 0.8.36 does not — so *local* variable inspection legitimately reports nothing in
+scope on those compilers. That is a debug-info gap, and the correct behavior is to say so
+rather than to guess values from the stack. Do not "fix" it by inferring locations.
+
+*State* variables do not depend on that gap: `solc --storage-layout` has always said where
+they live, so `vars` and `print` read them through `StorageLayout` for ETHDebug and legacy
+artifacts alike. That is the line to hold when a piece of debug info is missing — take
+what the compiler does emit, and say plainly what it does not. Argument values at an
+internal call are the counter-example we deliberately do not show: the order of the
+parameter words on the stack differs between the legacy and via-IR pipelines, and nothing
+in the artifacts says which produced the code, so naming them positionally would be a
+guess. The call-frame summary decodes external call arguments from calldata instead, where
+the ABI makes it exact.
 
 ### Artifacts
 
 Artifacts produced per contract in the output directory:
 
+- `<Contract>_storage.json` — the storage layout, from `--storage-layout`. Optional debug
+  info: absent, state variables are reported as unavailable; malformed, it is an error.
+  `soldb compile` passes the flag (`CompilerConfig::ethdebug_flags`), and so does
+  `test/deploy-contract.sh` for both ETHDebug flag generations and for the legacy
+  `--combined-json` set, which carries it per contract as `storage-layout` instead.
 - `<Contract>_ethdebug.json` — creation-code debug info.
 - `<Contract>_ethdebug-runtime.json` — runtime debug info; this is what PC-to-source
   mapping uses for an ordinary call.

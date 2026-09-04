@@ -1722,54 +1722,69 @@ fn print_debugger_memory(state: &DebuggerState, offset: Option<u64>, length: Opt
     }
 }
 
-/// The contract's storage as captured at the current step, marking slots written here.
+/// Every slot whose value is known at the current step: what the transaction has read or
+/// written so far in this frame's storage, not only what the current opcode touched.
 fn print_debugger_storage(state: &DebuggerState) {
-    let Some(step) = state.current_step_data() else {
+    if state.current_step_data().is_none() {
         println!("{}", warning("No trace loaded."));
         return;
-    };
-    let snapshot = step.snapshot_ref();
-    if snapshot.storage.is_empty() && snapshot.storage_diff.is_empty() {
-        let captured = state
-            .trace()
-            .is_some_and(|trace| trace.capabilities.storage);
-        if captured {
-            println!("{}", dim("Storage: no slots touched yet."));
-        } else {
-            println!(
-                "{}",
-                warning("Storage was not captured by this backend; the debug-rpc node returned no per-step storage.")
-            );
-        }
+    }
+    let captured = state
+        .trace()
+        .is_some_and(|trace| trace.capabilities.storage);
+    if !captured {
+        println!(
+            "{}",
+            warning("Storage was not captured by this backend; the debug-rpc node returned no per-step storage.")
+        );
         return;
     }
-    println!("{}", info("Storage:"));
-    for (slot, value) in snapshot.storage {
-        let change = snapshot
-            .storage_diff
-            .get(slot)
-            .map(|change| {
+    let known = state
+        .storage_words()
+        .map(|words| words.known())
+        .unwrap_or_default();
+    if known.is_empty() {
+        println!("{}", dim("Storage: no slots read or written yet."));
+        return;
+    }
+    match state.storage_address() {
+        Some(address) => println!("{} {}", info("Storage:"), dim(format!("of {address}"))),
+        None => println!("{}", info("Storage:")),
+    }
+    // The slots this step itself changed, so a stop at an `SSTORE` shows what moved.
+    let changed = state
+        .current_step_data()
+        .map(|step| step.snapshot_ref().storage_diff.clone())
+        .unwrap_or_default();
+    for (slot, value) in known {
+        let slot = soldb_debugger::short_hex(&slot);
+        let change = changed
+            .iter()
+            .find(|(candidate, _)| normalize_storage_slot(candidate) == slot)
+            .map(|(_, change)| {
                 dim(format!(
                     "  (was {})",
                     change.before.as_deref().unwrap_or("0x0")
                 ))
             })
             .unwrap_or_default();
-        println!("  {} = {}{}", slot, value, change);
-    }
-    for (slot, change) in snapshot.storage_diff {
-        if snapshot.storage.contains_key(slot) {
-            continue;
-        }
         println!(
             "  {} = {}{}",
             slot,
-            change.after.as_deref().unwrap_or("0x0"),
-            dim(format!(
-                "  (was {})",
-                change.before.as_deref().unwrap_or("0x0")
-            ))
+            soldb_debugger::short_hex(&value),
+            change
         );
+    }
+}
+
+/// A recorded slot as `print_debugger_storage` prints it: `0x`-prefixed, no leading
+/// zeros.
+fn normalize_storage_slot(slot: &str) -> String {
+    let digits = slot.trim_start_matches("0x").trim_start_matches('0');
+    if digits.is_empty() {
+        "0x0".to_owned()
+    } else {
+        format!("0x{}", digits.to_ascii_lowercase())
     }
 }
 
@@ -1850,42 +1865,80 @@ fn print_debugger_variables(
     };
 
     let variables = soldb_debugger::variables_for_step(trace, &index.debug.info, step);
-    let selected = variables
-        .iter()
-        .filter(|variable| filter.is_none_or(|name| variable.name == name))
-        .collect::<Vec<_>>();
+    let words = state.storage_words();
+    let layout = state
+        .storage_layout()
+        .or(index.debug.storage_layout.as_ref());
 
-    if selected.is_empty() {
-        match filter {
-            Some(name) => println!(
-                "{} `{name}` is not in scope at PC {}",
+    let print_value = |ty: &str, name: &str, value: &soldb_debugger::DebugValue, place: String| {
+        let shown = match value.status {
+            soldb_debugger::DebugValueStatus::Unavailable => warning(&value.display),
+            _ => success(&value.display),
+        };
+        println!("{} {} = {} {}", info(ty), bold(name), shown, dim(place));
+    };
+    let print_variable = |variable: &soldb_debugger::DebugVariable| {
+        print_value(
+            &variable.ty,
+            &variable.name,
+            &variable.value,
+            format!("[{}+{}]", variable.location.kind, variable.location.offset),
+        );
+    };
+    let print_state = |variable: &soldb_debugger::StateVariable| {
+        let place = if variable.offset == 0 {
+            format!("[slot {}]", variable.slot)
+        } else {
+            format!("[slot {} + {}]", variable.slot, variable.offset)
+        };
+        print_value(&variable.ty, &variable.name, &variable.value, place);
+    };
+
+    if let Some(name) = filter {
+        if let Some(variable) = variables.iter().find(|variable| variable.name == name) {
+            print_variable(variable);
+            return;
+        }
+        let (Some(layout), Some(words)) = (layout, words) else {
+            println!(
+                "{} `{name}` is not in scope at PC {}; state variables need a storage layout, compile with `--storage-layout`",
                 warning("No such variable:"),
                 number_color(step.pc)
-            ),
-            None => println!(
-                "{} no variables in scope at PC {}",
-                dim("Variables:"),
+            );
+            return;
+        };
+        match soldb_debugger::state_value(layout, &words, name) {
+            Ok(variable) => print_state(&variable),
+            Err(error) => println!(
+                "{} `{name}` is not in scope at PC {}; {error}",
+                warning("No such variable:"),
                 number_color(step.pc)
             ),
         }
         return;
     }
 
-    for variable in selected {
-        let value = match variable.value.status {
-            soldb_debugger::DebugValueStatus::Unavailable => warning(&variable.value.display),
-            _ => success(&variable.value.display),
-        };
+    if variables.is_empty() {
         println!(
-            "{} {} = {} {}",
-            info(&variable.ty),
-            bold(&variable.name),
-            value,
-            dim(format!(
-                "[{}+{}]",
-                variable.location.kind, variable.location.offset
-            ))
+            "{} no variables in scope at PC {}",
+            dim("Variables:"),
+            number_color(step.pc)
         );
+    }
+    for variable in &variables {
+        print_variable(variable);
+    }
+    match (layout, words) {
+        (Some(layout), Some(words)) => {
+            println!("{}", dim("State:"));
+            for variable in soldb_debugger::state_variables(layout, &words) {
+                print_state(&variable);
+            }
+        }
+        _ => println!(
+            "{}",
+            dim("State: no storage layout loaded; compile with `--storage-layout` to read state variables")
+        ),
     }
 }
 
@@ -1898,8 +1951,9 @@ fn print_debugger_help(topic: Option<&str>) {
             println!("info storage - print the contract's storage at the current step");
         }
         Some("vars" | "locals" | "print") => {
-            println!("vars - print every source variable live at the current PC");
-            println!("print <variable> - print one source variable by name");
+            println!("vars - print the variables live at the current PC, the frame's arguments at entry, and every state variable");
+            println!("print <variable> - print one variable by name");
+            println!("print <state>[<key>] | <state>[<i>] | <state>.<member> - read a mapping entry, an array element, or a struct member from storage");
         }
         Some("break" | "b" | "clear" | "delete") => {
             println!("break <pc> - stop at a program counter");
@@ -1941,7 +1995,7 @@ fn print_debugger_help(topic: Option<&str>) {
             println!("Reverse:  reverse-next (rn), reverse-step (rs), reverse-nexti (back), reverse-finish (rfin), reverse-continue (rc)");
             println!("Break:    break <pc>|<file>:<line>|line <line>|<function>|storage <slot>|revert|call [<address>]|op <OPCODE>");
             println!("          clear <target>, delete <n>, info breakpoints");
-            println!("Inspect:  backtrace (bt), list (l), vars, print <variable>, stack, memory [offset [length]], storage, calldata");
+            println!("Inspect:  backtrace (bt), list (l), vars, print <variable>|<state>[<key>], stack, memory [offset [length]], storage, calldata");
             println!("Other:    info resources [--json], mode source|asm, help <command>, quit");
         }
     }
@@ -2309,7 +2363,8 @@ impl TraceSourceIndex {
             &spec.name,
             program.info,
             program.source_contents,
-        );
+        )
+        .with_storage_layout(program.storage_layout);
         Ok(Some(Self {
             spec: spec.clone(),
             resources: program.resources,

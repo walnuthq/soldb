@@ -32,6 +32,7 @@ const STACK_REF: u64 = 1001;
 const STEP_REF: u64 = 1002;
 const MEMORY_REF: u64 = 1003;
 const STORAGE_REF: u64 = 1004;
+const STATE_REF: u64 = 1005;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DapServer {
@@ -382,6 +383,7 @@ impl DapServer {
             Some(json!({
                 "scopes": [
                     {"name": "Locals", "variablesReference": LOCALS_REF, "expensive": false},
+                    {"name": "State", "variablesReference": STATE_REF, "expensive": false},
                     {"name": "Stack", "variablesReference": STACK_REF, "expensive": false},
                     {"name": "Memory", "variablesReference": MEMORY_REF, "expensive": false},
                     {"name": "Storage", "variablesReference": STORAGE_REF, "expensive": false},
@@ -404,6 +406,7 @@ impl DapServer {
             STACK_REF => self.stack_variables(),
             MEMORY_REF => self.memory_variables(),
             STORAGE_REF => self.storage_variables(),
+            STATE_REF => self.state_variables(),
             STEP_REF => self.step_variables(),
             _ => Vec::new(),
         };
@@ -559,6 +562,29 @@ impl DapServer {
             .collect()
     }
 
+    /// Every state variable of the contract executing at the current step, read through
+    /// its storage layout.
+    fn state_variables(&self) -> Vec<Value> {
+        let Some(layout) = self.debugger.storage_layout() else {
+            return Vec::new();
+        };
+        let Some(words) = self.debugger.storage_words() else {
+            return Vec::new();
+        };
+        soldb_debugger::state_variables(layout, &words)
+            .into_iter()
+            .map(|variable| {
+                json!({
+                    "name": variable.name,
+                    "value": variable.value.display,
+                    "type": variable.ty,
+                    "evaluateName": variable.name,
+                    "variablesReference": 0
+                })
+            })
+            .collect()
+    }
+
     fn stack_variables(&self) -> Vec<Value> {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
@@ -664,7 +690,22 @@ impl DapServer {
                     .cloned()
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
-            _ => "<unsupported expression>".to_owned(),
+            expression => self.evaluate_state(expression),
+        }
+    }
+
+    /// A storage path such as `counter` or `balances[0xabc]`, read through the storage
+    /// layout when one is loaded.
+    fn evaluate_state(&self, expression: &str) -> String {
+        let Some(layout) = self.debugger.storage_layout() else {
+            return "<unsupported expression>".to_owned();
+        };
+        let Some(words) = self.debugger.storage_words() else {
+            return "<unsupported expression>".to_owned();
+        };
+        match soldb_debugger::state_value(layout, &words, expression) {
+            Ok(variable) => variable.value.display,
+            Err(error) => format!("<{error}>"),
         }
     }
 
@@ -801,7 +842,8 @@ impl LoadedSource {
         let name = program.info.contract_name.clone();
         Ok(Self {
             root: root.to_path_buf(),
-            contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents),
+            contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents)
+                .with_storage_layout(program.storage_layout),
         })
     }
 }

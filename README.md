@@ -161,7 +161,9 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
 
 - ETHDebug-first source debugging with legacy `srcmap`/`srcmap-runtime` fallback
 - Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
-  server, decoded from ETHDebug variable locations
+  server: locals decoded from ETHDebug variable locations, and state variables — including
+  `balances[0xabc…]`, `items[2]`, and `config.owner` — read through the storage layout
+  `solc --storage-layout` emits, for legacy compilers as well
 - Full transaction traces with internal calls & decoded parameters
 - Dynamic gas profiles by contract, function, source line, opcode, and instruction
 - Folded-stack and interactive SVG flame graph output

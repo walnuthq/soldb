@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
+use crate::storage_layout::StorageLayout;
 use crate::{EthdebugInfo, Instruction};
 
 /// The bytecode environment described by a legacy source map.
@@ -41,6 +42,8 @@ pub struct SourceMapProgram {
     pub info: EthdebugInfo,
     pub resources: Value,
     pub source_contents: BTreeMap<u64, String>,
+    /// The contract's `storage-layout` entry, when the artifact was compiled with it.
+    pub storage_layout: Option<StorageLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,10 +306,22 @@ fn source_map_program_from_combined(
         variable_locations: BTreeMap::new(),
     };
 
+    let storage_layout = contract
+        .get("storage-layout")
+        .map(StorageLayout::parse)
+        .transpose()
+        .map_err(|error| {
+            SoldbError::Message(format!(
+                "legacy artifact `{}` has an invalid `storage-layout` for `{contract_key}`: {error}",
+                artifact_path.display()
+            ))
+        })?;
+
     Ok(Some(SourceMapProgram {
         info,
         resources,
         source_contents,
+        storage_layout,
     }))
 }
 
@@ -673,7 +688,24 @@ mod tests {
                 "contracts": {
                     "Counter.sol:Counter": {
                         "bin-runtime": "600100",
-                        "srcmap-runtime": "0:8:0:-:0;9:3:0"
+                        "srcmap-runtime": "0:8:0:-:0;9:3:0",
+                        "storage-layout": {
+                            "storage": [{
+                                "astId": 1,
+                                "contract": "Counter.sol:Counter",
+                                "label": "value",
+                                "offset": 0,
+                                "slot": "0",
+                                "type": "t_uint256"
+                            }],
+                            "types": {
+                                "t_uint256": {
+                                    "encoding": "inplace",
+                                    "label": "uint256",
+                                    "numberOfBytes": "32"
+                                }
+                            }
+                        }
                     }
                 }
             })
@@ -684,6 +716,16 @@ mod tests {
         let program = load_source_map_program(&dir, "Counter", SourceMapEnvironment::Runtime)
             .expect("load source map")
             .expect("runtime program");
+
+        // `solc --combined-json ...,storage-layout` carries the layout per contract, so a
+        // pre-ETHDebug compiler reads state variables by name just as a modern one does.
+        let layout = program.storage_layout.as_ref().expect("storage layout");
+        assert_eq!(layout.variables.len(), 1);
+        assert_eq!(layout.variable("value").expect("value").slot, [0_u8; 32]);
+        assert_eq!(
+            layout.resolve("value").expect("resolve").type_id,
+            "t_uint256"
+        );
 
         assert_eq!(program.info.contract_name, "Counter");
         assert_eq!(program.info.environment, "call");
