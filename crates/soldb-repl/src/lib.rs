@@ -18,8 +18,8 @@
 
 use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
 use soldb_debugger::{
-    call_target, normalize_address, ContractDebugInfo, Frame, ResolvedFunction, ResolvedLine,
-    SourceListing, StepLocation, StepMap, StorageLayout, StorageTape, StorageWords,
+    call_target, normalize_address, ChainStorage, ContractDebugInfo, Frame, ResolvedFunction,
+    ResolvedLine, SourceListing, StepLocation, StepMap, StorageLayout, StorageTape, StorageWords,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +341,16 @@ impl DebuggerState {
     pub fn storage_words(&self) -> Option<StorageWords<'_>> {
         let map = self.step_map.as_ref()?;
         Some(self.storage_tape.as_ref()?.at_step(map, self.current_step))
+    }
+
+    /// The same words, with a chain the frontend can read slots the transaction never
+    /// touched from.
+    #[must_use]
+    pub fn storage_words_with_chain<'a>(
+        &'a self,
+        chain: Option<&'a dyn ChainStorage>,
+    ) -> Option<StorageWords<'a>> {
+        Some(self.storage_words()?.with_chain(chain))
     }
 
     /// The account whose storage the current step reads and writes.
@@ -757,10 +767,17 @@ impl DebuggerState {
     /// The call structure at the current step, innermost frame first.
     #[must_use]
     pub fn frames(&self) -> Vec<Frame> {
-        self.step_map
-            .as_ref()
-            .map(|map| map.frames(self.current_step))
-            .unwrap_or_default()
+        let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
+            return Vec::new();
+        };
+        let mut frames = map.frames(self.current_step);
+        for frame in &mut frames {
+            let Some(entry) = trace.steps.get(frame.entry_step) else {
+                continue;
+            };
+            frame.arguments = map.frame_arguments(frame, entry.snapshot_ref().stack);
+        }
+        frames
     }
 
     /// Source lines around the current step.

@@ -14,9 +14,13 @@
 //! reverted did not keep its writes, so after it a slot holds what it held before the
 //! frame — and if that was never read, it is unknown again.
 //!
-//! A slot with no record yet is unknown, and is reported as unknown rather than as zero:
-//! the debugger has no chain to ask, and it does not pretend to.
+//! A slot with no record yet is unknown here, because the trace does not say what is in
+//! it. A frontend that has a node can supply one through [`ChainStorage`], which is read
+//! only for slots the trace never recorded, and the value is then marked as coming from
+//! the chain rather than from the recording. Without one, unknown is reported as unknown
+//! and never as zero: this crate has no chain to ask, and it does not pretend to.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use soldb_core::TransactionTrace;
@@ -24,6 +28,29 @@ use soldb_ethdebug::{parse_word, word_hex, StorageLayout, StorageRef, Word};
 
 use crate::stepping::StepMap;
 use crate::{DebugValue, DebugValueStatus};
+
+/// Where a value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSource {
+    /// A word the transaction itself read or wrote.
+    Trace,
+    /// A word read from the chain, for a slot the transaction never touched.
+    Chain,
+}
+
+/// A chain a frontend can read storage from, for slots the trace never recorded.
+///
+/// The debugger never opens a connection; the frontend that has a node implements this
+/// and answers, and says in [`ChainStorage::label`] where the answer came from, so the
+/// value can be shown as what it is rather than as part of the recording.
+pub trait ChainStorage {
+    /// The word at `slot` of `address`, or `None` when it could not be read.
+    fn word(&self, address: &str, slot: &Word) -> Option<Word>;
+
+    /// Where these words come from, as a user-facing phrase such as
+    /// `the chain at block 21000000`.
+    fn label(&self) -> &str;
+}
 
 /// One state variable, or one place inside one, with its value at a step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +64,8 @@ pub struct StateVariable {
     /// The byte offset within the slot.
     pub offset: u64,
     pub value: DebugValue,
+    /// Whether the value came from the recording or from the chain.
+    pub source: StateSource,
 }
 
 /// Every storage word a trace recorded, by storage context and slot.
@@ -145,13 +174,22 @@ impl StorageTape {
             tape: self,
             step,
             context,
+            address: None,
+            chain: None,
         }
     }
 
-    /// The words known at `step`, in the storage context that step runs in.
+    /// The words known at `step`, in the storage context that step runs in, with the
+    /// address of that context so a [`ChainStorage`] can be asked about its slots.
     #[must_use]
-    pub fn at_step(&self, map: &StepMap, step: usize) -> StorageWords<'_> {
-        self.at(step, map.storage_context_index(step))
+    pub fn at_step<'a>(&'a self, map: &'a StepMap, step: usize) -> StorageWords<'a> {
+        StorageWords {
+            tape: self,
+            step,
+            context: map.storage_context_index(step),
+            address: map.storage_address(step),
+            chain: None,
+        }
     }
 
     fn lookup(&self, context: usize, slot: &Word, step: usize) -> Lookup {
@@ -168,14 +206,24 @@ impl StorageTape {
 }
 
 /// The storage words known at one step, in one storage context.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct StorageWords<'a> {
     tape: &'a StorageTape,
     step: usize,
     context: Option<usize>,
+    /// The account whose storage this is, for reading from a chain.
+    address: Option<&'a str>,
+    chain: Option<&'a dyn ChainStorage>,
 }
 
-impl StorageWords<'_> {
+impl<'a> StorageWords<'a> {
+    /// Reads slots the trace never recorded from `chain`.
+    #[must_use]
+    pub fn with_chain(mut self, chain: Option<&'a dyn ChainStorage>) -> Self {
+        self.chain = chain;
+        self
+    }
+
     /// The word at `slot`, when the trace recorded one that still holds.
     #[must_use]
     pub fn get(&self, slot: &Word) -> Option<Word> {
@@ -183,6 +231,18 @@ impl StorageWords<'_> {
             Lookup::Known(value) => Some(value),
             Lookup::Untouched | Lookup::Reverted => None,
         }
+    }
+
+    /// The word at `slot` from the chain, for a slot the trace did not record.
+    #[must_use]
+    fn chain_word(&self, slot: &Word) -> Option<Word> {
+        self.chain?.word(self.address?, slot)
+    }
+
+    /// How a chain-read value should be described, when a chain is attached.
+    #[must_use]
+    pub fn chain_label(&self) -> Option<&str> {
+        Some(self.chain?.label())
     }
 
     /// Every slot with a known value at the step, in slot order.
@@ -215,6 +275,17 @@ impl StorageWords<'_> {
 
     /// Why a word is missing, for the user.
     fn unavailable(&self, slot: &Word) -> String {
+        let unread = if self.chain.is_some() {
+            format!(
+                "<unknown: slot {} was not touched by this transaction and the chain could not be read>",
+                short_hex(slot)
+            )
+        } else {
+            format!(
+                "<unknown: slot {} has not been read or written yet>",
+                short_hex(slot)
+            )
+        };
         if !self.tape.captured {
             return "<unavailable: this backend recorded no storage>".to_owned();
         }
@@ -228,10 +299,7 @@ impl StorageWords<'_> {
                 short_hex(slot)
             ),
             // `Known` cannot reach here: a decode only fails on a slot with no word.
-            Lookup::Known(_) | Lookup::Untouched => format!(
-                "<unknown: slot {} has not been read or written yet>",
-                short_hex(slot)
-            ),
+            Lookup::Known(_) | Lookup::Untouched => unread,
         }
     }
 }
@@ -269,7 +337,18 @@ fn read(layout: &StorageLayout, words: &StorageWords<'_>, reference: &StorageRef
     let ty = layout
         .type_of(&reference.type_id)
         .map_or_else(|| reference.type_id.clone(), |ty| ty.label.clone());
-    let value = match layout.decode(reference, &|slot| words.get(slot)) {
+    // The recording first; the chain only for a slot it never mentioned, and the value is
+    // marked as coming from there.
+    let from_chain = Cell::new(false);
+    let decoded = layout.decode(reference, &|slot| {
+        if let Some(word) = words.get(slot) {
+            return Some(word);
+        }
+        let word = words.chain_word(slot)?;
+        from_chain.set(true);
+        Some(word)
+    });
+    let value = match decoded {
         Ok(decoded) => DebugValue {
             display: decoded.display,
             raw: decoded.raw,
@@ -287,6 +366,11 @@ fn read(layout: &StorageLayout, words: &StorageWords<'_>, reference: &StorageRef
         slot: short_hex(&reference.slot),
         offset: reference.offset,
         value,
+        source: if from_chain.get() {
+            StateSource::Chain
+        } else {
+            StateSource::Trace
+        },
     }
 }
 
@@ -324,9 +408,17 @@ mod tests {
     use soldb_core::{StepSnapshot, StorageChange, TraceCapabilities, TraceStep, TransactionTrace};
     use soldb_ethdebug::StorageLayout;
 
-    use super::{short_hex, state_value, state_variables, StorageTape};
+    use super::{short_hex, state_value, state_variables, StorageTape, Word};
     use crate::stepping::StepMap;
     use crate::DebugValueStatus;
+
+    /// The slot of `balances[0xf39f…]`, as the layout resolves it.
+    fn mapping_entry_slot() -> Word {
+        layout()
+            .resolve("balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]")
+            .expect("entry")
+            .slot
+    }
 
     fn layout() -> StorageLayout {
         StorageLayout::parse(&json!({
@@ -533,6 +625,98 @@ mod tests {
         assert_eq!(show(&trace, 7, "counter"), "5");
         assert_eq!(show(&trace, 8, "counter"), "6");
         assert_eq!(show(&trace, 9, "counter"), "6");
+    }
+
+    /// A chain a frontend would read through a node, answering from a fixed table.
+    struct FakeChain {
+        words: BTreeMap<(String, Word), Word>,
+        label: String,
+    }
+
+    impl super::ChainStorage for FakeChain {
+        fn word(&self, address: &str, slot: &Word) -> Option<Word> {
+            self.words
+                .get(&(address.to_ascii_lowercase(), *slot))
+                .copied()
+        }
+
+        fn label(&self) -> &str {
+            &self.label
+        }
+    }
+
+    #[test]
+    fn a_slot_the_trace_never_touched_can_come_from_the_chain() {
+        let trace = trace(
+            vec![
+                step("SLOAD", 1, &[], &[]),
+                step("SSTORE", 1, &[], &[("0x0", "0x2a")]),
+                step("STOP", 1, &[], &[]),
+            ],
+            true,
+        );
+        let map = StepMap::new(&trace, Vec::new());
+        let tape = StorageTape::new(&trace, &map);
+        let address = map.storage_address(0).expect("address").to_owned();
+        let entry_slot = mapping_entry_slot();
+        let chain = FakeChain {
+            words: BTreeMap::from([
+                // `counter` before the transaction, and one mapping entry.
+                ((address.clone(), [0_u8; 32]), {
+                    let mut word = [0_u8; 32];
+                    word[31] = 9;
+                    word
+                }),
+                ((address.clone(), entry_slot), {
+                    let mut word = [0_u8; 32];
+                    word[31] = 4;
+                    word
+                }),
+            ]),
+            label: "the chain at block 7".to_owned(),
+        };
+        let layout = layout();
+        let words = tape.at_step(&map, 0).with_chain(Some(&chain));
+        assert_eq!(words.chain_label(), Some("the chain at block 7"));
+
+        // Before the transaction writes it, the slot reads from the chain and says so.
+        let counter = state_value(&layout, &words, "counter").expect("counter");
+        assert_eq!(counter.value.display, "9");
+        assert_eq!(counter.source, super::StateSource::Chain);
+        assert_eq!(counter.value.status, DebugValueStatus::Decoded);
+
+        // A mapping entry the transaction never touched, read by key.
+        let entry = state_value(
+            &layout,
+            &words,
+            "balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]",
+        )
+        .expect("entry");
+        assert_eq!(entry.value.display, "4");
+        assert_eq!(entry.source, super::StateSource::Chain);
+
+        // After the transaction writes it, the recording wins over the chain.
+        let words = tape.at_step(&map, 2).with_chain(Some(&chain));
+        let counter = state_value(&layout, &words, "counter").expect("counter");
+        assert_eq!(counter.value.display, "42");
+        assert_eq!(counter.source, super::StateSource::Trace);
+
+        // A slot the chain cannot answer for stays unknown, and says the chain was asked.
+        let empty = FakeChain {
+            words: BTreeMap::new(),
+            label: "the chain at block 7".to_owned(),
+        };
+        let words = tape.at_step(&map, 0).with_chain(Some(&empty));
+        let counter = state_value(&layout, &words, "counter").expect("counter");
+        assert_eq!(counter.source, super::StateSource::Trace);
+        assert!(
+            counter
+                .value
+                .display
+                .contains("the chain could not be read"),
+            "{}",
+            counter.value.display
+        );
     }
 
     #[test]

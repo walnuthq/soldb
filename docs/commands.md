@@ -253,10 +253,28 @@ the innermost one show the call site.
 ```text
 soldb> bt
 #0  increment3 at TestContract.sol:54  step 596, PC 1522
-#1  increment2 at TestContract.sol:48  step 595, PC 1770
-#2  increment at TestContract.sol:30  step 300, PC 1902
+#1  increment2(amount = 4) at TestContract.sol:48  step 595, PC 1770
+#2  increment(amount = 4) at TestContract.sol:30  step 300, PC 1902
 #3  TestContract at TestContract.sol:8  step 103, PC 824
 ```
+
+A frame shows the arguments it was entered with when the trace has shown where its
+compiler leaves them. Solidity's two code generators disagree — the legacy pipeline pushes
+parameters left to right and via-IR right to left — and nothing in the artifacts says which
+produced the code, so SolDB proves it instead of assuming: the first function entered in a
+frame whose calldata is known is the function that calldata selected, so comparing the
+calldata words with the words on the entry stack settles both whether the parameters are
+there and which end the first one is at. What that proves for a contract is used for every
+frame of it.
+
+Three things follow. A frame of more than one parameter shows nothing until a call with at
+least two arguments has proven the order, which is why `increment3` above is bare. A
+contract whose public functions are entered through a dispatcher wrapper that has not
+decoded the arguments yet — how solc's legacy pipeline compiles them — shows nothing at
+all, because a frame that disagrees disproves the whole contract. And only value-type
+parameters are shown, since each is exactly one word; a `string`, `bytes`, array, or struct
+parameter is a pointer whose width depends on where it lives, so a function taking one
+reports no arguments rather than a memory offset dressed up as a number.
 
 Internal frames come from three sources, in this order of trust. Jump markers when the
 artifact carries them: legacy source maps mark every jump into and out of a function, and
@@ -360,9 +378,21 @@ mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
 ```
 
 A value shown as `<unavailable>` means the backend did not capture the stack, memory, or
-storage the variable lives in, not that the variable is unset. A state variable shown as
-`<unknown: slot … has not been read or written yet>` means the transaction has not
-touched that slot, so the trace does not say what is there; it does not mean zero.
+storage the variable lives in, not that the variable is unset.
+
+A state variable the transaction never touched is read from the node when the session has
+one, and the value says where it came from:
+
+```text
+uint256 counter = 41 [slot 0x0, from the chain at block 21000000, before this transaction's block]
+```
+
+For a traced transaction that is the state at the end of the parent block, which is what
+the transaction started from unless a transaction earlier in the same block wrote the slot;
+for a simulated call it is the block the call ran on top of. Each slot is read once and
+remembered. Without a node — `soldb run`, or `soldb replay` from a file — there is nothing
+to ask, and the value reads `<unknown: slot … has not been read or written yet>`: the trace
+does not say what is there, and it does not mean zero.
 
 ### `print <variable>`
 

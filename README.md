@@ -163,7 +163,11 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
 - Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
   server: locals decoded from ETHDebug variable locations, and state variables — including
   `balances[0xabc…]`, `items[2]`, and `config.owner` — read through the storage layout
-  `solc --storage-layout` emits, for legacy compilers as well
+  `solc --storage-layout` emits, for legacy compilers as well. A slot the transaction never
+  touched is read from the node at the block it started from, and says so
+- Call frames carry the arguments they were entered with, once the trace itself has proven
+  where the compiler leaves them; a frame that cannot be proven stays bare rather than
+  naming stack words that may not be the parameters
 - Full transaction traces with internal calls & decoded parameters
 - Dynamic gas profiles by contract, function, source line, opcode, and instruction
 - Folded-stack and interactive SVG flame graph output

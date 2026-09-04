@@ -19,8 +19,19 @@
 # CHECK: Breakpoint #2 hit at step {{[0-9]+}}, storage slot 0x0
 # CHECK: uint256 counter = [[#COUNT+4]] [slot 0x0]
 
-# A mapping entry is read by key, and a key the transaction never touched is unknown.
-# RUN: printf 'print balances\nprint balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=MAPPING %s
+# A mapping entry is read by key. The transaction never touched this one, so its value
+# comes from the node, at the block before the transaction's, and says so.
+# RUN: printf 'print balances\nprint counter\nprint balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=MAPPING %s
 
 # MAPPING: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
-# MAPPING: uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = <unknown: slot 0x{{[0-9a-f]+}} has not been read or written yet>
+# The counter before the transaction ran, plus what `increment` adds, is what the state
+# view shows once the first `SSTORE` has happened.
+# MAPPING: uint256 counter = [[#BEFORE:]] [slot 0x0, from the chain at block {{[0-9]+}}, before this transaction's block]
+# MAPPING: uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = {{[0-9]+}} [slot 0x{{[0-9a-f]+}}, from the chain at block {{[0-9]+}}, before this transaction's block]
+
+# Without a node there is no chain to read: `soldb run` says the slot is untouched rather
+# than reaching for a value.
+# RUN: %soldb compile %S/../examples/StateVars.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: printf 'print counter\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck --check-prefix=NOCHAIN %s
+
+# NOCHAIN: uint256 counter = <unknown: slot 0x0 has not been read or written yet> [slot 0x0]

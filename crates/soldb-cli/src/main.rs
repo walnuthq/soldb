@@ -21,7 +21,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace};
-use soldb_debugger::{ContractDebugInfo, SourceFunction, SourceParam};
+use soldb_debugger::{ChainStorage, ContractDebugInfo, SourceFunction, SourceParam, StorageWords};
 use soldb_ethdebug::{
     encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
     function_selector, load_debug_program, parse_ethdebug_spec, parse_event_abis, parse_signature,
@@ -31,7 +31,8 @@ use soldb_repl::{
     BreakpointKind, DebuggerCommand, DebuggerInfoCommand, DebuggerState, DisplayMode, StepOutcome,
 };
 use soldb_rpc::{RpcLog, TraceBackend};
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::Display;
 use std::fs;
@@ -313,6 +314,9 @@ struct TraceArgs {
 #[derive(Debug, Clone)]
 struct TraceView {
     tx_hash: String,
+    /// The node the transaction was traced through, or `None` for a trace read from a
+    /// replay file, which has no chain to ask.
+    rpc_url: Option<String>,
     ethdebug_dir: Vec<String>,
     contracts: Option<String>,
     max_steps: i64,
@@ -322,6 +326,7 @@ impl TraceView {
     fn for_trace(args: &TraceArgs) -> Self {
         Self {
             tx_hash: args.tx_hash.clone(),
+            rpc_url: Some(args.rpc.clone()),
             ethdebug_dir: args.ethdebug_dir.clone(),
             contracts: args.contracts.clone(),
             max_steps: args.max_steps,
@@ -331,10 +336,23 @@ impl TraceView {
     fn for_replay(args: &ReplayArgs, tx_hash: &str) -> Self {
         Self {
             tx_hash: tx_hash.to_owned(),
+            rpc_url: None,
             ethdebug_dir: args.ethdebug_dir.clone(),
             contracts: args.contracts.clone(),
             max_steps: args.max_steps,
         }
+    }
+
+    /// The chain the traced transaction started from, for reading slots it never touched.
+    fn chain_storage(&self) -> Option<NodeStorage> {
+        NodeStorage::before_transaction(self.rpc_url.as_deref()?, &self.tx_hash)
+    }
+}
+
+impl SimulationView {
+    /// The chain the call ran on top of, for reading slots it never touched.
+    fn chain_storage(&self) -> Option<NodeStorage> {
+        NodeStorage::at_block(self.rpc_url.as_deref()?, self.chain_block?)
     }
 }
 
@@ -360,6 +378,10 @@ struct SimulationView {
     json: bool,
     raw: bool,
     max_steps: i64,
+    /// The block the call ran on top of, when it ran on a node and the block is fixed:
+    /// its end state is exactly what the call started from. `None` when the call ran at a
+    /// position inside a block, where neither that block nor its parent is that state.
+    chain_block: Option<Option<u64>>,
 }
 
 impl SimulationView {
@@ -367,6 +389,12 @@ impl SimulationView {
         Self {
             rpc_url: Some(args.rpc_url.clone()),
             replayed_from: None,
+            // A call placed inside a block runs after the transactions before it, so
+            // neither that block's end state nor its parent's is what it started from.
+            chain_block: args
+                .tx_index
+                .is_none_or(|index| index == 0)
+                .then_some(args.block),
             contract_address: contract_address.to_owned(),
             function_signature: args.function_signature.clone(),
             function_args: args.function_args.clone(),
@@ -384,6 +412,7 @@ impl SimulationView {
         Self {
             rpc_url: None,
             replayed_from: None,
+            chain_block: None,
             contract_address: contract_address.to_owned(),
             function_signature: args.function_signature.clone(),
             function_args: args.function_args.clone(),
@@ -412,6 +441,7 @@ impl SimulationView {
         Self {
             rpc_url: None,
             replayed_from: Some(file.to_path_buf()),
+            chain_block: None,
             contract_address: request.to_addr.clone(),
             function_signature: None,
             function_args: Vec::new(),
@@ -897,7 +927,12 @@ fn present_trace(
 ) -> SoldbResult<()> {
     if interactive {
         let source_indexes = interactive_trace_source_indexes(view, &trace);
-        run_interactive_debugger(trace, "Transaction trace debugger", source_indexes)?;
+        run_interactive_debugger(
+            trace,
+            "Transaction trace debugger",
+            source_indexes,
+            view.chain_storage(),
+        )?;
     } else if json {
         println!(
             "{}",
@@ -1046,7 +1081,12 @@ fn present_simulation(
             &display_function_name,
         );
         let source_indexes = interactive_simulation_source_indexes(view, contract_address);
-        run_interactive_debugger(trace, "Simulation debugger", source_indexes)?;
+        run_interactive_debugger(
+            trace,
+            "Simulation debugger",
+            source_indexes,
+            view.chain_storage(),
+        )?;
     } else if view.json {
         println!(
             "{}",
@@ -1320,10 +1360,124 @@ fn source_indexes_for_specs(
     indexes
 }
 
+/// The chain a debugging session reads storage slots from, for slots the transaction
+/// never touched.
+///
+/// The block is fixed when the session starts, so every answer is the state one point in
+/// history, and each slot is read at most once. A read that fails is reported once and
+/// the slot stays unknown, which is what it is.
+struct NodeStorage {
+    rpc_url: String,
+    /// The block to ask about, as hex.
+    block: String,
+    /// How to describe where a value came from.
+    label: String,
+    words: RefCell<HashMap<StorageKey, Option<Word>>>,
+}
+
+/// A 256-bit storage word, as the debugger's storage layout uses them.
+type Word = [u8; 32];
+
+/// One slot of one account: what a chain read is cached under.
+type StorageKey = (String, Word);
+
+impl NodeStorage {
+    /// The state the traced transaction started from: the end of its parent block.
+    ///
+    /// A transaction that is not the first in its block ran after its neighbours, so a
+    /// slot one of them wrote reads here as it was before the block. That is why the
+    /// value is labelled with the block it came from rather than presented as the
+    /// transaction's own starting state.
+    fn before_transaction(rpc_url: &str, tx_hash: &str) -> Option<Self> {
+        let (block, _index) = match soldb_rpc::transaction_block(rpc_url, tx_hash) {
+            Ok(found) => found,
+            Err(error) => {
+                report_once(
+                    format!("chain-storage-block:{rpc_url}"),
+                    &format!("could not find the block of the traced transaction: {error}"),
+                    "state variables this transaction never touched stay unknown",
+                );
+                return None;
+            }
+        };
+        let number = u64::from_str_radix(block.trim_start_matches("0x"), 16).ok()?;
+        let parent = number.checked_sub(1)?;
+        Some(Self::new(
+            rpc_url,
+            format!("0x{parent:x}"),
+            format!("the chain at block {parent}, before this transaction's block"),
+        ))
+    }
+
+    /// The state a call was simulated on: the end of the block it ran on top of.
+    fn at_block(rpc_url: &str, block: Option<u64>) -> Option<Self> {
+        let number = match block {
+            Some(number) => number,
+            None => match soldb_rpc::latest_block(rpc_url) {
+                Ok(latest) => u64::from_str_radix(latest.trim_start_matches("0x"), 16).ok()?,
+                Err(error) => {
+                    report_once(
+                        format!("chain-storage-latest:{rpc_url}"),
+                        &format!("could not resolve the latest block: {error}"),
+                        "state variables this call never touched stay unknown",
+                    );
+                    return None;
+                }
+            },
+        };
+        Some(Self::new(
+            rpc_url,
+            format!("0x{number:x}"),
+            format!("the chain at block {number}"),
+        ))
+    }
+
+    fn new(rpc_url: &str, block: String, label: String) -> Self {
+        Self {
+            rpc_url: rpc_url.to_owned(),
+            block,
+            label,
+            words: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl soldb_debugger::ChainStorage for NodeStorage {
+    fn word(&self, address: &str, slot: &Word) -> Option<Word> {
+        let key = (address.to_ascii_lowercase(), *slot);
+        if let Some(cached) = self.words.borrow().get(&key) {
+            return *cached;
+        }
+        let word = match soldb_rpc::storage_at(
+            &self.rpc_url,
+            address,
+            &soldb_ethdebug::word_hex(slot),
+            &self.block,
+        ) {
+            Ok(value) => soldb_ethdebug::parse_word(&value).ok(),
+            Err(error) => {
+                report_once(
+                    format!("chain-storage-read:{}", self.rpc_url),
+                    &format!("could not read storage from the node: {error}"),
+                    "state variables the transaction never touched stay unknown",
+                );
+                None
+            }
+        };
+        self.words.borrow_mut().insert(key, word);
+        word
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 fn run_interactive_debugger(
     trace: TransactionTrace,
     title: &str,
     source_indexes: Vec<TraceSourceIndex>,
+    chain: Option<NodeStorage>,
 ) -> SoldbResult<()> {
     let contract_address = trace.to_addr.clone().or(trace.contract_address.clone());
     let mut state = DebuggerState::new();
@@ -1388,14 +1542,14 @@ fn run_interactive_debugger(
             }
             DebuggerCommand::Info(DebuggerInfoCommand::Storage) => print_debugger_storage(&state),
             DebuggerCommand::Vars => {
-                print_debugger_variables(&state, &source_indexes, None);
+                print_debugger_variables(&state, &source_indexes, chain.as_ref(), None);
             }
             DebuggerCommand::Print(name) => {
                 let name = name.trim();
                 if name.is_empty() {
                     println!("{} print <variable>", warning("Usage:"));
                 } else {
-                    print_debugger_variables(&state, &source_indexes, Some(name));
+                    print_debugger_variables(&state, &source_indexes, chain.as_ref(), Some(name));
                 }
             }
             DebuggerCommand::Backtrace => print_debugger_backtrace(&state),
@@ -1626,6 +1780,15 @@ fn print_debugger_backtrace(state: &DebuggerState) {
             .or_else(|| frame.address.clone())
             .unwrap_or_else(|| "<unknown>".to_owned());
         let mut line = format!("#{index:<2} {}", function_color(&name));
+        if !frame.arguments.is_empty() {
+            let arguments = frame
+                .arguments
+                .iter()
+                .map(|argument| format!("{} = {}", argument.name, argument.value.display))
+                .collect::<Vec<_>>()
+                .join(", ");
+            line.push_str(&format!("({arguments})"));
+        }
         if let Some(location) = &frame.location {
             line.push_str(&format!(" at {}:{}", location.path, location.line));
         }
@@ -1828,6 +1991,7 @@ fn print_debugger_stack(state: &DebuggerState) {
 fn print_debugger_variables(
     state: &DebuggerState,
     source_indexes: &[TraceSourceIndex],
+    chain: Option<&NodeStorage>,
     filter: Option<&str>,
 ) {
     let executing = state
@@ -1865,7 +2029,7 @@ fn print_debugger_variables(
     };
 
     let variables = soldb_debugger::variables_for_step(trace, &index.debug.info, step);
-    let words = state.storage_words();
+    let words = state.storage_words_with_chain(chain.map(|chain| chain as &dyn ChainStorage));
     let layout = state
         .storage_layout()
         .or(index.debug.storage_layout.as_ref());
@@ -1885,12 +2049,19 @@ fn print_debugger_variables(
             format!("[{}+{}]", variable.location.kind, variable.location.offset),
         );
     };
+    let chain_label = words.as_ref().and_then(StorageWords::chain_label);
     let print_state = |variable: &soldb_debugger::StateVariable| {
-        let place = if variable.offset == 0 {
-            format!("[slot {}]", variable.slot)
+        let mut place = if variable.offset == 0 {
+            format!("[slot {}", variable.slot)
         } else {
-            format!("[slot {} + {}]", variable.slot, variable.offset)
+            format!("[slot {} + {}", variable.slot, variable.offset)
         };
+        // A value the transaction never touched came from the chain; say so, because it
+        // is the state before the transaction, not a step of it.
+        if variable.source == soldb_debugger::StateSource::Chain {
+            place.push_str(&format!(", from {}", chain_label.unwrap_or("the chain")));
+        }
+        place.push(']');
         print_value(&variable.ty, &variable.name, &variable.value, place);
     };
 
@@ -4559,6 +4730,7 @@ contract Counter {
 
         let trace_args = TraceView {
             tx_hash: "0xabc".to_owned(),
+            rpc_url: None,
             ethdebug_dir: vec![format!("0x2:Legacy:{}", dir.display())],
             contracts: None,
             max_steps: 1,

@@ -520,6 +520,39 @@ pub fn record_simulation_replay(
     replay::simulate_call_with_replay_recording(&client, request)
 }
 
+/// One storage slot of an account as the node has it at `block`.
+///
+/// `block` is a block number in hex or a tag such as `latest`. The answer is the word at
+/// the end of that block, so a caller that wants the state a transaction started from
+/// asks for its parent block.
+pub fn storage_at(rpc_url: &str, address: &str, slot: &str, block: &str) -> SoldbResult<String> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    client.request::<String>("eth_getStorageAt", json!([address, slot, block]))
+}
+
+/// The block a transaction was mined in, as a hex number, and its index within it.
+pub fn transaction_block(rpc_url: &str, tx_hash: &str) -> SoldbResult<(String, u64)> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    let tx = client
+        .request::<Option<RpcTransaction>>("eth_getTransactionByHash", json!([tx_hash]))?
+        .ok_or_else(|| SoldbError::Message(format!("Transaction not found: {tx_hash}")))?;
+    let block = tx
+        .block_number
+        .ok_or_else(|| SoldbError::Message(format!("Transaction {tx_hash} is not mined yet")))?;
+    let index = tx
+        .transaction_index
+        .as_deref()
+        .and_then(|index| u64::from_str_radix(index.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    Ok((block, index))
+}
+
+/// The number of the latest block, as hex.
+pub fn latest_block(rpc_url: &str) -> SoldbResult<String> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    client.request::<String>("eth_blockNumber", json!([]))
+}
+
 pub fn transaction_logs(rpc_url: &str, tx_hash: &str) -> SoldbResult<Vec<RpcLog>> {
     let client = HttpJsonRpcClient::new(rpc_url)?;
     transaction_logs_with_client(&client, tx_hash)

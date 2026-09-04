@@ -32,9 +32,14 @@
 use std::collections::{BTreeMap, HashMap};
 
 use soldb_core::TransactionTrace;
-use soldb_ethdebug::{EthdebugInfo, FunctionExit, SourceLocation, StorageLayout};
+use soldb_ethdebug::{
+    function_selector, EthdebugInfo, FunctionExit, SourceLocation, StorageLayout,
+};
 
-use crate::{parse_source_functions, SourceFunction};
+use crate::{
+    decode_arguments, is_value_type, parse_source_functions, ArgumentLayout, ArgumentOrder,
+    FrameArgument, SourceFunction,
+};
 
 const CALL_OPCODES: [&str; 4] = ["CALL", "CALLCODE", "DELEGATECALL", "STATICCALL"];
 
@@ -385,6 +390,10 @@ pub struct Frame {
     pub step: usize,
     pub pc: u64,
     pub location: Option<StepLocation>,
+    /// The arguments the function was entered with, when the frame was entered at its
+    /// entry point and the contract's argument order is known. Filled in by
+    /// [`StepMap::frame_arguments`]; empty otherwise.
+    pub arguments: Vec<FrameArgument>,
 }
 
 /// Lines of source around a step.
@@ -442,6 +451,45 @@ pub struct StepMap {
     /// Every EVM frame that reverted, as the step it was entered at and the step it
     /// reverted on, innermost first.
     reverted: Vec<(usize, usize)>,
+    /// What this trace proved about where each contract's compiler leaves function
+    /// parameters on the stack.
+    argument_layouts: Vec<Evidence>,
+}
+
+/// What a trace has shown about one contract's argument passing. Only a proof is used;
+/// a contradiction disables arguments for the contract entirely, because it means the
+/// entry point we detect is not where the parameters are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// Nothing in the trace said either way.
+    Unknown,
+    /// A frame whose arguments we knew did not have them on top of its entry stack.
+    Contradicted,
+    /// The parameters are the top words; the order was not established.
+    TopWords,
+    /// The parameters are the top words, in this order.
+    Ordered(ArgumentOrder),
+}
+
+impl Evidence {
+    /// Keeps the stronger of two observations, and a contradiction over everything: one
+    /// frame that disagrees is enough to stop guessing for the whole contract.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Contradicted, _) | (_, Self::Contradicted) => Self::Contradicted,
+            (Self::Ordered(order), _) | (_, Self::Ordered(order)) => Self::Ordered(order),
+            (Self::TopWords, _) | (_, Self::TopWords) => Self::TopWords,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn layout(self) -> Option<ArgumentLayout> {
+        match self {
+            Self::Ordered(order) => Some(ArgumentLayout::Ordered(order)),
+            Self::TopWords => Some(ArgumentLayout::TopWords),
+            Self::Unknown | Self::Contradicted => None,
+        }
+    }
 }
 
 /// What the first pass records about a step: its EVM frame and its own span.
@@ -805,12 +853,14 @@ impl StepMap {
             pcs.push(trace.steps[index].pc);
         }
 
+        let argument_layouts = prove_argument_layouts(trace, &contracts, &framed);
         let mut map = Self {
             contracts,
             steps,
             addresses,
             pcs,
             reverted,
+            argument_layouts,
         };
         map.smooth_single_step_excursions();
         map.mark_line_starts();
@@ -962,6 +1012,47 @@ impl StepMap {
     #[must_use]
     pub fn reverted_spans(&self) -> &[(usize, usize)] {
         &self.reverted
+    }
+
+    /// What this trace proved about where a contract's compiler leaves function
+    /// parameters on the stack. `None` when the trace carried no frame that could show
+    /// it, or when a frame contradicted it.
+    #[must_use]
+    pub fn argument_layout(&self, contract: usize) -> Option<ArgumentLayout> {
+        self.argument_layouts.get(contract).copied()?.layout()
+    }
+
+    /// The arguments `frame` was entered with, given the stack at its entry step.
+    ///
+    /// Only a frame entered at its function's entry point carries them, and only once
+    /// this trace has shown that the compiler leaves them there: which word is which
+    /// parameter depends on the code generator, and a legacy public function is entered
+    /// through a dispatcher wrapper that has not decoded them yet. See
+    /// [`StepMap::argument_layout`].
+    #[must_use]
+    pub fn frame_arguments(&self, frame: &Frame, entry_stack: &[String]) -> Vec<FrameArgument> {
+        let Some(info) = self.steps.get(frame.entry_step) else {
+            return Vec::new();
+        };
+        let Some(location) = info.location else {
+            return Vec::new();
+        };
+        let Some(function_index) = location.function else {
+            return Vec::new();
+        };
+        let Some(contract) = self.contracts.get(location.key.contract) else {
+            return Vec::new();
+        };
+        if contract.function_entry_at_pc(self.pcs[frame.entry_step]) != Some(function_index) {
+            return Vec::new();
+        }
+        let Some(function) = contract.functions.get(function_index) else {
+            return Vec::new();
+        };
+        let Some(layout) = self.argument_layout(location.key.contract) else {
+            return Vec::new();
+        };
+        decode_arguments(&function.params, entry_stack, layout)
     }
 
     #[must_use]
@@ -1273,6 +1364,7 @@ impl StepMap {
                     step: record.last_step,
                     pc: self.pcs[record.last_step],
                     location,
+                    arguments: Vec::new(),
                 }
             })
             .collect()
@@ -1302,6 +1394,149 @@ impl StepMap {
             lines,
         })
     }
+}
+
+/// Proves, per contract, whether its compiler leaves function parameters on top of the
+/// stack at a function's entry point, and in which order.
+///
+/// The evidence is a frame whose arguments the trace already tells us: the first function
+/// entered in an EVM frame whose calldata is known is the function that calldata selected,
+/// so its arguments are the calldata words. Comparing those with the words on the entry
+/// stack shows whether the parameters are there at all, and with more than one parameter,
+/// which end the first one is at. Only frames whose parameters are all value types are
+/// used, since each is then exactly one word.
+///
+/// A frame that disagrees contradicts the whole contract: solc's legacy pipeline enters a
+/// public function through a dispatcher wrapper that has not decoded the arguments yet, so
+/// the words on top there are not the parameters, and nothing about that contract's frames
+/// can be trusted to hold them.
+fn prove_argument_layouts(
+    trace: &TransactionTrace,
+    contracts: &[ContractDebugInfo],
+    framed: &[FramedStep],
+) -> Vec<Evidence> {
+    let mut evidence = vec![Evidence::Unknown; contracts.len()];
+    if contracts.is_empty() || framed.is_empty() {
+        return evidence;
+    }
+    // The calldata each EVM frame was entered with: the transaction's input at the root,
+    // and the recorded input of a call for a nested frame.
+    let mut calldata_by_entry = HashMap::<usize, &str>::new();
+    calldata_by_entry.insert(0, trace.input_data.as_str());
+    for call in &trace.artifacts.calls {
+        if let Some(entry_step) = call.entry_step {
+            calldata_by_entry.insert(entry_step, call.input.as_str());
+        }
+    }
+
+    let mut examined = std::collections::HashSet::<u32>::new();
+    let mut frame_calldata = HashMap::<u32, &str>::new();
+    for (index, step) in framed.iter().enumerate() {
+        let entered = index == 0 || framed[index - 1].frame_id != step.frame_id;
+        if entered {
+            if let Some(calldata) = calldata_by_entry.get(&index) {
+                frame_calldata.insert(step.frame_id, calldata);
+            }
+        }
+        let (Some(contract_index), Some(function_index)) = (step.contract, step.entry) else {
+            continue;
+        };
+        // Only the first function entered in an EVM frame: a later one was called from
+        // inside the code, not by this calldata.
+        if !examined.insert(step.frame_id) {
+            continue;
+        }
+        let Some(calldata) = frame_calldata.get(&step.frame_id) else {
+            continue;
+        };
+        let Some(function) = contracts[contract_index].functions.get(function_index) else {
+            continue;
+        };
+        let stack = trace.steps[index].snapshot_ref().stack;
+        let observed = argument_evidence(function, calldata, stack);
+        evidence[contract_index] = evidence[contract_index].merge(observed);
+    }
+    evidence
+}
+
+/// What one frame's entry stack says, given the calldata that selected its function.
+fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[String]) -> Evidence {
+    let count = function.params.len();
+    if count == 0 || stack.len() < count {
+        return Evidence::Unknown;
+    }
+    if !function.params.iter().all(|param| is_value_type(&param.ty)) {
+        return Evidence::Unknown;
+    }
+    let signature = format!(
+        "{}({})",
+        function.name,
+        function
+            .params
+            .iter()
+            .map(|param| canonical_value_type(&param.ty))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let Ok(selector) = function_selector(&signature) else {
+        return Evidence::Unknown;
+    };
+    let data = calldata.trim_start_matches("0x");
+    let Some((encoded_selector, arguments)) = data.split_at_checked(8) else {
+        return Evidence::Unknown;
+    };
+    // A different function's calldata says nothing about this frame.
+    if encoded_selector.to_ascii_lowercase() != hex_bytes(&selector) {
+        return Evidence::Unknown;
+    }
+    let expected = (0..count)
+        .map(|index| {
+            arguments
+                .get(index * 64..(index + 1) * 64)
+                .map(str::to_ascii_lowercase)
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(expected) = expected else {
+        return Evidence::Unknown;
+    };
+    let matches = |order: ArgumentOrder| {
+        expected.iter().enumerate().all(|(index, word)| {
+            let candidate = &stack[order.word_index(index, count, stack.len())];
+            normalize_word(candidate) == *word
+        })
+    };
+    let first = matches(ArgumentOrder::FirstOnTop);
+    let last = matches(ArgumentOrder::LastOnTop);
+    match (first, last) {
+        // Equal words at both ends, or a single parameter: the arguments are on top, but
+        // the order cannot be told apart.
+        (true, true) => Evidence::TopWords,
+        (true, false) => Evidence::Ordered(ArgumentOrder::FirstOnTop),
+        (false, true) => Evidence::Ordered(ArgumentOrder::LastOnTop),
+        // The arguments are not on the entry stack: this is not where they live.
+        (false, false) => Evidence::Contradicted,
+    }
+}
+
+/// The ABI name of a value type as written in the source: the bare integer names are
+/// their 256-bit forms, and `address payable` encodes as `address`.
+fn canonical_value_type(ty: &str) -> String {
+    match ty {
+        "uint" => "uint256".to_owned(),
+        "int" => "int256".to_owned(),
+        "address payable" => "address".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// A stack word as 64 lowercase hex digits, however the backend spelled it.
+fn normalize_word(word: &str) -> String {
+    let digits = word.trim_start_matches("0x").trim_start_matches('0');
+    format!("{:0>64}", digits.to_ascii_lowercase())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The code address a call instruction targets, read off its stack.
@@ -1340,7 +1575,8 @@ mod tests {
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
     use super::{
-        address_from_word, normalize_address, ContractDebugInfo, JumpMarker, LineKey, StepMap,
+        address_from_word, normalize_address, ArgumentLayout, ArgumentOrder, ContractDebugInfo,
+        JumpMarker, LineKey, StepMap,
     };
 
     // Two functions; `outer` calls `inner` internally. Line numbers are one-based.
@@ -1466,6 +1702,195 @@ contract C {
             step(14, 1, "POP", &[]),
             step(30, 1, "STOP", &[]),
         ])
+    }
+
+    // A contract whose functions take two parameters, so the order they are passed in
+    // can be told apart.
+    const PAY_SOURCE: &str = "\
+contract P {
+    function pay(address to, uint256 amount) public {
+        total(to, amount);
+    }
+    function total(address to, uint256 amount) internal {
+        amount += 1;
+    }
+}
+";
+
+    fn pay_contract() -> ContractDebugInfo {
+        let whole = PAY_SOURCE.len() as u64;
+        let at = |needle: &str| PAY_SOURCE.find(needle).expect(needle) as u64;
+        let span = |pc: u64, offset: u64, length: u64| {
+            serde_json::from_value::<Instruction>(json!({
+                "offset": pc,
+                "operation": {"mnemonic": "JUMPDEST"},
+                "context": {"code": {
+                    "source": {"id": 0},
+                    "range": {"offset": offset, "length": length}
+                }}
+            }))
+            .expect("instruction")
+        };
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "P".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: vec![
+                span(0, 0, whole),
+                span(10, at("function pay"), 80),
+                span(11, at("total(to, amount);"), 18),
+                span(20, at("function total"), 70),
+                span(21, at("amount += 1;"), 12),
+            ],
+            sources: BTreeMap::from([(0, "P.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        ContractDebugInfo::new(
+            None,
+            "P",
+            info,
+            BTreeMap::from([(0, PAY_SOURCE.to_owned())]),
+        )
+    }
+
+    fn word_of(value: &str) -> String {
+        format!("0x{:0>64}", value.trim_start_matches("0x"))
+    }
+
+    /// A call to `pay(to, amount)` that calls `total(to, amount)` internally, with the
+    /// entry stacks the caller chooses, bottom-first as a backend reports them.
+    fn pay_trace(entry_stack: &[String], inner_stack: &[String]) -> TransactionTrace {
+        let selector = soldb_ethdebug::function_selector("pay(address,uint256)").expect("selector");
+        let calldata = format!(
+            "0x{}{}{}",
+            selector
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            &word_of(PAY_TO)[2..],
+            &word_of(PAY_AMOUNT)[2..]
+        );
+        fn borrow(stack: &[String]) -> Vec<&str> {
+            stack.iter().map(String::as_str).collect()
+        }
+        let mut trace = trace(vec![
+            step(0, 1, "PUSH1", &[]),
+            step(10, 1, "JUMPDEST", &borrow(entry_stack)),
+            step(11, 1, "JUMP", &borrow(inner_stack)),
+            step(20, 1, "JUMPDEST", &borrow(inner_stack)),
+            step(21, 1, "ADD", &[]),
+        ]);
+        trace.input_data = calldata;
+        trace
+    }
+
+    const PAY_TO: &str = "00000000000000000000000000000000000000aa";
+    const PAY_AMOUNT: &str = "7";
+
+    #[test]
+    fn the_trace_proves_which_end_the_first_argument_is_at() {
+        let to = word_of(PAY_TO);
+        let amount = word_of(PAY_AMOUNT);
+        let tag = word_of("2a");
+
+        // via-IR pushes the parameters right to left, so the first is on top.
+        let first_on_top = [tag.clone(), amount.clone(), to.clone()];
+        let trace = pay_trace(&first_on_top, &first_on_top);
+        let map = StepMap::new(&trace, vec![pay_contract()]);
+        assert_eq!(
+            map.argument_layout(0),
+            Some(ArgumentLayout::Ordered(ArgumentOrder::FirstOnTop))
+        );
+        let frames = map.frames(4);
+        let inner = frames.first().expect("innermost frame");
+        assert_eq!(inner.function_name.as_deref(), Some("total"));
+        let arguments = map.frame_arguments(inner, &first_on_top);
+        assert_eq!(
+            arguments
+                .iter()
+                .map(|argument| format!("{} = {}", argument.name, argument.value.display))
+                .collect::<Vec<_>>(),
+            [
+                "to = 0x00000000000000000000000000000000000000aa".to_owned(),
+                "amount = 7".to_owned()
+            ]
+        );
+
+        // The legacy pipeline pushes them left to right, so the last is on top.
+        let last_on_top = [tag.clone(), to.clone(), amount.clone()];
+        let trace = pay_trace(&last_on_top, &last_on_top);
+        let map = StepMap::new(&trace, vec![pay_contract()]);
+        assert_eq!(
+            map.argument_layout(0),
+            Some(ArgumentLayout::Ordered(ArgumentOrder::LastOnTop))
+        );
+        let frames = map.frames(4);
+        let arguments = map.frame_arguments(frames.first().expect("frame"), &last_on_top);
+        assert_eq!(
+            arguments[0].value.display,
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(arguments[1].value.display, "7");
+
+        // A frame entered through a dispatcher wrapper does not hold the arguments yet.
+        // That contradicts the whole contract: nothing is reported for any frame of it.
+        let wrapper = [tag.clone(), word_of("dead"), word_of("beef")];
+        let trace = pay_trace(&wrapper, &first_on_top);
+        let map = StepMap::new(&trace, vec![pay_contract()]);
+        assert_eq!(map.argument_layout(0), None);
+        let frames = map.frames(4);
+        assert!(map
+            .frame_arguments(frames.first().expect("frame"), &first_on_top)
+            .is_empty());
+
+        // Without the calldata to compare against, nothing is proven and nothing shown.
+        let mut unknown = pay_trace(&first_on_top, &first_on_top);
+        unknown.input_data = "0x".to_owned();
+        let map = StepMap::new(&unknown, vec![pay_contract()]);
+        assert_eq!(map.argument_layout(0), None);
+        let frames = map.frames(4);
+        assert!(map
+            .frame_arguments(frames.first().expect("frame"), &first_on_top)
+            .is_empty());
+    }
+
+    #[test]
+    fn one_parameter_is_on_top_under_either_order() {
+        // `outer(uint256 a)` takes one parameter: matching it against the calldata shows
+        // the arguments are on the entry stack, which is all a one-parameter frame needs.
+        let mut trace = outer_calls_inner();
+        let selector = soldb_ethdebug::function_selector("outer(uint256)").expect("selector");
+        let amount = word_of("5");
+        trace.input_data = format!(
+            "0x{}{}",
+            selector
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            &amount[2..]
+        );
+        let stack = [word_of("2a"), amount.clone()];
+        trace.steps[2].snapshot = StepSnapshot::new(
+            stack.iter().map(String::to_owned).collect(),
+            None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let map = StepMap::new(&trace, vec![contract(None)]);
+        assert_eq!(map.argument_layout(0), Some(ArgumentLayout::TopWords));
+        let frames = map.frames(3);
+        let outer = frames
+            .iter()
+            .find(|frame| frame.function_name.as_deref() == Some("outer"))
+            .expect("outer frame");
+        let arguments = map.frame_arguments(outer, &stack);
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0].name, "a");
+        assert_eq!(arguments[0].value.display, "5");
+
+        // Two parameters need the order, which one parameter cannot show.
+        let map = StepMap::new(&trace, vec![pay_contract()]);
+        assert_eq!(map.argument_layout(0), None);
     }
 
     fn key(line: u64) -> Option<LineKey> {

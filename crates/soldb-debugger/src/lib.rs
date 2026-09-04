@@ -18,14 +18,15 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
-use soldb_ethdebug::{EthdebugInfo, VariableLocation};
+use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
 pub mod state;
 pub mod stepping;
 
 pub use soldb_ethdebug::StorageLayout;
 pub use state::{
-    short_hex, state_value, state_variables, StateVariable, StorageTape, StorageWords,
+    short_hex, state_value, state_variables, ChainStorage, StateSource, StateVariable, StorageTape,
+    StorageWords,
 };
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
@@ -198,6 +199,14 @@ pub struct SourceParam {
     pub ty: String,
 }
 
+/// One argument of a function frame, as it was on the stack when the frame was entered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameArgument {
+    pub name: String,
+    pub ty: String,
+    pub value: DebugValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugVariable {
     pub name: String,
@@ -337,6 +346,127 @@ fn decode_static_word(word: &str, ty: &str) -> Option<String> {
         return Some(format!("0x{}", &padded[..size * 2]).to_ascii_lowercase());
     }
     None
+}
+
+/// Where the compiler leaves a function's parameters on the stack when the function is
+/// entered. Solidity's two code generators disagree, and nothing in the artifacts says
+/// which produced the code, so [`StepMap`] proves it from the trace instead of assuming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgumentOrder {
+    /// The first declared parameter is on top: the via-IR pipeline pushes them
+    /// right-to-left.
+    FirstOnTop,
+    /// The last declared parameter is on top: the legacy pipeline pushes them
+    /// left-to-right.
+    LastOnTop,
+}
+
+/// What this trace proved about how a contract's compiler passes arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgumentLayout {
+    /// The parameters are the top words at the entry point, in this order.
+    Ordered(ArgumentOrder),
+    /// The parameters are the top words, but which is which was not established: the
+    /// evidence came from a one-parameter frame, where both orders look the same.
+    TopWords,
+}
+
+impl ArgumentOrder {
+    /// The stack index of parameter `index` of `count`, counting from the bottom of the
+    /// stack, given that the parameters occupy the top `count` words.
+    #[must_use]
+    fn word_index(self, index: usize, count: usize, stack_len: usize) -> usize {
+        match self {
+            Self::FirstOnTop => stack_len - 1 - index,
+            Self::LastOnTop => stack_len - count + index,
+        }
+    }
+}
+
+/// The arguments a function was entered with, read off the stack at its entry point.
+///
+/// Only value-type parameters are read: each takes exactly one word, so the words under
+/// the top of the stack are the arguments themselves. A reference parameter is a pointer
+/// whose width depends on its data location, and reading one as a value would show a
+/// memory offset as if it were a number, so a function that takes one reports nothing.
+#[must_use]
+pub fn decode_arguments(
+    params: &[SourceParam],
+    stack: &[String],
+    layout: ArgumentLayout,
+) -> Vec<FrameArgument> {
+    if params.is_empty() || stack.len() < params.len() {
+        return Vec::new();
+    }
+    if !params.iter().all(|param| is_value_type(&param.ty)) {
+        return Vec::new();
+    }
+    // One parameter is on top under either order; more than one needs the order proven.
+    let order = match layout {
+        ArgumentLayout::Ordered(order) => order,
+        ArgumentLayout::TopWords if params.len() == 1 => ArgumentOrder::FirstOnTop,
+        ArgumentLayout::TopWords => return Vec::new(),
+    };
+    params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let word = &stack[order.word_index(index, params.len(), stack.len())];
+            FrameArgument {
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+                value: argument_value(&param.ty, word),
+            }
+        })
+        .collect()
+}
+
+fn argument_value(ty: &str, word: &str) -> DebugValue {
+    let Ok(parsed) = parse_word(&format!("0x{}", word.trim_start_matches("0x"))) else {
+        return DebugValue {
+            display: "<unreadable stack word>".to_owned(),
+            raw: Some(word.to_owned()),
+            status: DebugValueStatus::Unavailable,
+        };
+    };
+    DebugValue {
+        display: decode_value(value_bytes(&parsed, ty), ty),
+        raw: Some(short_hex(&parsed)),
+        status: DebugValueStatus::Decoded,
+    }
+}
+
+/// The bytes of a stack word a value of type `ty` occupies: a signed integer is its own
+/// width from the low end so the sign bit is the right one, fixed bytes are left-aligned,
+/// and everything else reads as a whole word.
+fn value_bytes<'a>(word: &'a Word, ty: &str) -> &'a [u8] {
+    if let Some(bits) = integer_bits(ty, "int") {
+        return &word[32 - bits / 8..];
+    }
+    if let Some(size) = fixed_bytes_size(ty) {
+        return &word[..size];
+    }
+    word
+}
+
+/// Whether a value of this type is one stack word the debugger can decode.
+#[must_use]
+pub fn is_value_type(ty: &str) -> bool {
+    matches!(ty, "bool" | "address" | "address payable")
+        || fixed_bytes_size(ty).is_some()
+        || integer_bits(ty, "uint").is_some()
+        || integer_bits(ty, "int").is_some()
+}
+
+/// The width of `uint<N>`/`int<N>` in bits, the bare names counting as 256.
+fn integer_bits(ty: &str, prefix: &str) -> Option<usize> {
+    let rest = ty.strip_prefix(prefix)?;
+    // `int8` must not match the `uint` prefix; `strip_prefix` already ruled that out.
+    if rest.is_empty() {
+        return Some(256);
+    }
+    let bits = rest.parse::<usize>().ok()?;
+    (bits % 8 == 0 && (8..=256).contains(&bits)).then_some(bits)
 }
 
 fn fixed_bytes_size(ty: &str) -> Option<usize> {

@@ -503,8 +503,24 @@ impl DapServer {
                     || format!("step {}", frame.step),
                     |step| format!("step {}: {} @ pc {}", frame.step, step.op, step.pc),
                 );
+                let arguments = if frame.arguments.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "({})",
+                        frame
+                            .arguments
+                            .iter()
+                            .map(|argument| format!(
+                                "{} = {}",
+                                argument.name, argument.value.display
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
                 let name = match (&frame.function_name, &frame.contract_name) {
-                    (Some(function), _) => format!("{function} ({step_name})"),
+                    (Some(function), _) => format!("{function}{arguments} ({step_name})"),
                     (None, Some(contract)) => format!("{contract} ({step_name})"),
                     (None, None) => step_name,
                 };

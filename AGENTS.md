@@ -167,7 +167,10 @@ belongs in `soldb-debugger`, not in a second copy.
   the trace recorded by the account whose storage it belongs to (a `DELEGATECALL` writes
   the caller's, which `StepMap::storage_context_index` decides) and by the step it holds
   from, and drops what a reverted frame wrote; a slot with no record is unknown, never
-  zero. All of it is a search over the recording; nothing re-executes.
+  zero. A frontend that has a node can fill those in through the `ChainStorage` trait,
+  whose implementation stays in the frontend because this crate does no I/O; a value read
+  that way is marked `StateSource::Chain` so it is shown as the chain's state and not as
+  part of the recording. All of it is a search over the recording; nothing re-executes.
 - **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
   programs. Frontend-agnostic; returns tables and folded stacks without printing or I/O.
 - **soldb-repl**: the interactive debugger *state machine* — breakpoints, stepping,
@@ -273,12 +276,19 @@ rather than to guess values from the stack. Do not "fix" it by inferring locatio
 *State* variables do not depend on that gap: `solc --storage-layout` has always said where
 they live, so `vars` and `print` read them through `StorageLayout` for ETHDebug and legacy
 artifacts alike. That is the line to hold when a piece of debug info is missing — take
-what the compiler does emit, and say plainly what it does not. Argument values at an
-internal call are the counter-example we deliberately do not show: the order of the
-parameter words on the stack differs between the legacy and via-IR pipelines, and nothing
-in the artifacts says which produced the code, so naming them positionally would be a
-guess. The call-frame summary decodes external call arguments from calldata instead, where
-the ABI makes it exact.
+what the compiler does emit, prove what you can from the recording, and say plainly what
+is left.
+
+Frame arguments are the worked example of proving it. The order of the parameter words on
+the stack differs between the legacy and via-IR pipelines and no artifact says which
+produced the code, so `prove_argument_layouts` in `soldb-debugger/src/stepping.rs` settles
+it from the trace: the first function entered in an EVM frame whose calldata is known is
+the one that calldata selected, so its arguments are the calldata words, and comparing
+them with the entry stack shows whether the parameters are there and which end the first
+one is at. A frame that disagrees — solc's legacy pipeline enters public functions through
+a dispatcher wrapper that has not decoded them yet — contradicts the contract, and no
+frame of it reports arguments after that. Do not replace this with a version check or a
+pipeline fingerprint.
 
 ### Artifacts
 
