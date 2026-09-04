@@ -5,24 +5,15 @@ programs. The trace supplies executed program counters and dynamic opcode costs;
 the debug artifact supplies the source range associated with each instruction.
 ETHDebug also supplies compiler-authored function identities.
 
-Solar can emit the required resources plus creation and runtime programs directly:
-
-```console
-solar -g --out-dir out Contract.sol
-```
-
-The loader accepts Solar's source-qualified artifact names, such as
-`Contract_sol_Contract_ethdebug-runtime.json`, as well as solc's
+Any compiler that writes the ETHDebug resource file and the creation and runtime
+programs can supply them. The loader accepts source-qualified artifact names,
+such as `Contract_sol_Contract_ethdebug-runtime.json`, as well as solc's
 `Contract_ethdebug-runtime.json` spelling.
 
 When ETHDebug is unavailable, the loader accepts `srcmap` and `srcmap-runtime`
 from `combined.json`. The artifact must also contain `bin` and `bin-runtime`,
 because decoding PUSH widths is required to translate instruction indexes into
-program counters. With Solar, use:
-
-```console
-solar -g source-maps --emit=abi,bin,bin-runtime --out-dir out Contract.sol
-```
+program counters.
 
 Legacy source maps preserve exact PC-to-source attribution. They do not contain
 variable locations or unambiguous function identities, so profiles report their
