@@ -42,9 +42,9 @@ Compile your contracts with ETHDebug (Solidity 0.8.29+):
 solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime --bin --abi --overwrite -o out examples/Counter.sol
 ```
 
-Legacy source maps are also accepted. For example, compile with Solar using
-`-g source-maps --emit=abi,bin,bin-runtime --out-dir out`; SolDB reads
-`combined.json` when ETHDebug programs are absent.
+Legacy source maps are also accepted: SolDB reads `combined.json` when ETHDebug
+programs are absent, so contracts built by pre-ETHDebug compilers still debug by
+source line, function, and frame.
 
 Trace a transaction:
 ```bash
