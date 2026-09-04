@@ -5,8 +5,10 @@
 # RUN: not %soldb run %{ethdebug_dir}/TestContract.bin --constructor-args 1 2>&1 | FileCheck --check-prefix=ABI %s
 # RUN: not %soldb run 0x60 --runtime --deploy 2>&1 | FileCheck --check-prefix=DEPLOY %s
 # RUN: not %soldb run 0x60 --runtime --storage bad 2>&1 | FileCheck --check-prefix=STORAGE %s
-# A chain the engine cannot model is refused by name before anything runs.
+# A chain the engine cannot model is refused by name before anything runs; one it knows
+# only as EVM-equivalent runs, and the summary carries the note.
 # RUN: not %soldb run 0x60 --runtime --chain-id 42161 2>&1 | FileCheck --check-prefix=CHAIN %s
+# RUN: %soldb run 0x6000405060005460010160005500 --runtime --chain-id 10 2>&1 | FileCheck --check-prefix=NOTE %s
 # A deployment lands at the CREATE address; `--address` only places `--runtime` code.
 # RUN: not %soldb run 0x60 --address 0x0000000000000000000000000000000000000001 2>&1 | FileCheck --check-prefix=ADDRESS %s
 
@@ -17,3 +19,5 @@
 # ADDRESS: --runtime
 # CHAIN: the replay backend does not model Arbitrum One (chain id 42161)
 # CHAIN: --backend debug-rpc
+# NOTE: Capability note: OP Mainnet (chain id 10) is replayed with Ethereum mainnet rules
+# NOTE: Status: SUCCESS

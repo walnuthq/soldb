@@ -129,6 +129,15 @@ impl ContractDebugInfo {
         self.function_entries.get(&pc).copied()
     }
 
+    /// Whether the instruction at `pc` is a `JUMPDEST`.
+    #[must_use]
+    pub fn is_jumpdest(&self, pc: u64) -> bool {
+        self.pc_index
+            .get(&pc)
+            .and_then(|index| self.info.instructions.get(*index))
+            .is_some_and(|instruction| instruction.mnemonic() == Some("JUMPDEST"))
+    }
+
     /// What the artifact says about the jump the instruction at `pc` makes.
     #[must_use]
     pub fn jump_marker_at_pc(&self, pc: u64) -> JumpMarker {
@@ -438,13 +447,24 @@ struct EvmFrame {
     address: Option<usize>,
 }
 
+/// One internal frame: a function, or a placeholder for a compiler-generated helper
+/// entered through a marked call, which absorbs the matching marked return and counts as
+/// no frame of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameEntry {
+    function: Option<usize>,
+    /// Where the frame returns to: the tag the caller pushed before the arguments, read
+    /// off the stack at the call. A jump landing there is the return, whatever function
+    /// it lands in, which is what tells a return from a recursive call apart from
+    /// staying in the function.
+    return_pc: Option<u64>,
+}
+
 /// The inferred Solidity state of one EVM frame.
 #[derive(Default)]
 struct InternalFrame {
-    /// The functions active in this frame, innermost last. `None` is a compiler-generated
-    /// helper entered through a marked call: it absorbs the matching marked return and
-    /// counts as no frame of its own.
-    functions: Vec<Option<usize>>,
+    /// The frames active in this EVM frame, innermost last.
+    functions: Vec<FrameEntry>,
     /// The last real statement executed in this frame, which generated code belongs to.
     statement: Option<LocationRef>,
 }
@@ -452,11 +472,32 @@ struct InternalFrame {
 impl InternalFrame {
     /// The innermost function, looking past helper placeholders.
     fn active(&self) -> Option<usize> {
-        self.functions.iter().rev().find_map(|entry| *entry)
+        self.functions.iter().rev().find_map(|entry| entry.function)
     }
 
     fn is_active(&self, function: usize) -> bool {
         self.active() == Some(function)
+    }
+
+    fn push_function(&mut self, function: usize, return_pc: Option<u64>) {
+        self.functions.push(FrameEntry {
+            function: Some(function),
+            return_pc,
+        });
+    }
+
+    fn push_placeholder(&mut self) {
+        self.functions.push(FrameEntry {
+            function: None,
+            return_pc: None,
+        });
+    }
+
+    /// Whether a jump landing on `pc` returns from the innermost frame.
+    fn returns_to(&self, pc: u64) -> bool {
+        self.functions
+            .last()
+            .is_some_and(|entry| entry.return_pc == Some(pc))
     }
 }
 
@@ -598,24 +639,42 @@ impl StepMap {
             };
             let structured = structured(step.contract);
             let mut generated = false;
-            // A marked return pops whatever the matching call pushed, wherever it lands.
-            // A marked call is resolved once the landing's function is known.
+            // A return pops whatever the matching call pushed, wherever it lands: the
+            // artifact marks it, or the jump lands on the return address recorded at the
+            // call. A marked call is resolved once the landing's function is known.
             let mut pending_call = false;
             if landed_by_jump {
+                let pc = trace.steps[index].pc;
                 match previous_marker {
                     JumpMarker::Call => pending_call = true,
                     JumpMarker::Return => {
                         frame.functions.pop();
                     }
+                    JumpMarker::None if frame.returns_to(pc) => {
+                        frame.functions.pop();
+                    }
                     JumpMarker::None => {}
                 }
             }
+            // The return address a call being made here would come back to, read off
+            // the caller's stack at the jump: the tag pushed before the arguments.
+            let return_address = |function: usize| -> Option<u64> {
+                if !landed_by_jump {
+                    return None;
+                }
+                let contract = &contracts[step.contract?];
+                let arguments = contract.functions.get(function)?.params.len();
+                let stack = trace.steps[index - 1].snapshot_ref().stack;
+                let word = stack.get(stack.len().checked_sub(2 + arguments)?)?;
+                let pc = u64::from_str_radix(word.trim_start_matches("0x"), 16).ok()?;
+                contract.is_jumpdest(pc).then_some(pc)
+            };
             let (location, key) = match step.location {
                 None => {
                     // Code without source, such as a generated helper: a marked call into
                     // it gets a placeholder its marked return pops.
                     if pending_call {
-                        frame.functions.push(None);
+                        frame.push_placeholder();
                     }
                     (None, None)
                 }
@@ -630,22 +689,22 @@ impl StepMap {
                         if entering || (pending_call && !frame.is_active(function)) {
                             // A call: onto the entry point, or marked and into a function
                             // other than the active one.
-                            frame.functions.push(Some(function));
+                            frame.push_function(function, return_address(function));
                             frame_entry = true;
                         } else if pending_call {
                             // A marked call into the active function away from its entry
                             // point is a generated helper whose span is the calling line:
                             // recursion always enters at the entry point.
-                            frame.functions.push(None);
+                            frame.push_placeholder();
                         } else if !frame.is_active(function) {
                             match frame
                                 .functions
                                 .iter()
-                                .rposition(|entry| *entry == Some(function))
+                                .rposition(|entry| entry.function == Some(function))
                             {
                                 Some(position) => frame.functions.truncate(position + 1),
                                 None => {
-                                    frame.functions.push(Some(function));
+                                    frame.push_function(function, None);
                                     frame_entry = true;
                                 }
                             }
@@ -660,7 +719,7 @@ impl StepMap {
                     }
                     None => {
                         if pending_call {
-                            frame.functions.push(None);
+                            frame.push_placeholder();
                         }
                         match frame.statement {
                             Some(statement) => {
@@ -680,7 +739,7 @@ impl StepMap {
                     frame
                         .functions
                         .iter()
-                        .filter(|entry| entry.is_some())
+                        .filter(|entry| entry.function.is_some())
                         .count()
                 })
                 .sum::<usize>();
@@ -1691,6 +1750,39 @@ contract C {
         assert_eq!(map.finish(6), Some(8));
         assert_eq!(map.reverse_finish(6), Some(5));
         assert_eq!(map.finish(4), Some(10));
+    }
+
+    #[test]
+    fn a_recursive_call_returns_at_the_address_read_off_the_stack() {
+        // outer calls outer: the jump at pc 12 carries [return tag 13, argument, entry 10]
+        // on its stack. Landing on the entry point pushes a second outer frame; the jump
+        // that lands on pc 13 is its return, which no span could tell apart from staying
+        // in outer.
+        let map = StepMap::new(
+            &trace(vec![
+                step(0, 1, "PUSH1", &[]),
+                step(1, 1, "JUMP", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(12, 1, "JUMP", &["0xd", "0x1", "0xa"]),
+                step(10, 1, "JUMPDEST", &["0x1"]),
+                step(11, 1, "ADD", &["0x2"]),
+                step(14, 1, "JUMP", &["0xd"]),
+                step(13, 1, "JUMPDEST", &[]),
+                step(14, 1, "POP", &[]),
+                step(30, 1, "STOP", &[]),
+            ]),
+            vec![contract(None)],
+        );
+        let depths = (0..10)
+            .map(|step| map.frame_depth(step).expect("depth"))
+            .collect::<Vec<_>>();
+        assert_eq!(depths, vec![0, 0, 1, 1, 2, 2, 2, 1, 1, 0]);
+        assert!(map.is_frame_entry(4));
+        assert_eq!(map.finish(4), Some(7));
+        assert_eq!(map.frames(5).len(), 3);
+        assert_eq!(map.frames(7).len(), 2);
+        assert!(map.contracts()[0].is_jumpdest(13));
+        assert!(!map.contracts()[0].is_jumpdest(99));
     }
 
     #[test]

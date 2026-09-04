@@ -62,3 +62,33 @@
 # NOMETA: Could not set breakpoint: source breakpoints require compiler debug metadata
 # NOMETA: Could not set breakpoint: function breakpoints require compiler debug metadata
 # NOMETA: Cannot list source: no ETHDebug metadata is loaded
+
+# Reverse source stepping mirrors the forward commands. From line 32, `reverse-step` stops
+# where the call on line 30 returned, then inside increment2; `reverse-finish` goes back
+# to the call site; `reverse-next` goes to the start of the line, then to the line before.
+# RUN: printf 'break TestContract.sol:32\ncontinue\nreverse-step\nreverse-step\nreverse-finish\nreverse-next\nreverse-next\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=REVERSE %s
+
+# REVERSE: Breakpoint #1 hit at step {{[0-9]+}}, TestContract.sol:32
+# REVERSE: TestContract.sol:30 in increment
+# REVERSE: in increment2
+# REVERSE: TestContract.sol:30 in increment
+# REVERSE: TestContract.sol:30 in increment
+# REVERSE: TestContract.sol:28 in increment
+
+# Every breakpoint kind: an opcode, a bare line in the only source, a revert, and a call;
+# `clear` removes by target and `info breakpoints` lists what is left. Nothing in this
+# transaction reverts or calls out, so those run to the end.
+# RUN: printf 'break op SSTORE\ncontinue\nclear op SSTORE\nbreak line 30\nbreak revert\nbreak call\ninfo breakpoints\ncontinue\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=KINDS %s
+
+# KINDS: Breakpoint #1 set at opcode SSTORE
+# KINDS: Breakpoint #1 hit at step {{[0-9]+}}, opcode SSTORE, PC {{[0-9]+}}
+# KINDS: TestContract.sol:28 in increment (compiler-generated code for this line)
+# KINDS: Breakpoint #1 cleared at opcode SSTORE
+# KINDS: Breakpoint #2 set at TestContract.sol:30
+# KINDS: Breakpoint #3 set at revert
+# KINDS: Breakpoint #4 set at any call
+# KINDS: #2 TestContract.sol:30
+# KINDS-NEXT: #3 revert
+# KINDS-NEXT: #4 any call
+# KINDS: Breakpoint #2 hit at step {{[0-9]+}}, TestContract.sol:30
+# KINDS: End of trace at step

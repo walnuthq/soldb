@@ -156,7 +156,8 @@ belongs in `soldb-debugger`, not in a second copy.
   maps every step of a trace through the loaded
   contracts once: the line it belongs to, its frame depth (EVM depth plus internal
   Solidity functions, from the artifact's jump markers where it has them, from a jump
-  onto a parsed function's entry point, and from the spans as a fallback), and the
+  onto a parsed function's entry point with the return address read off the stack at
+  the call, and from the spans as a fallback), and the
   searches behind `next`, `step`, `finish`, their reverse forms,
   line and function breakpoints, and `backtrace`. Compiler-generated helpers carry the
   whole-contract span; the map attributes them to the executing statement and marks them

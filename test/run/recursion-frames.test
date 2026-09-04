@@ -1,0 +1,35 @@
+# Recursion and mutual recursion keep their frames: a jump onto a function's entry point
+# is a call even when the function is active, and a jump landing on the return address
+# read off the stack at the call is its return. No node: the contract is compiled here
+# and run on a local chain.
+# REQUIRES: soldb
+# RUN: %soldb compile %S/../examples/Recursion.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: printf 'break fact\ncontinue\ncontinue\ncontinue\nbt\nfinish\nbt\nfinish\nbt\nquit\n' | %soldb run %t.out/Recursion.bin "fact(uint256)" 3 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Recursion:%t.out -i 2>&1 | FileCheck --check-prefix=FACT %s
+
+# FACT: Breakpoint #1 set at function Recursion.fact at {{.*}}Recursion.sol:6
+# FACT: Breakpoint #1 hit at step {{[0-9]+}}, function Recursion.fact
+# FACT: Breakpoint #1 hit at step {{[0-9]+}}, function Recursion.fact
+# FACT: Breakpoint #1 hit at step {{[0-9]+}}, function Recursion.fact
+# Three activations of fact, each at the call site of the next.
+# FACT: #0  fact at {{.*}}Recursion.sol:6
+# FACT-NEXT: #1  fact at {{.*}}Recursion.sol:10
+# FACT-NEXT: #2  fact at {{.*}}Recursion.sol:10
+# FACT-NEXT: #3  Recursion at {{.*}}Recursion.sol:5
+# `finish` returns one activation at a time, not out of the whole recursion.
+# FACT: #0  fact at {{.*}}Recursion.sol:10
+# FACT-NEXT: #1  fact at {{.*}}Recursion.sol:10
+# FACT-NEXT: #2  Recursion at {{.*}}Recursion.sol:5
+# FACT: #0  fact at {{.*}}Recursion.sol:10
+# FACT-NEXT: #1  Recursion at {{.*}}Recursion.sol:5
+
+# RUN: printf 'break ping\ncontinue\ncontinue\nbt\nfinish\nbt\nquit\n' | %soldb run %t.out/Recursion.bin "ping(uint256)" 2 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Recursion:%t.out -i 2>&1 | FileCheck --check-prefix=PING %s
+
+# PING: Breakpoint #1 hit at step {{[0-9]+}}, function Recursion.ping
+# PING: Breakpoint #1 hit at step {{[0-9]+}}, function Recursion.ping
+# PING: #0  ping at {{.*}}Recursion.sol:13
+# PING-NEXT: #1  pong at {{.*}}Recursion.sol:24
+# PING-NEXT: #2  ping at {{.*}}Recursion.sol:17
+# PING-NEXT: #3  Recursion at {{.*}}Recursion.sol:5
+# PING: #0  pong at {{.*}}Recursion.sol:24
+# PING-NEXT: #1  ping at {{.*}}Recursion.sol:17
+# PING-NEXT: #2  Recursion at {{.*}}Recursion.sol:5
