@@ -24,8 +24,8 @@ pub mod stepping;
 
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
-    Frame, FunctionId, LineKey, ResolvedFunction, ResolvedLine, SourceListing, StepLocation,
-    StepMap,
+    Frame, FunctionId, JumpMarker, LineKey, ResolvedFunction, ResolvedLine, SourceListing,
+    StepLocation, StepMap,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

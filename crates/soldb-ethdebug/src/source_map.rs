@@ -392,7 +392,41 @@ fn opcode_operation(opcode: u8) -> Value {
     json!({"mnemonic": mnemonic})
 }
 
+/// The ETHDebug-shaped context of one legacy entry: its source range, and the jump
+/// markers ETHDebug defines (`invoke` for a jump into a function, `return` for a jump
+/// out of one) when the map's jump type carries them. Generated code has no range but
+/// may still jump.
 fn source_context(
+    entry: &SourceMapEntry,
+    source_count: usize,
+    source_contents: &BTreeMap<u64, String>,
+    instruction_index: usize,
+    contract_name: &str,
+) -> SoldbResult<Option<Value>> {
+    let mut context = serde_json::Map::new();
+    if let Some(code) = source_code(
+        entry,
+        source_count,
+        source_contents,
+        instruction_index,
+        contract_name,
+    )? {
+        context.insert("code".to_owned(), code);
+    }
+    match entry.jump_type.as_str() {
+        "i" => {
+            context.insert("invoke".to_owned(), json!({}));
+        }
+        "o" => {
+            context.insert("return".to_owned(), json!({}));
+        }
+        _ => {}
+    }
+    Ok((!context.is_empty()).then_some(Value::Object(context)))
+}
+
+/// The `code` part of an entry's context: the source range it maps to, if any.
+fn source_code(
     entry: &SourceMapEntry,
     source_count: usize,
     source_contents: &BTreeMap<u64, String>,
@@ -452,12 +486,10 @@ fn source_context(
     }
 
     Ok(Some(json!({
-        "code": {
-            "source": {"id": source_id},
-            "range": {
-                "offset": offset,
-                "length": length,
-            },
+        "source": {"id": source_id},
+        "range": {
+            "offset": offset,
+            "length": length,
         },
     })))
 }
@@ -545,6 +577,7 @@ fn parse_inherited_string(field: Option<&str>, previous: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::metadata::FunctionExit;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -678,6 +711,40 @@ mod tests {
             program.resources["compilation"]["compiler"]["version"],
             "0.8.36+commit.test"
         );
+    }
+
+    #[test]
+    fn jump_types_become_call_and_return_markers() {
+        let dir = temp_dir("jump-types");
+        let source = "contract Counter { function add() external {} }";
+        fs::write(dir.join("Counter.sol"), source).expect("write source");
+        fs::write(
+            dir.join("combined.json"),
+            json!({
+                "version": "0.8.16+commit.test",
+                "sourceList": ["Counter.sol"],
+                "contracts": {
+                    "Counter.sol:Counter": {
+                        "bin-runtime": "6001600100",
+                        "srcmap-runtime": "0:8:0:i;9:3:0:o;0:0:-1:-"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined JSON");
+
+        let program = load_source_map_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect("load source map")
+            .expect("runtime program");
+        let at = |pc: u64| program.info.instruction_at_pc(pc).expect("instruction");
+        assert_eq!(at(0).function_invocations().len(), 1);
+        assert_eq!(at(0).function_exit(), None);
+        assert!(at(2).function_invocations().is_empty());
+        assert_eq!(at(2).function_exit(), Some(FunctionExit::Return));
+        // Generated code without a range has no context when it does not jump.
+        assert!(at(4).source_location().is_none());
+        assert!(at(4).function_invocations().is_empty());
     }
 
     #[test]

@@ -155,8 +155,9 @@ belongs in `soldb-debugger`, not in a second copy.
   index, parsed functions), from ETHDebug or a legacy source map alike, and `StepMap`
   maps every step of a trace through the loaded
   contracts once: the line it belongs to, its frame depth (EVM depth plus internal
-  Solidity functions inferred from the source spans, since compilers emit no function
-  boundaries yet), and the searches behind `next`, `step`, `finish`, their reverse forms,
+  Solidity functions, from the artifact's jump markers where it has them, from a jump
+  onto a parsed function's entry point, and from the spans as a fallback), and the
+  searches behind `next`, `step`, `finish`, their reverse forms,
   line and function breakpoints, and `backtrace`. Compiler-generated helpers carry the
   whole-contract span; the map attributes them to the executing statement and marks them
   `generated`. All of it is a search over the recording; nothing re-executes.

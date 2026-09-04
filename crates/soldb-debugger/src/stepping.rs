@@ -11,10 +11,13 @@
 //! frame executes is read off the caller's stack at the call, which is how steps inside
 //! another contract map through that contract's debug info. Inside one contract,
 //! Solidity's internal calls are plain jumps, so the map keeps a virtual stack of the
-//! source functions a frame passes through: entering a function that is not on the stack
-//! pushes it, landing in one that is pops back to it. Compilers do not yet emit
-//! function-boundary markers in ETHDebug, so this is inferred from the source spans and
-//! the functions parsed from the source text.
+//! source functions a frame passes through. A jump is a call when the artifact marks it
+//! as one (legacy source maps mark calls and returns; ETHDebug's `invoke` and `return`
+//! context does the same once a compiler emits it) or when it lands on a parsed
+//! function's entry point, and that holds even when the function is already active, so
+//! recursion and mutual recursion count. A marked return pops the frame. Otherwise the
+//! function a span lands in decides: one not on the stack is entered, one on the stack
+//! is returned to.
 //!
 //! Two habits of solc's output shape the model. Generated helpers (checked arithmetic,
 //! `require` reverts, storage updates) carry the whole-contract span, the same one the
@@ -29,7 +32,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use soldb_core::TransactionTrace;
-use soldb_ethdebug::{EthdebugInfo, SourceLocation};
+use soldb_ethdebug::{EthdebugInfo, FunctionExit, SourceLocation};
 
 use crate::{parse_source_functions, SourceFunction};
 
@@ -50,6 +53,19 @@ pub struct ContractDebugInfo {
     line_starts: BTreeMap<u64, Vec<usize>>,
     /// Instruction index by program counter.
     pc_index: HashMap<u64, usize>,
+    /// The program counter each parsed function is entered at: its first `JUMPDEST`
+    /// carrying the declaration's span.
+    function_entries: HashMap<u64, usize>,
+}
+
+/// What an artifact says about the jump an instruction makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JumpMarker {
+    None,
+    /// The jump enters a function.
+    Call,
+    /// The jump returns from one.
+    Return,
 }
 
 impl ContractDebugInfo {
@@ -66,7 +82,7 @@ impl ContractDebugInfo {
         let functions = source_contents
             .iter()
             .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
-            .collect();
+            .collect::<Vec<SourceFunction>>();
         let line_starts = source_contents
             .iter()
             .map(|(source_id, source)| (*source_id, line_starts(source)))
@@ -77,6 +93,24 @@ impl ContractDebugInfo {
             .enumerate()
             .map(|(index, instruction)| (instruction.offset, index))
             .collect();
+        let function_entries = functions
+            .iter()
+            .enumerate()
+            .filter_map(|(function_index, function)| {
+                info.instructions
+                    .iter()
+                    .filter(|instruction| instruction.mnemonic() == Some("JUMPDEST"))
+                    .filter(|instruction| {
+                        instruction.source_location().is_some_and(|location| {
+                            location.source_id == function.source_id
+                                && location.offset == function.declaration_start
+                        })
+                    })
+                    .map(|instruction| instruction.offset)
+                    .min()
+                    .map(|pc| (pc, function_index))
+            })
+            .collect();
         Self {
             address: address.map(normalize_address),
             name: name.to_owned(),
@@ -85,6 +119,32 @@ impl ContractDebugInfo {
             functions,
             line_starts,
             pc_index,
+            function_entries,
+        }
+    }
+
+    /// The function whose entry point `pc` is, when it is one.
+    #[must_use]
+    pub fn function_entry_at_pc(&self, pc: u64) -> Option<usize> {
+        self.function_entries.get(&pc).copied()
+    }
+
+    /// What the artifact says about the jump the instruction at `pc` makes.
+    #[must_use]
+    pub fn jump_marker_at_pc(&self, pc: u64) -> JumpMarker {
+        let Some(instruction) = self
+            .pc_index
+            .get(&pc)
+            .and_then(|index| self.info.instructions.get(*index))
+        else {
+            return JumpMarker::None;
+        };
+        if !instruction.function_invocations().is_empty() {
+            JumpMarker::Call
+        } else if instruction.function_exit() == Some(FunctionExit::Return) {
+            JumpMarker::Return
+        } else {
+            JumpMarker::None
         }
     }
 
@@ -366,6 +426,10 @@ struct FramedStep {
     contract: Option<usize>,
     address: Option<usize>,
     location: Option<LocationRef>,
+    /// The function this step's program counter is the entry point of.
+    entry: Option<usize>,
+    /// What the artifact says about the jump this step makes.
+    marker: JumpMarker,
 }
 
 struct EvmFrame {
@@ -377,9 +441,23 @@ struct EvmFrame {
 /// The inferred Solidity state of one EVM frame.
 #[derive(Default)]
 struct InternalFrame {
-    functions: Vec<usize>,
+    /// The functions active in this frame, innermost last. `None` is a compiler-generated
+    /// helper entered through a marked call: it absorbs the matching marked return and
+    /// counts as no frame of its own.
+    functions: Vec<Option<usize>>,
     /// The last real statement executed in this frame, which generated code belongs to.
     statement: Option<LocationRef>,
+}
+
+impl InternalFrame {
+    /// The innermost function, looking past helper placeholders.
+    fn active(&self) -> Option<usize> {
+        self.functions.iter().rev().find_map(|entry| *entry)
+    }
+
+    fn is_active(&self, function: usize) -> bool {
+        self.active() == Some(function)
+    }
 }
 
 impl StepMap {
@@ -459,12 +537,17 @@ impl StepMap {
                     function: contract.function_for_location(&location),
                 })
             });
+            let contract = frame.contract.map(|index| &contracts[index]);
             framed.push(FramedStep {
                 evm_depth: evm_depth as u32,
                 frame_id: frame.id,
                 contract: frame.contract,
                 address: frame.address,
                 location,
+                entry: contract.and_then(|contract| contract.function_entry_at_pc(step.pc)),
+                marker: contract.map_or(JumpMarker::None, |contract| {
+                    contract.jump_marker_at_pc(step.pc)
+                }),
             });
         }
 
@@ -503,10 +586,39 @@ impl StepMap {
             }
             let frame = internal.last_mut().expect("the root frame is never popped");
 
+            // A step reached by a `JUMP` from the same EVM frame is a landing: the jump's
+            // marker, or landing on a function's entry point, says whether it was a call.
+            let landed_by_jump = index > 0
+                && framed[index - 1].evm_depth == step.evm_depth
+                && trace.steps[index - 1].op == "JUMP";
+            let previous_marker = if landed_by_jump {
+                framed[index - 1].marker
+            } else {
+                JumpMarker::None
+            };
             let structured = structured(step.contract);
             let mut generated = false;
+            // A marked return pops whatever the matching call pushed, wherever it lands.
+            // A marked call is resolved once the landing's function is known.
+            let mut pending_call = false;
+            if landed_by_jump {
+                match previous_marker {
+                    JumpMarker::Call => pending_call = true,
+                    JumpMarker::Return => {
+                        frame.functions.pop();
+                    }
+                    JumpMarker::None => {}
+                }
+            }
             let (location, key) = match step.location {
-                None => (None, None),
+                None => {
+                    // Code without source, such as a generated helper: a marked call into
+                    // it gets a placeholder its marked return pops.
+                    if pending_call {
+                        frame.functions.push(None);
+                    }
+                    (None, None)
+                }
                 Some(own) if !structured => {
                     // No parsed functions: every mapped step is a line of its own.
                     frame.statement = Some(own);
@@ -514,11 +626,26 @@ impl StepMap {
                 }
                 Some(own) => match own.function {
                     Some(function) => {
-                        if frame.functions.last() != Some(&function) {
-                            match frame.functions.iter().rposition(|entry| *entry == function) {
+                        let entering = landed_by_jump && step.entry == Some(function);
+                        if entering || (pending_call && !frame.is_active(function)) {
+                            // A call: onto the entry point, or marked and into a function
+                            // other than the active one.
+                            frame.functions.push(Some(function));
+                            frame_entry = true;
+                        } else if pending_call {
+                            // A marked call into the active function away from its entry
+                            // point is a generated helper whose span is the calling line:
+                            // recursion always enters at the entry point.
+                            frame.functions.push(None);
+                        } else if !frame.is_active(function) {
+                            match frame
+                                .functions
+                                .iter()
+                                .rposition(|entry| *entry == Some(function))
+                            {
                                 Some(position) => frame.functions.truncate(position + 1),
                                 None => {
-                                    frame.functions.push(function);
+                                    frame.functions.push(Some(function));
                                     frame_entry = true;
                                 }
                             }
@@ -531,20 +658,31 @@ impl StepMap {
                         frame.statement = None;
                         (Some(own), None)
                     }
-                    None => match frame.statement {
-                        Some(statement) => {
-                            generated = true;
-                            (Some(statement), Some(statement.key))
+                    None => {
+                        if pending_call {
+                            frame.functions.push(None);
                         }
-                        // The dispatcher before any function: shown as it is, stepped
-                        // through as no line at all.
-                        None => (Some(own), None),
-                    },
+                        match frame.statement {
+                            Some(statement) => {
+                                generated = true;
+                                (Some(statement), Some(statement.key))
+                            }
+                            // The dispatcher before any function: shown as it is, stepped
+                            // through as no line at all.
+                            None => (Some(own), None),
+                        }
+                    }
                 },
             };
             let internal_total = internal
                 .iter()
-                .map(|frame| frame.functions.len())
+                .map(|frame| {
+                    frame
+                        .functions
+                        .iter()
+                        .filter(|entry| entry.is_some())
+                        .count()
+                })
                 .sum::<usize>();
             steps.push(StepInfo {
                 location,
@@ -1066,7 +1204,9 @@ mod tests {
     use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
-    use super::{address_from_word, normalize_address, ContractDebugInfo, LineKey, StepMap};
+    use super::{
+        address_from_word, normalize_address, ContractDebugInfo, JumpMarker, LineKey, StepMap,
+    };
 
     // Two functions; `outer` calls `inner` internally. Line numbers are one-based.
     const SOURCE: &str = "\
@@ -1087,10 +1227,25 @@ contract C {
     }
 
     fn instruction(pc: u64, offset: u64, length: u64) -> Instruction {
+        instruction_with(pc, offset, length, json!({}))
+    }
+
+    /// An instruction with extra ETHDebug context, such as a jump marker.
+    fn instruction_with(
+        pc: u64,
+        offset: u64,
+        length: u64,
+        extra: serde_json::Value,
+    ) -> Instruction {
+        let mut context =
+            json!({"code": {"source": {"id": 0}, "range": {"offset": offset, "length": length}}});
+        for (key, value) in extra.as_object().expect("object") {
+            context[key] = value.clone();
+        }
         serde_json::from_value(json!({
             "offset": pc,
             "operation": {"mnemonic": "JUMPDEST"},
-            "context": {"code": {"source": {"id": 0}, "range": {"offset": offset, "length": length}}}
+            "context": context
         }))
         .expect("instruction")
     }
@@ -1491,6 +1646,179 @@ contract C {
         // A real line of one instruction between two different lines is kept.
         assert_eq!(map.line_key(5), key(5));
         assert!(map.is_line_start(5));
+    }
+
+    #[test]
+    fn a_jump_onto_a_function_entry_is_a_call_even_when_it_is_active() {
+        // outer calls inner, inner calls outer again, and both return: mutual recursion.
+        // The entry points (pc 10 for outer, pc 20 for inner) make every jump onto them
+        // a call, where landing in an active function used to read as a return.
+        let map = StepMap::new(
+            &trace(vec![
+                step(0, 1, "PUSH1", &[]),
+                step(1, 1, "JUMP", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(12, 1, "JUMP", &[]),
+                step(20, 1, "JUMPDEST", &[]),
+                step(21, 1, "JUMP", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(14, 1, "JUMP", &[]),
+                step(21, 1, "SWAP1", &[]),
+                step(21, 1, "JUMP", &[]),
+                step(13, 1, "JUMPDEST", &[]),
+                step(14, 1, "POP", &[]),
+                step(30, 1, "STOP", &[]),
+            ]),
+            vec![contract(None)],
+        );
+        let contract = &map.contracts()[0];
+        assert_eq!(contract.function_entry_at_pc(10), Some(0));
+        assert_eq!(contract.function_entry_at_pc(20), Some(1));
+        assert_eq!(contract.function_entry_at_pc(11), None);
+        let depths = (0..13)
+            .map(|step| map.frame_depth(step).expect("depth"))
+            .collect::<Vec<_>>();
+        assert_eq!(depths, vec![0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 1, 1, 0]);
+        assert!(map.is_frame_entry(6));
+        let frames = map.frames(6);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.function_name.as_deref().unwrap_or("-"))
+                .collect::<Vec<_>>(),
+            vec!["outer", "inner", "outer", "-"]
+        );
+        assert_eq!(map.finish(6), Some(8));
+        assert_eq!(map.reverse_finish(6), Some(5));
+        assert_eq!(map.finish(4), Some(10));
+    }
+
+    #[test]
+    fn jump_markers_decide_calls_and_returns_without_entry_points() {
+        // The jump at pc 12 is marked as a call and lands mid-outer (pc 11): a helper
+        // whose span is the calling line, since recursion would enter at pc 10. It gets
+        // a placeholder frame the marked return at pc 14 pops, so outer stays on the
+        // stack throughout and its depth never moves.
+        let whole = SOURCE.len() as u64;
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: vec![
+                instruction(0, 0, whole),
+                instruction(1, 0, whole),
+                instruction(10, offset_of("function outer"), 90),
+                instruction(11, offset_of("uint256 b = a + 1;"), 18),
+                instruction_with(
+                    12,
+                    offset_of("inner(b);"),
+                    9,
+                    json!({"invoke": {"identifier": "outer"}}),
+                ),
+                instruction(13, offset_of("inner(b);"), 9),
+                instruction_with(14, offset_of("b = 0;"), 6, json!({"return": {}})),
+                instruction(30, 0, whole),
+            ],
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let marked =
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
+        assert_eq!(marked.jump_marker_at_pc(12), JumpMarker::Call);
+        assert_eq!(marked.jump_marker_at_pc(14), JumpMarker::Return);
+        assert_eq!(marked.jump_marker_at_pc(13), JumpMarker::None);
+        let map = StepMap::new(
+            &trace(vec![
+                step(0, 1, "PUSH1", &[]),
+                step(1, 1, "JUMP", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(12, 1, "JUMP", &[]),
+                step(11, 1, "ADD", &[]),
+                step(14, 1, "JUMP", &[]),
+                step(13, 1, "JUMPDEST", &[]),
+                step(14, 1, "POP", &[]),
+                step(30, 1, "STOP", &[]),
+            ]),
+            vec![marked],
+        );
+        let depths = (0..9)
+            .map(|step| map.frame_depth(step).expect("depth"))
+            .collect::<Vec<_>>();
+        assert_eq!(depths, vec![0, 0, 1, 1, 1, 1, 1, 1, 0]);
+        assert!(!map.is_frame_entry(4));
+        assert_eq!(map.frames(4).len(), 2);
+        assert_eq!(map.finish(4), Some(8));
+        // A marked call from outer that lands on inner's entry point is a real call.
+        let map = StepMap::new(
+            &trace(vec![
+                step(0, 1, "PUSH1", &[]),
+                step(1, 1, "JUMP", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(12, 1, "JUMP", &[]),
+                step(20, 1, "JUMPDEST", &[]),
+                step(21, 1, "JUMP", &[]),
+                step(13, 1, "JUMPDEST", &[]),
+                step(30, 1, "STOP", &[]),
+            ]),
+            vec![contract(None)],
+        );
+        assert_eq!(map.frame_depth(4), Some(2));
+        assert_eq!(map.frame_depth(6), Some(1));
+    }
+
+    #[test]
+    fn marked_jumps_into_generated_helpers_do_not_pop_the_function() {
+        // Inside outer, a marked call jumps to helper code with the whole-contract span
+        // (pc 40) and a marked return comes back: outer stays on the stack throughout,
+        // and the helper counts as no frame the user steps by.
+        let whole = SOURCE.len() as u64;
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: vec![
+                instruction(0, 0, whole),
+                instruction(1, 0, whole),
+                instruction(10, offset_of("function outer"), 90),
+                instruction_with(
+                    11,
+                    offset_of("uint256 b = a + 1;"),
+                    18,
+                    json!({"invoke": {}}),
+                ),
+                instruction_with(40, 0, whole, json!({"return": {}})),
+                instruction(14, offset_of("b = 0;"), 6),
+                instruction(30, 0, whole),
+            ],
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let contract =
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
+        let map = StepMap::new(
+            &trace(vec![
+                step(0, 1, "PUSH1", &[]),
+                step(1, 1, "JUMP", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(11, 1, "JUMP", &[]),
+                step(40, 1, "JUMPDEST", &[]),
+                step(40, 1, "JUMP", &[]),
+                step(14, 1, "JUMPDEST", &[]),
+                step(30, 1, "STOP", &[]),
+            ]),
+            vec![contract],
+        );
+        let depths = (0..8)
+            .map(|step| map.frame_depth(step).expect("depth"))
+            .collect::<Vec<_>>();
+        assert_eq!(depths, vec![0, 0, 1, 1, 1, 1, 1, 0]);
+        assert!(map.location(4).expect("location").generated);
+        assert_eq!(
+            map.location(6).expect("location").function_name.as_deref(),
+            Some("outer")
+        );
+        assert_eq!(map.next_source(3), Some(6));
+        assert_eq!(map.finish(3), Some(7));
     }
 
     #[test]

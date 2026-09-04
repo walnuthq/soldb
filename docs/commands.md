@@ -257,9 +257,12 @@ soldb> bt
 #3  TestContract at TestContract.sol:8  step 103, PC 824
 ```
 
-Compilers do not yet emit function boundaries in ETHDebug, so internal frames are inferred
-from the source spans and the functions parsed from the source text: landing in a function
-that is not on the stack enters it, landing in one that is returns to it.
+Internal frames come from three sources, in this order of trust. Jump markers when the
+artifact carries them: legacy source maps mark every jump into and out of a function, and
+ETHDebug's `invoke` and `return` context does the same once a compiler emits it. The entry
+point of each parsed function: a jump onto it is a call even when that function is already
+active, so recursion and mutual recursion count. Otherwise, the function a span lands in:
+one that is not on the stack is entered, one that is on the stack is returned to.
 
 ### `list`
 
