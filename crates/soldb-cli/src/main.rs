@@ -21,18 +21,20 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace, Word as StackWord};
-use soldb_debugger::{ChainStorage, ContractDebugInfo, SourceFunction, SourceParam, StorageWords};
+use soldb_debugger::{
+    CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam,
+    StorageWords,
+};
 use soldb_ethdebug::{
     encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-    function_selector, load_debug_program, parse_ethdebug_spec, parse_event_abis, parse_signature,
-    DecodedEvent, EventRegistry, SourceMapEnvironment,
+    function_selector, load_debug_program_with_sources, parse_ethdebug_spec, parse_event_abis,
+    parse_signature, DecodedEvent, EventRegistry, SourceMapEnvironment,
 };
 use soldb_repl::{
     BreakpointKind, DebuggerCommand, DebuggerInfoCommand, DebuggerState, DisplayMode, StepOutcome,
 };
 use soldb_rpc::{RpcLog, TraceBackend};
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Display;
 use std::fs;
@@ -245,6 +247,10 @@ enum InfoCommand {
 struct InfoResourcesArgs {
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the debug artifacts are, when they are not next to
+    /// them: the directory the contract was compiled in. Repeatable.
+    #[arg(long = "source-path")]
+    source_path: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
     #[arg(long)]
@@ -263,6 +269,10 @@ struct ListContractsArgs {
     rpc_url: String,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the debug artifacts are, when they are not next to
+    /// them: the directory the contract was compiled in. Repeatable.
+    #[arg(long = "source-path")]
+    source_path: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
     #[arg(long)]
@@ -274,6 +284,10 @@ struct ListEventsArgs {
     tx_hash: String,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the debug artifacts are, when they are not next to
+    /// them: the directory the contract was compiled in. Repeatable.
+    #[arg(long = "source-path")]
+    source_path: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
     #[arg(
@@ -300,6 +314,10 @@ struct TraceArgs {
     backend: TraceBackendArg,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the debug artifacts are, when they are not next to
+    /// them: the directory the contract was compiled in. Repeatable.
+    #[arg(long = "source-path")]
+    source_path: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
     #[arg(long)]
@@ -332,6 +350,8 @@ struct TraceView {
     /// replay file, which has no chain to ask.
     rpc_url: Option<String>,
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the artifacts are, when they are not next to them.
+    source_path: Vec<String>,
     contracts: Option<String>,
     max_steps: i64,
 }
@@ -342,6 +362,7 @@ impl TraceView {
             tx_hash: args.tx_hash.clone(),
             rpc_url: Some(args.rpc.clone()),
             ethdebug_dir: args.ethdebug_dir.clone(),
+            source_path: args.source_path.clone(),
             contracts: args.contracts.clone(),
             max_steps: args.max_steps,
         }
@@ -352,20 +373,21 @@ impl TraceView {
             tx_hash: tx_hash.to_owned(),
             rpc_url: None,
             ethdebug_dir: args.ethdebug_dir.clone(),
+            source_path: args.source_path.clone(),
             contracts: args.contracts.clone(),
             max_steps: args.max_steps,
         }
     }
 
     /// The chain the traced transaction started from, for reading slots it never touched.
-    fn chain_storage(&self) -> Option<NodeStorage> {
+    fn chain_storage(&self) -> Option<ChainReader> {
         NodeStorage::before_transaction(self.rpc_url.as_deref()?, &self.tx_hash)
     }
 }
 
 impl SimulationView {
     /// The chain the call ran on top of, for reading slots it never touched.
-    fn chain_storage(&self) -> Option<NodeStorage> {
+    fn chain_storage(&self) -> Option<ChainReader> {
         NodeStorage::at_block(self.rpc_url.as_deref()?, self.chain_block?)
     }
 }
@@ -387,6 +409,8 @@ struct SimulationView {
     function_args: Vec<String>,
     raw_data: Option<String>,
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the artifacts are, when they are not next to them.
+    source_path: Vec<String>,
     contracts: Option<String>,
     interactive: bool,
     json: bool,
@@ -414,6 +438,7 @@ impl SimulationView {
             function_args: args.function_args.clone(),
             raw_data: args.raw_data.clone(),
             ethdebug_dir: args.ethdebug_dir.clone(),
+            source_path: args.source_path.clone(),
             contracts: args.contracts.clone(),
             interactive: args.interactive,
             json: args.json,
@@ -437,6 +462,7 @@ impl SimulationView {
                 .clone()
                 .or_else(|| args.function_signature.is_none().then(|| "0x".to_owned())),
             ethdebug_dir: args.ethdebug_dir.clone(),
+            source_path: args.source_path.clone(),
             contracts: args.contracts.clone(),
             interactive: args.interactive,
             json: args.json,
@@ -461,6 +487,7 @@ impl SimulationView {
             function_args: Vec::new(),
             raw_data: Some(request.calldata.clone()),
             ethdebug_dir: args.ethdebug_dir.clone(),
+            source_path: args.source_path.clone(),
             contracts: args.contracts.clone(),
             interactive: args.interactive,
             json: args.json,
@@ -477,6 +504,10 @@ struct ReplayArgs {
     file: PathBuf,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the debug artifacts are, when they are not next to
+    /// them: the directory the contract was compiled in. Repeatable.
+    #[arg(long = "source-path")]
+    source_path: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
     #[arg(long)]
@@ -543,6 +574,10 @@ struct RunArgs {
     gas_limit: u64,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the debug artifacts are, when they are not next to
+    /// them: the directory the contract was compiled in. Repeatable.
+    #[arg(long = "source-path")]
+    source_path: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
     #[arg(long)]
@@ -582,6 +617,10 @@ struct SimulateArgs {
     value: String,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the debug artifacts are, when they are not next to
+    /// them: the directory the contract was compiled in. Repeatable.
+    #[arg(long = "source-path")]
+    source_path: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
     #[arg(long)]
@@ -688,7 +727,11 @@ struct InfoResourcesContractJson {
 }
 
 fn info_resources_command(args: &InfoResourcesArgs) -> SoldbResult<()> {
-    let specs = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())?;
+    let specs = resolve_contract_specs(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    )?;
     if specs.is_empty() {
         return Err(soldb_core::SoldbError::Message(
             "No ETHDebug contract specs provided".to_owned(),
@@ -1304,7 +1347,7 @@ fn run_constructor_args(args: &RunArgs) -> SoldbResult<String> {
     if args.constructor_args.is_empty() {
         return Ok(String::new());
     }
-    let abi = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
+    let abi = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref(), &args.source_path)
         .iter()
         .find_map(abi_value_for_spec)
         .and_then(|abi| abi.as_array().cloned())
@@ -1367,23 +1410,26 @@ fn print_simulation_interactive_prelude(
     println!("{} {}", dim("=> contract"), function_color(&contract_name));
     if !args.function_args.is_empty() {
         println!("{}", info("Parameters:"));
-        let params =
-            resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
-                .into_iter()
-                .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
-                .map(|descriptor| descriptor.params)
-                .unwrap_or_else(|| {
-                    args.function_args
-                        .iter()
-                        .enumerate()
-                        .map(|(index, value)| DecodedCallParam {
-                            name: format!("arg{index}"),
-                            ty: None,
-                            value: value.clone(),
-                            raw: false,
-                        })
-                        .collect()
-                });
+        let params = resolve_contract_specs_reporting(
+            &args.ethdebug_dir,
+            args.contracts.as_deref(),
+            &args.source_path,
+        )
+        .into_iter()
+        .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
+        .map(|descriptor| descriptor.params)
+        .unwrap_or_else(|| {
+            args.function_args
+                .iter()
+                .enumerate()
+                .map(|(index, value)| DecodedCallParam {
+                    name: format!("arg{index}"),
+                    ty: None,
+                    value: value.clone(),
+                    raw: false,
+                })
+                .collect()
+        });
         for param in params {
             println!(
                 "{} {}",
@@ -1400,7 +1446,11 @@ fn interactive_trace_source_indexes(
 ) -> Vec<TraceSourceIndex> {
     let contract_address = trace.to_addr.as_ref().or(trace.contract_address.as_ref());
     source_indexes_for_specs(
-        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref()),
+        resolve_contract_specs_reporting(
+            &args.ethdebug_dir,
+            args.contracts.as_deref(),
+            &args.source_path,
+        ),
         contract_address.map(String::as_str),
     )
 }
@@ -1410,7 +1460,11 @@ fn interactive_simulation_source_indexes(
     contract_address: &str,
 ) -> Vec<TraceSourceIndex> {
     source_indexes_for_specs(
-        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref()),
+        resolve_contract_specs_reporting(
+            &args.ethdebug_dir,
+            args.contracts.as_deref(),
+            &args.source_path,
+        ),
         Some(contract_address),
     )
 }
@@ -1443,23 +1497,10 @@ fn source_indexes_for_specs(
 /// The chain a debugging session reads storage slots from, for slots the transaction
 /// never touched.
 ///
-/// The block is fixed when the session starts, so every answer is the state one point in
-/// history, and each slot is read at most once. A read that fails is reported once and
-/// the slot stays unknown, which is what it is.
-struct NodeStorage {
-    rpc_url: String,
-    /// The block to ask about, as hex.
-    block: String,
-    /// How to describe where a value came from.
-    label: String,
-    words: RefCell<HashMap<StorageKey, Option<Word>>>,
-}
-
-/// A 256-bit storage word, as the debugger's storage layout uses them.
-type Word = [u8; 32];
-
-/// One slot of one account: what a chain read is cached under.
-type StorageKey = (String, Word);
+/// The block is fixed when the session starts, so every answer is the state at one point
+/// in history. The caching and the labelling are [`soldb_debugger::CachedChain`]'s; what
+/// is here is which block to ask about and the reading itself.
+struct NodeStorage;
 
 impl NodeStorage {
     /// The state the traced transaction started from: the end of its parent block.
@@ -1468,7 +1509,7 @@ impl NodeStorage {
     /// slot one of them wrote reads here as it was before the block. That is why the
     /// value is labelled with the block it came from rather than presented as the
     /// transaction's own starting state.
-    fn before_transaction(rpc_url: &str, tx_hash: &str) -> Option<Self> {
+    fn before_transaction(rpc_url: &str, tx_hash: &str) -> Option<ChainReader> {
         let (block, _index) = match soldb_rpc::transaction_block(rpc_url, tx_hash) {
             Ok(found) => found,
             Err(error) => {
@@ -1482,7 +1523,7 @@ impl NodeStorage {
         };
         let number = u64::from_str_radix(block.trim_start_matches("0x"), 16).ok()?;
         let parent = number.checked_sub(1)?;
-        Some(Self::new(
+        Some(Self::reader(
             rpc_url,
             format!("0x{parent:x}"),
             format!("the chain at block {parent}, before this transaction's block"),
@@ -1490,7 +1531,7 @@ impl NodeStorage {
     }
 
     /// The state a call was simulated on: the end of the block it ran on top of.
-    fn at_block(rpc_url: &str, block: Option<u64>) -> Option<Self> {
+    fn at_block(rpc_url: &str, block: Option<u64>) -> Option<ChainReader> {
         let number = match block {
             Some(number) => number,
             None => match soldb_rpc::latest_block(rpc_url) {
@@ -1505,59 +1546,41 @@ impl NodeStorage {
                 }
             },
         };
-        Some(Self::new(
+        Some(Self::reader(
             rpc_url,
             format!("0x{number:x}"),
             format!("the chain at block {number}"),
         ))
     }
 
-    fn new(rpc_url: &str, block: String, label: String) -> Self {
-        Self {
-            rpc_url: rpc_url.to_owned(),
-            block,
-            label,
-            words: RefCell::new(HashMap::new()),
-        }
-    }
-}
-
-impl soldb_debugger::ChainStorage for NodeStorage {
-    fn word(&self, address: &str, slot: &Word) -> Option<Word> {
-        let key = (address.to_ascii_lowercase(), *slot);
-        if let Some(cached) = self.words.borrow().get(&key) {
-            return *cached;
-        }
-        let word = match soldb_rpc::storage_at(
-            &self.rpc_url,
-            address,
-            &soldb_ethdebug::word_hex(slot),
-            &self.block,
-        ) {
-            Ok(value) => soldb_ethdebug::parse_word(&value).ok(),
-            Err(error) => {
-                report_once(
-                    format!("chain-storage-read:{}", self.rpc_url),
-                    &format!("could not read storage from the node: {error}"),
-                    "state variables the transaction never touched stay unknown",
-                );
-                None
+    fn reader(rpc_url: &str, block: String, label: String) -> ChainReader {
+        let rpc_url = rpc_url.to_owned();
+        let read: ChainRead = Box::new(move |address: &str, slot: &[u8; 32]| {
+            match soldb_rpc::storage_at(&rpc_url, address, &soldb_ethdebug::word_hex(slot), &block)
+            {
+                Ok(value) => soldb_ethdebug::parse_word(&value).ok(),
+                Err(error) => {
+                    report_once(
+                        format!("chain-storage-read:{rpc_url}"),
+                        &format!("could not read storage from the node: {error}"),
+                        "state variables the transaction never touched stay unknown",
+                    );
+                    None
+                }
             }
-        };
-        self.words.borrow_mut().insert(key, word);
-        word
-    }
-
-    fn label(&self) -> &str {
-        &self.label
+        });
+        CachedChain::new(label, read)
     }
 }
+
+/// What a session reads untouched slots through.
+type ChainReader = CachedChain<ChainRead>;
 
 fn run_interactive_debugger(
     trace: TransactionTrace,
     title: &str,
     source_indexes: Vec<TraceSourceIndex>,
-    chain: Option<NodeStorage>,
+    chain: Option<ChainReader>,
 ) -> SoldbResult<()> {
     let contract_address = trace.to_addr.clone().or(trace.contract_address.clone());
     let mut state = DebuggerState::new();
@@ -2087,7 +2110,7 @@ fn print_debugger_stack(state: &DebuggerState) {
 fn print_debugger_variables(
     state: &DebuggerState,
     source_indexes: &[TraceSourceIndex],
-    chain: Option<&NodeStorage>,
+    chain: Option<&ChainReader>,
     filter: Option<&str>,
 ) {
     let executing = state
@@ -2326,7 +2349,7 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
 
     let mut call_count = 0;
     for step in &trace.steps {
-        if !matches!(step.op.as_str(), "CALL" | "DELEGATECALL" | "STATICCALL") {
+        if !matches!(&*step.op, "CALL" | "DELEGATECALL" | "STATICCALL") {
             continue;
         }
         let Some(address_word) = call_target_stack_word(step.snapshot_ref().stack) else {
@@ -2649,7 +2672,13 @@ impl TraceSourceIndex {
         spec: &ResolvedContractSpec,
         environment: SourceMapEnvironment,
     ) -> SoldbResult<Option<Self>> {
-        let Some(program) = load_debug_program(&spec.debug_dir, &spec.name, environment)? else {
+        let Some(program) = load_debug_program_with_sources(
+            &spec.debug_dir,
+            &spec.name,
+            environment,
+            &spec.source_paths,
+        )?
+        else {
             return Ok(None);
         };
         if !program.missing_sources.is_empty() {
@@ -2813,17 +2842,24 @@ fn build_simulation_call_frames(
     raw_data: &str,
     fallback: Option<CallDescriptor>,
 ) -> Vec<CallFrame> {
-    let source_index =
-        resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
-            .into_iter()
-            .find_map(|spec| load_source_index(&spec));
+    let source_index = resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    )
+    .into_iter()
+    .find_map(|spec| load_source_index(&spec));
     let descriptor = source_index
         .as_ref()
         .and_then(|index| index.descriptor_for_calldata(raw_data))
         .or_else(|| {
-            resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
-                .into_iter()
-                .find_map(|spec| abi_descriptor_for_calldata(&spec, raw_data))
+            resolve_contract_specs_reporting(
+                &args.ethdebug_dir,
+                args.contracts.as_deref(),
+                &args.source_path,
+            )
+            .into_iter()
+            .find_map(|spec| abi_descriptor_for_calldata(&spec, raw_data))
         })
         .or(fallback);
     build_call_frames(trace, source_index.as_ref(), descriptor)
@@ -2935,9 +2971,13 @@ fn simulated_call_descriptor(
         });
     }
 
-    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
-        .into_iter()
-        .find_map(|spec| call_descriptor_for_calldata(&spec, raw_data))
+    resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    )
+    .into_iter()
+    .find_map(|spec| call_descriptor_for_calldata(&spec, raw_data))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3343,6 +3383,7 @@ fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
     event_registry_for_specs(resolve_contract_specs(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
+        &args.source_path,
     )?)
 }
 
@@ -3350,6 +3391,7 @@ fn trace_event_registry(args: &TraceView) -> EventRegistry {
     event_registry_reporting(resolve_contract_specs_reporting(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
+        &args.source_path,
     ))
 }
 
@@ -3357,6 +3399,7 @@ fn simulate_event_registry(args: &SimulationView) -> EventRegistry {
     event_registry_reporting(resolve_contract_specs_reporting(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
+        &args.source_path,
     ))
 }
 
@@ -3409,6 +3452,8 @@ struct ResolvedContractSpec {
     address: Option<String>,
     name: String,
     debug_dir: PathBuf,
+    /// Where to look for the sources the artifacts name, from `--source-path`.
+    source_paths: Vec<PathBuf>,
 }
 
 /// Loads ETHDebug metadata for a contract spec, reporting a failure instead of hiding it.
@@ -3445,8 +3490,9 @@ fn load_source_index(spec: &ResolvedContractSpec) -> Option<TraceSourceIndex> {
 fn resolve_contract_specs_reporting(
     ethdebug_dirs: &[String],
     contracts_file: Option<&str>,
+    source_paths: &[String],
 ) -> Vec<ResolvedContractSpec> {
-    match resolve_contract_specs(ethdebug_dirs, contracts_file) {
+    match resolve_contract_specs(ethdebug_dirs, contracts_file, source_paths) {
         Ok(specs) => specs,
         Err(error) => {
             report_once(
@@ -3479,6 +3525,7 @@ fn report_once(key: String, message: &str, note: &str) {
 fn resolve_contract_specs(
     ethdebug_dirs: &[String],
     contracts_file: Option<&str>,
+    source_paths: &[String],
 ) -> SoldbResult<Vec<ResolvedContractSpec>> {
     let mut specs = Vec::new();
     if let Some(contracts_file) = contracts_file {
@@ -3487,6 +3534,12 @@ fn resolve_contract_specs(
 
     for spec_text in ethdebug_dirs {
         specs.extend(resolve_ethdebug_spec(spec_text)?);
+    }
+    // Where to look for sources is a property of this invocation, not of one contract, so
+    // every spec gets what the user passed.
+    let source_paths = source_paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+    for spec in &mut specs {
+        spec.source_paths = source_paths.clone();
     }
     Ok(specs)
 }
@@ -3498,6 +3551,7 @@ fn resolve_ethdebug_spec(spec_text: &str) -> SoldbResult<Vec<ResolvedContractSpe
             address: spec.address,
             name,
             debug_dir: PathBuf::from(spec.path),
+            source_paths: Vec::new(),
         }]);
     }
 
@@ -3522,6 +3576,7 @@ fn resolve_ethdebug_spec(spec_text: &str) -> SoldbResult<Vec<ResolvedContractSpe
                 address: Some(address),
                 name: infer_contract_name_from_dir(&path).unwrap_or_else(|| "Unknown".to_owned()),
                 debug_dir: path,
+                source_paths: Vec::new(),
             }]);
         }
     }
@@ -3606,6 +3661,7 @@ fn parse_contract_mapping_array(
                 address: Some(address),
                 name,
                 debug_dir,
+                source_paths: Vec::new(),
             })
         })
         .collect())
@@ -3624,6 +3680,7 @@ fn parse_deployment_value(
             address: Some(address.to_owned()),
             name: contract.to_owned(),
             debug_dir: base_dir.to_path_buf(),
+            source_paths: Vec::new(),
         }]);
     }
 
@@ -3641,6 +3698,7 @@ fn parse_deployment_value(
                 address: Some(address),
                 name: name.clone(),
                 debug_dir: find_debug_dir_for_contract(base_dir, name),
+                source_paths: Vec::new(),
             })
         })
         .collect())
@@ -3669,6 +3727,7 @@ fn infer_contract_specs_from_dir(path: &Path) -> SoldbResult<Vec<ResolvedContrac
         address: None,
         name,
         debug_dir: path.to_path_buf(),
+        source_paths: Vec::new(),
     }])
 }
 
@@ -3731,7 +3790,11 @@ fn trace_web_contracts(
     args: &TraceView,
     trace: &TransactionTrace,
 ) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref());
+    let specs = resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    );
     web_contracts_for_specs(specs, trace, None)
 }
 
@@ -3740,7 +3803,11 @@ fn simulate_web_contracts(
     trace: &TransactionTrace,
     contract_address: &str,
 ) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref());
+    let specs = resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    );
     web_contracts_for_specs(specs, trace, Some(contract_address))
 }
 
@@ -3808,9 +3875,13 @@ fn trace_contract_name(args: &TraceView) -> Option<String> {
 }
 
 fn trace_contract_spec(args: &TraceView) -> Option<ResolvedContractSpec> {
-    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
-        .into_iter()
-        .next()
+    resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    )
+    .into_iter()
+    .next()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3876,10 +3947,14 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
 }
 
 fn simulate_contract_name(args: &SimulationView) -> Option<String> {
-    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
-        .into_iter()
-        .next()
-        .map(|spec| spec.name)
+    resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    )
+    .into_iter()
+    .next()
+    .map(|spec| spec.name)
 }
 
 fn simulate_calldata(args: &SimulationView) -> SoldbResult<String> {
@@ -3979,22 +4054,26 @@ fn format_simulated_call(args: &SimulationView, function_name: &str) -> String {
 }
 
 fn simulation_source_file(args: &SimulationView, contract_name: &str) -> Option<String> {
-    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
-        .into_iter()
-        .find(|spec| spec.name == contract_name)
-        .and_then(|spec| {
-            let ethdebug = find_ethdebug_metadata(&spec.debug_dir)?;
-            read_json_file(&ethdebug).ok().and_then(|value| {
-                value
-                    .get("compilation")
-                    .and_then(|compilation| compilation.get("sources"))
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|sources| sources.first())
-                    .and_then(|source| source.get("path"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
+    resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    )
+    .into_iter()
+    .find(|spec| spec.name == contract_name)
+    .and_then(|spec| {
+        let ethdebug = find_ethdebug_metadata(&spec.debug_dir)?;
+        read_json_file(&ethdebug).ok().and_then(|value| {
+            value
+                .get("compilation")
+                .and_then(|compilation| compilation.get("sources"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|sources| sources.first())
+                .and_then(|source| source.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
         })
+    })
 }
 
 fn simulate_json_function_name(args: &SimulationView, calldata: &str) -> String {
@@ -4013,10 +4092,14 @@ fn simulate_display_function_name(args: &SimulationView, calldata: &str) -> Stri
         return signature.clone();
     }
 
-    resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
-        .into_iter()
-        .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
-        .map_or_else(|| "raw_data".to_owned(), |descriptor| descriptor.name)
+    resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    )
+    .into_iter()
+    .find_map(|spec| call_descriptor_for_calldata(&spec, calldata))
+    .map_or_else(|| "raw_data".to_owned(), |descriptor| descriptor.name)
 }
 
 fn normalize_hex(value: &str) -> String {
@@ -4151,7 +4234,7 @@ mod tests {
     fn trace_step(pc: u64, stack: &[&str]) -> soldb_core::TraceStep {
         soldb_core::TraceStep {
             pc,
-            op: "JUMPDEST".to_owned(),
+            op: "JUMPDEST".into(),
             gas: 100,
             gas_cost: 1,
             depth: 0,
@@ -4199,6 +4282,7 @@ mod tests {
             tx_index: None,
             value: "0".to_owned(),
             ethdebug_dir: Vec::new(),
+            source_path: Vec::new(),
             contracts: None,
             multi_contract: false,
             rpc_url: "http://localhost:8545".to_owned(),
@@ -4231,6 +4315,7 @@ mod tests {
         ListEventsArgs {
             tx_hash: "0xabc".to_owned(),
             ethdebug_dir: Vec::new(),
+            source_path: Vec::new(),
             contracts: None,
             rpc_url: "http://localhost:8545".to_owned(),
             multi_contract: false,
@@ -4292,7 +4377,7 @@ mod tests {
         for pc in [2, 4, 64] {
             trace.steps.push(soldb_core::TraceStep {
                 pc,
-                op: "JUMPDEST".to_owned(),
+                op: "JUMPDEST".into(),
                 gas: 0,
                 gas_cost: 0,
                 depth: 0,
@@ -4408,6 +4493,7 @@ contract Counter {
             address: Some("0x2".to_owned()),
             name: "Counter".to_owned(),
             debug_dir: dir,
+            source_paths: Vec::new(),
         };
         let calldata = encode_function_call("set(uint256)", &["4".to_owned()]).expect("calldata");
         let trace = transaction_trace(
@@ -4469,6 +4555,7 @@ contract Counter {
             address: Some("0x2".to_owned()),
             name: "Counter".to_owned(),
             debug_dir: dir,
+            source_paths: Vec::new(),
         };
 
         let index = TraceSourceIndex::load(&spec).expect("load legacy source map");
@@ -4589,6 +4676,7 @@ contract Counter {
             address: None,
             name: "Counter".to_owned(),
             debug_dir: dir,
+            source_paths: Vec::new(),
         };
         let trace = transaction_trace("0x".to_owned(), Vec::new());
         let contracts = web_contracts_for_specs(vec![spec], &trace, None);
@@ -4618,6 +4706,7 @@ contract Counter {
             address: Some("0x2".to_owned()),
             name: "Token".to_owned(),
             debug_dir: abi_dir,
+            source_paths: Vec::new(),
         };
         let calldata = encode_function_call(
             "transfer(address,uint256)",
@@ -4659,6 +4748,7 @@ contract Counter {
             address: None,
             name: "Legacy".to_owned(),
             debug_dir: combined_dir,
+            source_paths: Vec::new(),
         };
         let raw = encode_function_call("set(string)", &["hi".to_owned()]).expect("calldata");
         let descriptor = abi_descriptor_for_calldata(&legacy, &raw).expect("combined descriptor");
@@ -4847,6 +4937,7 @@ contract Counter {
             address: None,
             name: "Legacy".to_owned(),
             debug_dir: dir.clone(),
+            source_paths: Vec::new(),
         };
         let metadata = trace_debug_metadata(&spec);
         assert!(metadata.is_legacy);
@@ -4872,6 +4963,7 @@ contract Counter {
             tx_hash: "0xabc".to_owned(),
             rpc_url: None,
             ethdebug_dir: vec![format!("0x2:Legacy:{}", dir.display())],
+            source_path: Vec::new(),
             contracts: None,
             max_steps: 1,
         };

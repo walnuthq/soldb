@@ -809,7 +809,7 @@ impl DebuggerState {
                         .is_some_and(|id| functions.iter().any(|function| function.id == id))
             }),
             BreakpointKind::Storage(slot) => {
-                trace_step.op == "SSTORE"
+                &*trace_step.op == "SSTORE"
                     && trace_step
                         .snapshot_ref()
                         .stack
@@ -817,7 +817,7 @@ impl DebuggerState {
                         .and_then(|word| normalize_slot(word))
                         .is_some_and(|written| written == *slot)
             }
-            BreakpointKind::Revert => trace_step.op == "REVERT" || trace_step.error.is_some(),
+            BreakpointKind::Revert => &*trace_step.op == "REVERT" || trace_step.error.is_some(),
             BreakpointKind::Call(address) => {
                 let target = call_target(trace_step);
                 match address {
@@ -1008,7 +1008,7 @@ impl DebuggerState {
         StepOutcome::Moved {
             step: self.current_step,
             pc: step.pc,
-            op: step.op.clone(),
+            op: step.op.to_string(),
         }
     }
 }
@@ -1343,7 +1343,7 @@ mod tests {
 
         state.load_trace(sample_trace());
         assert_eq!(state.step_count(), 4);
-        assert_eq!(state.current_step_data().expect("step").op, "PUSH1");
+        assert_eq!(&*state.current_step_data().expect("step").op, "PUSH1");
         assert!(!state.has_source());
 
         assert_eq!(
@@ -1351,7 +1351,7 @@ mod tests {
             StepOutcome::Moved {
                 step: 1,
                 pc: 2,
-                op: "MSTORE".to_owned()
+                op: "MSTORE".into()
             }
         );
         assert_eq!(state.current_step, 1);
@@ -1447,7 +1447,7 @@ mod tests {
             StepOutcome::Moved {
                 step: 3,
                 pc: 4,
-                op: "CALL".to_owned()
+                op: "CALL".into()
             }
         );
         assert_eq!(
@@ -1533,7 +1533,7 @@ mod tests {
             Some(StepOutcome::Moved {
                 step: 1,
                 pc: sample_trace().steps[1].pc,
-                op: sample_trace().steps[1].op.clone(),
+                op: sample_trace().steps[1].op.to_string(),
             })
         );
     }
@@ -1813,7 +1813,7 @@ contract C {
         let pcs = [0, 1, 10, 11, 12, 20, 21, 21, 13, 14, 30];
         let mut trace = sample_trace();
         trace.steps = pcs.iter().map(|pc| step(*pc, "JUMPDEST", 0, &[])).collect();
-        trace.steps[6].op = "SSTORE".to_owned();
+        trace.steps[6].op = "SSTORE".into();
         trace.steps[6].stack = vec!["0x2a".into(), "0x5".into()];
         let mut state = DebuggerState::new();
         state.load_trace(trace);
@@ -2023,7 +2023,7 @@ contract C {
     fn step(pc: u64, op: &str, gas: u64, stack: &[&str]) -> TraceStep {
         TraceStep {
             pc,
-            op: op.to_owned(),
+            op: op.into(),
             gas,
             gas_cost: 1,
             depth: 1,

@@ -53,7 +53,9 @@ pub type SoldbResult<T> = Result<T, SoldbError>;
 #[derive(Debug, Clone, Eq)]
 pub struct TraceStep {
     pub pc: u64,
-    pub op: String,
+    /// The mnemonic, shared with every other step running the same opcode: there are a
+    /// couple of hundred of them and hundreds of thousands of steps.
+    pub op: Word,
     pub gas: u64,
     pub gas_cost: u64,
     pub depth: u64,
@@ -72,7 +74,7 @@ impl TraceStep {
     #[must_use]
     pub fn new(
         pc: u64,
-        op: String,
+        op: Word,
         gas: u64,
         gas_cost: u64,
         depth: u64,
@@ -209,7 +211,7 @@ impl<'de> Deserialize<'de> for TraceStep {
         let repr = TraceStepRepr::deserialize(deserializer)?;
         Ok(TraceStep {
             pc: repr.pc,
-            op: repr.op,
+            op: Arc::from(repr.op),
             gas: repr.gas,
             gas_cost: repr.gas_cost,
             depth: repr.depth,
@@ -714,7 +716,7 @@ mod tests {
     fn step_with(snapshot: StepSnapshot) -> TraceStep {
         TraceStep {
             pc: 3,
-            op: "SSTORE".to_owned(),
+            op: Arc::from("SSTORE"),
             gas: 100,
             gas_cost: 5,
             depth: 1,
@@ -774,7 +776,7 @@ mod tests {
         // flat fields older readers expect, filled from that one copy.
         let step = TraceStep::new(
             3,
-            "SSTORE".to_owned(),
+            Arc::from("SSTORE"),
             100,
             5,
             1,
@@ -823,7 +825,7 @@ mod tests {
         // Steps share memory and storage by reference when a backend hands them on.
         let shared = TraceStep::new(
             4,
-            "POP".to_owned(),
+            Arc::from("POP"),
             95,
             2,
             1,
@@ -845,7 +847,7 @@ mod tests {
     fn step_with_legacy_fields() -> TraceStep {
         TraceStep {
             pc: 1,
-            op: "ADD".to_owned(),
+            op: Arc::from("ADD"),
             gas: 9,
             gas_cost: 3,
             depth: 1,
@@ -868,7 +870,7 @@ mod tests {
             )
         };
         let step = |pc: u64, snapshot: StepSnapshot| {
-            TraceStep::new(pc, "PUSH1".to_owned(), 1, 1, 1, None, snapshot)
+            TraceStep::new(pc, Arc::from("PUSH1"), 1, 1, 1, None, snapshot)
         };
         let trace = TransactionTrace {
             tx_hash: None,
@@ -936,7 +938,7 @@ mod tests {
             error: None,
             steps: vec![TraceStep {
                 pc: 0,
-                op: "STOP".to_owned(),
+                op: Arc::from("STOP"),
                 gas: 1,
                 gas_cost: 0,
                 depth: 0,

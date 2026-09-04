@@ -633,7 +633,7 @@ impl StepMap {
                 // A `DELEGATECALL` or `CALLCODE` runs the callee's code against the
                 // caller's storage; every other call has the callee's own.
                 let delegated = call.is_some_and(|caller| {
-                    matches!(trace.steps[caller].op.as_str(), "DELEGATECALL" | "CALLCODE")
+                    matches!(&*trace.steps[caller].op, "DELEGATECALL" | "CALLCODE")
                 });
                 let storage = if delegated {
                     evm_frames.last().and_then(|frame| frame.storage)
@@ -649,7 +649,7 @@ impl StepMap {
                 });
                 next_frame_id += 1;
             }
-            if step.op == "REVERT" || step.error.is_some() {
+            if &*step.op == "REVERT" || step.error.is_some() {
                 let entry_step = evm_frames
                     .last()
                     .expect("the root frame is never popped")
@@ -726,7 +726,7 @@ impl StepMap {
             // marker, or landing on a function's entry point, says whether it was a call.
             let landed_by_jump = index > 0
                 && framed[index - 1].evm_depth == step.evm_depth
-                && trace.steps[index - 1].op == "JUMP";
+                && &*trace.steps[index - 1].op == "JUMP";
             let previous_marker = if landed_by_jump {
                 framed[index - 1].marker
             } else {
@@ -1542,7 +1542,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 /// The code address a call instruction targets, read off its stack.
 #[must_use]
 pub fn call_target(step: &soldb_core::TraceStep) -> Option<String> {
-    if !CALL_OPCODES.contains(&step.op.as_str()) {
+    if !CALL_OPCODES.contains(&&*step.op) {
         return None;
     }
     let stack = step.snapshot_ref().stack;
@@ -1656,7 +1656,7 @@ contract C {
     fn step(pc: u64, depth: u64, op: &str, stack: &[&str]) -> TraceStep {
         TraceStep {
             pc,
-            op: op.to_owned(),
+            op: op.into(),
             gas: 0,
             gas_cost: 0,
             depth,

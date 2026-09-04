@@ -1615,10 +1615,12 @@ where
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         self.gas.step(&interp.gas);
         let opcode = interp.bytecode.opcode();
-        let op = OpCode::new(opcode).map_or_else(
-            || format!("UNKNOWN(0x{opcode:02x})"),
-            |op| op.as_str().to_owned(),
-        );
+        // The same interner as the stack: a couple of hundred mnemonics across every
+        // step of the run.
+        let mnemonic = OpCode::new(opcode)
+            .map(|op| op.as_str().to_owned())
+            .unwrap_or_else(|| format!("UNKNOWN(0x{opcode:02x})"));
+        let op = self.words.intern(&mnemonic);
         let stack = interp
             .stack
             .data()
@@ -1931,7 +1933,7 @@ fn create_scheme_name(scheme: revm::context_interface::CreateScheme) -> &'static
 }
 
 fn record_replay_storage_touch(log: &mut StructLog, interp: &Interpreter) {
-    match log.op.as_str() {
+    match &*log.op {
         "SLOAD" => {
             let Some(slot) = log.stack.last().map(|word| word.to_string()) else {
                 return;
@@ -2496,11 +2498,7 @@ mod tests {
         );
 
         assert!(!result.failed, "{:?}", result.error);
-        let ops: Vec<&str> = result
-            .struct_logs
-            .iter()
-            .map(|log| log.op.as_str())
-            .collect();
+        let ops: Vec<&str> = result.struct_logs.iter().map(|log| &*log.op).collect();
         assert_eq!(
             ops,
             [
@@ -2854,11 +2852,7 @@ mod tests {
             Some(created.as_str())
         );
         assert_eq!(constructor.output, COUNTER_CODE);
-        let ops: Vec<&str> = constructor
-            .steps
-            .iter()
-            .map(|step| step.op.as_str())
-            .collect();
+        let ops: Vec<&str> = constructor.steps.iter().map(|step| &*step.op).collect();
         assert_eq!(&ops[..3], ["PUSH1", "PUSH1", "SSTORE"]);
         assert_eq!(*ops.last().expect("last"), "RETURN");
 

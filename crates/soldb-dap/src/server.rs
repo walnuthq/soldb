@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
-use soldb_debugger::ContractDebugInfo;
+use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo};
 use soldb_ethdebug::{load_debug_program, SourceMapEnvironment};
 use soldb_repl::{BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome};
 use soldb_rpc::trace_transaction;
@@ -34,7 +34,7 @@ const MEMORY_REF: u64 = 1003;
 const STORAGE_REF: u64 = 1004;
 const STATE_REF: u64 = 1005;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct DapServer {
     seq: u64,
     config: DapServerConfig,
@@ -51,7 +51,35 @@ pub struct DapServer {
     function_breakpoint_ids: Vec<u32>,
     /// Whether the console note about inferred frame arguments has been sent.
     reported_frame_arguments: bool,
+    /// The chain to read state variables the transaction never touched from, when the
+    /// session was launched against a node.
+    chain: Option<ChainReader>,
     terminated: bool,
+}
+
+/// What the server reads untouched storage slots through.
+type ChainReader = CachedChain<ChainRead>;
+
+/// The chain state the traced transaction started from: the end of its parent block.
+///
+/// A read that fails leaves the slot unknown, which is what an editor should show; there
+/// is no console to report it on before the session has started.
+fn chain_before_transaction(rpc_url: &str, tx_hash: &str) -> Option<ChainReader> {
+    let (block, _index) = soldb_rpc::transaction_block(rpc_url, tx_hash).ok()?;
+    let number = u64::from_str_radix(block.trim_start_matches("0x"), 16).ok()?;
+    let parent = number.checked_sub(1)?;
+    let block = format!("0x{parent:x}");
+    let rpc_url = rpc_url.to_owned();
+    let read: ChainRead = Box::new(move |address: &str, slot: &[u8; 32]| {
+        let value =
+            soldb_rpc::storage_at(&rpc_url, address, &soldb_ethdebug::word_hex(slot), &block)
+                .ok()?;
+        soldb_ethdebug::parse_word(&value).ok()
+    });
+    Some(CachedChain::new(
+        format!("the chain at block {parent}, before this transaction's block"),
+        read,
+    ))
 }
 
 /// A source breakpoint as the editor sent it.
@@ -83,6 +111,7 @@ impl Default for DapServer {
             line_breakpoint_ids: BTreeMap::new(),
             function_breakpoint_ids: Vec::new(),
             reported_frame_arguments: false,
+            chain: None,
             terminated: false,
         }
     }
@@ -212,6 +241,9 @@ impl DapServer {
             let rpc_url = string_arg(&args, &["rpcUrl", "rpcURL", "rpc"])
                 .or_else(|| std::env::var("RPC_URL").ok())
                 .unwrap_or_else(|| "http://127.0.0.1:8545".to_owned());
+            // The node the trace came from also answers for slots the transaction never
+            // touched, as it does in the CLI.
+            self.chain = chain_before_transaction(&rpc_url, &tx_hash);
             Some(trace_transaction(&rpc_url, &tx_hash)?)
         } else {
             None
@@ -633,7 +665,10 @@ impl DapServer {
         let Some(layout) = self.debugger.storage_layout() else {
             return Vec::new();
         };
-        let Some(words) = self.debugger.storage_words() else {
+        let Some(words) = self
+            .debugger
+            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
+        else {
             return Vec::new();
         };
         soldb_debugger::state_variables(layout, &words)
@@ -731,7 +766,7 @@ impl DapServer {
         };
         match expression.trim() {
             "pc" => step.pc.to_string(),
-            "op" => step.op.clone(),
+            "op" => step.op.to_string(),
             "gas" => step.gas.to_string(),
             "gasCost" | "gas_cost" => step.gas_cost.to_string(),
             "depth" => step.depth.to_string(),
@@ -770,7 +805,10 @@ impl DapServer {
         let Some(layout) = self.debugger.storage_layout() else {
             return "<unsupported expression>".to_owned();
         };
-        let Some(words) = self.debugger.storage_words() else {
+        let Some(words) = self
+            .debugger
+            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
+        else {
             return "<unsupported expression>".to_owned();
         };
         match soldb_debugger::state_value(layout, &words, expression) {
@@ -1308,7 +1346,7 @@ mod tests {
             steps: vec![
                 TraceStep {
                     pc: 0,
-                    op: "PUSH1".to_owned(),
+                    op: "PUSH1".into(),
                     gas: 100,
                     gas_cost: 1,
                     depth: 0,
@@ -1320,7 +1358,7 @@ mod tests {
                 },
                 TraceStep {
                     pc: 3,
-                    op: "STOP".to_owned(),
+                    op: "STOP".into(),
                     gas: 99,
                     gas_cost: 0,
                     depth: 0,

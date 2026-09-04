@@ -56,7 +56,8 @@ applied. It prints what it found, and `--base-path`, `--include-path`, `--remapp
 
 Legacy source maps are also accepted: SolDB reads `combined.json` when ETHDebug
 programs are absent, so contracts built by pre-ETHDebug compilers still debug by
-source line, function, and frame.
+source line, function, and frame. When the sources those artifacts name are not next to
+them, pass `--source-path <dir>` — the directory the contract was compiled in.
 
 Trace a transaction:
 ```bash

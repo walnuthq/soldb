@@ -27,8 +27,8 @@ pub mod stepping;
 pub use condition::{Condition, ConditionContext, Evaluation};
 pub use soldb_ethdebug::StorageLayout;
 pub use state::{
-    short_hex, state_value, state_variables, ChainStorage, StateSource, StateVariable, StorageTape,
-    StorageWords,
+    short_hex, state_value, state_variables, CachedChain, ChainRead, ChainStorage, StateSource,
+    StateVariable, StorageTape, StorageWords,
 };
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
@@ -93,7 +93,7 @@ impl DebugSession {
         Some(DebugStep {
             index: step_index,
             pc: step.pc,
-            op: step.op.clone(),
+            op: step.op.to_string(),
             gas: step.gas,
             gas_cost: step.gas_cost,
             depth: step.depth,
@@ -969,7 +969,7 @@ mod tests {
             artifacts: Default::default(),
             steps: vec![TraceStep {
                 pc: 0,
-                op: "PUSH1".to_owned(),
+                op: "PUSH1".into(),
                 gas: 1,
                 gas_cost: 0,
                 depth: 0,

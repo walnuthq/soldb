@@ -10,7 +10,11 @@ soldb simulate <contract_address> <function_signature> [args...] --from <sender>
 soldb run <bytecode> [<function_signature> [args...]] --interactive
 ```
 
-Pass `--ethdebug-dir <address>:<contract>:<dir>` to load the compiler's debug metadata.
+Pass `--ethdebug-dir <address>:<contract>:<dir>` to load the compiler's debug metadata,
+and `--source-path <dir>` when the sources it names are not next to it — a compiler
+records the paths it was given, which are relative to the directory it ran in, so that
+directory is what to pass. Sources that cannot be read are reported rather than leaving a
+session with no lines and no explanation.
 Source-level stepping, line and function breakpoints, `list`, `vars`, and `print` need it;
 everything else works on the bare trace. ETHDebug artifacts and the legacy `combined.json`
 source maps of pre-ETHDebug compilers both serve: lines, functions, and frames come from

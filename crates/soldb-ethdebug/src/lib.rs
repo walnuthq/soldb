@@ -31,8 +31,9 @@ pub use abi::{
 };
 pub use artifacts::{
     contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-    find_program_ethdebug, load_debug_program, load_storage_layout, read_debug_source,
-    read_json_file, source_candidates, DebugProgram,
+    find_program_ethdebug, load_debug_program, load_debug_program_with_sources,
+    load_storage_layout, read_debug_source, read_debug_source_from, read_json_file,
+    source_candidates, DebugProgram,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,
@@ -44,8 +45,9 @@ pub use metadata::{
     EthdebugSpec, FunctionExit, FunctionIdentity, Instruction, SourceLocation, VariableLocation,
 };
 pub use source_map::{
-    build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, parse_srcmap,
-    SourceMapEntry, SourceMapEnvironment, SourceMapInfo, SourceMapProgram,
+    build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program,
+    load_source_map_program_with_sources, parse_srcmap, SourceMapEntry, SourceMapEnvironment,
+    SourceMapInfo, SourceMapProgram,
 };
 pub use storage_layout::{
     add_word, decode_value, element_place, mapping_slot, parse_word, word_hex, word_to_decimal,

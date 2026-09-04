@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
 use crate::metadata::{read_compilation_source, EthdebugInfo};
-use crate::source_map::{load_source_map_program, SourceMapEnvironment};
+use crate::source_map::{load_source_map_program_with_sources, SourceMapEnvironment};
 use crate::storage_layout::StorageLayout;
 
 /// One contract's debug information as loaded from its artifacts.
@@ -120,8 +120,20 @@ pub fn contract_name_from_program_path(
 /// directory, to that directory's parent, and as given.
 #[must_use]
 pub fn read_debug_source(root: &Path, source_path: &str) -> Option<String> {
-    source_candidates(root, source_path)
-        .into_iter()
+    read_debug_source_from(root, &[], source_path)
+}
+
+/// The same, looking in `extra_roots` first: directories the user named because the
+/// sources are not where the artifact's paths reach.
+pub fn read_debug_source_from(
+    root: &Path,
+    extra_roots: &[PathBuf],
+    source_path: &str,
+) -> Option<String> {
+    extra_roots
+        .iter()
+        .flat_map(|extra| source_candidates(extra, source_path))
+        .chain(source_candidates(root, source_path))
         .find_map(|candidate| fs::read_to_string(candidate).ok())
 }
 
@@ -193,6 +205,20 @@ pub fn load_debug_program(
     contract_name: &str,
     environment: SourceMapEnvironment,
 ) -> SoldbResult<Option<DebugProgram>> {
+    load_debug_program_with_sources(root, contract_name, environment, &[])
+}
+
+/// The same, also looking for sources in `source_roots`.
+///
+/// A compiler records the source paths it was given, which are relative to the directory
+/// the compilation ran in. When the artifacts are somewhere else entirely, that directory
+/// is the one thing the debugger cannot work out for itself, so a frontend passes it.
+pub fn load_debug_program_with_sources(
+    root: &Path,
+    contract_name: &str,
+    environment: SourceMapEnvironment,
+    source_roots: &[PathBuf],
+) -> SoldbResult<Option<DebugProgram>> {
     let environment_name = match environment {
         SourceMapEnvironment::Creation => "create",
         SourceMapEnvironment::Runtime => "call",
@@ -215,7 +241,8 @@ pub fn load_debug_program(
         };
         let info = EthdebugInfo::from_artifacts(&name, environment_name, &metadata, &program)
             .map_err(|error| SoldbError::Message(format!("{}: {error}", program_path.display())))?;
-        let (source_contents, missing_sources) = read_sources(root, &info, BTreeMap::new());
+        let (source_contents, missing_sources) =
+            read_sources(root, source_roots, &info, BTreeMap::new());
         let storage_layout = load_storage_layout(root, &info.contract_name)?;
         return Ok(Some(DebugProgram {
             info,
@@ -227,11 +254,13 @@ pub fn load_debug_program(
         }));
     }
 
-    let Some(program) = load_source_map_program(root, contract_name, environment)? else {
+    let Some(program) =
+        load_source_map_program_with_sources(root, source_roots, contract_name, environment)?
+    else {
         return Ok(None);
     };
     let (source_contents, missing_sources) =
-        read_sources(root, &program.info, program.source_contents);
+        read_sources(root, source_roots, &program.info, program.source_contents);
     let storage_layout = match program.storage_layout {
         Some(layout) => Some(layout),
         None => load_storage_layout(root, &program.info.contract_name)?,
@@ -265,6 +294,7 @@ pub fn load_storage_layout(root: &Path, contract_name: &str) -> SoldbResult<Opti
 /// record first and from disk next to the artifacts otherwise.
 fn read_sources(
     root: &Path,
+    source_roots: &[PathBuf],
     info: &EthdebugInfo,
     mut source_contents: BTreeMap<u64, String>,
 ) -> (BTreeMap<u64, String>, Vec<String>) {
@@ -274,7 +304,7 @@ fn read_sources(
             continue;
         }
         match read_compilation_source(&info.compilation, *source_id)
-            .or_else(|| read_debug_source(root, source_path))
+            .or_else(|| read_debug_source_from(root, source_roots, source_path))
         {
             Some(source) => {
                 source_contents.insert(*source_id, source);

@@ -555,7 +555,7 @@ mod tests {
         // and one with nothing captured at all.
         trace.steps.push(TraceStep {
             pc: 7,
-            op: "SSTORE".to_owned(),
+            op: "SSTORE".into(),
             gas: 90,
             gas_cost: 20_000,
             depth: 1,
@@ -590,7 +590,7 @@ mod tests {
         });
         trace.steps.push(TraceStep {
             pc: 8,
-            op: "STOP".to_owned(),
+            op: "STOP".into(),
             gas: 70,
             gas_cost: 0,
             depth: 1,
@@ -849,7 +849,7 @@ mod tests {
         };
         trace.steps.push(TraceStep {
             pc: 1,
-            op: "CALL".to_owned(),
+            op: "CALL".into(),
             gas: 90,
             gas_cost: 40,
             depth: 0,
@@ -861,7 +861,7 @@ mod tests {
         });
         trace.steps.push(TraceStep {
             pc: 2,
-            op: "STOP".to_owned(),
+            op: "STOP".into(),
             gas: 50,
             gas_cost: 0,
             depth: 0,
@@ -936,7 +936,7 @@ mod tests {
             artifacts: Default::default(),
             steps: vec![TraceStep {
                 pc: 0,
-                op: "PUSH1".to_owned(),
+                op: "PUSH1".into(),
                 gas: 100,
                 gas_cost: 3,
                 depth: 0,

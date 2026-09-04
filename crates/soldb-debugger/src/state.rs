@@ -20,7 +20,7 @@
 //! the chain rather than from the recording. Without one, unknown is reported as unknown
 //! and never as zero: this crate has no chain to ask, and it does not pretend to.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use soldb_core::TransactionTrace;
@@ -50,6 +50,64 @@ pub trait ChainStorage {
     /// Where these words come from, as a user-facing phrase such as
     /// `the chain at block 21000000`.
     fn label(&self) -> &str;
+}
+
+/// The reading a frontend supplies: one storage word of one account, or nothing.
+pub type ChainRead = Box<dyn Fn(&str, &Word) -> Option<Word>>;
+
+/// A [`ChainStorage`] that reads each slot once, through a function the frontend gives.
+///
+/// The reading is the frontend's — this crate opens no connections — but the caching and
+/// the labelling are the same wherever the words come from, so they live here rather than
+/// once per frontend.
+pub struct CachedChain<F> {
+    read: F,
+    label: String,
+    words: RefCell<HashMap<(String, Word), Option<Word>>>,
+}
+
+impl<F> std::fmt::Debug for CachedChain<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CachedChain")
+            .field("label", &self.label)
+            .field("words", &self.words.borrow().len())
+            .finish()
+    }
+}
+
+impl<F> CachedChain<F>
+where
+    F: Fn(&str, &Word) -> Option<Word>,
+{
+    /// `label` says where the words come from, as a user-facing phrase such as
+    /// `the chain at block 21000000`.
+    pub fn new(label: impl Into<String>, read: F) -> Self {
+        Self {
+            read,
+            label: label.into(),
+            words: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl<F> ChainStorage for CachedChain<F>
+where
+    F: Fn(&str, &Word) -> Option<Word>,
+{
+    fn word(&self, address: &str, slot: &Word) -> Option<Word> {
+        let key = (address.to_ascii_lowercase(), *slot);
+        if let Some(cached) = self.words.borrow().get(&key) {
+            return *cached;
+        }
+        let word = (self.read)(&key.0, slot);
+        self.words.borrow_mut().insert(key, word);
+        word
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
 }
 
 /// One state variable, or one place inside one, with its value at a step.
@@ -112,7 +170,7 @@ impl StorageTape {
                 continue;
             };
             // A write takes effect after its step; a read reports what is there at it.
-            let from = if step.op == "SSTORE" {
+            let from = if &*step.op == "SSTORE" {
                 index + 1
             } else {
                 index
@@ -456,7 +514,7 @@ mod tests {
             .collect();
         TraceStep {
             pc: 0,
-            op: op.to_owned(),
+            op: op.into(),
             gas: 0,
             gas_cost: 0,
             depth,
@@ -720,6 +778,34 @@ mod tests {
             "{}",
             counter.value.display
         );
+    }
+
+    #[test]
+    fn a_cached_chain_reads_each_slot_once() {
+        use std::cell::Cell;
+
+        let reads = Cell::new(0_u32);
+        let chain =
+            super::CachedChain::new("the chain at block 7", |_address: &str, slot: &Word| {
+                reads.set(reads.get() + 1);
+                (slot[31] == 1).then(|| {
+                    let mut word = [0_u8; 32];
+                    word[31] = 9;
+                    word
+                })
+            });
+        let mut slot = [0_u8; 32];
+        slot[31] = 1;
+        assert_eq!(super::ChainStorage::label(&chain), "the chain at block 7");
+        assert!(super::ChainStorage::word(&chain, "0xAA", &slot).is_some());
+        // The same slot, and the same account however it is spelled, is not read again.
+        assert!(super::ChainStorage::word(&chain, "0xaa", &slot).is_some());
+        assert_eq!(reads.get(), 1);
+        // A slot the chain has no answer for is remembered as unanswered, not retried.
+        let missing = [0_u8; 32];
+        assert!(super::ChainStorage::word(&chain, "0xaa", &missing).is_none());
+        assert!(super::ChainStorage::word(&chain, "0xaa", &missing).is_none());
+        assert_eq!(reads.get(), 2);
     }
 
     #[test]

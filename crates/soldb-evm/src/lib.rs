@@ -79,7 +79,8 @@ impl TraceBackend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructLog {
     pub pc: u64,
-    pub op: String,
+    /// The mnemonic, shared the way the stack words are.
+    pub op: Word,
     pub gas: u64,
     #[serde(rename = "gasCost", default)]
     pub gas_cost: u64,
@@ -159,7 +160,7 @@ impl StructLog {
         };
         TraceStep::new(
             self.pc,
-            self.op.clone(),
+            Arc::clone(&self.op),
             self.gas,
             self.gas_cost,
             self.depth,
@@ -1016,7 +1017,7 @@ mod tests {
         // building every step. Pin it against the definition it replaces.
         let log = |storage: &[(&str, &str)]| StructLog {
             pc: 0,
-            op: "SSTORE".to_owned(),
+            op: "SSTORE".into(),
             gas: 0,
             gas_cost: 0,
             depth: 0,
@@ -1079,7 +1080,7 @@ mod tests {
     fn consecutive_steps_share_unchanged_memory_and_storage() {
         let log = |op: &str, memory: &[&str], slot_value: &str| StructLog {
             pc: 0,
-            op: op.to_owned(),
+            op: op.into(),
             gas: 0,
             gas_cost: 0,
             depth: 1,
@@ -1248,7 +1249,7 @@ mod tests {
         assert!(trace.capabilities.memory);
         assert!(trace.capabilities.gas_details);
         assert_eq!(trace.artifacts.gas.as_ref().map(|gas| gas.used), Some(7));
-        assert_eq!(trace.steps[0].op, "STOP");
+        assert_eq!(&*trace.steps[0].op, "STOP");
     }
 
     #[test]

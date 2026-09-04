@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use revm_bytecode::OpCode;
 use serde::{Deserialize, Serialize};
@@ -159,6 +159,16 @@ pub fn load_source_map_program(
     contract_name: &str,
     environment: SourceMapEnvironment,
 ) -> SoldbResult<Option<SourceMapProgram>> {
+    load_source_map_program_with_sources(root, &[], contract_name, environment)
+}
+
+/// The same, also looking for the sources it names in `source_roots`.
+pub fn load_source_map_program_with_sources(
+    root: &Path,
+    source_roots: &[PathBuf],
+    contract_name: &str,
+    environment: SourceMapEnvironment,
+) -> SoldbResult<Option<SourceMapProgram>> {
     let path = root.join("combined.json");
     if !path.exists() {
         return Ok(None);
@@ -170,11 +180,19 @@ pub fn load_source_map_program(
     let combined = serde_json::from_str::<Value>(&input).map_err(|error| {
         SoldbError::Message(format!("invalid JSON in `{}`: {error}", path.display()))
     })?;
-    source_map_program_from_combined(root, &path, &combined, contract_name, environment)
+    source_map_program_from_combined(
+        root,
+        source_roots,
+        &path,
+        &combined,
+        contract_name,
+        environment,
+    )
 }
 
 fn source_map_program_from_combined(
     root: &Path,
+    source_roots: &[PathBuf],
     artifact_path: &Path,
     combined: &Value,
     contract_name: &str,
@@ -232,7 +250,7 @@ fn source_map_program_from_combined(
             .map_err(|_| SoldbError::Message("source index does not fit in `u64`".to_owned()))?;
         sources.insert(source_id, source_path.to_owned());
 
-        let contents = read_source(root, source_path)?;
+        let contents = read_source(root, source_roots, source_path)?;
         if let Some(contents) = &contents {
             source_contents.insert(source_id, contents.clone());
         }
@@ -509,8 +527,16 @@ fn source_code(
     })))
 }
 
-fn read_source(root: &Path, source_path: &str) -> SoldbResult<Option<String>> {
-    for candidate in crate::artifacts::source_candidates(root, source_path) {
+fn read_source(
+    root: &Path,
+    source_roots: &[PathBuf],
+    source_path: &str,
+) -> SoldbResult<Option<String>> {
+    let candidates = source_roots
+        .iter()
+        .flat_map(|extra| crate::artifacts::source_candidates(extra, source_path))
+        .chain(crate::artifacts::source_candidates(root, source_path));
+    for candidate in candidates {
         if candidate.exists() {
             return fs::read_to_string(&candidate).map(Some).map_err(|error| {
                 SoldbError::Message(format!(
