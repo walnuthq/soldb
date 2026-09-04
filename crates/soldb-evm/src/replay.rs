@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 
 use soldb_core::{
     AccountChange, ContractCreation, ExecutionCall, ExecutionLog, GasSummary, SoldbError,
-    SoldbResult, TraceArtifacts, TraceCapabilities, TransactionTrace,
+    SoldbResult, TraceArtifacts, TraceCapabilities, TransactionTrace, WordInterner,
 };
 
 use crate::{
@@ -1589,6 +1589,10 @@ struct ReplayStepInspector {
     /// logs from holding a copy per step.
     last_memory: Vec<u8>,
     last_memory_words: Arc<Vec<String>>,
+    /// One shared copy of each distinct stack word. A run of a few hundred thousand steps
+    /// pushes millions of words drawn from a few thousand values, so the sharing is the
+    /// difference between holding an allocation per occurrence and one per value.
+    words: WordInterner,
     /// The storage every log starts from; a log that touches a slot gets its own map.
     empty_storage: Arc<BTreeMap<String, String>>,
 }
@@ -1619,7 +1623,7 @@ where
             .stack
             .data()
             .iter()
-            .map(|value| format_u256_quantity(*value))
+            .map(|value| self.words.intern(&format_u256_quantity(*value)))
             .collect();
         {
             let memory_slice = interp.memory.slice(0..interp.memory.size());
@@ -1929,7 +1933,7 @@ fn create_scheme_name(scheme: revm::context_interface::CreateScheme) -> &'static
 fn record_replay_storage_touch(log: &mut StructLog, interp: &Interpreter) {
     match log.op.as_str() {
         "SLOAD" => {
-            let Some(slot) = log.stack.last().cloned() else {
+            let Some(slot) = log.stack.last().map(|word| word.to_string()) else {
                 return;
             };
             let value = interp
@@ -1942,10 +1946,14 @@ fn record_replay_storage_touch(log: &mut StructLog, interp: &Interpreter) {
             Arc::make_mut(&mut log.storage).insert(normalize_storage_key(&slot), value);
         }
         "SSTORE" => {
-            let Some(slot) = log.stack.last().cloned() else {
+            let Some(slot) = log.stack.last().map(|word| word.to_string()) else {
                 return;
             };
-            let Some(value) = log.stack.get(log.stack.len().saturating_sub(2)).cloned() else {
+            let Some(value) = log
+                .stack
+                .get(log.stack.len().saturating_sub(2))
+                .map(|word| word.to_string())
+            else {
                 return;
             };
             Arc::make_mut(&mut log.storage)
@@ -2078,6 +2086,11 @@ fn bytes_to_prefixed_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A stack as plain strings, for assertions.
+    fn stack_words(stack: &[soldb_core::Word]) -> Vec<&str> {
+        stack.iter().map(|word| &**word).collect()
+    }
+
     use std::collections::BTreeMap;
 
     use revm::primitives::{Address, B256, U256};
@@ -2507,7 +2520,7 @@ mod tests {
         // value and the SSTORE writes the increment.
         let steps = result.steps();
         assert_eq!(steps[4].snapshot.storage["0x0"], "0x29");
-        assert_eq!(steps[8].snapshot.stack, ["0x2a", "0x0"]);
+        assert_eq!(stack_words(&steps[8].snapshot.stack), ["0x2a", "0x0"]);
         assert_eq!(steps[8].snapshot.storage["0x0"], "0x2a");
         assert_eq!(
             steps[8].snapshot.storage_diff["0x0"].after.as_deref(),

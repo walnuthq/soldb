@@ -20,7 +20,7 @@ mod profile;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
-use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace};
+use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace, Word as StackWord};
 use soldb_debugger::{ChainStorage, ContractDebugInfo, SourceFunction, SourceParam, StorageWords};
 use soldb_ethdebug::{
     encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
@@ -205,6 +205,20 @@ struct CompileArgs {
     output_dir: String,
     #[arg(long)]
     dual_compile: bool,
+    /// The directory relative imports resolve against. Found from the project the
+    /// contract is in when not given.
+    #[arg(long)]
+    base_path: Option<String>,
+    /// Where non-relative imports are looked up, such as a `lib` directory. Repeatable.
+    #[arg(long = "include-path")]
+    include_paths: Vec<String>,
+    /// An import remapping, as `prefix=target`. Repeatable, and added to the ones the
+    /// project declares.
+    #[arg(long = "remapping")]
+    remappings: Vec<String>,
+    /// Ignore the project's own layout and remappings.
+    #[arg(long)]
+    no_project: bool,
     #[arg(long, default_value = "./build/contracts")]
     production_dir: String,
     #[arg(long)]
@@ -734,12 +748,30 @@ fn print_info_resources(contracts: &[InfoResourcesContractJson]) {
     }
 }
 
+/// How the compile command resolves imports: what the user passed, over what the
+/// contract's own project declares.
+fn compile_project_layout(args: &CompileArgs) -> soldb_compiler::ProjectLayout {
+    let mut project = match (&args.contract_file, args.no_project) {
+        (Some(file), false) => soldb_compiler::ProjectLayout::detect(Path::new(file)),
+        _ => soldb_compiler::ProjectLayout::default(),
+    };
+    if let Some(base_path) = &args.base_path {
+        project.base_path = Some(PathBuf::from(base_path));
+    }
+    project
+        .include_paths
+        .extend(args.include_paths.iter().map(PathBuf::from));
+    project.remappings.extend(args.remappings.iter().cloned());
+    project
+}
+
 fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
-    let config = soldb_compiler::CompilerConfig::with_paths(
+    let mut config = soldb_compiler::CompilerConfig::with_paths(
         args.solc_path.clone(),
         &args.output_dir,
         &args.production_dir,
     );
+    config.project = compile_project_layout(args);
 
     if args.verify_version {
         let info = config.verify_solc_version();
@@ -782,6 +814,21 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
         return Err(soldb_core::SoldbError::Message(format!(
             "Contract file '{contract_file}' not found"
         )));
+    }
+
+    if !args.json && !config.project.is_empty() {
+        // Say what the imports resolve against: a wrong root is the difference between a
+        // contract that compiles and one that does not, and it should not be a mystery.
+        if let Some(base_path) = &config.project.base_path {
+            println!("{} {}", info("Project root:"), base_path.display());
+        }
+        if !config.project.remappings.is_empty() {
+            println!(
+                "{} {}",
+                info("Remappings:"),
+                config.project.remappings.join(", ")
+            );
+        }
     }
 
     if args.dual_compile {
@@ -1522,9 +1569,9 @@ fn run_interactive_debugger(
         }
 
         let command = DebuggerCommand::parse(&line);
-        let report_condition_note = |state: &DebuggerState| {
-            if let Some(note) = state.take_condition_note() {
-                println!("{} {note}", warning("A breakpoint condition never held:"));
+        let report_note = |state: &DebuggerState| {
+            if let Some(note) = state.take_note() {
+                println!("{} {note}", warning("Note:"));
             }
         };
         match command {
@@ -1571,7 +1618,7 @@ fn run_interactive_debugger(
                 if let Some(outcome) = state.apply_command(command) {
                     print_step_outcome(&state, &outcome);
                 }
-                report_condition_note(&state);
+                report_note(&state);
             }
         }
     }
@@ -2133,6 +2180,12 @@ fn print_debugger_variables(
         print_variable(variable);
     }
     match (layout, words) {
+        // A contract can have a layout and no state variables at all, which is worth
+        // saying: an empty `State:` heading reads like something failed.
+        (Some(layout), _) if layout.variables.is_empty() => println!(
+            "{}",
+            dim("State: this contract declares no state variables")
+        ),
         (Some(layout), Some(words)) => {
             println!("{}", dim("State:"));
             for variable in soldb_debugger::state_variables(layout, &words) {
@@ -2521,7 +2574,7 @@ struct CallFrame {
     source_params: Vec<SourceParam>,
     source_path: Option<String>,
     source_line: Option<u64>,
-    raw_stack: Vec<String>,
+    raw_stack: Vec<StackWord>,
     internal: bool,
 }
 
@@ -2566,6 +2619,26 @@ impl TraceSourceIndex {
         let Some(program) = load_debug_program(&spec.debug_dir, &spec.name, environment)? else {
             return Ok(None);
         };
+        if !program.missing_sources.is_empty() {
+            // The artifact names sources that are not where it says: source lines,
+            // functions, and frames come from that text, so say it plainly rather than
+            // showing an opcode view that looks like a contract compiled without debug
+            // info.
+            report_once(
+                format!("sources:{}", spec.debug_dir.display()),
+                &format!(
+                    "could not read {} for `{}`: {}",
+                    if program.missing_sources.len() == 1 {
+                        "the source".to_owned()
+                    } else {
+                        format!("{} sources", program.missing_sources.len())
+                    },
+                    spec.name,
+                    program.missing_sources.join(", ")
+                ),
+                "source lines and functions are unavailable for them; the paths are relative to the directory the contract was compiled in, so run soldb from there or keep the sources next to the artifacts",
+            );
+        }
         let debug = ContractDebugInfo::new(
             spec.address.as_deref(),
             &spec.name,
@@ -3064,7 +3137,7 @@ fn format_decoded_call_param(param: &DecodedCallParam) -> String {
     }
 }
 
-fn format_raw_stack(stack: &[String]) -> String {
+fn format_raw_stack(stack: &[StackWord]) -> String {
     if stack.is_empty() {
         return "[empty]".to_owned();
     }
@@ -3946,11 +4019,11 @@ fn print_json<T: serde::Serialize>(value: &T) -> SoldbResult<()> {
     Ok(())
 }
 
-fn call_target_stack_word(stack: &[String]) -> Option<&str> {
+fn call_target_stack_word(stack: &[StackWord]) -> Option<&str> {
     if stack.len() < 2 {
         return None;
     }
-    stack.get(stack.len() - 2).map(String::as_str)
+    stack.get(stack.len() - 2).map(|word| &**word)
 }
 
 fn extract_address_from_stack_word(word: &str) -> Option<String> {
@@ -3967,7 +4040,7 @@ fn extract_address_from_stack_word(word: &str) -> Option<String> {
     Some(format!("0x{}", address.to_ascii_lowercase()))
 }
 
-fn format_stack(stack: &[String]) -> String {
+fn format_stack(stack: &[StackWord]) -> String {
     if stack.is_empty() {
         return dim("[empty]");
     }
@@ -4049,7 +4122,7 @@ mod tests {
             gas: 100,
             gas_cost: 1,
             depth: 0,
-            stack: stack.iter().map(|value| (*value).to_owned()).collect(),
+            stack: stack.iter().map(|value| StackWord::from(*value)).collect(),
             memory: None,
             storage: None,
             error: None,
@@ -4709,18 +4782,15 @@ contract Counter {
         assert_eq!(shorten_hex("0x1234567890"), "0x1234...");
         assert_eq!(shorten_hex("0x1234"), "0x1234");
         assert_eq!(format_stack(&[]), "[empty]");
-        assert!(format_stack(&[
-            "0x01".to_owned(),
-            "0x02".to_owned(),
-            "0x03".to_owned(),
-            "0x04".to_owned()
-        ])
-        .contains("... +1 more"));
+        assert!(
+            format_stack(&["0x01".into(), "0x02".into(), "0x03".into(), "0x04".into()])
+                .contains("... +1 more")
+        );
         assert_eq!(
-            call_target_stack_word(&["0x1".to_owned(), "0x2".to_owned()]),
+            call_target_stack_word(&["0x1".into(), "0x2".into()]),
             Some("0x1")
         );
-        assert_eq!(call_target_stack_word(&["0x1".to_owned()]), None);
+        assert_eq!(call_target_stack_word(&["0x1".into()]), None);
         assert_eq!(
             extract_address_from_stack_word(
                 "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"

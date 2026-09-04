@@ -465,7 +465,10 @@ mod tests {
             storage: None,
             error: None,
             snapshot: StepSnapshot::new(
-                stack.iter().map(|word| (*word).to_owned()).collect(),
+                stack
+                    .iter()
+                    .map(|word| soldb_core::Word::from(*word))
+                    .collect(),
                 None,
                 storage,
                 storage_diff,

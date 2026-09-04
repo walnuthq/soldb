@@ -27,7 +27,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use soldb_core::{
     ExecutionLog, GasSummary, SoldbError, SoldbResult, StepSnapshot, StorageChange, TraceArtifacts,
-    TraceCapabilities, TraceStep, TransactionTrace,
+    TraceCapabilities, TraceStep, TransactionTrace, Word, WordInterner,
 };
 
 #[cfg(feature = "replay")]
@@ -84,8 +84,10 @@ pub struct StructLog {
     #[serde(rename = "gasCost", default)]
     pub gas_cost: u64,
     pub depth: u64,
+    /// The stack, shared word by word with every other log holding the same value; see
+    /// [`soldb_core::WordInterner`].
     #[serde(default)]
-    pub stack: Vec<String>,
+    pub stack: Vec<Word>,
     /// Memory as the node reports it, in 32-byte words. Shared with the previous log when
     /// nothing changed, so a payload of hundreds of thousands of steps holds one copy per
     /// change; see [`DebugTraceResult`].
@@ -377,7 +379,12 @@ impl DebugTraceResult {
         // The previous log's memory and storage, kept by reference count rather than as
         // the log itself, which has moved into its step.
         let mut previous = None::<(Arc<Vec<String>>, Arc<BTreeMap<String, String>>)>;
-        for log in self.struct_logs {
+        // Logs parsed from a node's answer carry their own copy of every stack word;
+        // steps built from them share one per distinct value. A log the inspector interned
+        // already passes through unchanged, at the cost of a hash lookup.
+        let mut words = WordInterner::new();
+        for mut log in self.struct_logs {
+            words.intern_stack(&mut log.stack);
             let memory = Arc::clone(&log.memory);
             let storage = Arc::clone(&log.storage);
             let step = match &previous {
@@ -828,6 +835,11 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A stack as plain strings, for assertions.
+    fn stack_words(stack: &[soldb_core::Word]) -> Vec<&str> {
+        stack.iter().map(|word| &**word).collect()
+    }
+
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -1179,7 +1191,7 @@ mod tests {
         // prefixed them, so byte-offset lookups stay valid and both backends agree.
         assert_eq!(steps[0].snapshot_ref().memory, Some("aabb"));
         assert_eq!(steps[0].snapshot_ref().storage["0x00"], "0x2a");
-        assert_eq!(steps[0].snapshot.stack, ["0x01"]);
+        assert_eq!(stack_words(&steps[0].snapshot.stack), ["0x01"]);
         assert_eq!(steps[0].snapshot.memory.as_deref(), Some("aabb"));
         assert_eq!(steps[0].snapshot.storage["0x00"], "0x2a");
         assert_eq!(

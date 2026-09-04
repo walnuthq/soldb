@@ -596,7 +596,14 @@ mod tests {
         assert_eq!(step.depth, 1);
         assert_eq!(step.source, None);
         assert_eq!(step.function, None);
-        assert_eq!(step.snapshot.stack, ["0x80", "0x40"]);
+        assert_eq!(
+            step.snapshot
+                .stack
+                .iter()
+                .map(|word| &**word)
+                .collect::<Vec<_>>(),
+            ["0x80", "0x40"]
+        );
         assert_eq!(step.snapshot.memory.as_deref(), Some("aabb"));
         assert!(step.variables.is_empty());
 
@@ -728,7 +735,15 @@ mod tests {
 
         assert_eq!(trace.to_json().expect("json"), before);
         assert_eq!(trace.step_count(), count);
-        assert_eq!(step_at(&trace, 1).snapshot.stack, ["0x80", "0x40"]);
+        assert_eq!(
+            step_at(&trace, 1)
+                .snapshot
+                .stack
+                .iter()
+                .map(|word| &**word)
+                .collect::<Vec<_>>(),
+            ["0x80", "0x40"]
+        );
     }
 
     #[test]

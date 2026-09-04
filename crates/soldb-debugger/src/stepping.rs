@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use soldb_core::TransactionTrace;
+use soldb_core::{TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{
     function_selector, EthdebugInfo, FunctionExit, SourceLocation, StorageLayout,
 };
@@ -1030,7 +1030,7 @@ impl StepMap {
     /// through a dispatcher wrapper that has not decoded them yet. See
     /// [`StepMap::argument_layout`].
     #[must_use]
-    pub fn frame_arguments(&self, frame: &Frame, entry_stack: &[String]) -> Vec<FrameArgument> {
+    pub fn frame_arguments(&self, frame: &Frame, entry_stack: &[StackWord]) -> Vec<FrameArgument> {
         let Some(info) = self.steps.get(frame.entry_step) else {
             return Vec::new();
         };
@@ -1460,7 +1460,7 @@ fn prove_argument_layouts(
 }
 
 /// What one frame's entry stack says, given the calldata that selected its function.
-fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[String]) -> Evidence {
+fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[StackWord]) -> Evidence {
     let count = function.params.len();
     if count == 0 || stack.len() < count {
         return Evidence::Unknown;
@@ -1574,6 +1574,8 @@ mod tests {
     use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
+    use soldb_core::Word as StackWord;
+
     use super::{
         address_from_word, normalize_address, ArgumentLayout, ArgumentOrder, ContractDebugInfo,
         JumpMarker, LineKey, StepMap,
@@ -1658,7 +1660,7 @@ contract C {
             gas: 0,
             gas_cost: 0,
             depth,
-            stack: stack.iter().map(|word| (*word).to_owned()).collect(),
+            stack: stack.iter().map(|word| StackWord::from(*word)).collect(),
             memory: None,
             storage: None,
             error: None,
@@ -1753,13 +1755,13 @@ contract P {
         )
     }
 
-    fn word_of(value: &str) -> String {
-        format!("0x{:0>64}", value.trim_start_matches("0x"))
+    fn word_of(value: &str) -> StackWord {
+        StackWord::from(format!("0x{:0>64}", value.trim_start_matches("0x")).as_str())
     }
 
     /// A call to `pay(to, amount)` that calls `total(to, amount)` internally, with the
     /// entry stacks the caller chooses, bottom-first as a backend reports them.
-    fn pay_trace(entry_stack: &[String], inner_stack: &[String]) -> TransactionTrace {
+    fn pay_trace(entry_stack: &[StackWord], inner_stack: &[StackWord]) -> TransactionTrace {
         let selector = soldb_ethdebug::function_selector("pay(address,uint256)").expect("selector");
         let calldata = format!(
             "0x{}{}{}",
@@ -1770,8 +1772,8 @@ contract P {
             &word_of(PAY_TO)[2..],
             &word_of(PAY_AMOUNT)[2..]
         );
-        fn borrow(stack: &[String]) -> Vec<&str> {
-            stack.iter().map(String::as_str).collect()
+        fn borrow(stack: &[StackWord]) -> Vec<&str> {
+            stack.iter().map(|word| &**word).collect()
         }
         let mut trace = trace(vec![
             step(0, 1, "PUSH1", &[]),
@@ -1870,12 +1872,8 @@ contract P {
             &amount[2..]
         );
         let stack = [word_of("2a"), amount.clone()];
-        trace.steps[2].snapshot = StepSnapshot::new(
-            stack.iter().map(String::to_owned).collect(),
-            None,
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
+        trace.steps[2].snapshot =
+            StepSnapshot::new(stack.to_vec(), None, BTreeMap::new(), BTreeMap::new());
         let map = StepMap::new(&trace, vec![contract(None)]);
         assert_eq!(map.argument_layout(0), Some(ArgumentLayout::TopWords));
         let frames = map.frames(3);

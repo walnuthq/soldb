@@ -33,6 +33,156 @@ pub struct CompilerConfig {
     pub build_dir: PathBuf,
     pub ethdebug_flags: Vec<String>,
     pub production_flags: Vec<String>,
+    /// How imports resolve: the project root, its library directories, and its
+    /// remappings. Empty means solc's own defaults, which only reach the source file's
+    /// own directory.
+    #[serde(default)]
+    pub project: ProjectLayout,
+}
+
+/// Where a contract's imports come from.
+///
+/// A contract in a real project imports across directories — `../../token/ERC20.sol`,
+/// `forge-std/Test.sol`, `@openzeppelin/contracts/…` — and solc resolves none of that
+/// without being told the project root, the library directories, and the remappings.
+/// [`ProjectLayout::detect`] reads them from the project itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectLayout {
+    /// solc's `--base-path`: the directory relative imports resolve against.
+    pub base_path: Option<PathBuf>,
+    /// solc's `--include-path`: where non-relative imports are looked up.
+    pub include_paths: Vec<PathBuf>,
+    /// Remappings as solc takes them on the command line, `prefix=target`.
+    pub remappings: Vec<String>,
+}
+
+impl ProjectLayout {
+    /// The layout of the project `contract_file` belongs to, found by walking up to the
+    /// nearest directory holding a `foundry.toml`, `remappings.txt`, or `lib/`.
+    ///
+    /// Returns an empty layout when the file is not in a project, which leaves solc's own
+    /// behavior untouched.
+    #[must_use]
+    pub fn detect(contract_file: &Path) -> Self {
+        let Some(root) = project_root(contract_file) else {
+            return Self::default();
+        };
+        let mut include_paths = Vec::new();
+        for name in ["lib", "node_modules"] {
+            let path = root.join(name);
+            if path.is_dir() {
+                include_paths.push(path);
+            }
+        }
+        Self {
+            remappings: read_remappings(&root),
+            base_path: Some(root),
+            include_paths,
+        }
+    }
+
+    /// Whether anything was found.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.base_path.is_none() && self.include_paths.is_empty() && self.remappings.is_empty()
+    }
+
+    /// The solc arguments this layout adds, in the order solc expects them.
+    #[must_use]
+    pub fn solc_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(base_path) = &self.base_path {
+            args.push("--base-path".to_owned());
+            args.push(base_path.display().to_string());
+            // Imports written as absolute paths, and sources given as absolute paths, are
+            // outside the base path; allow the project itself.
+            args.push("--allow-paths".to_owned());
+            args.push(base_path.display().to_string());
+        }
+        for include_path in &self.include_paths {
+            args.push("--include-path".to_owned());
+            args.push(include_path.display().to_string());
+        }
+        // Remappings are positional arguments to solc, not options.
+        args.extend(self.remappings.iter().cloned());
+        args
+    }
+}
+
+/// The nearest ancestor of `contract_file` that looks like a project root.
+fn project_root(contract_file: &Path) -> Option<PathBuf> {
+    let absolute = contract_file
+        .canonicalize()
+        .unwrap_or_else(|_| contract_file.to_path_buf());
+    let mut directory = absolute.parent()?;
+    loop {
+        let marked = ["foundry.toml", "remappings.txt", "hardhat.config.js"]
+            .iter()
+            .any(|name| directory.join(name).is_file())
+            || directory.join("lib").is_dir();
+        if marked {
+            return Some(directory.to_path_buf());
+        }
+        directory = directory.parent()?;
+    }
+}
+
+/// The project's `remappings.txt`, one `prefix=target` per line, and the `remappings`
+/// array of its `foundry.toml`. Targets stay as written: solc resolves them against the
+/// base path, which is the same directory they are written relative to.
+fn read_remappings(root: &Path) -> Vec<String> {
+    let mut remappings = Vec::new();
+    if let Ok(text) = fs::read_to_string(root.join("remappings.txt")) {
+        remappings.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#') && line.contains('='))
+                .map(str::to_owned),
+        );
+    }
+    if let Ok(text) = fs::read_to_string(root.join("foundry.toml")) {
+        remappings.extend(foundry_remappings(&text));
+    }
+    remappings.sort();
+    remappings.dedup();
+    remappings
+}
+
+/// The `remappings = [...]` entries of a `foundry.toml`, read without a TOML parser: the
+/// array is a list of quoted `prefix=target` strings, and anything else is ignored.
+fn foundry_remappings(text: &str) -> Vec<String> {
+    let mut remappings = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if !inside {
+            let Some(rest) = line.strip_prefix("remappings") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            inside = true;
+            remappings.extend(quoted_remappings(rest));
+            if rest.contains(']') {
+                inside = false;
+            }
+            continue;
+        }
+        remappings.extend(quoted_remappings(line));
+        if line.contains(']') {
+            inside = false;
+        }
+    }
+    remappings
+}
+
+fn quoted_remappings(line: &str) -> Vec<String> {
+    line.split(['"', '\''])
+        .map(str::trim)
+        .filter(|entry| entry.contains('=') && !entry.starts_with('['))
+        .map(str::to_owned)
+        .collect()
 }
 
 impl Default for CompilerConfig {
@@ -42,6 +192,7 @@ impl Default for CompilerConfig {
             debug_output_dir: PathBuf::from("./out"),
             contracts_dir: PathBuf::from("./contracts"),
             build_dir: PathBuf::from("./build"),
+            project: ProjectLayout::default(),
             ethdebug_flags: vec![
                 "--via-ir".to_owned(),
                 "--debug-info".to_owned(),
@@ -112,6 +263,7 @@ impl CompilerConfig {
         match run_solc(
             &self.solc_path,
             &self.ethdebug_flags,
+            &self.project,
             contract_file.as_ref(),
             output_dir,
         ) {
@@ -123,6 +275,7 @@ impl CompilerConfig {
                 run_solc(
                     &self.solc_path,
                     &modern_flags,
+                    &self.project,
                     contract_file.as_ref(),
                     output_dir,
                 )
@@ -147,6 +300,7 @@ impl CompilerConfig {
         run_solc(
             &self.solc_path,
             &self.production_flags,
+            &self.project,
             contract_file.as_ref(),
             output_dir,
         )
@@ -391,6 +545,7 @@ pub fn auto_deploy(config: &AutoDeployConfig) -> SoldbResult<AutoDeployResult> {
 fn run_solc(
     solc_path: &str,
     flags: &[String],
+    project: &ProjectLayout,
     contract_file: &Path,
     output_dir: &Path,
 ) -> SoldbResult<CompilationResult> {
@@ -403,6 +558,7 @@ fn run_solc(
 
     let mut command = Command::new(solc_path);
     command.args(flags);
+    command.args(project.solc_args());
     command.arg("-o").arg(output_dir).arg(contract_file);
     let output = command.output().map_err(|error| {
         SoldbError::Message(format!(

@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
+use soldb_core::{StepSnapshot, TraceStep, TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
 pub mod condition;
@@ -394,7 +394,7 @@ impl ArgumentOrder {
 #[must_use]
 pub fn decode_arguments(
     params: &[SourceParam],
-    stack: &[String],
+    stack: &[StackWord],
     layout: ArgumentLayout,
 ) -> Vec<FrameArgument> {
     if params.is_empty() || stack.len() < params.len() {
@@ -813,7 +813,14 @@ mod tests {
         let step = session.step(0).expect("debug step");
         assert_eq!(step.source.as_ref().expect("source").line, 3);
         assert_eq!(step.function.as_ref().expect("function").name, "set");
-        assert_eq!(step.snapshot.stack, ["0x2a"]);
+        assert_eq!(
+            step.snapshot
+                .stack
+                .iter()
+                .map(|word| &**word)
+                .collect::<Vec<_>>(),
+            ["0x2a"]
+        );
         assert_eq!(step.variables[0].name, "x");
         assert_eq!(step.variables[0].value.display, "42");
         assert_eq!(step.variables[0].value.status, DebugValueStatus::Decoded);
@@ -966,7 +973,7 @@ mod tests {
                 gas: 1,
                 gas_cost: 0,
                 depth: 0,
-                stack: vec!["0x2a".to_owned()],
+                stack: vec!["0x2a".into()],
                 memory: Some(format!("{}{}", "00".repeat(32), "2a".repeat(32))),
                 storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                 error: None,

@@ -546,9 +546,17 @@ Beyond the rule:
 ## Notes
 
 - **Trace steps are the hot loop.** A mainnet transaction is easily hundreds of thousands
-  of `TraceStep`s, each carrying a stack `Vec<String>` and all of memory as a hex string.
+  of `TraceStep`s, each carrying a dozen stack words and all of memory as a hex string.
   Avoid per-step `clone()`, `format!`, and `String`-keyed map lookups in anything that
   walks the full trace; borrow, and hoist allocation out of the loop.
+- **Stack words are shared, not copied.** A stack word is a `soldb_core::Word`
+  (`Arc<str>`), handed out by a `WordInterner`: the replay inspector interns as it
+  records and the trace-file visitor interns as it parses, so the same value costs one
+  allocation for the whole trace rather than one per occurrence. A 614,000-step trace of
+  one loop holds 1.7 million stack words drawn from about 1,200 distinct ones, and
+  interning them took it from 543 MB to 361 MB. Keep new step-building paths interning;
+  the remaining per-step cost is the `Vec` itself and `TraceStep::op`, which is still a
+  `String` per step.
 - **Read a step's state with `TraceStep::snapshot_ref`, never `normalized_snapshot`.**
   The borrowed view costs nothing; the owned one copies the stack, all of memory, and the
   storage map. Reach for `normalized_snapshot` only where ownership is genuinely required.

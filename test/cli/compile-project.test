@@ -1,0 +1,23 @@
+# `soldb compile` resolves imports the way the contract's project does: a relative import
+# that leaves the source's own directory, and a remapped one, both of which solc refuses
+# without being told the project root and the remappings.
+# REQUIRES: soldb
+# RUN: rm -rf %t.project %t.out && mkdir -p %t.project/src/token %t.project/lib/dep
+# RUN: printf '// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\ncontract Base { uint256 public total; }\n' > %t.project/src/Base.sol
+# RUN: printf '// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nlibrary Dep { function one() internal pure returns (uint256) { return 1; } }\n' > %t.project/lib/dep/Dep.sol
+# RUN: printf '// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\nimport {Base} from "../Base.sol";\nimport {Dep} from "dep/Dep.sol";\ncontract Token is Base { function bump() public { total += Dep.one(); } }\n' > %t.project/src/token/Token.sol
+# RUN: printf 'dep/=lib/dep/\n' > %t.project/remappings.txt
+# RUN: %soldb compile %t.project/src/token/Token.sol -o %t.out --solc %{solc_path} 2>&1 | FileCheck %s
+
+# The root and the remappings it found are printed, because a wrong root is the difference
+# between a contract that compiles and one that does not.
+# CHECK: Project root: {{.*}}.project
+# CHECK: Remappings: dep/=lib/dep/
+# CHECK: ETHDebug compilation successful
+# CHECK-DAG: Contract: Token
+# CHECK-DAG: Contract: Base
+
+# Without the project, solc sees only the source's own directory and says so.
+# RUN: not %soldb compile %t.project/src/token/Token.sol -o %t.out --no-project --solc %{solc_path} 2>&1 | FileCheck --check-prefix=NOPROJECT %s
+
+# NOPROJECT: not found

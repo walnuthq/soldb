@@ -742,7 +742,12 @@ impl DapServer {
                     .parse::<usize>()
                     .ok();
                 index
-                    .and_then(|index| step.snapshot_ref().stack.get(index).cloned())
+                    .and_then(|index| {
+                        step.snapshot_ref()
+                            .stack
+                            .get(index)
+                            .map(|word| word.to_string())
+                    })
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
             expression if expression.starts_with("storage[") && expression.ends_with(']') => {
@@ -1307,7 +1312,7 @@ mod tests {
                     gas: 100,
                     gas_cost: 1,
                     depth: 0,
-                    stack: vec!["0x2a".to_owned()],
+                    stack: vec!["0x2a".into()],
                     memory: Some("aa".to_owned()),
                     storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                     error: None,

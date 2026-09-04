@@ -310,10 +310,10 @@ pub struct DebuggerState {
     trace: Option<TransactionTrace>,
     step_map: Option<StepMap>,
     storage_tape: Option<StorageTape>,
-    /// Why a breakpoint condition could not be evaluated, kept until a frontend reports
-    /// it. A condition that never fires because it cannot be read is a silent trap
+    /// Something the frontend should tell the user, kept until it does: a breakpoint that
+    /// cannot be hit, or a condition that could not be evaluated. Both are silent traps
     /// otherwise.
-    condition_note: RefCell<Option<String>>,
+    note: RefCell<Option<String>>,
 }
 
 impl Default for DebuggerState {
@@ -326,7 +326,7 @@ impl Default for DebuggerState {
             trace: None,
             step_map: None,
             storage_tape: None,
-            condition_note: RefCell::new(None),
+            note: RefCell::new(None),
         }
     }
 }
@@ -649,7 +649,20 @@ impl DebuggerState {
             Err(message) => return StepOutcome::BreakpointError(message),
         };
         match self.resolve_target(target) {
-            Ok(kind) => self.add_breakpoint(kind, condition),
+            Ok(kind) => {
+                if !self.matches_any_step(&kind) {
+                    let label = Breakpoint {
+                        id: 0,
+                        kind: kind.clone(),
+                        condition: None,
+                    }
+                    .label();
+                    self.push_note(format!(
+                        "no step of this trace reaches {label}, so this breakpoint cannot be hit"
+                    ));
+                }
+                self.add_breakpoint(kind, condition)
+            }
             Err(message) => StepOutcome::BreakpointError(message),
         }
     }
@@ -764,42 +777,9 @@ impl DebuggerState {
     #[must_use]
     pub fn breakpoint_hit(&self, step: usize) -> Option<Breakpoint> {
         let trace_step = self.trace.as_ref()?.steps.get(step)?;
-        let map = self.step_map.as_ref();
         self.breakpoints
             .iter()
-            .filter(|breakpoint| match &breakpoint.kind {
-                BreakpointKind::Pc(pc) => trace_step.pc == *pc,
-                BreakpointKind::Line(lines) => map.is_some_and(|map| {
-                    map.is_line_start(step)
-                        && map
-                            .line_key(step)
-                            .is_some_and(|key| lines.iter().any(|line| line.key == key))
-                }),
-                BreakpointKind::Function(functions) => map.is_some_and(|map| {
-                    map.is_frame_entry(step)
-                        && map
-                            .function_id(step)
-                            .is_some_and(|id| functions.iter().any(|function| function.id == id))
-                }),
-                BreakpointKind::Storage(slot) => {
-                    trace_step.op == "SSTORE"
-                        && trace_step
-                            .snapshot_ref()
-                            .stack
-                            .last()
-                            .and_then(|word| normalize_slot(word))
-                            .is_some_and(|written| written == *slot)
-                }
-                BreakpointKind::Revert => trace_step.op == "REVERT" || trace_step.error.is_some(),
-                BreakpointKind::Call(address) => {
-                    let target = call_target(trace_step);
-                    match address {
-                        Some(address) => target.as_deref() == Some(address.as_str()),
-                        None => target.is_some() || is_call_opcode(&trace_step.op),
-                    }
-                }
-                BreakpointKind::Opcode(mnemonic) => trace_step.op.eq_ignore_ascii_case(mnemonic),
-            })
+            .filter(|breakpoint| self.kind_matches(&breakpoint.kind, step, trace_step))
             // A condition is checked only where the target matched, so the cost falls on
             // the handful of steps that got that far, not on every step passed through.
             .find(|breakpoint| match &breakpoint.condition {
@@ -811,10 +791,66 @@ impl DebuggerState {
             .cloned()
     }
 
+    /// Whether a breakpoint's target matches this step, before any condition.
+    fn kind_matches(&self, kind: &BreakpointKind, step: usize, trace_step: &TraceStep) -> bool {
+        let map = self.step_map.as_ref();
+        match kind {
+            BreakpointKind::Pc(pc) => trace_step.pc == *pc,
+            BreakpointKind::Line(lines) => map.is_some_and(|map| {
+                map.is_line_start(step)
+                    && map
+                        .line_key(step)
+                        .is_some_and(|key| lines.iter().any(|line| line.key == key))
+            }),
+            BreakpointKind::Function(functions) => map.is_some_and(|map| {
+                map.is_frame_entry(step)
+                    && map
+                        .function_id(step)
+                        .is_some_and(|id| functions.iter().any(|function| function.id == id))
+            }),
+            BreakpointKind::Storage(slot) => {
+                trace_step.op == "SSTORE"
+                    && trace_step
+                        .snapshot_ref()
+                        .stack
+                        .last()
+                        .and_then(|word| normalize_slot(word))
+                        .is_some_and(|written| written == *slot)
+            }
+            BreakpointKind::Revert => trace_step.op == "REVERT" || trace_step.error.is_some(),
+            BreakpointKind::Call(address) => {
+                let target = call_target(trace_step);
+                match address {
+                    Some(address) => target.as_deref() == Some(address.as_str()),
+                    None => target.is_some() || is_call_opcode(&trace_step.op),
+                }
+            }
+            BreakpointKind::Opcode(mnemonic) => trace_step.op.eq_ignore_ascii_case(mnemonic),
+        }
+    }
+
+    /// Whether any step of the loaded trace matches this target.
+    ///
+    /// A trace is a finished recording, so a breakpoint that matches nothing in it will
+    /// never fire, and saying that when it is set beats leaving the user to wonder why
+    /// `continue` ran to the end. It happens for real reasons: a line that this
+    /// transaction did not execute, and a function of a base contract, whose code solc
+    /// currently attributes to the deriving contract's own file.
+    fn matches_any_step(&self, kind: &BreakpointKind) -> bool {
+        let Some(trace) = &self.trace else {
+            return true;
+        };
+        trace
+            .steps
+            .iter()
+            .enumerate()
+            .any(|(step, trace_step)| self.kind_matches(kind, step, trace_step))
+    }
+
     /// Evaluates a breakpoint condition at `step`.
     ///
     /// A condition that cannot be read there — an untouched slot, an unknown name — does
-    /// not stop, and the reason is kept for [`DebuggerState::take_condition_note`].
+    /// not stop, and the reason is kept for [`DebuggerState::take_note`].
     #[must_use]
     pub fn evaluate_condition(&self, condition: &Condition, step: usize) -> Evaluation {
         let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
@@ -832,22 +868,27 @@ impl DebuggerState {
         let context = ConditionContext::new(map, step, trace_step, words).with_frame(frame);
         let outcome = condition.evaluate(&context);
         if let Evaluation::Unavailable(reason) = &outcome {
-            let mut note = self.condition_note.borrow_mut();
-            if note.is_none() {
-                *note = Some(format!(
-                    "`{}` could not be evaluated: {reason}",
-                    condition.text()
-                ));
-            }
+            self.push_note(format!(
+                "`{}` could not be evaluated: {reason}",
+                condition.text()
+            ));
         }
         outcome
     }
 
-    /// Takes the first reason a breakpoint condition could not be evaluated since the
-    /// last call, so a frontend can say why a conditional breakpoint never fired.
+    /// Records something for the frontend to report, keeping the first of several.
+    fn push_note(&self, note: String) {
+        let mut slot = self.note.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(note);
+        }
+    }
+
+    /// Takes what the frontend should tell the user since the last call: a breakpoint that
+    /// cannot be hit, or a condition that could not be evaluated.
     #[must_use]
-    pub fn take_condition_note(&self) -> Option<String> {
-        self.condition_note.borrow_mut().take()
+    pub fn take_note(&self) -> Option<String> {
+        self.note.borrow_mut().take()
     }
 
     /// The call structure at any step, with each frame's arguments.
@@ -1578,7 +1619,7 @@ mod tests {
             state.continue_execution(),
             StepOutcome::AtEnd { .. }
         ));
-        assert_eq!(state.take_condition_note(), None);
+        assert_eq!(state.take_note(), None);
 
         // `&&` and `||`, and a bare value.
         state.goto_step(0);
@@ -1610,12 +1651,12 @@ mod tests {
             state.continue_execution(),
             StepOutcome::AtEnd { .. }
         ));
-        let note = state.take_condition_note().expect("a reason");
+        let note = state.take_note().expect("a reason");
         assert!(
             note.contains("`counter > 1` could not be evaluated"),
             "{note}"
         );
-        assert_eq!(state.take_condition_note(), None, "the note is taken once");
+        assert_eq!(state.take_note(), None, "the note is taken once");
 
         // A condition that does not parse is refused when the breakpoint is set.
         assert!(matches!(
@@ -1773,7 +1814,7 @@ contract C {
         let mut trace = sample_trace();
         trace.steps = pcs.iter().map(|pc| step(*pc, "JUMPDEST", 0, &[])).collect();
         trace.steps[6].op = "SSTORE".to_owned();
-        trace.steps[6].stack = vec!["0x2a".to_owned(), "0x5".to_owned()];
+        trace.steps[6].stack = vec!["0x2a".into(), "0x5".into()];
         let mut state = DebuggerState::new();
         state.load_trace(trace);
         state.attach_debug_info(vec![contract]);
@@ -1986,7 +2027,10 @@ contract C {
             gas,
             gas_cost: 1,
             depth: 1,
-            stack: stack.iter().map(|word| (*word).to_owned()).collect(),
+            stack: stack
+                .iter()
+                .map(|word| soldb_core::Word::from(*word))
+                .collect(),
             memory: None,
             storage: Some(BTreeMap::new()),
             error: None,

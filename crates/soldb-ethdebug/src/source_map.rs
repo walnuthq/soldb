@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use revm_bytecode::OpCode;
 use serde::{Deserialize, Serialize};
@@ -510,19 +510,7 @@ fn source_code(
 }
 
 fn read_source(root: &Path, source_path: &str) -> SoldbResult<Option<String>> {
-    let source_path = Path::new(source_path);
-    let mut candidates = Vec::<PathBuf>::new();
-    if source_path.is_absolute() {
-        candidates.push(source_path.to_path_buf());
-    } else {
-        candidates.push(root.join(source_path));
-        if let Some(parent) = root.parent() {
-            candidates.push(parent.join(source_path));
-        }
-        candidates.push(source_path.to_path_buf());
-    }
-
-    for candidate in candidates {
+    for candidate in crate::artifacts::source_candidates(root, source_path) {
         if candidate.exists() {
             return fs::read_to_string(&candidate).map(Some).map_err(|error| {
                 SoldbError::Message(format!(

@@ -58,7 +58,7 @@ pub struct TraceStep {
     pub gas_cost: u64,
     pub depth: u64,
     /// Legacy layout; empty unless a caller filled it by hand. See the type docs.
-    pub stack: Vec<String>,
+    pub stack: Vec<Word>,
     /// Legacy layout; `None` unless a caller filled it by hand. See the type docs.
     pub memory: Option<String>,
     /// Legacy layout; `None` unless a caller filled it by hand. See the type docs.
@@ -213,7 +213,7 @@ impl<'de> Deserialize<'de> for TraceStep {
             gas: repr.gas,
             gas_cost: repr.gas_cost,
             depth: repr.depth,
-            stack: repr.stack,
+            stack: repr.stack.into_iter().map(Arc::from).collect(),
             memory: repr.memory,
             storage: repr.storage,
             error: repr.error,
@@ -223,13 +223,68 @@ impl<'de> Deserialize<'de> for TraceStep {
     }
 }
 
+/// One machine word as a backend spelled it, shared between the steps that hold it.
+///
+/// A trace of hundreds of thousands of steps carries a stack of a dozen words at every
+/// one of them, and the same handful of values — a jump target, a length, a small
+/// constant — appear over and over: a 600,000-step trace of one loop holds 1.7 million
+/// stack words drawn from about 1,200 distinct ones. Holding each as its own `String`
+/// costs a heap allocation per occurrence; holding a shared pointer costs one per
+/// distinct value. [`WordInterner`] is what produces the sharing.
+pub type Word = Arc<str>;
+
+/// Hands out one [`Word`] per distinct value, so repeated stack words are stored once.
+///
+/// One interner covers one trace being built or parsed; it is dropped with the loop that
+/// filled it, and the words it handed out live as long as the steps holding them.
+#[derive(Debug, Default)]
+pub struct WordInterner {
+    words: std::collections::HashMap<Word, Word>,
+}
+
+impl WordInterner {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The shared word equal to `word`, interning it the first time it is seen.
+    #[must_use]
+    pub fn intern(&mut self, word: &str) -> Word {
+        if let Some(shared) = self.words.get(word) {
+            return Arc::clone(shared);
+        }
+        let shared: Word = Arc::from(word);
+        self.words.insert(Arc::clone(&shared), Arc::clone(&shared));
+        shared
+    }
+
+    /// Interns a whole stack, in place.
+    pub fn intern_stack(&mut self, stack: &mut [Word]) {
+        for word in stack {
+            *word = self.intern(word);
+        }
+    }
+
+    /// How many distinct words have been interned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+}
+
 /// A borrowed view of one step's captured machine state.
 ///
 /// Serializes identically to [`StepSnapshot`], so it can stand in wherever a snapshot is
 /// written out. Produced by [`TraceStep::snapshot_ref`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StepSnapshotRef<'a> {
-    pub stack: &'a [String],
+    pub stack: &'a [Word],
     pub memory: Option<&'a str>,
     pub storage: &'a BTreeMap<String, String>,
     pub storage_diff: &'a BTreeMap<String, StorageChange>,
@@ -257,7 +312,7 @@ impl StepSnapshotRef<'_> {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(from = "StepSnapshotRepr")]
 pub struct StepSnapshot {
-    pub stack: Vec<String>,
+    pub stack: Vec<Word>,
     /// Memory as one unprefixed hex string.
     pub memory: Option<Arc<str>>,
     pub storage: Arc<BTreeMap<String, String>>,
@@ -268,7 +323,7 @@ impl StepSnapshot {
     /// A snapshot that owns its values, for a backend or a test building one from parts.
     #[must_use]
     pub fn new(
-        stack: Vec<String>,
+        stack: Vec<Word>,
         memory: Option<String>,
         storage: BTreeMap<String, String>,
         storage_diff: BTreeMap<String, StorageChange>,
@@ -304,7 +359,7 @@ impl Serialize for StepSnapshot {
 #[derive(Deserialize, Default)]
 struct StepSnapshotRepr {
     #[serde(default)]
-    stack: Vec<String>,
+    stack: Vec<Word>,
     #[serde(default)]
     memory: Option<String>,
     #[serde(default)]
@@ -407,10 +462,14 @@ fn deserialize_shared_steps<'de, D: Deserializer<'de>>(
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
             let mut steps = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            let mut words = WordInterner::new();
             while let Some(mut step) = seq.next_element::<TraceStep>()? {
                 if let Some(previous) = steps.last() {
                     share_snapshot(previous, &mut step);
                 }
+                // The stack words a file repeats are stored once, as they are when a
+                // backend builds the steps itself.
+                words.intern_stack(&mut step.snapshot.stack);
                 steps.push(step);
             }
             Ok(steps)
@@ -588,6 +647,62 @@ pub struct FunctionCall {
 
 #[cfg(test)]
 mod tests {
+    /// Borrows a stack as plain strings, for comparing in assertions.
+
+    #[test]
+    fn repeated_stack_words_are_stored_once() {
+        let mut words = super::WordInterner::new();
+        assert!(words.is_empty());
+        let first = words.intern("0x2a");
+        let again = words.intern("0x2a");
+        let other = words.intern("0x1");
+        assert_eq!(words.len(), 2);
+        assert_eq!(&*first, "0x2a");
+        // The same value is the same allocation, which is the whole point: a trace of a
+        // few hundred thousand steps repeats a few thousand distinct words millions of
+        // times.
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let mut stack = vec![Arc::from("0x2a"), Arc::from("0x2a"), Arc::from("0x1")];
+        words.intern_stack(&mut stack);
+        assert!(Arc::ptr_eq(&stack[0], &stack[1]));
+        assert!(Arc::ptr_eq(&stack[0], &first));
+        assert_eq!(words.len(), 2, "nothing new was seen");
+    }
+
+    #[test]
+    fn a_parsed_trace_shares_its_repeated_stack_words() {
+        // Two steps holding the same words: reading them back leaves one copy of each.
+        let document = serde_json::json!({
+            "tx_hash": "0xabc",
+            "from_addr": "0x1",
+            "to_addr": "0x2",
+            "value": "0x0",
+            "input_data": "0x",
+            "gas_used": 0,
+            "output": "0x",
+            "success": true,
+            "debug_trace_available": true,
+            "steps": [
+                {"pc": 0, "op": "PUSH1", "gas": 1, "gas_cost": 1, "depth": 1,
+                 "stack": ["0x2a", "0x1"]},
+                {"pc": 2, "op": "ADD", "gas": 0, "gas_cost": 1, "depth": 1,
+                 "stack": ["0x2a", "0x1"]}
+            ]
+        })
+        .to_string();
+        let trace: TransactionTrace = serde_json::from_str(&document).expect("trace");
+        let first = &trace.steps[0].snapshot.stack;
+        let second = &trace.steps[1].snapshot.stack;
+        assert_eq!(words(first), ["0x2a", "0x1"]);
+        assert!(Arc::ptr_eq(&first[0], &second[0]));
+        assert!(Arc::ptr_eq(&first[1], &second[1]));
+    }
+    fn words(stack: &[super::Word]) -> Vec<&str> {
+        stack.iter().map(|word| &**word).collect()
+    }
+
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -603,7 +718,7 @@ mod tests {
             gas: 100,
             gas_cost: 5,
             depth: 1,
-            stack: vec!["0x01".to_owned(), "0x02".to_owned()],
+            stack: vec![Arc::from("0x01"), Arc::from("0x02")],
             memory: Some("aabb".to_owned()),
             storage: Some(BTreeMap::from([("0x00".to_owned(), "0x2a".to_owned())])),
             error: None,
@@ -619,7 +734,7 @@ mod tests {
         // the web JSON document writes a snapshot per step.
         let flat = step_with(StepSnapshot::default());
         let populated = step_with(StepSnapshot::new(
-            vec!["0x09".to_owned()],
+            vec![Arc::from("0x09")],
             Some("ccdd".to_owned()),
             BTreeMap::from([("0x01".to_owned(), "0x63".to_owned())]),
             BTreeMap::from([(
@@ -643,12 +758,12 @@ mod tests {
         }
 
         // The flat shape falls back to the top-level fields and reports no storage diff.
-        assert_eq!(flat.snapshot_ref().stack, ["0x01", "0x02"]);
+        assert_eq!(words(flat.snapshot_ref().stack), ["0x01", "0x02"]);
         assert_eq!(flat.snapshot_ref().memory, Some("aabb"));
         assert!(flat.snapshot_ref().storage_diff.is_empty());
 
         // A populated snapshot wins over the flat fields.
-        assert_eq!(populated.snapshot_ref().stack, ["0x09"]);
+        assert_eq!(words(populated.snapshot_ref().stack), ["0x09"]);
         assert_eq!(populated.snapshot_ref().memory, Some("ccdd"));
         assert_eq!(populated.snapshot_ref().storage_diff.len(), 1);
     }
@@ -665,7 +780,7 @@ mod tests {
             1,
             None,
             StepSnapshot::new(
-                vec!["0x01".to_owned()],
+                vec![Arc::from("0x01")],
                 Some("aabb".to_owned()),
                 BTreeMap::from([("0x00".to_owned(), "0x2a".to_owned())]),
                 BTreeMap::new(),
@@ -699,7 +814,7 @@ mod tests {
             r#"{"pc":1,"op":"ADD","gas":9,"gas_cost":3,"depth":1,"stack":["0x1"],"memory":"cc","storage":{"0x0":"0x1"},"error":null}"#,
         )
         .expect("legacy step");
-        assert_eq!(legacy.snapshot_ref().stack, ["0x1"]);
+        assert_eq!(words(legacy.snapshot_ref().stack), ["0x1"]);
         assert_eq!(legacy.snapshot_ref().memory, Some("cc"));
         assert_eq!(legacy.snapshot_ref().storage["0x0"], "0x1");
         assert!(legacy.stack.is_empty());
@@ -734,7 +849,7 @@ mod tests {
             gas: 9,
             gas_cost: 3,
             depth: 1,
-            stack: vec!["0x1".to_owned()],
+            stack: vec![Arc::from("0x1")],
             memory: Some("cc".to_owned()),
             storage: Some(BTreeMap::from([("0x0".to_owned(), "0x1".to_owned())])),
             error: None,

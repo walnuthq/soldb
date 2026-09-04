@@ -42,6 +42,18 @@ Compile your contracts with ETHDebug (Solidity 0.8.29+):
 solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime --bin --abi --overwrite -o out examples/Counter.sol
 ```
 
+Or let SolDB drive the compiler, which also asks for the storage layout the debugger
+reads state variables from:
+```bash
+soldb compile src/Token.sol -o out
+```
+
+Inside a project it resolves imports the way the project does: the nearest directory
+holding a `foundry.toml`, a `remappings.txt`, or a `lib/` is the base path, `lib` and
+`node_modules` are searched for non-relative imports, and the project's remappings are
+applied. It prints what it found, and `--base-path`, `--include-path`, `--remapping`, and
+`--no-project` override it.
+
 Legacy source maps are also accepted: SolDB reads `combined.json` when ETHDebug
 programs are absent, so contracts built by pre-ETHDebug compilers still debug by
 source line, function, and frame.

@@ -33,6 +33,9 @@ pub struct DebugProgram {
     pub legacy: bool,
     /// The contract's storage layout, when it was compiled with `--storage-layout`.
     pub storage_layout: Option<StorageLayout>,
+    /// Sources the artifact names that could not be read, so a frontend can say why its
+    /// lines are missing instead of degrading to an opcode view without a word.
+    pub missing_sources: Vec<String>,
 }
 
 /// The global ETHDebug resource file in `root`, under either of its names.
@@ -117,21 +120,34 @@ pub fn contract_name_from_program_path(
 /// directory, to that directory's parent, and as given.
 #[must_use]
 pub fn read_debug_source(root: &Path, source_path: &str) -> Option<String> {
-    let source = Path::new(source_path);
-    let mut candidates = Vec::new();
-    if source.is_absolute() {
-        candidates.push(source.to_path_buf());
-    } else {
-        candidates.push(root.join(source));
-        if let Some(parent) = root.parent() {
-            candidates.push(parent.join(source));
-        }
-        candidates.push(source.to_path_buf());
-    }
-
-    candidates
+    source_candidates(root, source_path)
         .into_iter()
         .find_map(|candidate| fs::read_to_string(candidate).ok())
+}
+
+/// Where a source path recorded in an artifact might be on disk.
+///
+/// A compiler writes the path it was given, which is relative to the directory the
+/// compilation ran in — usually a project root, with the artifacts a few directories
+/// below it. So the artifact directory is tried first, then its ancestors, then the path
+/// as given, which resolves against the directory soldb runs in.
+pub fn source_candidates(root: &Path, source_path: &str) -> Vec<PathBuf> {
+    let source = Path::new(source_path);
+    if source.is_absolute() {
+        return vec![source.to_path_buf()];
+    }
+    let mut candidates = Vec::new();
+    let mut directory = Some(root);
+    // The project root is rarely more than a few directories above `out/`.
+    for _ in 0..4 {
+        let Some(current) = directory else {
+            break;
+        };
+        candidates.push(current.join(source));
+        directory = current.parent();
+    }
+    candidates.push(source.to_path_buf());
+    candidates
 }
 
 /// Parses a JSON file, naming the file in the error.
@@ -199,7 +215,7 @@ pub fn load_debug_program(
         };
         let info = EthdebugInfo::from_artifacts(&name, environment_name, &metadata, &program)
             .map_err(|error| SoldbError::Message(format!("{}: {error}", program_path.display())))?;
-        let source_contents = read_sources(root, &info, BTreeMap::new());
+        let (source_contents, missing_sources) = read_sources(root, &info, BTreeMap::new());
         let storage_layout = load_storage_layout(root, &info.contract_name)?;
         return Ok(Some(DebugProgram {
             info,
@@ -207,13 +223,15 @@ pub fn load_debug_program(
             source_contents,
             legacy: false,
             storage_layout,
+            missing_sources,
         }));
     }
 
     let Some(program) = load_source_map_program(root, contract_name, environment)? else {
         return Ok(None);
     };
-    let source_contents = read_sources(root, &program.info, program.source_contents);
+    let (source_contents, missing_sources) =
+        read_sources(root, &program.info, program.source_contents);
     let storage_layout = match program.storage_layout {
         Some(layout) => Some(layout),
         None => load_storage_layout(root, &program.info.contract_name)?,
@@ -224,6 +242,7 @@ pub fn load_debug_program(
         source_contents,
         legacy: true,
         storage_layout,
+        missing_sources,
     }))
 }
 
@@ -248,18 +267,22 @@ fn read_sources(
     root: &Path,
     info: &EthdebugInfo,
     mut source_contents: BTreeMap<u64, String>,
-) -> BTreeMap<u64, String> {
+) -> (BTreeMap<u64, String>, Vec<String>) {
+    let mut missing = Vec::new();
     for (source_id, source_path) in &info.sources {
         if source_contents.contains_key(source_id) {
             continue;
         }
-        if let Some(source) = read_compilation_source(&info.compilation, *source_id)
+        match read_compilation_source(&info.compilation, *source_id)
             .or_else(|| read_debug_source(root, source_path))
         {
-            source_contents.insert(*source_id, source);
+            Some(source) => {
+                source_contents.insert(*source_id, source);
+            }
+            None => missing.push(source_path.clone()),
         }
     }
-    source_contents
+    (source_contents, missing)
 }
 
 #[cfg(test)]

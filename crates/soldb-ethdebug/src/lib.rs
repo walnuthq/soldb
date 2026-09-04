@@ -32,7 +32,7 @@ pub use abi::{
 pub use artifacts::{
     contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
     find_program_ethdebug, load_debug_program, load_storage_layout, read_debug_source,
-    read_json_file, DebugProgram,
+    read_json_file, source_candidates, DebugProgram,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,

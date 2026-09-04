@@ -15,7 +15,7 @@ use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::Serialize;
 use soldb_core::{
     ContractCreation, ExecutionCall, SoldbResult, StepSnapshotRef, StorageChange, TraceArtifacts,
-    TraceCapabilities, TransactionTrace,
+    TraceCapabilities, TransactionTrace, Word,
 };
 use soldb_ethdebug::EthdebugInfo;
 
@@ -210,7 +210,7 @@ struct WebStep<'a> {
     op: &'a str,
     pc: u64,
     snapshot: WebSnapshot<'a>,
-    stack: &'a [String],
+    stack: &'a [Word],
     step: usize,
     #[serde(rename = "traceCallIndex")]
     trace_call_index: u64,
@@ -222,7 +222,7 @@ struct WebStep<'a> {
 #[derive(Debug, Serialize)]
 struct WebSnapshot<'a> {
     memory: Option<&'a str>,
-    stack: &'a [String],
+    stack: &'a [Word],
     storage: &'a BTreeMap<String, String>,
     storage_diff: WebStorageDiff<'a>,
 }
@@ -564,7 +564,7 @@ mod tests {
             storage: None,
             error: None,
             snapshot: soldb_core::StepSnapshot {
-                stack: vec!["0x02".to_owned(), "0x01".to_owned()],
+                stack: vec!["0x02".into(), "0x01".into()],
                 memory: Some("bb".into()),
                 storage: std::sync::Arc::new(BTreeMap::from([(
                     "0x01".to_owned(),
@@ -940,7 +940,7 @@ mod tests {
                 gas: 100,
                 gas_cost: 3,
                 depth: 0,
-                stack: vec!["0x01".to_owned()],
+                stack: vec!["0x01".into()],
                 memory: Some("aa".to_owned()),
                 storage: Some(BTreeMap::new()),
                 error: None,
