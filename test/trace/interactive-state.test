@@ -35,3 +35,24 @@
 # RUN: printf 'print counter\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck --check-prefix=NOCHAIN %s
 
 # NOCHAIN: uint256 counter = <unknown: slot 0x0 has not been read or written yet> [slot 0x0]
+
+# A breakpoint can carry a condition over the values the debugger can read: state
+# variables, the frame's arguments, and facts about the step. It is checked only where the
+# target already matched.
+# RUN: printf 'break TestContract.sol:44 if counter > 100000\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=NEVER %s
+
+# NEVER: Breakpoint #1 set at TestContract.sol:44 if counter > 100000
+# NEVER: End of trace at step {{[0-9]+}}
+# NEVER-NOT: Breakpoint #1 hit
+
+# RUN: printf 'break increment2 if amount == 4\ncontinue\nbt\nbreak TestContract.sol:44 if counter >= 4\ncontinue\nprint counter\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WHEN %s
+
+# WHEN: Breakpoint #1 set at function TestContract.increment2 at TestContract.sol:39 if amount == 4
+# WHEN: Breakpoint #1 hit at step {{[0-9]+}}, function TestContract.increment2 at TestContract.sol:39 if amount == 4
+# WHEN: #0  increment2(amount = 4) at TestContract.sol:39
+# WHEN: Breakpoint #2 hit at step {{[0-9]+}}, TestContract.sol:44 if counter >= 4
+
+# A condition that cannot be read does not stop, and says why instead of failing silently.
+# RUN: printf 'break TestContract.sol:44 if nosuch > 1\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=UNREADABLE %s
+
+# UNREADABLE: A breakpoint condition never held: `nosuch > 1` could not be evaluated: no state variable named `nosuch` in the storage layout

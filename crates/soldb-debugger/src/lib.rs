@@ -20,9 +20,11 @@ use serde::{Deserialize, Serialize};
 use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
+pub mod condition;
 pub mod state;
 pub mod stepping;
 
+pub use condition::{Condition, ConditionContext, Evaluation};
 pub use soldb_ethdebug::StorageLayout;
 pub use state::{
     short_hex, state_value, state_variables, ChainStorage, StateSource, StateVariable, StorageTape,

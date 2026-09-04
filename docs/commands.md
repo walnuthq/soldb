@@ -215,6 +215,50 @@ target is the given address.
 
 Stop at every execution of one opcode, for example `break op SSTORE` or `break op LOG1`.
 
+### `break <target> if <condition>`
+
+Stop at the target only when the condition holds there.
+
+```text
+soldb> break TestContract.sol:44 if counter >= 4
+Breakpoint #1 set at TestContract.sol:44 if counter >= 4
+soldb> continue
+Breakpoint #1 hit at step 354, TestContract.sol:44 if counter >= 4, PC 1714
+soldb> break increment2 if amount == 4
+soldb> break op SSTORE if depth == 1 && gas > 0
+```
+
+A condition compares values the debugger can read at that step:
+
+- state variables through the storage layout, including `balances[0xabc…]`,
+  `items[2]`, and `config.limit`;
+- the arguments of the frame being entered, by name, when the trace has proven them
+  (see [`backtrace`](#backtrace));
+- `pc`, `gas`, `depth`, and `step` as numbers, and `op` as text.
+
+Operands are those names, decimal or `0x` numbers, `true`, `false`, and quoted strings.
+Comparisons are `==`, `!=`, `<`, `<=`, `>`, and `>=`; a bare name holds when it is true or
+non-zero. Terms join with `&&` and `||`, which is as far as it goes: there is no
+arithmetic and no calls, because evaluating those would mean executing Solidity, and the
+debugger only reads the recording.
+
+Signed types compare as signed. A condition is checked only at steps the target already
+matched, so it costs nothing on the steps a movement passes through.
+
+A condition that cannot be read at all — a slot the transaction never touched, a name
+nothing defines — does not stop, and the debugger says why rather than leaving a
+breakpoint that silently never fires:
+
+```text
+soldb> break TestContract.sol:44 if nosuch > 1
+soldb> continue
+End of trace at step 1071
+A breakpoint condition never held: `nosuch > 1` could not be evaluated: no state variable named `nosuch` in the storage layout
+```
+
+The DAP server takes the editor's own breakpoint conditions through the same path, so a
+condition typed in an editor behaves exactly as one typed here.
+
 ### `clear <target>`
 
 Remove the breakpoint that was set with the same target: `clear 141`, `clear Counter.sol:7`,

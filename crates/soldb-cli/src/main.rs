@@ -1522,6 +1522,11 @@ fn run_interactive_debugger(
         }
 
         let command = DebuggerCommand::parse(&line);
+        let report_condition_note = |state: &DebuggerState| {
+            if let Some(note) = state.take_condition_note() {
+                println!("{} {note}", warning("A breakpoint condition never held:"));
+            }
+        };
         match command {
             DebuggerCommand::Empty => {}
             DebuggerCommand::Quit => {
@@ -1566,6 +1571,7 @@ fn run_interactive_debugger(
                 if let Some(outcome) = state.apply_command(command) {
                     print_step_outcome(&state, &outcome);
                 }
+                report_condition_note(&state);
             }
         }
     }
@@ -2165,6 +2171,9 @@ fn print_debugger_help(topic: Option<&str>) {
             println!("break revert - stop at a REVERT or a failing step");
             println!("break call [<address>] - stop at a call, to one address or to any");
             println!("break op <OPCODE> - stop at every execution of an opcode");
+            println!("break <target> if <condition> - stop there only when the condition holds,");
+            println!("    over state variables, the frame's arguments, and pc/gas/depth/op/step,");
+            println!("    compared with == != < <= > >= and joined with && or ||");
             println!("clear <target> - remove the breakpoint set with that target");
             println!("delete <n> - remove breakpoint number n");
         }
@@ -2192,6 +2201,7 @@ fn print_debugger_help(topic: Option<&str>) {
             );
             println!("Reverse:  reverse-next (rn), reverse-step (rs), reverse-nexti (back), reverse-finish (rfin), reverse-continue (rc)");
             println!("Break:    break <pc>|<file>:<line>|line <line>|<function>|storage <slot>|revert|call [<address>]|op <OPCODE>");
+            println!("          break <target> if <condition>, e.g. break line 30 if counter > 4");
             println!("          clear <target>, delete <n>, info breakpoints");
             println!("Inspect:  backtrace (bt), list (l), vars, print <variable>|<state>[<key>], stack, memory [offset [length]], storage, calldata");
             println!("Other:    info resources [--json], mode source|asm, help <command>, quit");

@@ -43,7 +43,7 @@ pub struct DapServer {
     source: Option<LoadedSource>,
     /// Line breakpoints by source file, as the editor last sent them. They are applied
     /// once a trace and its debug info are loaded, and re-applied after each launch.
-    pending_breakpoints: BTreeMap<String, Vec<u64>>,
+    pending_breakpoints: BTreeMap<String, Vec<SourceBreakpoint>>,
     pending_function_breakpoints: Vec<String>,
     /// The breakpoints each `setBreakpoints` source last produced, so the next request
     /// for that source replaces them, as the protocol requires.
@@ -52,6 +52,14 @@ pub struct DapServer {
     /// Whether the console note about inferred frame arguments has been sent.
     reported_frame_arguments: bool,
     terminated: bool,
+}
+
+/// A source breakpoint as the editor sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceBreakpoint {
+    line: u64,
+    /// The editor's condition, evaluated exactly as `break … if …` is.
+    condition: Option<String>,
 }
 
 /// The contract's debug info and the directory it came from, which the paths reported to
@@ -241,13 +249,26 @@ impl DapServer {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let source_key = source_key(args.get("source")).unwrap_or_else(|| "unknown".to_owned());
+        // The editor sends `condition` with a breakpoint; it is carried through as the
+        // debugger's own condition, so an editor's conditional breakpoint and the REPL's
+        // `break … if …` are the same thing.
         let lines = args
             .get("breakpoints")
             .and_then(Value::as_array)
             .map(|breakpoints| {
                 breakpoints
                     .iter()
-                    .filter_map(|breakpoint| breakpoint.get("line").and_then(Value::as_u64))
+                    .filter_map(|breakpoint| {
+                        Some(SourceBreakpoint {
+                            line: breakpoint.get("line").and_then(Value::as_u64)?,
+                            condition: breakpoint
+                                .get("condition")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|condition| !condition.is_empty())
+                                .map(str::to_owned),
+                        })
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -261,7 +282,7 @@ impl DapServer {
             // trace, and reported as set so the editor keeps them.
             lines
                 .into_iter()
-                .map(|line| json!({"verified": true, "line": line}))
+                .map(|breakpoint| json!({"verified": true, "line": breakpoint.line}))
                 .collect()
         };
         self.response(
@@ -302,7 +323,11 @@ impl DapServer {
 
     /// Replaces the line breakpoints of one source with `lines`, reporting each as the
     /// protocol wants: verified when it resolved, otherwise with the reason.
-    fn apply_line_breakpoints(&mut self, source_key: &str, lines: &[u64]) -> Vec<Value> {
+    fn apply_line_breakpoints(
+        &mut self,
+        source_key: &str,
+        lines: &[SourceBreakpoint],
+    ) -> Vec<Value> {
         for id in self
             .line_breakpoint_ids
             .remove(source_key)
@@ -313,12 +338,16 @@ impl DapServer {
         let mut ids = Vec::new();
         let breakpoints = lines
             .iter()
-            .map(|line| {
+            .map(|source_breakpoint| {
+                let line = source_breakpoint.line;
                 let target = BreakpointTarget::SourceLine(SourceBreakpointTarget {
                     file: Some(source_key.to_owned()),
-                    line: *line,
+                    line,
                 });
-                match self.debugger.set_breakpoint_target(&target) {
+                match self.debugger.set_conditional_breakpoint_target(
+                    &target,
+                    source_breakpoint.condition.as_deref(),
+                ) {
                     StepOutcome::BreakpointSet(breakpoint) => {
                         ids.push(breakpoint.id);
                         json!({"verified": true, "line": line, "id": breakpoint.id})

@@ -16,10 +16,13 @@
 //! Source-level movement comes from [`soldb_debugger::StepMap`], which every frontend
 //! shares, so `next` means the same thing in the terminal and in an editor.
 
+use std::cell::RefCell;
+
 use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
 use soldb_debugger::{
-    call_target, normalize_address, ChainStorage, ContractDebugInfo, Frame, ResolvedFunction,
-    ResolvedLine, SourceListing, StepLocation, StepMap, StorageLayout, StorageTape, StorageWords,
+    call_target, normalize_address, ChainStorage, Condition, ConditionContext, ContractDebugInfo,
+    Evaluation, Frame, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
+    StorageLayout, StorageTape, StorageWords,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +76,8 @@ pub struct SourceBreakpointTarget {
 pub struct Breakpoint {
     pub id: u32,
     pub kind: BreakpointKind,
+    /// Stops only when this holds at a step the kind matched.
+    pub condition: Option<Condition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +101,7 @@ impl Breakpoint {
     /// How the frontend names this breakpoint to the user.
     #[must_use]
     pub fn label(&self) -> String {
-        match &self.kind {
+        let target = match &self.kind {
             BreakpointKind::Pc(pc) => format!("PC {pc}"),
             BreakpointKind::Line(lines) => lines
                 .iter()
@@ -127,6 +132,10 @@ impl Breakpoint {
             BreakpointKind::Call(Some(address)) => format!("call to {address}"),
             BreakpointKind::Call(None) => "any call".to_owned(),
             BreakpointKind::Opcode(mnemonic) => format!("opcode {mnemonic}"),
+        };
+        match &self.condition {
+            Some(condition) => format!("{target} if {}", condition.text()),
+            None => target,
         }
     }
 }
@@ -172,7 +181,8 @@ pub enum DebuggerCommand {
     /// The stack at the current step.
     Stack,
     Mode(Option<DisplayMode>),
-    Break(BreakpointTarget),
+    /// Set a breakpoint, optionally one that stops only when a condition holds.
+    Break(BreakpointTarget, Option<String>),
     Clear(BreakpointTarget),
     /// Remove a breakpoint by number.
     Delete(u32),
@@ -234,9 +244,14 @@ impl DebuggerCommand {
                     .then(|| DisplayMode::parse(&rest))
                     .flatten(),
             ),
-            "break" | "b" => parse_breakpoint_target(&rest)
-                .map(Self::Break)
-                .unwrap_or_else(|| Self::Unknown(line.to_owned())),
+            "break" | "b" => {
+                // `break <target> if <condition>`: the condition is everything after the
+                // first ` if `, so a target containing `if` in a name still parses.
+                let (target, condition) = split_condition(&rest);
+                parse_breakpoint_target(target)
+                    .map(|target| Self::Break(target, condition))
+                    .unwrap_or_else(|| Self::Unknown(line.to_owned()))
+            }
             "clear" => parse_breakpoint_target(&rest)
                 .map(Self::Clear)
                 .unwrap_or_else(|| Self::Unknown(line.to_owned())),
@@ -295,6 +310,10 @@ pub struct DebuggerState {
     trace: Option<TransactionTrace>,
     step_map: Option<StepMap>,
     storage_tape: Option<StorageTape>,
+    /// Why a breakpoint condition could not be evaluated, kept until a frontend reports
+    /// it. A condition that never fires because it cannot be read is a silent trap
+    /// otherwise.
+    condition_note: RefCell<Option<String>>,
 }
 
 impl Default for DebuggerState {
@@ -307,6 +326,7 @@ impl Default for DebuggerState {
             trace: None,
             step_map: None,
             storage_tape: None,
+            condition_note: RefCell::new(None),
         }
     }
 }
@@ -604,7 +624,7 @@ impl DebuggerState {
 
     /// Sets a breakpoint on a program counter.
     pub fn set_breakpoint(&mut self, pc: u64) -> StepOutcome {
-        self.add_breakpoint(BreakpointKind::Pc(pc))
+        self.add_breakpoint(BreakpointKind::Pc(pc), None)
     }
 
     /// Clears the breakpoint on a program counter.
@@ -615,8 +635,21 @@ impl DebuggerState {
     /// Resolves a target against the trace and its debug info and sets a breakpoint on
     /// it.
     pub fn set_breakpoint_target(&mut self, target: &BreakpointTarget) -> StepOutcome {
+        self.set_conditional_breakpoint_target(target, None)
+    }
+
+    /// Sets a breakpoint that only stops when `condition` holds there.
+    pub fn set_conditional_breakpoint_target(
+        &mut self,
+        target: &BreakpointTarget,
+        condition: Option<&str>,
+    ) -> StepOutcome {
+        let condition = match condition.map(Condition::parse).transpose() {
+            Ok(condition) => condition,
+            Err(message) => return StepOutcome::BreakpointError(message),
+        };
         match self.resolve_target(target) {
-            Ok(kind) => self.add_breakpoint(kind),
+            Ok(kind) => self.add_breakpoint(kind, condition),
             Err(message) => StepOutcome::BreakpointError(message),
         }
     }
@@ -628,6 +661,7 @@ impl DebuggerState {
                 let label = Breakpoint {
                     id: 0,
                     kind: kind.clone(),
+                    condition: None,
                 }
                 .label();
                 self.remove_breakpoint(&kind, &label)
@@ -648,17 +682,22 @@ impl DebuggerState {
         }
     }
 
-    fn add_breakpoint(&mut self, kind: BreakpointKind) -> StepOutcome {
+    fn add_breakpoint(
+        &mut self,
+        kind: BreakpointKind,
+        condition: Option<Condition>,
+    ) -> StepOutcome {
         if let Some(existing) = self
             .breakpoints
             .iter()
-            .find(|breakpoint| breakpoint.kind == kind)
+            .find(|breakpoint| breakpoint.kind == kind && breakpoint.condition == condition)
         {
             return StepOutcome::BreakpointSet(existing.clone());
         }
         let breakpoint = Breakpoint {
             id: self.next_breakpoint_id,
             kind,
+            condition,
         };
         self.next_breakpoint_id += 1;
         self.breakpoints.push(breakpoint.clone());
@@ -728,7 +767,7 @@ impl DebuggerState {
         let map = self.step_map.as_ref();
         self.breakpoints
             .iter()
-            .find(|breakpoint| match &breakpoint.kind {
+            .filter(|breakpoint| match &breakpoint.kind {
                 BreakpointKind::Pc(pc) => trace_step.pc == *pc,
                 BreakpointKind::Line(lines) => map.is_some_and(|map| {
                     map.is_line_start(step)
@@ -761,16 +800,63 @@ impl DebuggerState {
                 }
                 BreakpointKind::Opcode(mnemonic) => trace_step.op.eq_ignore_ascii_case(mnemonic),
             })
+            // A condition is checked only where the target matched, so the cost falls on
+            // the handful of steps that got that far, not on every step passed through.
+            .find(|breakpoint| match &breakpoint.condition {
+                Some(condition) => {
+                    matches!(self.evaluate_condition(condition, step), Evaluation::True)
+                }
+                None => true,
+            })
             .cloned()
     }
 
-    /// The call structure at the current step, innermost frame first.
+    /// Evaluates a breakpoint condition at `step`.
+    ///
+    /// A condition that cannot be read there — an untouched slot, an unknown name — does
+    /// not stop, and the reason is kept for [`DebuggerState::take_condition_note`].
     #[must_use]
-    pub fn frames(&self) -> Vec<Frame> {
+    pub fn evaluate_condition(&self, condition: &Condition, step: usize) -> Evaluation {
+        let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
+            return Evaluation::Unavailable("no trace is loaded".to_owned());
+        };
+        let Some(trace_step) = trace.steps.get(step) else {
+            return Evaluation::Unavailable(format!("step {step} is outside the trace"));
+        };
+        let words = self
+            .storage_tape
+            .as_ref()
+            .map(|tape| tape.at_step(map, step));
+        let frames = self.frames_at(step);
+        let frame = frames.iter().find(|frame| !frame.arguments.is_empty());
+        let context = ConditionContext::new(map, step, trace_step, words).with_frame(frame);
+        let outcome = condition.evaluate(&context);
+        if let Evaluation::Unavailable(reason) = &outcome {
+            let mut note = self.condition_note.borrow_mut();
+            if note.is_none() {
+                *note = Some(format!(
+                    "`{}` could not be evaluated: {reason}",
+                    condition.text()
+                ));
+            }
+        }
+        outcome
+    }
+
+    /// Takes the first reason a breakpoint condition could not be evaluated since the
+    /// last call, so a frontend can say why a conditional breakpoint never fired.
+    #[must_use]
+    pub fn take_condition_note(&self) -> Option<String> {
+        self.condition_note.borrow_mut().take()
+    }
+
+    /// The call structure at any step, with each frame's arguments.
+    #[must_use]
+    pub fn frames_at(&self, step: usize) -> Vec<Frame> {
         let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
             return Vec::new();
         };
-        let mut frames = map.frames(self.current_step);
+        let mut frames = map.frames(step);
         for frame in &mut frames {
             let Some(entry) = trace.steps.get(frame.entry_step) else {
                 continue;
@@ -778,6 +864,12 @@ impl DebuggerState {
             frame.arguments = map.frame_arguments(frame, entry.snapshot_ref().stack);
         }
         frames
+    }
+
+    /// The call structure at the current step, innermost frame first.
+    #[must_use]
+    pub fn frames(&self) -> Vec<Frame> {
+        self.frames_at(self.current_step)
     }
 
     /// Source lines around the current step.
@@ -833,7 +925,9 @@ impl DebuggerState {
             DebuggerCommand::ReverseFinish => Some(self.reverse_finish()),
             DebuggerCommand::Goto(step) => Some(self.goto_step(step)),
             DebuggerCommand::Mode(Some(mode)) => Some(self.set_display_mode(mode)),
-            DebuggerCommand::Break(target) => Some(self.set_breakpoint_target(&target)),
+            DebuggerCommand::Break(target, condition) => {
+                Some(self.set_conditional_breakpoint_target(&target, condition.as_deref()))
+            }
             DebuggerCommand::Clear(target) => Some(self.clear_breakpoint_target(&target)),
             DebuggerCommand::Delete(id) => Some(self.delete_breakpoint(id)),
             DebuggerCommand::Empty
@@ -972,6 +1066,22 @@ fn parse_breakpoint_target(input: &str) -> Option<BreakpointTarget> {
     }
 }
 
+/// Splits `<target> if <condition>` at the first ` if `, which cannot appear inside a
+/// target: a file name, a function name, a slot, and an opcode all lack spaces.
+fn split_condition(input: &str) -> (&str, Option<String>) {
+    let input = input.trim();
+    match input.find(" if ") {
+        Some(index) => {
+            let condition = input[index + 4..].trim();
+            (
+                input[..index].trim(),
+                (!condition.is_empty()).then(|| condition.to_owned()),
+            )
+        }
+        None => (input, None),
+    }
+}
+
 fn is_function_name(input: &str) -> bool {
     let mut segments = input.split('.');
     segments.all(|segment| {
@@ -1076,49 +1186,58 @@ mod tests {
         );
         assert_eq!(
             DebuggerCommand::parse("break 0x10"),
-            DebuggerCommand::Break(BreakpointTarget::Pc(16))
+            DebuggerCommand::Break(BreakpointTarget::Pc(16), None)
         );
         assert_eq!(
             DebuggerCommand::parse("break Counter.sol:7"),
-            DebuggerCommand::Break(BreakpointTarget::SourceLine(SourceBreakpointTarget {
-                file: Some("Counter.sol".to_owned()),
-                line: 7
-            }))
+            DebuggerCommand::Break(
+                BreakpointTarget::SourceLine(SourceBreakpointTarget {
+                    file: Some("Counter.sol".to_owned()),
+                    line: 7
+                }),
+                None
+            )
         );
         assert_eq!(
             DebuggerCommand::parse("break line 7"),
-            DebuggerCommand::Break(BreakpointTarget::SourceLine(SourceBreakpointTarget {
-                file: None,
-                line: 7
-            }))
+            DebuggerCommand::Break(
+                BreakpointTarget::SourceLine(SourceBreakpointTarget {
+                    file: None,
+                    line: 7
+                }),
+                None
+            )
         );
         assert_eq!(
             DebuggerCommand::parse("break increment"),
-            DebuggerCommand::Break(BreakpointTarget::Function("increment".to_owned()))
+            DebuggerCommand::Break(BreakpointTarget::Function("increment".to_owned()), None)
         );
         assert_eq!(
             DebuggerCommand::parse("b Counter.increment"),
-            DebuggerCommand::Break(BreakpointTarget::Function("Counter.increment".to_owned()))
+            DebuggerCommand::Break(
+                BreakpointTarget::Function("Counter.increment".to_owned()),
+                None
+            )
         );
         assert_eq!(
             DebuggerCommand::parse("break storage 0x0"),
-            DebuggerCommand::Break(BreakpointTarget::Storage("0x0".to_owned()))
+            DebuggerCommand::Break(BreakpointTarget::Storage("0x0".to_owned()), None)
         );
         assert_eq!(
             DebuggerCommand::parse("break revert"),
-            DebuggerCommand::Break(BreakpointTarget::Revert)
+            DebuggerCommand::Break(BreakpointTarget::Revert, None)
         );
         assert_eq!(
             DebuggerCommand::parse("break call"),
-            DebuggerCommand::Break(BreakpointTarget::Call(None))
+            DebuggerCommand::Break(BreakpointTarget::Call(None), None)
         );
         assert_eq!(
             DebuggerCommand::parse("break call 0xabc"),
-            DebuggerCommand::Break(BreakpointTarget::Call(Some("0xabc".to_owned())))
+            DebuggerCommand::Break(BreakpointTarget::Call(Some("0xabc".to_owned())), None)
         );
         assert_eq!(
             DebuggerCommand::parse("break op sstore"),
-            DebuggerCommand::Break(BreakpointTarget::Opcode("sstore".to_owned()))
+            DebuggerCommand::Break(BreakpointTarget::Opcode("sstore".to_owned()), None)
         );
         assert_eq!(
             DebuggerCommand::parse("break"),
@@ -1414,7 +1533,7 @@ mod tests {
         );
         assert_eq!(state.display_mode.as_str(), "asm");
         assert!(matches!(
-            state.apply_command(DebuggerCommand::Break(BreakpointTarget::Pc(2))),
+            state.apply_command(DebuggerCommand::Break(BreakpointTarget::Pc(2), None)),
             Some(StepOutcome::BreakpointSet(_))
         ));
         assert!(matches!(
@@ -1424,6 +1543,88 @@ mod tests {
         assert_eq!(state.apply_command(DebuggerCommand::Help(None)), None);
         assert_eq!(state.apply_command(DebuggerCommand::Backtrace), None);
         assert_eq!(state.apply_command(DebuggerCommand::Quit), None);
+    }
+
+    #[test]
+    fn a_condition_gates_a_breakpoint_and_says_when_it_cannot_be_read() {
+        let mut state = DebuggerState::new();
+        state.load_trace(sample_trace());
+
+        // `pc` and `gas` are facts about the step, so they need no debug info.
+        assert!(matches!(
+            state.set_conditional_breakpoint_target(
+                &BreakpointTarget::Opcode("sstore".to_owned()),
+                Some("pc == 3")
+            ),
+            StepOutcome::BreakpointSet(breakpoint)
+                if breakpoint.label() == "opcode SSTORE if pc == 3"
+        ));
+        assert!(matches!(
+            state.continue_execution(),
+            StepOutcome::BreakpointHit { step: 2, .. }
+        ));
+
+        // The same target with a condition that never holds runs to the end.
+        state.goto_step(0);
+        state.delete_breakpoint(1);
+        assert!(matches!(
+            state.set_conditional_breakpoint_target(
+                &BreakpointTarget::Opcode("sstore".to_owned()),
+                Some("pc == 999")
+            ),
+            StepOutcome::BreakpointSet(_)
+        ));
+        assert!(matches!(
+            state.continue_execution(),
+            StepOutcome::AtEnd { .. }
+        ));
+        assert_eq!(state.take_condition_note(), None);
+
+        // `&&` and `||`, and a bare value.
+        state.goto_step(0);
+        state.delete_breakpoint(2);
+        assert!(matches!(
+            state.set_conditional_breakpoint_target(
+                &BreakpointTarget::Opcode("sstore".to_owned()),
+                Some("pc == 999 || gas >= 94 && depth == 1")
+            ),
+            StepOutcome::BreakpointSet(_)
+        ));
+        assert!(matches!(
+            state.continue_execution(),
+            StepOutcome::BreakpointHit { step: 2, .. }
+        ));
+
+        // A name nothing defines cannot be read: the breakpoint does not stop, and the
+        // reason is kept for the frontend to report rather than failing silently.
+        state.goto_step(0);
+        state.delete_breakpoint(3);
+        assert!(matches!(
+            state.set_conditional_breakpoint_target(
+                &BreakpointTarget::Opcode("sstore".to_owned()),
+                Some("counter > 1")
+            ),
+            StepOutcome::BreakpointSet(_)
+        ));
+        assert!(matches!(
+            state.continue_execution(),
+            StepOutcome::AtEnd { .. }
+        ));
+        let note = state.take_condition_note().expect("a reason");
+        assert!(
+            note.contains("`counter > 1` could not be evaluated"),
+            "{note}"
+        );
+        assert_eq!(state.take_condition_note(), None, "the note is taken once");
+
+        // A condition that does not parse is refused when the breakpoint is set.
+        assert!(matches!(
+            state.set_conditional_breakpoint_target(
+                &BreakpointTarget::Opcode("sstore".to_owned()),
+                Some("pc ==")
+            ),
+            StepOutcome::BreakpointError(_)
+        ));
     }
 
     #[test]
