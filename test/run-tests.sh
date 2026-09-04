@@ -212,6 +212,33 @@ ensure_ethdebug_solc() {
     return 0
 }
 
+# Whether the artifacts next to an existing deployment are everything the tests read.
+#
+# A directory left by an older checkout can be missing what a newer test needs -- the
+# storage layout is the one that has bitten -- and reusing it fails tests for reasons that
+# have nothing to do with the code under test. Anything missing means recompile.
+test_artifacts_complete() {
+    local out_dir="${PROJECT_DIR}/examples/out"
+    local required=(
+        "TestContract.abi"
+        "TestContract.bin"
+        "TestContract_storage.json"
+    )
+    for name in "${required[@]}"; do
+        if [ ! -f "${out_dir}/${name}" ]; then
+            echo -e "${YELLOW}Existing artifacts are missing ${name}; recompiling${NC}"
+            return 1
+        fi
+    done
+    # One of the two ETHDebug program names, depending on the compiler's flag generation.
+    if [ ! -f "${out_dir}/TestContract_ethdebug-runtime.json" ] \
+        && [ ! -f "${out_dir}/combined.json" ]; then
+        echo -e "${YELLOW}Existing artifacts carry no debug program; recompiling${NC}"
+        return 1
+    fi
+    return 0
+}
+
 # Use environment variable if no command line option provided
 SEPOLIA_KEY="${SEPOLIA_KEY:-${SEPOLIA_KEY_ENV:-}}"
 
@@ -261,9 +288,13 @@ if [ -f "${DEPLOYMENT_JSON}" ]; then
             if [ -z "$DEPLOYED_CODE" ] || [ "$DEPLOYED_CODE" = "0x" ]; then
                 echo -e "${YELLOW}Found TestContract deployment file, but no code at ${DEPLOYED_ADDRESS}${NC}"
                 NEED_DEPLOY=true
+            elif ! test_artifacts_complete; then
+                NEED_DEPLOY=true
             else
                 echo -e "${GREEN}Found existing TestContract deployment${NC}"
             fi
+        elif ! test_artifacts_complete; then
+            NEED_DEPLOY=true
         else
             echo -e "${GREEN}Found existing TestContract deployment${NC}"
         fi

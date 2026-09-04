@@ -64,6 +64,12 @@ search — and the `solc` on `PATH` otherwise. An unrecognised option stops the 
 than being ignored, so a suite never quietly answers for a different setup than the one
 asked for.
 
+`run-tests.sh` reuses an existing `examples/out` deployment when it can, and recompiles
+when the artifacts there are missing something the tests read — the storage layout, the
+ABI, the bytecode, a debug program. A directory left by an older checkout is otherwise
+reused as-is and fails tests for reasons that have nothing to do with the code under test;
+when a new test needs a new artifact, add it to `test_artifacts_complete`.
+
 `run-tests.sh` generates `test/lit.site.cfg.py` (gitignored) with the freshly deployed
 contract address and transaction hashes. **Run it at least once before invoking `lit`
 directly**, otherwise every substitution such as `%{test_tx}` is empty and tests fail for
