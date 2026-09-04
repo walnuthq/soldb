@@ -152,7 +152,8 @@ belongs in `soldb-debugger`, not in a second copy.
 - **soldb-debugger**: source-step, function, and variable decoding over a
   `TransactionTrace` plus `EthdebugInfo`. Frontend-agnostic; shared by CLI, REPL, and DAP.
   `ContractDebugInfo` is one contract's metadata prepared for stepping (line index, PC
-  index, parsed functions), and `StepMap` maps every step of a trace through the loaded
+  index, parsed functions), from ETHDebug or a legacy source map alike, and `StepMap`
+  maps every step of a trace through the loaded
   contracts once: the line it belongs to, its frame depth (EVM depth plus internal
   Solidity functions inferred from the source spans, since compilers emit no function
   boundaries yet), and the searches behind `next`, `step`, `finish`, their reverse forms,

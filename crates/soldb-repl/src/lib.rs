@@ -1519,13 +1519,8 @@ contract C {
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
         };
-        let contract = ContractDebugInfo::new(
-            None,
-            "C",
-            info,
-            BTreeMap::from([(0, SOURCE.to_owned())]),
-            true,
-        );
+        let contract =
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
         let pcs = [0, 1, 10, 11, 12, 20, 21, 21, 13, 14, 30];
         let mut trace = sample_trace();
         trace.steps = pcs.iter().map(|pc| step(*pc, "JUMPDEST", 0, &[])).collect();

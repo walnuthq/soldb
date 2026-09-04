@@ -12,7 +12,10 @@ soldb run <bytecode> [<function_signature> [args...]] --interactive
 
 Pass `--ethdebug-dir <address>:<contract>:<dir>` to load the compiler's debug metadata.
 Source-level stepping, line and function breakpoints, `list`, `vars`, and `print` need it;
-everything else works on the bare trace.
+everything else works on the bare trace. ETHDebug artifacts and the legacy `combined.json`
+source maps of pre-ETHDebug compilers both serve: lines, functions, and frames come from
+the map and the source text either way. Only `vars` and `print` need ETHDebug, because
+variable locations exist nowhere else.
 
 The prompt is:
 

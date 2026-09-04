@@ -801,13 +801,7 @@ impl LoadedSource {
         let name = program.info.contract_name.clone();
         Ok(Self {
             root: root.to_path_buf(),
-            contract: ContractDebugInfo::new(
-                None,
-                &name,
-                program.info,
-                program.source_contents,
-                !program.legacy,
-            ),
+            contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents),
         })
     }
 }

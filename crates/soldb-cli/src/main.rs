@@ -2304,14 +2304,11 @@ impl TraceSourceIndex {
         let Some(program) = load_debug_program(&spec.debug_dir, &spec.name, environment)? else {
             return Ok(None);
         };
-        // Legacy source maps do not line up with declarations closely enough to attribute
-        // steps to functions, so functions are parsed for ETHDebug programs only.
         let debug = ContractDebugInfo::new(
             spec.address.as_deref(),
             &spec.name,
             program.info,
             program.source_contents,
-            !program.legacy,
         );
         Ok(Some(Self {
             spec: spec.clone(),
@@ -3903,13 +3900,8 @@ mod tests {
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
         };
-        let debug = ContractDebugInfo::new(
-            None,
-            "C",
-            info,
-            BTreeMap::from([(0, source.to_owned())]),
-            true,
-        );
+        let debug =
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]));
 
         let mut trace = TransactionTrace {
             tx_hash: None,
@@ -4115,7 +4107,13 @@ contract Counter {
             index.debug.info.source_info(2),
             Some(("Counter.sol", set_offset as u64, 12))
         );
-        assert!(index.function_at_pc(2).is_none());
+        // Legacy maps attribute steps to functions like ETHDebug does.
+        assert_eq!(
+            index
+                .function_at_pc(2)
+                .map(|function| function.name.as_str()),
+            Some("set")
+        );
 
         let trace = transaction_trace(
             "0x".to_owned(),

@@ -53,25 +53,20 @@ pub struct ContractDebugInfo {
 }
 
 impl ContractDebugInfo {
-    /// Prepares one contract's debug info. Functions are parsed from the source text when
-    /// `parse_functions` is set; legacy source maps leave it off because their spans do
-    /// not line up with declarations closely enough to attribute steps to functions.
+    /// Prepares one contract's debug info. Functions are parsed from the source text,
+    /// which serves ETHDebug and legacy source maps alike: both attach byte ranges of the
+    /// same sources to instructions.
     #[must_use]
     pub fn new(
         address: Option<&str>,
         name: &str,
         info: EthdebugInfo,
         source_contents: BTreeMap<u64, String>,
-        parse_functions: bool,
     ) -> Self {
-        let functions = if parse_functions {
-            source_contents
-                .iter()
-                .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let functions = source_contents
+            .iter()
+            .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
+            .collect();
         let line_starts = source_contents
             .iter()
             .map(|(source_id, source)| (*source_id, line_starts(source)))
@@ -1127,13 +1122,7 @@ contract C {
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
         };
-        ContractDebugInfo::new(
-            address,
-            "C",
-            info,
-            BTreeMap::from([(0, SOURCE.to_owned())]),
-            true,
-        )
+        ContractDebugInfo::new(address, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]))
     }
 
     fn step(pc: u64, depth: u64, op: &str, stack: &[&str]) -> TraceStep {

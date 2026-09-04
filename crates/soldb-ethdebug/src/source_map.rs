@@ -414,11 +414,13 @@ fn source_context(
              source index"
         ))
     })?;
+    // solc attributes the Yul it generates (ABI decoding, checked arithmetic, panics) to a
+    // utility source whose index is one past the last entry in `sourceList`, and that
+    // source is never in the artifact. Such an instruction has no user source, the same
+    // as an entry with index -1; treating it as an error would reject every map a modern
+    // legacy-format compiler emits.
     if usize::try_from(source_id).map_or(true, |source_id| source_id >= source_count) {
-        return Err(SoldbError::Message(format!(
-            "legacy source-map entry {instruction_index} for `{contract_name}` references \
-             missing source {source_id}"
-        )));
+        return Ok(None);
     }
     let offset = u64::try_from(entry.offset).map_err(|_| {
         SoldbError::Message(format!(
@@ -676,6 +678,37 @@ mod tests {
             program.resources["compilation"]["compiler"]["version"],
             "0.8.36+commit.test"
         );
+    }
+
+    #[test]
+    fn generated_code_past_the_source_list_has_no_source() {
+        // solc 0.8.x maps its generated Yul to a source index one past `sourceList`;
+        // those instructions are unmapped rather than a reason to reject the map.
+        let dir = temp_dir("utility-source");
+        let source = "contract Counter { function add() external {} }";
+        fs::write(dir.join("Counter.sol"), source).expect("write source");
+        fs::write(
+            dir.join("combined.json"),
+            json!({
+                "version": "0.8.16+commit.test",
+                "sourceList": ["Counter.sol"],
+                "contracts": {
+                    "Counter.sol:Counter": {
+                        "bin-runtime": "600100",
+                        "srcmap-runtime": "0:8:0:-:0;0:5:1"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined JSON");
+
+        let program = load_source_map_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect("load source map")
+            .expect("runtime program");
+        assert_eq!(program.info.source_info(0), Some(("Counter.sol", 0, 8)));
+        assert_eq!(program.info.source_info(2), None);
+        assert!(program.info.instruction_at_pc(2).is_some());
     }
 
     #[test]
