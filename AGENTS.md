@@ -424,7 +424,11 @@ Follow the [FileCheck reference](https://llvm.org/docs/CommandGuide/FileCheck.ht
   (help text flags, event fields), `CHECK-NEXT` when adjacency *is* the contract (call
   stack nesting), and `CHECK-NOT` to pin an absence.
 - Capture varying values with `[[NAME:regex]]` and reuse them as `[[NAME]]`. Gas numbers,
-  addresses, and transaction hashes change between runs — never hardcode them.
+  addresses, and transaction hashes change between runs — never hardcode them. Stay in
+  that syntax: FileCheck's numeric substitution (`[[#NAME+4]]`) is not in every build the
+  suite has to run against, and a test that needs arithmetic to state its expectation is
+  usually pinning a value that belongs in a node-free `test/run/` fixture instead, where
+  the state is deterministic.
 - Use `--check-prefix` only when one file drives several distinct invocations (as
   `test/cli/help.test` does). With a single invocation, use the default `CHECK`.
 - lit substitutions are regular expressions applied to the whole RUN line, and this suite
