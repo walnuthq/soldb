@@ -58,10 +58,12 @@ pub struct ProjectLayout {
 
 impl ProjectLayout {
     /// The layout of the project `contract_file` belongs to, found by walking up to the
-    /// nearest directory holding a `foundry.toml`, `remappings.txt`, or `lib/`.
+    /// nearest directory holding a file that only a project root holds.
     ///
     /// Returns an empty layout when the file is not in a project, which leaves solc's own
-    /// behavior untouched.
+    /// behavior untouched. Guessing wrong is worse than not guessing: the base path
+    /// decides the source paths the compiler records, and a contract compiled against the
+    /// wrong root records paths that nothing can resolve later.
     #[must_use]
     pub fn detect(contract_file: &Path) -> Self {
         let Some(root) = project_root(contract_file) else {
@@ -109,19 +111,37 @@ impl ProjectLayout {
     }
 }
 
-/// The nearest ancestor of `contract_file` that looks like a project root.
+/// Files that only a project root holds.
+///
+/// A `lib` directory is deliberately not among them. Every Linux system has `/lib`, so a
+/// walk that accepted it would call `/` the project root of any contract whose own
+/// directories carry no marker, and compile it with source paths relative to `/`.
+const PROJECT_MARKERS: &[&str] = &[
+    "foundry.toml",
+    "remappings.txt",
+    "hardhat.config.js",
+    "hardhat.config.ts",
+];
+
+/// The nearest ancestor of `contract_file` that a project marker names as its root.
+///
+/// The walk stops at the repository the file is in: a directory holding `.git` is the
+/// last one considered, so a marker outside the checkout never claims a contract inside
+/// it.
 fn project_root(contract_file: &Path) -> Option<PathBuf> {
     let absolute = contract_file
         .canonicalize()
         .unwrap_or_else(|_| contract_file.to_path_buf());
     let mut directory = absolute.parent()?;
     loop {
-        let marked = ["foundry.toml", "remappings.txt", "hardhat.config.js"]
+        if PROJECT_MARKERS
             .iter()
             .any(|name| directory.join(name).is_file())
-            || directory.join("lib").is_dir();
-        if marked {
+        {
             return Some(directory.to_path_buf());
+        }
+        if directory.join(".git").exists() {
+            return None;
         }
         directory = directory.parent()?;
     }
@@ -864,6 +884,46 @@ fn write_deployment_json(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_a_project_marker_names_a_root() {
+        let base = std::env::temp_dir().join(format!(
+            "soldb-project-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        // A checkout with a `lib` directory above it, which is what every Linux system
+        // looks like: `/lib` is always there.
+        let outside = base.join("outside");
+        let repo = outside.join("repo");
+        let sources = repo.join("src");
+        std::fs::create_dir_all(outside.join("lib")).expect("lib");
+        std::fs::create_dir_all(&sources).expect("src");
+        std::fs::write(repo.join(".git"), "gitdir: elsewhere").expect("git marker");
+        let contract = sources.join("Token.sol");
+        std::fs::write(&contract, "contract Token {}").expect("contract");
+
+        // A `lib` directory alone is not a project, and the walk stops at the checkout, so
+        // nothing outside it can claim the contract.
+        assert_eq!(super::project_root(&contract), None);
+        assert!(super::ProjectLayout::detect(&contract).is_empty());
+
+        // The marker the project itself carries is what names the root.
+        std::fs::write(repo.join("foundry.toml"), "[profile.default]\n").expect("foundry.toml");
+        let root = super::project_root(&contract).expect("a root");
+        assert_eq!(root.canonicalize().ok(), repo.canonicalize().ok());
+        let layout = super::ProjectLayout::detect(&contract);
+        assert!(!layout.is_empty());
+        assert_eq!(
+            layout.base_path.and_then(|path| path.canonicalize().ok()),
+            repo.canonicalize().ok()
+        );
+
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
 
     #[test]
     fn recompiling_with_another_compiler_leaves_one_metadata_file() {

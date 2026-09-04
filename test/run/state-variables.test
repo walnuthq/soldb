@@ -32,3 +32,32 @@
 # UNKNOWN: No such variable: `counter[1]` is not in scope at PC {{[0-9]+}}; `counter` is a `uint256`, which cannot be indexed
 # UNKNOWN: No such variable: `config.missing` is not in scope at PC {{[0-9]+}}; `struct StateVars.Config` has no member `missing`; it has owner, limit
 # UNKNOWN: uint256 counter = <unknown: slot 0x0 has not been read or written yet> [slot 0x0]
+
+# What a transaction wrote, step by step. This runs on a local chain, which records every
+# storage touch, so the values are exact here in a way they cannot be against an arbitrary
+# node: a backend that reports no per-step storage leaves the same variables readable only
+# from the chain, which is what `trace/interactive-state.test` covers instead.
+# RUN: printf 'break counter\ncontinue\nprint counter\nnexti\nprint counter\nstorage\ncontinue\nnexti\nprint counter\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck --check-prefix=WRITES %s
+
+# `break counter` stops at the write, and the write takes effect after its step.
+# WRITES: Breakpoint #1 set at a write to `counter` (storage slot 0x0)
+# WRITES: Breakpoint #1 hit at step {{[0-9]+}}, a write to `counter` (storage slot 0x0)
+# WRITES: uint256 counter = 0 [slot 0x0]
+# WRITES: uint256 counter = 42 [slot 0x0]
+# The storage view is every slot known at this step, not only the one this opcode touched.
+# WRITES: Storage: {{.*}}0x{{[0-9a-f]+}}
+# WRITES-NEXT: 0x0 = 0x2a
+# The second write is `counter = total()`, which reads the counter back and adds the
+# configured limit: 42 + 99.
+# WRITES: Breakpoint #1 hit at step {{[0-9]+}}, a write to `counter` (storage slot 0x0)
+# WRITES: uint256 counter = 141 [slot 0x0]
+
+# A condition over a state variable is checked only where the target already matched, and
+# reads the value the recording has at that step.
+# RUN: printf 'break op SSTORE if counter == 42\ncontinue\nprint counter\ndelete 1\nbreak op SSTORE if counter > 100000\ncontinue\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck --check-prefix=CONDITION %s
+
+# CONDITION: Breakpoint #1 hit at step {{[0-9]+}}, opcode SSTORE if counter == 42
+# CONDITION: uint256 counter = 42 [slot 0x0]
+# CONDITION: Breakpoint #2 set at opcode SSTORE if counter > 100000
+# CONDITION: End of trace at step {{[0-9]+}}
+# CONDITION-NOT: Breakpoint #2 hit

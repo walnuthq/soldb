@@ -49,8 +49,9 @@ soldb compile src/Token.sol -o out
 ```
 
 Inside a project it resolves imports the way the project does: the nearest directory
-holding a `foundry.toml`, a `remappings.txt`, or a `lib/` is the base path, `lib` and
-`node_modules` are searched for non-relative imports, and the project's remappings are
+holding a `foundry.toml`, a `remappings.txt`, or a Hardhat config is the base path — the
+search stops at the checkout, so nothing outside it can claim a contract inside — `lib`
+and `node_modules` are searched for non-relative imports, and the project's remappings are
 applied. It prints what it found, and `--base-path`, `--include-path`, `--remapping`, and
 `--no-project` override it.
 

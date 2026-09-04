@@ -1,37 +1,23 @@
-# Reading state variables at a step: the value a slot holds is the most recent word the
-# transaction recorded for it, so `print counter` moves with the `SSTORE`s, and a slot
-# nothing has touched is reported as unknown rather than as zero. The counter's absolute
-# value depends on how many increments this deployment has seen, so what is pinned here is
-# how it changes.
+# Reading state variables of a traced transaction: which variables exist, where they live,
+# and where each value came from.
+#
+# Everything here holds whichever backend produced the trace. A node's
+# `debug_traceTransaction` may or may not report storage per step, so the exact values a
+# transaction wrote, and conditions over them, are pinned in `run/state-variables.test`,
+# where a local chain records them by construction.
 # REQUIRES: soldb
-# RUN: printf 'break TestContract.sol:30\ncontinue\nvars\nprint counter\nstorage\nbreak storage 0\ncontinue\nnexti\nprint counter\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s
+# RUN: printf 'vars\nprint balances\nprint counter\nprint balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s
 
-# `increment` has already added its amount to the counter by line 30. The counter's own
-# value depends on how many increments this deployment has seen, so what is pinned is that
-# `vars` and `print` agree, and that the value moves when the next write lands.
-# CHECK: Breakpoint #1 hit at step {{[0-9]+}}, TestContract.sol:30
+# `vars` names every state variable with its type and slot, whatever its value turns out
+# to be.
 # CHECK: State:
-# CHECK-NEXT: uint256 counter = [[COUNT:[0-9]+]] [slot 0x0]
+# CHECK-NEXT: uint256 counter = {{.*}} [slot 0x0{{.*}}]
 # CHECK-NEXT: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
-# CHECK: uint256 counter = [[COUNT]] [slot 0x0]
-# The storage view is every slot known at this step, not only the one this opcode touched.
-# CHECK: Storage: {{.*}}0x{{[0-9a-f]+}}
-# CHECK-NEXT: 0x0 = 0x{{[0-9a-f]+}}
-# `increment2` adds to the counter again; the write takes effect after its `SSTORE`, so
-# stepping over it leaves a different value than the one read at line 30.
-# CHECK: Breakpoint #2 hit at step {{[0-9]+}}, storage slot 0x0
-# CHECK-NOT: uint256 counter = [[COUNT]] [slot 0x0]
-# CHECK: uint256 counter = {{[0-9]+}} [slot 0x0]
-
-# A mapping entry is read by key. The transaction never touched this one, so its value
-# comes from the node, at the block before the transaction's, and says so.
-# RUN: printf 'print balances\nprint counter\nprint balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=MAPPING %s
-
-# MAPPING: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
-# The counter before the transaction ran, plus what `increment` adds, is what the state
-# view shows once the first `SSTORE` has happened.
-# MAPPING: uint256 counter = {{[0-9]+}} [slot 0x0, from the chain at block {{[0-9]+}}, before this transaction's block]
-# MAPPING: uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = {{[0-9]+}} [slot 0x{{[0-9a-f]+}}, from the chain at block {{[0-9]+}}, before this transaction's block]
+# CHECK: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
+# CHECK: uint256 counter = {{.*}} [slot 0x0{{.*}}]
+# A mapping entry this transaction never touched is read from the node, at the block
+# before the transaction's, and says so.
+# CHECK: uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = {{[0-9]+}} [slot 0x{{[0-9a-f]+}}, from the chain at block {{[0-9]+}}, before this transaction's block]
 
 # Without a node there is no chain to read: `soldb run` says the slot is untouched rather
 # than reaching for a value.
@@ -40,37 +26,27 @@
 
 # NOCHAIN: uint256 counter = <unknown: slot 0x0 has not been read or written yet> [slot 0x0]
 
-# A breakpoint can carry a condition over the values the debugger can read: state
-# variables, the frame's arguments, and facts about the step. It is checked only where the
-# target already matched.
-# RUN: printf 'break TestContract.sol:44 if counter > 100000\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=NEVER %s
+# A state variable can be named where a slot number would go: `break counter` stops where
+# the counter is written. The stop is an `SSTORE` to that slot, which every backend
+# records.
+# RUN: printf 'break counter\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WATCH %s
 
-# NEVER: Breakpoint #1 set at TestContract.sol:44 if counter > 100000
-# NEVER: End of trace at step {{[0-9]+}}
-# NEVER-NOT: Breakpoint #1 hit
+# WATCH: Breakpoint #1 set at a write to `counter` (storage slot 0x0)
+# WATCH: Breakpoint #1 hit at step {{[0-9]+}}, a write to `counter` (storage slot 0x0)
 
-# RUN: printf 'break increment2 if amount == 4\ncontinue\nbt\nbreak TestContract.sol:44 if counter >= 4\ncontinue\nprint counter\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WHEN %s
+# A condition over facts about the step needs no storage at all, and is checked only where
+# the target already matched.
+# RUN: printf 'break op SSTORE if depth == 1\ncontinue\ndelete 1\nbreak op SSTORE if depth > 100\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WHEN %s
 
-# WHEN: Breakpoint #1 set at function TestContract.increment2 at TestContract.sol:39 if amount == 4
-# WHEN: Breakpoint #1 hit at step {{[0-9]+}}, function TestContract.increment2 at TestContract.sol:39 if amount == 4
-# WHEN: #0  increment2(amount = 4) at TestContract.sol:39
-# WHEN: Breakpoint #2 hit at step {{[0-9]+}}, TestContract.sol:44 if counter >= 4
+# WHEN: Breakpoint #1 hit at step {{[0-9]+}}, opcode SSTORE if depth == 1
+# WHEN: Breakpoint #2 set at opcode SSTORE if depth > 100
+# WHEN: End of trace at step {{[0-9]+}}
+# WHEN-NOT: Breakpoint #2 hit
 
 # A condition that cannot be read does not stop, and says why instead of failing silently.
 # RUN: printf 'break TestContract.sol:44 if nosuch > 1\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=UNREADABLE %s
 
 # UNREADABLE: Note: `nosuch > 1` could not be evaluated: no state variable named `nosuch` in the storage layout
-
-# A state variable can be named where a slot number would go: `break counter` stops where
-# the counter is written, and a mapping entry stops where that entry is written.
-# RUN: printf 'break counter\ncontinue\nprint counter\nnexti\nprint counter\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WATCH %s
-
-# WATCH: Breakpoint #1 set at a write to `counter` (storage slot 0x0)
-# WATCH: Breakpoint #1 hit at step {{[0-9]+}}, a write to `counter` (storage slot 0x0)
-# The write takes effect after its step, so the value moves as the debugger steps over it.
-# WATCH: uint256 counter = [[BEFORE:[0-9]+]] [slot 0x0]
-# WATCH-NOT: uint256 counter = [[BEFORE]] [slot 0x0]
-# WATCH: uint256 counter = {{[0-9]+}} [slot 0x0]
 
 # A name that is neither a function nor a state variable says both things it tried.
 # RUN: printf 'break nosuchthing\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=NEITHER %s

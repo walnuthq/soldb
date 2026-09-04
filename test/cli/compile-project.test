@@ -17,6 +17,16 @@
 # CHECK-DAG: Contract: Token
 # CHECK-DAG: Contract: Base
 
+# A directory that merely has a `lib` in it is not a project: every Linux system has
+# `/lib`, so accepting that would make `/` the root of any contract outside a project and
+# compile it with source paths relative to there.
+# RUN: rm -rf %t.lone && mkdir -p %t.lone/lib %t.lone/repo/src
+# RUN: printf '// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\ncontract Lone { uint256 public total; }\n' > %t.lone/repo/src/Lone.sol
+# RUN: %soldb compile %t.lone/repo/src/Lone.sol -o %t.lone.out --solc %{solc_path} 2>&1 | FileCheck --check-prefix=NOROOT %s
+
+# NOROOT-NOT: Project root:
+# NOROOT: ETHDebug compilation successful
+
 # Without the project, solc sees only the source's own directory and says so.
 # RUN: not %soldb compile %t.project/src/token/Token.sol -o %t.out --no-project --solc %{solc_path} 2>&1 | FileCheck --check-prefix=NOPROJECT %s
 
