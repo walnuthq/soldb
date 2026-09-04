@@ -1,11 +1,13 @@
 //! The Debug Adapter Protocol server.
 //!
 //! [`DapServer`] holds one debug session and maps DAP requests onto it: launching from a
-//! trace file, an inline trace, or a transaction hash plus RPC URL; setting breakpoints;
-//! reporting stack frames, scopes, and variables; and stepping.
+//! trace file, an inline trace, or a transaction hash plus RPC URL; setting line and
+//! function breakpoints; reporting stack frames, scopes, and variables; and stepping by
+//! source line or by instruction, forward and backward.
 //!
-//! Source mapping and variable decoding go through `soldb-ethdebug` and `soldb-debugger`
-//! so an editor reports the same values as the terminal debugger.
+//! Stepping, breakpoints, and frames go through `soldb-repl` and `soldb-debugger`, the
+//! same state machine and source map the terminal debugger uses, so an editor stops at
+//! the same steps and reports the same values as the terminal.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,11 +15,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
-use soldb_ethdebug::{
-    load_source_map_program, read_compilation_source, EthdebugInfo, SourceMapEnvironment,
-};
-use soldb_repl::{DebuggerState, StepOutcome};
+use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo};
+use soldb_ethdebug::{load_debug_program, SourceMapEnvironment};
+use soldb_repl::{BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome};
 use soldb_rpc::trace_transaction;
 
 use crate::{
@@ -30,16 +32,70 @@ const STACK_REF: u64 = 1001;
 const STEP_REF: u64 = 1002;
 const MEMORY_REF: u64 = 1003;
 const STORAGE_REF: u64 = 1004;
+const STATE_REF: u64 = 1005;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct DapServer {
     seq: u64,
     config: DapServerConfig,
     thread_id: u64,
     debugger: DebuggerState,
-    source_index: Option<SourceIndex>,
-    pending_breakpoints: BTreeMap<String, Vec<u64>>,
+    source: Option<LoadedSource>,
+    /// Line breakpoints by source file, as the editor last sent them. They are applied
+    /// once a trace and its debug info are loaded, and re-applied after each launch.
+    pending_breakpoints: BTreeMap<String, Vec<SourceBreakpoint>>,
+    pending_function_breakpoints: Vec<String>,
+    /// The breakpoints each `setBreakpoints` source last produced, so the next request
+    /// for that source replaces them, as the protocol requires.
+    line_breakpoint_ids: BTreeMap<String, Vec<u32>>,
+    function_breakpoint_ids: Vec<u32>,
+    /// Whether the console note about inferred frame arguments has been sent.
+    reported_frame_arguments: bool,
+    /// The chain to read state variables the transaction never touched from, when the
+    /// session was launched against a node.
+    chain: Option<ChainReader>,
     terminated: bool,
+}
+
+/// What the server reads untouched storage slots through.
+type ChainReader = CachedChain<ChainRead>;
+
+/// The chain state the traced transaction started from: the end of its parent block.
+///
+/// A read that fails leaves the slot unknown, which is what an editor should show; there
+/// is no console to report it on before the session has started.
+fn chain_before_transaction(rpc_url: &str, tx_hash: &str) -> Option<ChainReader> {
+    let (block, _index) = soldb_rpc::transaction_block(rpc_url, tx_hash).ok()?;
+    let number = u64::from_str_radix(block.trim_start_matches("0x"), 16).ok()?;
+    let parent = number.checked_sub(1)?;
+    let block = format!("0x{parent:x}");
+    let rpc_url = rpc_url.to_owned();
+    let read: ChainRead = Box::new(move |address: &str, slot: &[u8; 32]| {
+        let value =
+            soldb_rpc::storage_at(&rpc_url, address, &soldb_ethdebug::word_hex(slot), &block)
+                .ok()?;
+        soldb_ethdebug::parse_word(&value).ok()
+    });
+    Some(CachedChain::new(
+        format!("the chain at block {parent}, before this transaction's block"),
+        read,
+    ))
+}
+
+/// A source breakpoint as the editor sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceBreakpoint {
+    line: u64,
+    /// The editor's condition, evaluated exactly as `break … if …` is.
+    condition: Option<String>,
+}
+
+/// The contract's debug info and the directory it came from, which the paths reported to
+/// the editor are built against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedSource {
+    root: PathBuf,
+    contract: ContractDebugInfo,
 }
 
 impl Default for DapServer {
@@ -49,8 +105,13 @@ impl Default for DapServer {
             config: DapServerConfig::default(),
             thread_id: 1,
             debugger: DebuggerState::new(),
-            source_index: None,
+            source: None,
             pending_breakpoints: BTreeMap::new(),
+            pending_function_breakpoints: Vec::new(),
+            line_breakpoint_ids: BTreeMap::new(),
+            function_breakpoint_ids: Vec::new(),
+            reported_frame_arguments: false,
+            chain: None,
             terminated: false,
         }
     }
@@ -77,19 +138,23 @@ impl DapServer {
             "launch" | "attach" => self.launch(message),
             "configurationDone" => vec![self.response(message, true, Some(json!({})), None)],
             "setBreakpoints" => vec![self.set_breakpoints(message)],
+            "setFunctionBreakpoints" => vec![self.set_function_breakpoints(message)],
             "threads" => vec![self.response(
                 message,
                 true,
                 Some(threads_body(self.thread_id, "SolDB trace")),
                 None,
             )],
-            "stackTrace" => vec![self.stack_trace(message)],
+            "stackTrace" => self.stack_trace(message),
             "scopes" => vec![self.scopes(message)],
             "variables" => vec![self.variables(message)],
             "evaluate" => vec![self.evaluate(message)],
             "continue" => self.continue_execution(message),
-            "next" | "stepIn" => self.step_instruction(message),
+            "next" => self.step_over(message),
+            "stepIn" => self.step_in(message),
             "stepOut" => self.step_out(message),
+            "stepBack" => self.step_back(message),
+            "reverseContinue" => self.reverse_continue(message),
             "pause" => {
                 let response = self.response(message, true, Some(json!({})), None);
                 let event = self.event(
@@ -120,8 +185,8 @@ impl DapServer {
             Some(initialize_body(&self.config.adapter_id)),
             None,
         );
-        let event = self.event("initialized", None);
-        vec![response, event]
+        let initialized = self.event("initialized", None);
+        vec![response, initialized]
     }
 
     fn launch(&mut self, request: &DapMessage) -> Vec<DapMessage> {
@@ -149,7 +214,10 @@ impl DapServer {
         if let Some(ethdebug_dir) = string_arg(&args, &["ethdebugDir", "ethdebugPath", "debugDir"])
         {
             let contract_name = string_arg(&args, &["contractName", "contract"]);
-            self.source_index = Some(SourceIndex::load(Path::new(&ethdebug_dir), contract_name)?);
+            self.source = Some(LoadedSource::load(
+                Path::new(&ethdebug_dir),
+                contract_name.as_deref().unwrap_or_default(),
+            )?);
         }
 
         let trace = if let Some(trace_file) = string_arg(&args, &["traceFile", "tracePath"]) {
@@ -173,13 +241,15 @@ impl DapServer {
             let rpc_url = string_arg(&args, &["rpcUrl", "rpcURL", "rpc"])
                 .or_else(|| std::env::var("RPC_URL").ok())
                 .unwrap_or_else(|| "http://127.0.0.1:8545".to_owned());
+            // The node the trace came from also answers for slots the transaction never
+            // touched, as it does in the CLI.
+            self.chain = chain_before_transaction(&rpc_url, &tx_hash);
             Some(trace_transaction(&rpc_url, &tx_hash)?)
         } else {
             None
         };
 
         let Some(trace) = trace else {
-            self.register_pending_breakpoints();
             return Ok(None);
         };
 
@@ -189,10 +259,19 @@ impl DapServer {
             .clone()
             .unwrap_or_else(|| "simulation".to_owned());
         self.debugger.load_trace(trace);
+        if let Some(source) = &self.source {
+            self.debugger
+                .attach_debug_info(vec![source.contract.clone()]);
+        }
         self.register_pending_breakpoints();
         Ok(Some(format!(
             "Loaded {tx_hash} with {step_count} EVM steps"
         )))
+    }
+
+    /// Whether breakpoints can be resolved now: a trace with debug info is loaded.
+    fn can_resolve_breakpoints(&self) -> bool {
+        self.debugger.trace().is_some() && self.source.is_some()
     }
 
     fn set_breakpoints(&mut self, request: &DapMessage) -> DapMessage {
@@ -202,25 +281,42 @@ impl DapServer {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let source_key = source_key(args.get("source")).unwrap_or_else(|| "unknown".to_owned());
+        // The editor sends `condition` with a breakpoint; it is carried through as the
+        // debugger's own condition, so an editor's conditional breakpoint and the REPL's
+        // `break … if …` are the same thing.
         let lines = args
             .get("breakpoints")
             .and_then(Value::as_array)
             .map(|breakpoints| {
                 breakpoints
                     .iter()
-                    .filter_map(|breakpoint| breakpoint.get("line").and_then(Value::as_u64))
+                    .filter_map(|breakpoint| {
+                        Some(SourceBreakpoint {
+                            line: breakpoint.get("line").and_then(Value::as_u64)?,
+                            condition: breakpoint
+                                .get("condition")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|condition| !condition.is_empty())
+                                .map(str::to_owned),
+                        })
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
         self.pending_breakpoints
             .insert(source_key.clone(), lines.clone());
-        self.register_source_breakpoints(&source_key, &lines);
-
-        let breakpoints = lines
-            .into_iter()
-            .map(|line| json!({"verified": true, "line": line}))
-            .collect::<Vec<_>>();
+        let breakpoints = if self.can_resolve_breakpoints() {
+            self.apply_line_breakpoints(&source_key, &lines)
+        } else {
+            // Nothing to resolve against yet; they are applied when the launch loads a
+            // trace, and reported as set so the editor keeps them.
+            lines
+                .into_iter()
+                .map(|breakpoint| json!({"verified": true, "line": breakpoint.line}))
+                .collect()
+        };
         self.response(
             request,
             true,
@@ -229,9 +325,136 @@ impl DapServer {
         )
     }
 
-    fn stack_trace(&mut self, request: &DapMessage) -> DapMessage {
-        let frames = self.current_stack_frame().into_iter().collect::<Vec<_>>();
-        self.response(request, true, Some(stack_trace_body(frames)), None)
+    fn set_function_breakpoints(&mut self, request: &DapMessage) -> DapMessage {
+        let names = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("breakpoints"))
+            .and_then(Value::as_array)
+            .map(|breakpoints| {
+                breakpoints
+                    .iter()
+                    .filter_map(|breakpoint| breakpoint.get("name").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.pending_function_breakpoints = names.clone();
+        let breakpoints = if self.can_resolve_breakpoints() {
+            self.apply_function_breakpoints(&names)
+        } else {
+            names.iter().map(|_| json!({"verified": true})).collect()
+        };
+        self.response(
+            request,
+            true,
+            Some(json!({"breakpoints": breakpoints})),
+            None,
+        )
+    }
+
+    /// Replaces the line breakpoints of one source with `lines`, reporting each as the
+    /// protocol wants: verified when it resolved, otherwise with the reason.
+    fn apply_line_breakpoints(
+        &mut self,
+        source_key: &str,
+        lines: &[SourceBreakpoint],
+    ) -> Vec<Value> {
+        for id in self
+            .line_breakpoint_ids
+            .remove(source_key)
+            .unwrap_or_default()
+        {
+            self.debugger.delete_breakpoint(id);
+        }
+        let mut ids = Vec::new();
+        let breakpoints = lines
+            .iter()
+            .map(|source_breakpoint| {
+                let line = source_breakpoint.line;
+                let target = BreakpointTarget::SourceLine(SourceBreakpointTarget {
+                    file: Some(source_key.to_owned()),
+                    line,
+                });
+                match self.debugger.set_conditional_breakpoint_target(
+                    &target,
+                    source_breakpoint.condition.as_deref(),
+                ) {
+                    StepOutcome::BreakpointSet(breakpoint) => {
+                        ids.push(breakpoint.id);
+                        json!({"verified": true, "line": line, "id": breakpoint.id})
+                    }
+                    StepOutcome::BreakpointError(message) => {
+                        json!({"verified": false, "line": line, "message": message})
+                    }
+                    other => {
+                        json!({"verified": false, "line": line, "message": format!("{other:?}")})
+                    }
+                }
+            })
+            .collect();
+        self.line_breakpoint_ids.insert(source_key.to_owned(), ids);
+        breakpoints
+    }
+
+    fn apply_function_breakpoints(&mut self, names: &[String]) -> Vec<Value> {
+        for id in std::mem::take(&mut self.function_breakpoint_ids) {
+            self.debugger.delete_breakpoint(id);
+        }
+        let mut ids = Vec::new();
+        let breakpoints = names
+            .iter()
+            .map(|name| {
+                match self
+                    .debugger
+                    .set_breakpoint_target(&BreakpointTarget::Function(name.clone()))
+                {
+                    StepOutcome::BreakpointSet(breakpoint) => {
+                        ids.push(breakpoint.id);
+                        json!({"verified": true, "id": breakpoint.id})
+                    }
+                    StepOutcome::BreakpointError(message) => {
+                        json!({"verified": false, "message": message})
+                    }
+                    other => json!({"verified": false, "message": format!("{other:?}")}),
+                }
+            })
+            .collect();
+        self.function_breakpoint_ids = ids;
+        breakpoints
+    }
+
+    fn register_pending_breakpoints(&mut self) {
+        if !self.can_resolve_breakpoints() {
+            return;
+        }
+        for (source, lines) in self.pending_breakpoints.clone() {
+            self.apply_line_breakpoints(&source, &lines);
+        }
+        let names = self.pending_function_breakpoints.clone();
+        self.apply_function_breakpoints(&names);
+    }
+
+    /// The call frames, and once per session a console note if any of them carries
+    /// argument values: those are read off the stack using the calling convention this
+    /// trace proved, not reported by the compiler, and the editor should not present them
+    /// as debug info.
+    fn stack_trace(&mut self, request: &DapMessage) -> Vec<DapMessage> {
+        let frames = self.stack_frames();
+        let inferred = frames.iter().any(|frame| frame.name.contains(" = "));
+        let response = self.response(request, true, Some(stack_trace_body(frames)), None);
+        if !inferred || self.reported_frame_arguments {
+            return vec![response];
+        }
+        self.reported_frame_arguments = true;
+        let note = self.event(
+            "output",
+            Some(json!({
+                "category": "console",
+                "output": "soldb: frame arguments are read off the stack, not from compiler-reported variable locations; the calling convention was proved from this trace's calldata\n"
+            })),
+        );
+        vec![response, note]
     }
 
     fn scopes(&mut self, request: &DapMessage) -> DapMessage {
@@ -241,6 +464,7 @@ impl DapServer {
             Some(json!({
                 "scopes": [
                     {"name": "Locals", "variablesReference": LOCALS_REF, "expensive": false},
+                    {"name": "State", "variablesReference": STATE_REF, "expensive": false},
                     {"name": "Stack", "variablesReference": STACK_REF, "expensive": false},
                     {"name": "Memory", "variablesReference": MEMORY_REF, "expensive": false},
                     {"name": "Storage", "variablesReference": STORAGE_REF, "expensive": false},
@@ -263,6 +487,7 @@ impl DapServer {
             STACK_REF => self.stack_variables(),
             MEMORY_REF => self.memory_variables(),
             STORAGE_REF => self.storage_variables(),
+            STATE_REF => self.state_variables(),
             STEP_REF => self.step_variables(),
             _ => Vec::new(),
         };
@@ -296,70 +521,164 @@ impl DapServer {
         vec![response, self.stopped_event(outcome)]
     }
 
-    fn step_instruction(&mut self, request: &DapMessage) -> Vec<DapMessage> {
-        let outcome = self.debugger.next_instruction();
+    /// `next`: the next source line in this frame, stepping over calls; one instruction
+    /// with instruction granularity or without debug info.
+    fn step_over(&mut self, request: &DapMessage) -> Vec<DapMessage> {
+        let outcome = if instruction_granularity(request) {
+            self.debugger.next_instruction()
+        } else {
+            self.debugger.next_source()
+        };
         let response = self.response(request, true, Some(json!({})), None);
         vec![response, self.stopped_event(outcome)]
     }
 
+    /// `stepIn`: the next source line anywhere, entering calls.
+    fn step_in(&mut self, request: &DapMessage) -> Vec<DapMessage> {
+        let outcome = if instruction_granularity(request) {
+            self.debugger.next_instruction()
+        } else {
+            self.debugger.step_into()
+        };
+        let response = self.response(request, true, Some(json!({})), None);
+        vec![response, self.stopped_event(outcome)]
+    }
+
+    /// The trace is a complete recording, so stepping back is exact: the previous source
+    /// line, or the previous instruction, with the machine state it had.
+    fn step_back(&mut self, request: &DapMessage) -> Vec<DapMessage> {
+        let outcome = if instruction_granularity(request) {
+            self.debugger.previous_instruction()
+        } else {
+            self.debugger.previous_source()
+        };
+        let response = self.response(request, true, Some(json!({})), None);
+        vec![response, self.stopped_event(outcome)]
+    }
+
+    fn reverse_continue(&mut self, request: &DapMessage) -> Vec<DapMessage> {
+        let outcome = self.debugger.reverse_continue();
+        let response = self.response(request, true, Some(json!({})), None);
+        vec![response, self.stopped_event(outcome)]
+    }
+
+    /// `stepOut`: run until the current frame, external or internal, has returned.
     fn step_out(&mut self, request: &DapMessage) -> Vec<DapMessage> {
-        let current_depth = self.debugger.current_step_data().map(|step| step.depth);
-        let mut outcome = self.debugger.next_instruction();
-        if let Some(depth) = current_depth {
-            while self
-                .debugger
-                .current_step_data()
-                .is_some_and(|step| step.depth >= depth)
-                && self.debugger.current_step + 1 < self.debugger.step_count()
-            {
-                outcome = self.debugger.next_instruction();
-            }
-        }
-
+        let outcome = self.debugger.finish();
         let response = self.response(request, true, Some(json!({})), None);
         vec![response, self.stopped_event(outcome)]
     }
 
-    fn current_stack_frame(&self) -> Option<StackFrame> {
-        let step = self.debugger.current_step_data()?;
-        let source = self.source_position(step.pc).map(|position| Source {
-            name: position.name.clone(),
-            path: position.path.clone(),
-        });
-        let (line, column) = self
-            .source_position(step.pc)
-            .map_or((1, 1), |position| (position.line, position.column));
+    /// The call structure at the current step, innermost frame first. Each frame names
+    /// its function when the source is known, otherwise the step it sits at.
+    fn stack_frames(&self) -> Vec<StackFrame> {
+        let Some(trace) = self.debugger.trace() else {
+            return Vec::new();
+        };
+        self.debugger
+            .frames()
+            .into_iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let step_name = trace.steps.get(frame.step).map_or_else(
+                    || format!("step {}", frame.step),
+                    |step| format!("step {}: {} @ pc {}", frame.step, step.op, step.pc),
+                );
+                let arguments = if frame.arguments.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "({})",
+                        frame
+                            .arguments
+                            .iter()
+                            .map(|argument| format!(
+                                "{} = {}",
+                                argument.name, argument.value.display
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                let name = match (&frame.function_name, &frame.contract_name) {
+                    (Some(function), _) => format!("{function}{arguments} ({step_name})"),
+                    (None, Some(contract)) => format!("{contract} ({step_name})"),
+                    (None, None) => step_name,
+                };
+                let (source, line, column) = match &frame.location {
+                    Some(location) => (
+                        Some(Source {
+                            name: normalize_source_key(&location.path),
+                            path: self.display_source_path(&location.path),
+                        }),
+                        location.line,
+                        location.column.max(1),
+                    ),
+                    None => (None, 1, 1),
+                };
+                StackFrame {
+                    id: index as u64 + 1,
+                    name,
+                    source,
+                    line,
+                    column,
+                }
+            })
+            .collect()
+    }
 
-        Some(StackFrame {
-            id: 1,
-            name: format!(
-                "step {}: {} @ pc {}",
-                self.debugger.current_step, step.op, step.pc
-            ),
-            source,
-            line,
-            column,
-        })
+    fn display_source_path(&self, source_path: &str) -> String {
+        let path = Path::new(source_path);
+        match &self.source {
+            Some(source) if !path.is_absolute() => source.root.join(path).display().to_string(),
+            _ => source_path.to_owned(),
+        }
     }
 
     fn local_variables(&self) -> Vec<Value> {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        let Some(index) = &self.source_index else {
+        let Some(source) = &self.source else {
             return Vec::new();
         };
         let Some(trace) = self.debugger.trace() else {
             return Vec::new();
         };
 
-        soldb_debugger::variables_for_step(trace, &index.info, step)
+        soldb_debugger::variables_for_step(trace, &source.contract.info, step)
             .into_iter()
             .map(|variable| {
                 json!({
                     "name": variable.name,
                     "value": variable.value.display,
                     "type": variable.ty,
+                    "variablesReference": 0
+                })
+            })
+            .collect()
+    }
+
+    /// Every state variable of the contract executing at the current step, read through
+    /// its storage layout.
+    fn state_variables(&self) -> Vec<Value> {
+        let Some(layout) = self.debugger.storage_layout() else {
+            return Vec::new();
+        };
+        let Some(words) = self
+            .debugger
+            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
+        else {
+            return Vec::new();
+        };
+        soldb_debugger::state_variables(layout, &words)
+            .into_iter()
+            .map(|variable| {
+                json!({
+                    "name": variable.name,
+                    "value": variable.value.display,
+                    "type": variable.ty,
+                    "evaluateName": variable.name,
                     "variablesReference": 0
                 })
             })
@@ -447,7 +766,7 @@ impl DapServer {
         };
         match expression.trim() {
             "pc" => step.pc.to_string(),
-            "op" => step.op.clone(),
+            "op" => step.op.to_string(),
             "gas" => step.gas.to_string(),
             "gasCost" | "gas_cost" => step.gas_cost.to_string(),
             "depth" => step.depth.to_string(),
@@ -458,7 +777,12 @@ impl DapServer {
                     .parse::<usize>()
                     .ok();
                 index
-                    .and_then(|index| step.snapshot_ref().stack.get(index).cloned())
+                    .and_then(|index| {
+                        step.snapshot_ref()
+                            .stack
+                            .get(index)
+                            .map(|word| word.to_string())
+                    })
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
             expression if expression.starts_with("storage[") && expression.ends_with(']') => {
@@ -471,7 +795,25 @@ impl DapServer {
                     .cloned()
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
-            _ => "<unsupported expression>".to_owned(),
+            expression => self.evaluate_state(expression),
+        }
+    }
+
+    /// A storage path such as `counter` or `balances[0xabc]`, read through the storage
+    /// layout when one is loaded.
+    fn evaluate_state(&self, expression: &str) -> String {
+        let Some(layout) = self.debugger.storage_layout() else {
+            return "<unsupported expression>".to_owned();
+        };
+        let Some(words) = self
+            .debugger
+            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
+        else {
+            return "<unsupported expression>".to_owned();
+        };
+        match soldb_debugger::state_value(layout, &words, expression) {
+            Ok(variable) => variable.value.display,
+            Err(error) => format!("<{error}>"),
         }
     }
 
@@ -479,6 +821,7 @@ impl DapServer {
         let reason = match outcome {
             StepOutcome::BreakpointHit { .. } => "breakpoint",
             StepOutcome::AtEnd { .. } => "end",
+            StepOutcome::AtStart { .. } => "entry",
             StepOutcome::NoTrace => "pause",
             _ => "step",
         };
@@ -486,27 +829,6 @@ impl DapServer {
             "stopped",
             Some(json!({"reason": reason, "threadId": self.thread_id})),
         )
-    }
-
-    fn source_position(&self, pc: u64) -> Option<&SourcePosition> {
-        self.source_index.as_ref()?.positions.get(&pc)
-    }
-
-    fn register_pending_breakpoints(&mut self) {
-        for (source, lines) in self.pending_breakpoints.clone() {
-            self.register_source_breakpoints(&source, &lines);
-        }
-    }
-
-    fn register_source_breakpoints(&mut self, source: &str, lines: &[u64]) {
-        let Some(index) = &self.source_index else {
-            return;
-        };
-        for line in lines {
-            if let Some(pc) = index.first_pc_for_line(source, *line) {
-                self.debugger.set_breakpoint(pc);
-            }
-        }
     }
 
     fn response(
@@ -576,6 +898,15 @@ pub fn run_stdio_server<R: Read, W: Write>(mut reader: R, mut writer: W) -> Sold
     Ok(())
 }
 
+fn instruction_granularity(request: &DapMessage) -> bool {
+    request
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("granularity"))
+        .and_then(Value::as_str)
+        == Some("instruction")
+}
+
 fn string_arg(args: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| args.get(*key).and_then(Value::as_str))
@@ -605,197 +936,24 @@ fn frame_error(error: DapFrameError) -> SoldbError {
     SoldbError::Message(format!("Invalid DAP frame: {error:?}"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SourceIndex {
-    info: EthdebugInfo,
-    positions: BTreeMap<u64, SourcePosition>,
-}
-
-impl SourceIndex {
-    fn load(root: &Path, contract_name: Option<String>) -> SoldbResult<Self> {
-        let metadata_path = find_ethdebug_metadata(root);
-        let runtime_path = find_runtime_ethdebug(root, contract_name.as_deref());
-        if let (Ok(metadata_path), Ok(runtime_path)) = (metadata_path, runtime_path) {
-            return Self::load_ethdebug(root, contract_name, &metadata_path, &runtime_path);
-        }
-
-        let name = contract_name.unwrap_or_default();
-        let program = load_source_map_program(root, &name, SourceMapEnvironment::Runtime)?
+impl LoadedSource {
+    /// Loads the contract's debug program from `root`: ETHDebug artifacts, or the legacy
+    /// source map. An empty name loads the only program in the directory.
+    fn load(root: &Path, contract_name: &str) -> SoldbResult<Self> {
+        let program = load_debug_program(root, contract_name, SourceMapEnvironment::Runtime)?
             .ok_or_else(|| {
                 SoldbError::Message(format!(
                     "no ETHDebug or legacy runtime source map found in `{}`",
                     root.display()
                 ))
             })?;
-        let positions = build_positions(root, &program.info);
+        let name = program.info.contract_name.clone();
         Ok(Self {
-            info: program.info,
-            positions,
+            root: root.to_path_buf(),
+            contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents)
+                .with_storage_layout(program.storage_layout),
         })
     }
-
-    fn load_ethdebug(
-        root: &Path,
-        contract_name: Option<String>,
-        metadata_path: &Path,
-        runtime_path: &Path,
-    ) -> SoldbResult<Self> {
-        let metadata = read_json(metadata_path)?;
-        let runtime = read_json(runtime_path)?;
-        let inferred_name = contract_name.unwrap_or_else(|| {
-            runtime_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_suffix("_ethdebug-runtime.json"))
-                .unwrap_or("Contract")
-                .to_owned()
-        });
-
-        let info = EthdebugInfo::from_artifacts(&inferred_name, "runtime", &metadata, &runtime)
-            .map_err(|error| SoldbError::Message(format!("{}: {error}", runtime_path.display())))?;
-        let positions = build_positions(root, &info);
-        Ok(Self { info, positions })
-    }
-
-    fn first_pc_for_line(&self, source: &str, line: u64) -> Option<u64> {
-        let source = normalize_source_key(source);
-        self.positions.iter().find_map(|(pc, position)| {
-            (position.line == line && position.matches_source(&source)).then_some(*pc)
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SourcePosition {
-    name: String,
-    path: String,
-    line: u64,
-    column: u64,
-}
-
-impl SourcePosition {
-    fn matches_source(&self, source: &str) -> bool {
-        self.name == source || normalize_source_key(&self.path) == source
-    }
-}
-
-fn read_json(path: impl AsRef<Path>) -> SoldbResult<Value> {
-    let path = path.as_ref();
-    let content = fs::read_to_string(path).map_err(|error| {
-        SoldbError::Message(format!("Failed to read {}: {error}", path.display()))
-    })?;
-    serde_json::from_str(&content)
-        .map_err(|error| SoldbError::Message(format!("Invalid JSON {}: {error}", path.display())))
-}
-
-fn find_ethdebug_metadata(root: &Path) -> SoldbResult<PathBuf> {
-    // Modern solc (>= ~0.8.32) renamed the global ETHDebug metadata file from
-    // `ethdebug.json` to `ethdebug_resources.json`; accept either.
-    [
-        root.join("ethdebug.json"),
-        root.join("ethdebug_resources.json"),
-    ]
-    .into_iter()
-    .find(|path| path.exists())
-    .ok_or_else(|| {
-        SoldbError::Message(format!(
-            "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
-            root.display()
-        ))
-    })
-}
-
-fn find_runtime_ethdebug(root: &Path, contract_name: Option<&str>) -> SoldbResult<PathBuf> {
-    if let Some(contract_name) = contract_name {
-        let path = root.join(format!("{contract_name}_ethdebug-runtime.json"));
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-
-    let entries = fs::read_dir(root).map_err(|error| {
-        SoldbError::Message(format!(
-            "Failed to read debug dir {}: {error}",
-            root.display()
-        ))
-    })?;
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with("_ethdebug-runtime.json"))
-        })
-        .ok_or_else(|| {
-            SoldbError::Message(format!(
-                "No *_ethdebug-runtime.json found in {}",
-                root.display()
-            ))
-        })
-}
-
-fn build_positions(root: &Path, info: &EthdebugInfo) -> BTreeMap<u64, SourcePosition> {
-    let mut source_cache = BTreeMap::<String, String>::new();
-    info.instructions
-        .iter()
-        .filter_map(|instruction| {
-            let location = instruction.source_location()?;
-            let source_path = info.sources.get(&location.source_id)?.clone();
-            let content = source_cache.entry(source_path.clone()).or_insert_with(|| {
-                read_compilation_source(&info.compilation, location.source_id)
-                    .unwrap_or_else(|| read_source(root, &source_path))
-            });
-            let (line, column) = line_column(content, location.offset);
-            let path = display_source_path(root, &source_path);
-            Some((
-                instruction.offset,
-                SourcePosition {
-                    name: normalize_source_key(&source_path),
-                    path,
-                    line,
-                    column,
-                },
-            ))
-        })
-        .collect()
-}
-
-fn read_source(root: &Path, source_path: &str) -> String {
-    let path = Path::new(source_path);
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    fs::read_to_string(absolute).unwrap_or_default()
-}
-
-fn display_source_path(root: &Path, source_path: &str) -> String {
-    let path = Path::new(source_path);
-    if path.is_absolute() {
-        source_path.to_owned()
-    } else {
-        root.join(path).display().to_string()
-    }
-}
-
-fn line_column(content: &str, offset: u64) -> (u64, u64) {
-    let mut line = 1;
-    let mut column = 1;
-    for byte in content
-        .as_bytes()
-        .iter()
-        .take(usize::try_from(offset).unwrap_or(usize::MAX))
-    {
-        if *byte == b'\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-    (line, column)
 }
 
 #[cfg(test)]
@@ -828,6 +986,60 @@ mod tests {
             messages[0].body.as_ref().expect("body")["threads"][0]["id"],
             1
         );
+    }
+
+    #[test]
+    fn steps_back_and_reverse_continues_over_the_recording() {
+        let temp = temp_dir("soldb-dap-reverse");
+        std::fs::create_dir_all(&temp).expect("create temp");
+        let trace_file = temp.join("trace.json");
+        std::fs::write(
+            &trace_file,
+            serde_json::to_string(&sample_trace()).expect("trace json"),
+        )
+        .expect("write trace");
+
+        let mut server = DapServer::new();
+        let initialize = DapMessage::request(1, "initialize", Some(json!({})));
+        let messages = server.handle_message(&initialize);
+        assert_eq!(
+            messages[0].body.as_ref().expect("capabilities")["supportsStepBack"],
+            true
+        );
+        let launch = DapMessage::request(
+            2,
+            "launch",
+            Some(json!({"traceFile": trace_file.display().to_string()})),
+        );
+        server.handle_message(&launch);
+        let frame_name = |server: &mut DapServer, seq: u64| {
+            let stack = server.handle_message(&DapMessage::request(seq, "stackTrace", None));
+            stack[0].body.as_ref().expect("body")["stackFrames"][0]["name"]
+                .as_str()
+                .expect("frame name")
+                .to_owned()
+        };
+
+        // One step forward, one back: the frame names show exactly where we are.
+        server.handle_message(&DapMessage::request(3, "next", None));
+        assert!(frame_name(&mut server, 4).starts_with("step 1:"));
+        let messages = server.handle_message(&DapMessage::request(5, "stepBack", None));
+        assert_eq!(messages[0].success, Some(true));
+        assert_eq!(messages[1].event.as_deref(), Some("stopped"));
+        assert_eq!(messages[1].body.as_ref().expect("body")["reason"], "step");
+        assert!(frame_name(&mut server, 6).starts_with("step 0:"));
+
+        // Reverse-continue runs back to the start when nothing earlier is a breakpoint.
+        server.handle_message(&DapMessage::request(7, "next", None));
+        let request = DapMessage::request(8, "reverseContinue", None);
+        let messages = server.handle_message(&request);
+        assert_eq!(messages[1].body.as_ref().expect("body")["reason"], "entry");
+        assert!(frame_name(&mut server, 9).starts_with("step 0:"));
+
+        // Stepping back at the start stays there and says so.
+        let messages = server.handle_message(&DapMessage::request(10, "stepBack", None));
+        assert_eq!(messages[1].body.as_ref().expect("body")["reason"], "entry");
+        assert!(frame_name(&mut server, 11).starts_with("step 0:"));
     }
 
     #[test]
@@ -968,6 +1180,61 @@ mod tests {
         let frame = &messages[0].body.as_ref().expect("body")["stackFrames"][0];
         assert_eq!(frame["source"]["name"], "Counter.sol");
         assert_eq!(frame["line"], 3);
+        assert!(
+            frame["name"]
+                .as_str()
+                .expect("name")
+                .starts_with("set (step 0:"),
+            "{frame}"
+        );
+
+        // Function breakpoints resolve against the parsed source; an unknown name is
+        // reported unverified with the reason.
+        let function_breakpoints = DapMessage::request(
+            30,
+            "setFunctionBreakpoints",
+            Some(json!({"breakpoints": [{"name": "set"}, {"name": "missing"}]})),
+        );
+        let body = server.handle_message(&function_breakpoints)[0]
+            .body
+            .clone()
+            .expect("body");
+        assert_eq!(body["breakpoints"][0]["verified"], true);
+        assert_eq!(body["breakpoints"][1]["verified"], false);
+        assert!(body["breakpoints"][1]["message"]
+            .as_str()
+            .expect("message")
+            .contains("no function named"));
+        // Re-sending the line breakpoints after launch resolves them for real: line 3 has
+        // code, line 5 (the closing brace) belongs to the contract-wide span.
+        let set_breakpoints = DapMessage::request(
+            31,
+            "setBreakpoints",
+            Some(json!({
+                "source": {"path": temp.join("Counter.sol").display().to_string()},
+                "breakpoints": [{"line": 3}, {"line": 99}]
+            })),
+        );
+        let body = server.handle_message(&set_breakpoints)[0]
+            .body
+            .clone()
+            .expect("body");
+        assert_eq!(body["breakpoints"][0]["verified"], true);
+        assert_eq!(body["breakpoints"][1]["verified"], false);
+        // Stepping by source line from step 0 reaches the end: both steps are line 3.
+        let messages = server.handle_message(&DapMessage::request(32, "next", None));
+        assert_eq!(messages[1].body.as_ref().expect("body")["reason"], "end");
+        // Stepping back one instruction lands on step 0, where both the line and the
+        // function breakpoint sit, so the stop is reported as a breakpoint.
+        let messages = server.handle_message(&DapMessage::request(
+            33,
+            "stepBack",
+            Some(json!({"granularity": "instruction"})),
+        ));
+        assert_eq!(
+            messages[1].body.as_ref().expect("body")["reason"],
+            "breakpoint"
+        );
 
         let variables = DapMessage::request(
             4,
@@ -1079,11 +1346,11 @@ mod tests {
             steps: vec![
                 TraceStep {
                     pc: 0,
-                    op: "PUSH1".to_owned(),
+                    op: "PUSH1".into(),
                     gas: 100,
                     gas_cost: 1,
                     depth: 0,
-                    stack: vec!["0x2a".to_owned()],
+                    stack: vec!["0x2a".into()],
                     memory: Some("aa".to_owned()),
                     storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                     error: None,
@@ -1091,7 +1358,7 @@ mod tests {
                 },
                 TraceStep {
                     pc: 3,
-                    op: "STOP".to_owned(),
+                    op: "STOP".into(),
                     gas: 99,
                     gas_cost: 0,
                     depth: 0,

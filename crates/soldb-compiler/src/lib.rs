@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -33,6 +33,176 @@ pub struct CompilerConfig {
     pub build_dir: PathBuf,
     pub ethdebug_flags: Vec<String>,
     pub production_flags: Vec<String>,
+    /// How imports resolve: the project root, its library directories, and its
+    /// remappings. Empty means solc's own defaults, which only reach the source file's
+    /// own directory.
+    #[serde(default)]
+    pub project: ProjectLayout,
+}
+
+/// Where a contract's imports come from.
+///
+/// A contract in a real project imports across directories — `../../token/ERC20.sol`,
+/// `forge-std/Test.sol`, `@openzeppelin/contracts/…` — and solc resolves none of that
+/// without being told the project root, the library directories, and the remappings.
+/// [`ProjectLayout::detect`] reads them from the project itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectLayout {
+    /// solc's `--base-path`: the directory relative imports resolve against.
+    pub base_path: Option<PathBuf>,
+    /// solc's `--include-path`: where non-relative imports are looked up.
+    pub include_paths: Vec<PathBuf>,
+    /// Remappings as solc takes them on the command line, `prefix=target`.
+    pub remappings: Vec<String>,
+}
+
+impl ProjectLayout {
+    /// The layout of the project `contract_file` belongs to, found by walking up to the
+    /// nearest directory holding a file that only a project root holds.
+    ///
+    /// Returns an empty layout when the file is not in a project, which leaves solc's own
+    /// behavior untouched. Guessing wrong is worse than not guessing: the base path
+    /// decides the source paths the compiler records, and a contract compiled against the
+    /// wrong root records paths that nothing can resolve later.
+    #[must_use]
+    pub fn detect(contract_file: &Path) -> Self {
+        let Some(root) = project_root(contract_file) else {
+            return Self::default();
+        };
+        let mut include_paths = Vec::new();
+        for name in ["lib", "node_modules"] {
+            let path = root.join(name);
+            if path.is_dir() {
+                include_paths.push(path);
+            }
+        }
+        Self {
+            remappings: read_remappings(&root),
+            base_path: Some(root),
+            include_paths,
+        }
+    }
+
+    /// Whether anything was found.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.base_path.is_none() && self.include_paths.is_empty() && self.remappings.is_empty()
+    }
+
+    /// The solc arguments this layout adds, in the order solc expects them.
+    #[must_use]
+    pub fn solc_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(base_path) = &self.base_path {
+            args.push("--base-path".to_owned());
+            args.push(base_path.display().to_string());
+            // Imports written as absolute paths, and sources given as absolute paths, are
+            // outside the base path; allow the project itself.
+            args.push("--allow-paths".to_owned());
+            args.push(base_path.display().to_string());
+        }
+        for include_path in &self.include_paths {
+            args.push("--include-path".to_owned());
+            args.push(include_path.display().to_string());
+        }
+        // Remappings are positional arguments to solc, not options.
+        args.extend(self.remappings.iter().cloned());
+        args
+    }
+}
+
+/// Files that only a project root holds.
+///
+/// A `lib` directory is deliberately not among them. Every Linux system has `/lib`, so a
+/// walk that accepted it would call `/` the project root of any contract whose own
+/// directories carry no marker, and compile it with source paths relative to `/`.
+const PROJECT_MARKERS: &[&str] = &[
+    "foundry.toml",
+    "remappings.txt",
+    "hardhat.config.js",
+    "hardhat.config.ts",
+];
+
+/// The nearest ancestor of `contract_file` that a project marker names as its root.
+///
+/// The walk stops at the repository the file is in: a directory holding `.git` is the
+/// last one considered, so a marker outside the checkout never claims a contract inside
+/// it.
+fn project_root(contract_file: &Path) -> Option<PathBuf> {
+    let absolute = contract_file
+        .canonicalize()
+        .unwrap_or_else(|_| contract_file.to_path_buf());
+    let mut directory = absolute.parent()?;
+    loop {
+        if PROJECT_MARKERS
+            .iter()
+            .any(|name| directory.join(name).is_file())
+        {
+            return Some(directory.to_path_buf());
+        }
+        if directory.join(".git").exists() {
+            return None;
+        }
+        directory = directory.parent()?;
+    }
+}
+
+/// The project's `remappings.txt`, one `prefix=target` per line, and the `remappings`
+/// array of its `foundry.toml`. Targets stay as written: solc resolves them against the
+/// base path, which is the same directory they are written relative to.
+fn read_remappings(root: &Path) -> Vec<String> {
+    let mut remappings = Vec::new();
+    if let Ok(text) = fs::read_to_string(root.join("remappings.txt")) {
+        remappings.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#') && line.contains('='))
+                .map(str::to_owned),
+        );
+    }
+    if let Ok(text) = fs::read_to_string(root.join("foundry.toml")) {
+        remappings.extend(foundry_remappings(&text));
+    }
+    remappings.sort();
+    remappings.dedup();
+    remappings
+}
+
+/// The `remappings = [...]` entries of a `foundry.toml`, read without a TOML parser: the
+/// array is a list of quoted `prefix=target` strings, and anything else is ignored.
+fn foundry_remappings(text: &str) -> Vec<String> {
+    let mut remappings = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if !inside {
+            let Some(rest) = line.strip_prefix("remappings") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            inside = true;
+            remappings.extend(quoted_remappings(rest));
+            if rest.contains(']') {
+                inside = false;
+            }
+            continue;
+        }
+        remappings.extend(quoted_remappings(line));
+        if line.contains(']') {
+            inside = false;
+        }
+    }
+    remappings
+}
+
+fn quoted_remappings(line: &str) -> Vec<String> {
+    line.split(['"', '\''])
+        .map(str::trim)
+        .filter(|entry| entry.contains('=') && !entry.starts_with('['))
+        .map(str::to_owned)
+        .collect()
 }
 
 impl Default for CompilerConfig {
@@ -42,6 +212,7 @@ impl Default for CompilerConfig {
             debug_output_dir: PathBuf::from("./out"),
             contracts_dir: PathBuf::from("./contracts"),
             build_dir: PathBuf::from("./build"),
+            project: ProjectLayout::default(),
             ethdebug_flags: vec![
                 "--via-ir".to_owned(),
                 "--debug-info".to_owned(),
@@ -50,6 +221,7 @@ impl Default for CompilerConfig {
                 "--ethdebug-runtime".to_owned(),
                 "--bin".to_owned(),
                 "--abi".to_owned(),
+                "--storage-layout".to_owned(),
                 "--overwrite".to_owned(),
             ],
             production_flags: vec![
@@ -102,6 +274,7 @@ impl CompilerConfig {
     ) -> SoldbResult<CompilationResult> {
         let output_dir = output_dir.unwrap_or(&self.debug_output_dir);
         self.ensure_directories()?;
+        let started = SystemTime::now();
         // solc >= ~0.8.32 dropped the `--ethdebug`/`--ethdebug-runtime` flags in favor of
         // `--ethdebug-program`/`--ethdebug-program-runtime` (gated behind `--experimental`).
         // Try the configured (legacy) flags first for compatibility with older/pinned solc
@@ -111,10 +284,14 @@ impl CompilerConfig {
         match run_solc(
             &self.solc_path,
             &self.ethdebug_flags,
+            &self.project,
             contract_file.as_ref(),
             output_dir,
         ) {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                drop_stale_metadata(output_dir, started);
+                Ok(result)
+            }
             Err(SoldbError::Message(legacy_error))
                 if is_unrecognised_ethdebug_option(&legacy_error) =>
             {
@@ -122,9 +299,11 @@ impl CompilerConfig {
                 run_solc(
                     &self.solc_path,
                     &modern_flags,
+                    &self.project,
                     contract_file.as_ref(),
                     output_dir,
                 )
+                .inspect(|_| drop_stale_metadata(output_dir, started))
                 .map_err(|modern_error| {
                     SoldbError::Message(format!(
                         "Compilation failed with legacy ETHDebug flags ({legacy_error}); \
@@ -146,6 +325,7 @@ impl CompilerConfig {
         run_solc(
             &self.solc_path,
             &self.production_flags,
+            &self.project,
             contract_file.as_ref(),
             output_dir,
         )
@@ -390,6 +570,7 @@ pub fn auto_deploy(config: &AutoDeployConfig) -> SoldbResult<AutoDeployResult> {
 fn run_solc(
     solc_path: &str,
     flags: &[String],
+    project: &ProjectLayout,
     contract_file: &Path,
     output_dir: &Path,
 ) -> SoldbResult<CompilationResult> {
@@ -402,6 +583,7 @@ fn run_solc(
 
     let mut command = Command::new(solc_path);
     command.args(flags);
+    command.args(project.solc_args());
     command.arg("-o").arg(output_dir).arg(contract_file);
     let output = command.output().map_err(|error| {
         SoldbError::Message(format!(
@@ -425,6 +607,26 @@ fn run_solc(
         stdout,
         stderr,
     })
+}
+
+/// Removes a global ETHDebug metadata file this compilation did not write.
+///
+/// solc names it `ethdebug.json` under the flags it used to take and
+/// `ethdebug_resources.json` under the ones it takes now, so compiling into a directory
+/// that a different compiler already wrote leaves both. A loader has no way to tell which
+/// one describes the programs sitting next to them, so the stale one goes.
+fn drop_stale_metadata(output_dir: &Path, started: SystemTime) {
+    for name in ["ethdebug.json", "ethdebug_resources.json"] {
+        let path = output_dir.join(name);
+        // Only a file that is certainly older than this run is removed; a timestamp that
+        // cannot be read leaves it alone.
+        let stale = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified < started);
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 /// solc's replacement names for the ETHDebug flags it dropped (see
@@ -617,7 +819,9 @@ fn read_bytecode(path: &Path) -> SoldbResult<String> {
     Ok(format!("0x{}", bytecode.to_ascii_lowercase()))
 }
 
-fn encode_constructor_args(abi: &[Value], args: &[String]) -> SoldbResult<String> {
+/// ABI-encodes constructor arguments against the `constructor` entry of `abi`, as they are
+/// appended to creation bytecode. An ABI without a constructor accepts no arguments.
+pub fn encode_constructor_args(abi: &[Value], args: &[String]) -> SoldbResult<String> {
     let constructor = abi
         .iter()
         .find(|item| item.get("type").and_then(Value::as_str) == Some("constructor"));
@@ -680,6 +884,77 @@ fn write_deployment_json(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_a_project_marker_names_a_root() {
+        let base = std::env::temp_dir().join(format!(
+            "soldb-project-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        // A checkout with a `lib` directory above it, which is what every Linux system
+        // looks like: `/lib` is always there.
+        let outside = base.join("outside");
+        let repo = outside.join("repo");
+        let sources = repo.join("src");
+        std::fs::create_dir_all(outside.join("lib")).expect("lib");
+        std::fs::create_dir_all(&sources).expect("src");
+        std::fs::write(repo.join(".git"), "gitdir: elsewhere").expect("git marker");
+        let contract = sources.join("Token.sol");
+        std::fs::write(&contract, "contract Token {}").expect("contract");
+
+        // A `lib` directory alone is not a project, and the walk stops at the checkout, so
+        // nothing outside it can claim the contract.
+        assert_eq!(super::project_root(&contract), None);
+        assert!(super::ProjectLayout::detect(&contract).is_empty());
+
+        // The marker the project itself carries is what names the root.
+        std::fs::write(repo.join("foundry.toml"), "[profile.default]\n").expect("foundry.toml");
+        let root = super::project_root(&contract).expect("a root");
+        assert_eq!(root.canonicalize().ok(), repo.canonicalize().ok());
+        let layout = super::ProjectLayout::detect(&contract);
+        assert!(!layout.is_empty());
+        assert_eq!(
+            layout.base_path.and_then(|path| path.canonicalize().ok()),
+            repo.canonicalize().ok()
+        );
+
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
+
+    #[test]
+    fn recompiling_with_another_compiler_leaves_one_metadata_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "soldb-compiler-metadata-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        // What a run with the other flag generation left behind.
+        let stale = dir.join("ethdebug.json");
+        std::fs::write(&stale, "{}").expect("write stale");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fresh = dir.join("ethdebug_resources.json");
+        std::fs::write(&fresh, "{}").expect("write fresh");
+
+        super::drop_stale_metadata(&dir, started);
+        assert!(!stale.exists(), "the older name is removed");
+        assert!(fresh.exists(), "the one this run wrote stays");
+
+        // A directory holding only what this run wrote is left alone.
+        super::drop_stale_metadata(&dir, started);
+        assert!(fresh.exists());
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::{SystemTime, UNIX_EPOCH};

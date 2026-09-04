@@ -1,0 +1,54 @@
+# Reading state variables of a traced transaction: which variables exist, where they live,
+# and where each value came from.
+#
+# Everything here holds whichever backend produced the trace. A node's
+# `debug_traceTransaction` may or may not report storage per step, so the exact values a
+# transaction wrote, and conditions over them, are pinned in `run/state-variables.test`,
+# where a local chain records them by construction.
+# REQUIRES: soldb
+# RUN: printf 'vars\nprint balances\nprint counter\nprint balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s
+
+# `vars` names every state variable with its type and slot, whatever its value turns out
+# to be.
+# CHECK: State:
+# CHECK-NEXT: uint256 counter = {{.*}} [slot 0x0{{.*}}]
+# CHECK-NEXT: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
+# CHECK: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x1]
+# CHECK: uint256 counter = {{.*}} [slot 0x0{{.*}}]
+# A mapping entry this transaction never touched is read from the node, at the block
+# before the transaction's, and says so.
+# CHECK: uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = {{[0-9]+}} [slot 0x{{[0-9a-f]+}}, from the chain at block {{[0-9]+}}, before this transaction's block]
+
+# Without a node there is no chain to read: `soldb run` says the slot is untouched rather
+# than reaching for a value.
+# RUN: %soldb compile %S/../examples/StateVars.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: printf 'print counter\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck --check-prefix=NOCHAIN %s
+
+# NOCHAIN: uint256 counter = <unknown: slot 0x0 has not been read or written yet> [slot 0x0]
+
+# A state variable can be named where a slot number would go: `break counter` stops where
+# the counter is written. The stop is an `SSTORE` to that slot, which every backend
+# records.
+# RUN: printf 'break counter\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WATCH %s
+
+# WATCH: Breakpoint #1 set at a write to `counter` (storage slot 0x0)
+# WATCH: Breakpoint #1 hit at step {{[0-9]+}}, a write to `counter` (storage slot 0x0)
+
+# A condition over facts about the step needs no storage at all, and is checked only where
+# the target already matched.
+# RUN: printf 'break op SSTORE if depth == 1\ncontinue\ndelete 1\nbreak op SSTORE if depth > 100\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WHEN %s
+
+# WHEN: Breakpoint #1 hit at step {{[0-9]+}}, opcode SSTORE if depth == 1
+# WHEN: Breakpoint #2 set at opcode SSTORE if depth > 100
+# WHEN: End of trace at step {{[0-9]+}}
+# WHEN-NOT: Breakpoint #2 hit
+
+# A condition that cannot be read does not stop, and says why instead of failing silently.
+# RUN: printf 'break TestContract.sol:44 if nosuch > 1\ncontinue\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=UNREADABLE %s
+
+# UNREADABLE: Note: `nosuch > 1` could not be evaluated: no state variable named `nosuch` in the storage layout
+
+# A name that is neither a function nor a state variable says both things it tried.
+# RUN: printf 'break nosuchthing\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=NEITHER %s
+
+# NEITHER: no function named `nosuchthing` in the loaded sources; and no state variable named `nosuchthing` in the storage layout

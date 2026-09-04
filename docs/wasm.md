@@ -22,8 +22,9 @@ spawn `solc`, listen on sockets, and read the filesystem, none of which a
 | `soldb-profiler` | yes | gas attribution and folded stacks |
 | `soldb-repl` | yes | breakpoint and stepping state machine |
 | `soldb-serializer` | yes | the web JSON document and its per-contract metadata |
-| `soldb-rpc` | yes | transport types and trace assembly in both packages; the REVM backend, behind the `replay` feature, only in the replay-capable one |
+| `soldb-evm` | yes | node data shapes and trace assembly in both packages; the REVM engine, behind the `replay` feature, only in the replay-capable one |
 | `soldb-wasm` | yes | the bindings described below |
+| `soldb-rpc` | no | the JSON-RPC transport; the bindings take the engine directly |
 | `soldb-cli`, `soldb-dap` | no | terminal and editor frontends |
 | `soldb-compiler` | no | invokes `solc` |
 | `soldb-bridge` | no | TCP bridge server |
@@ -100,6 +101,7 @@ throw a JavaScript `Error` whose message is the debugger's own error text.
 | `trace.toSimulationWebJson(functionName, contracts?)` | the versioned document for a simulation |
 | `trace.free()` | release the trace; it lives outside the JavaScript heap |
 | `Replay.prepare(transaction, receipt, block, chainId)` | replay-capable package only; see below |
+| `Replay.prepareCall(from, to, calldata, value, block, chainId, txIndex?)` | a call on a fork of the chain at `block`; see below |
 | `replay.exportState()` | the state a completed replay depended on, ready for `provideState` |
 | `replayAvailable()` | whether `Replay` is exported by this build |
 | `version()` | the version the module was built from |
@@ -324,6 +326,20 @@ localStorage.setItem(`soldb-replay:${txHash}`, replay.exportState()); // next ti
 const trace = replay.finish();
 ```
 
+### Calls on a fork
+
+`Replay.prepareCall(from, to, calldata, value, block, chainId, txIndex?)` drives the same
+loop for a call that was never mined. `block` is the `result` of `eth_getBlockByNumber`
+for the fork point, and its `number` says where the chain is forked. Without `txIndex` the
+call runs on top of that block's final state, so the block can be fetched without
+transaction objects; with it, the call runs inside the block after the transactions before
+that index, which must then be full objects. The call carries no nonce and pays no gas
+price, as with `eth_call`. `finish()` yields a simulation trace, the one
+`toSimulationWebJson` renders, and `exportState()` works the same way. This is how a
+browser steps through an `eth_call` against a fork with nothing but a node that serves
+state at that block. `test/wasm/replay-live.cjs` checks the result against the node's
+`debug_traceCall` step for step.
+
 The node must serve state at the parent block, which for anything but recent blocks
 means an archive-capable endpoint, exactly as for the native backend. That is a property
 of replay itself: the state a transaction ran against has to come from somewhere, and a
@@ -399,17 +415,18 @@ twiggy top -n 40 target/wasm32-unknown-unknown/release/soldb_wasm.wasm
 - Adding a dependency to a crate in the WebAssembly set means checking it against the
   target. Run `make wasm-check` before proposing the change; CI runs it too.
 - `std::net`, `std::process`, and `std::fs` compile for `wasm32-unknown-unknown` but every
-  operation fails at runtime. That is why `soldb-rpc`'s HTTP transport builds there and
-  why the bindings never call it. New code paths reachable from the exports must not
-  touch them.
-- `soldb-rpc` keeps REVM behind its `replay` feature, on by default. Code that needs REVM
-  belongs in its `replay` module, and execution stays separate from I/O there:
+  operation fails at runtime. The bindings therefore depend on `soldb-evm`, which does no
+  I/O, and not on `soldb-rpc`, whose transport would build there and fail on first use.
+  New code paths reachable from the exports must not touch them.
+- `soldb-evm` keeps REVM behind its `replay` feature, on by default. Code that needs REVM
+  belongs in its `replay` module, and the crate has no I/O at all:
   `replay_prefix_with_state` and `replay_target_with_state` run over any
   `ReplayStateProvider` and never touch a client, which is what lets the host-driven loop
   exist. A `ReplayPrefix` may only be reused after a run in which the provider recorded
   nothing missing; keeping one from a run that read defaults would bake those defaults
-  in. `soldb-rpc` and `soldb-wasm` must keep building and passing their tests with
-  `--no-default-features`, which `make wasm-check` verifies natively and on the target.
+  in. `soldb-evm`, `soldb-rpc`, and `soldb-wasm` must keep building and passing their
+  tests with `--no-default-features`, which `make wasm-check` verifies natively and on
+  the target.
 - The web document's `steps` are streamed from the trace by `WebSteps` in
   `soldb-serializer`, one step at a time, rather than copied into a `serde_json::Value`
   tree first. A test pins the output byte-for-byte against the former shape, so a change

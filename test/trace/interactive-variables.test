@@ -14,11 +14,26 @@
 # RUN: printf 'print definitely_not_a_variable\nprint\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s --check-prefix=LOOKUP
 
 # LOOKUP: No such variable: `definitely_not_a_variable` is not in scope at PC {{[0-9]+}}
+# The reason matters: this compiler emits no ETHDebug variable locations at all, which is
+# not the same as the name not being live here.
+# LOOKUP: note: this artifact carries no ETHDebug variable locations
 # LOOKUP: Usage: print <variable>
+
+# `vars` says the same thing rather than reporting an empty scope, and a backtrace that
+# carries argument values says once where they came from: the stack, read with the calling
+# convention this trace proved, not the compiler's own variable information.
+# RUN: printf 'vars\nbreak TestContract.sol:30\ncontinue\nbt\nbt\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s --check-prefix=SOURCES
+
+# SOURCES: Variables: this artifact carries no ETHDebug variable locations, so locals cannot be shown; the compiler that produced it does not emit them yet
+# SOURCES: warning: frame arguments are read off the stack, not from compiler-reported variable locations
+# SOURCES: note: the calling convention was proved from this trace's calldata
+# The note is printed once a session, not on every backtrace.
+# SOURCES-NOT: warning: frame arguments are read off the stack
 
 # Both commands are advertised in the REPL help.
 # RUN: printf 'help\nhelp vars\nquit\n' | %soldb trace %{test_tx} --rpc %{rpc_url} -i 2>&1 | FileCheck %s --check-prefix=HELP
 
 # HELP: vars, print <variable>
-# HELP: vars - print every source variable live at the current PC
-# HELP: print <variable> - print one source variable by name
+# HELP: vars - print the variables live at the current PC
+# HELP: print <variable> - print one variable by name
+# HELP: print <state>[<key>]

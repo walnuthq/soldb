@@ -6,8 +6,8 @@ Guidance for AI coding agents working in this repository.
 
 SolDB is an ETHDebug-first, LLDB-style debugger for Solidity and the EVM, written in
 Rust. It maps EVM execution back to Solidity source using compiler-generated debug
-information, and exposes that as a CLI (`trace`, `simulate`, `list-events`,
-`list-contracts`, `bridge`), an interactive REPL, a versioned JSON document for web
+information, and exposes that as a CLI (`trace`, `simulate`, `run`, `replay`,
+`list-events`, `list-contracts`, `bridge`), an interactive REPL, a versioned JSON document for web
 clients, a DAP server for editors, and a WebAssembly module for browser and Node.js
 hosts.
 
@@ -21,7 +21,9 @@ Two premises drive most design decisions:
 - **The node is the execution oracle.** We do not maintain chain state. Either the node
   replays the transaction for us (`debug_traceTransaction`), or we pull the state a
   transaction touched over normal RPC and replay it in REVM. Both paths must produce the
-  same `TransactionTrace` shape.
+  same `TransactionTrace` shape. The one exception is deliberate: `soldb run` executes
+  bytecode on a `LocalChain` that exists only for that run, with every account the user
+  described and nothing else, so what it shows is exactly as real as the state given.
 
 Do not describe SolDB in the third person in code comments, docs, or commit messages.
 This repository is the project: say "we", "this codebase", or "the debugger" instead of
@@ -56,6 +58,18 @@ cargo build --bin soldb                                # run-tests.sh picks up t
 ./test/run-tests.sh                                    # or SOLC_PATH=/path/to/solc ./test/run-tests.sh
 ```
 
+`run-tests.sh` compiles the tests with the compiler it prints on startup: `--solc=PATH`
+or `SOLC_PATH` when given — an explicit choice is never overridden by the solc-select
+search — and the `solc` on `PATH` otherwise. An unrecognised option stops the run rather
+than being ignored, so a suite never quietly answers for a different setup than the one
+asked for.
+
+`run-tests.sh` reuses an existing `examples/out` deployment when it can, and recompiles
+when the artifacts there are missing something the tests read — the storage layout, the
+ABI, the bytecode, a debug program. A directory left by an older checkout is otherwise
+reused as-is and fails tests for reasons that have nothing to do with the code under test;
+when a new test needs a new artifact, add it to `test_artifacts_complete`.
+
 `run-tests.sh` generates `test/lit.site.cfg.py` (gitignored) with the freshly deployed
 contract address and transaction hashes. **Run it at least once before invoking `lit`
 directly**, otherwise every substitution such as `%{test_tx}` is empty and tests fail for
@@ -66,7 +80,8 @@ lit test/trace/basic-trace.test -v
 lit test/simulate/ -v
 ```
 
-Scope a full run with `--trace-only`, `--simulate-only`, `--events-only`, or `--cli-only`.
+Scope a full run with `--trace-only`, `--simulate-only`, `--run-only`, `--events-only`, or
+`--cli-only`.
 Tests run with `-j1` on purpose: they share one node, one contract deployment, and the
 `examples/out` artifact directory.
 
@@ -91,8 +106,9 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | --- | --- |
 | `soldb-core` | *(nothing)* |
 | `soldb-ethdebug` | core, `revm-bytecode` |
-| `soldb-rpc` | core, `ruint`, `revm` (behind the default-on `replay` feature) |
-| `soldb-repl` | core |
+| `soldb-evm` | core, `ruint`, `revm` (behind the default-on `replay` feature) |
+| `soldb-rpc` | core, evm |
+| `soldb-repl` | core, debugger |
 | `soldb-serializer` | core, ethdebug |
 | `soldb-debugger` | core, ethdebug |
 | `soldb-profiler` | core, ethdebug |
@@ -100,17 +116,18 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | `soldb-compiler` | core, ethdebug, rpc |
 | `soldb-dap` | core, ethdebug, rpc, repl, debugger |
 | `soldb-cli` | core, ethdebug, rpc, repl, debugger, profiler, serializer, compiler, bridge, `inferno` |
-| `soldb-wasm` | core, ethdebug, rpc (without `replay`), debugger, serializer, `wasm-bindgen` |
+| `soldb-wasm` | core, ethdebug, evm (without `replay`), debugger, serializer, `wasm-bindgen` |
 
 The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
 `cargo install soldb`; the directory keeps the `soldb-cli` name to match its siblings.
 
-`soldb-debugger` is the shared frontend model, and both `soldb-cli` and `soldb-dap` go
-through it for variable decoding so the terminal and an editor report the same values.
-The CLI still carries its own source-stepping and frame-building logic in `main.rs`,
-including a near-verbatim copy of `soldb-debugger`'s Solidity source-function parser.
-Prefer moving CLI logic *into* `soldb-debugger` over growing that second implementation;
-new frontend logic that both would want belongs there.
+`soldb-debugger` is the shared frontend model: both `soldb-cli` and `soldb-dap` go
+through it for variable decoding, and both drive `soldb-repl`, whose stepping and
+breakpoints rest on `soldb-debugger`'s `StepMap`, so the terminal and an editor stop at
+the same steps and report the same values. Debug artifacts are found and read through
+`soldb_ethdebug::load_debug_program` in both frontends. The CLI still builds the `trace`
+command's call-frame summary itself in `main.rs`; new frontend logic that both would want
+belongs in `soldb-debugger`, not in a second copy.
 
 - **soldb-core**: the shared vocabulary — `TraceStep`, `StepSnapshot`,
   `TransactionTrace`, `TraceCapabilities`, `TraceArtifacts`, `SoldbError`. It has no
@@ -118,25 +135,62 @@ new frontend logic that both would want belongs there.
   agrees on.
 - **soldb-ethdebug**: ETHDebug artifact loading (`metadata.rs`), legacy `srcmap` parsing
   (`source_map.rs`), ABI encode/decode and signature parsing (`abi.rs`), event decoding
-  (`events.rs`). Pure functions over files and bytes; no network.
-- **soldb-rpc**: JSON-RPC transport, the `debug-rpc` backend, the REVM `replay` backend,
-  `debug_traceCall` simulation, and log retrieval. This is the only crate that talks to a
-  node. The replay backend lives in `replay.rs` behind the `replay` cargo feature (on by
-  default) because it is the only code that links REVM; the crate must keep building and
-  passing its tests with `--no-default-features`, and code that needs REVM goes in that
-  module. Inside it, execution is separate from I/O: `ReplayInputs` gathers what the node
-  says about the transaction and its block, `replay_prefix_with_state` and
-  `replay_target_with_state` run REVM over any `ReplayStateProvider`, and
-  `PrefetchedReplayState` is the provider a host fills in rounds; it records every read so
-  a completed run can export exactly the state it used. A `ReplayPrefix` is reusable only
-  after a run that recorded nothing missing. Keep network calls out of the execution path.
+  (`events.rs`), and the storage layout (`storage_layout.rs`): where solc put each state
+  variable, the slot arithmetic for mappings, arrays, and structs, and the decoding of a
+  word by its declared type. Pure functions over files and bytes; no network.
+- **soldb-evm**: the execution engine, with no I/O. The node data shapes
+  (`RpcTransaction`, `RpcReceipt`, `DebugTraceResult`, the block types) are what JSON-RPC
+  answers deserialize into, wherever they were fetched; `debug_rpc_transaction_trace` and
+  `debug_rpc_simulation_trace` assemble a trace from them, and every backend ends in
+  `build_transaction_trace`. The REVM engine lives in `replay.rs` behind the `replay`
+  cargo feature (on by default) because it is the only code that links REVM; the crate
+  must keep building and passing its tests with `--no-default-features`, and code that
+  needs REVM goes in that module. `ReplayInputs` holds what the node says about the
+  transaction and its block, `replay_prefix_with_state` and `replay_target_with_state`
+  run REVM over any `ReplayStateProvider`, `PrefetchedReplayState` is the provider a host
+  fills in rounds (it records every read so a completed run can export exactly the state
+  it used), `LocalChain` is the synthetic chain `soldb run` executes on, and
+  `ReplayBundle` is a completed replay's inputs and state as one serializable value, which
+  `--save-replay` writes and `soldb replay` runs with no node. A `ReplayPrefix` is
+  reusable only after a run that recorded nothing missing.
+  `replay_chain_support` decides per chain id whether the engine models the chain,
+  runs it under Ethereum rules with a capability note, or refuses it; extend the tables
+  there rather than letting an unknown chain replay silently wrong. Nothing in this crate
+  may open a socket, spawn a process, or read a file.
+- **soldb-rpc**: the JSON-RPC transport and everything that needs a node: the `debug-rpc`
+  backend, `debug_traceCall` simulation, log retrieval, and the node side of the `replay`
+  backend in its own `replay.rs` (fetching a transaction's inputs, the lazy
+  `RpcReplayStateProvider`, the archive preflight, batch requests), all behind the same
+  `replay` feature, which also turns on the engine's. It re-exports `soldb-evm`'s public
+  surface so frontends see one crate. This is the only crate that talks to a node.
 - **soldb-debugger**: source-step, function, and variable decoding over a
   `TransactionTrace` plus `EthdebugInfo`. Frontend-agnostic; shared by CLI, REPL, and DAP.
+  `ContractDebugInfo` is one contract's metadata prepared for stepping (line index, PC
+  index, parsed functions), from ETHDebug or a legacy source map alike, and `StepMap`
+  maps every step of a trace through the loaded
+  contracts once: the line it belongs to, its frame depth (EVM depth plus internal
+  Solidity functions, from the artifact's jump markers where it has them, from a jump
+  onto a parsed function's entry point with the return address read off the stack at
+  the call, and from the spans as a fallback), and the
+  searches behind `next`, `step`, `finish`, their reverse forms,
+  line and function breakpoints, and `backtrace`. Compiler-generated helpers carry the
+  whole-contract span; the map attributes them to the executing statement and marks them
+  `generated`. `state.rs` reads state variables: `StorageTape` indexes every storage word
+  the trace recorded by the account whose storage it belongs to (a `DELEGATECALL` writes
+  the caller's, which `StepMap::storage_context_index` decides) and by the step it holds
+  from, and drops what a reverted frame wrote; a slot with no record is unknown, never
+  zero. A frontend that has a node can fill those in through the `ChainStorage` trait,
+  whose implementation stays in the frontend because this crate does no I/O; a value read
+  that way is marked `StateSource::Chain` so it is shown as the chain's state and not as
+  part of the recording. All of it is a search over the recording; nothing re-executes.
 - **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
   programs. Frontend-agnostic; returns tables and folded stacks without printing or I/O.
 - **soldb-repl**: the interactive debugger *state machine* — breakpoints, stepping,
-  display mode. It owns no I/O; the CLI drives it and prints. Keep it that way, because
-  it is what makes REPL behavior unit-testable without a terminal.
+  display mode, and the inspection queries (`frames`, `source_listing`, `calldata`). It
+  owns no I/O; the CLI drives it and prints. Keep it that way, because it is what makes
+  REPL behavior unit-testable without a terminal. Breakpoints are predicates on a step
+  (`BreakpointKind`: PC, line entry, function entry, `SSTORE` to a slot, revert, call,
+  opcode), checked on every step a movement passes through, forward or backward.
 - **soldb-serializer**: the versioned web/JSON projection of traces and simulations,
   including the per-contract `contracts` entry built from `EthdebugInfo`.
 - **soldb-compiler**: `solc` invocation, ETHDebug artifact discovery, deploy helpers.
@@ -165,6 +219,9 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
 - Backend-specific quirks stay inside `soldb-rpc` behind `TraceBackend`. Everything above
   it reads `TraceCapabilities` to decide what it can show — never `backend == "replay"`.
   Adding a backend must not require touching the CLI.
+- Stepping is bidirectional. A trace is a complete recording, so `soldb-repl` moves
+  backward (`reverse-*` commands, DAP `stepBack`/`reverseContinue`) by index, never by
+  re-executing. Do not add reverse commands that replay the transaction.
 - ETHDebug parsing stays in `soldb-ethdebug`. If the CLI is indexing into raw ETHDebug
   JSON, the accessor is missing from the metadata layer.
 - `soldb-core` types are a serialization contract with on-disk artifacts and web clients.
@@ -172,23 +229,28 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
   breaking change (see JSON Output Contract).
 - The crates listed in `WASM_CRATES` in the `Makefile` must keep building for
   `wasm32-unknown-unknown`; the `wasm` CI job lints them on that target, checks
-  `soldb-rpc` without its `replay` feature, and runs the `soldb-wasm` package build and
+  `soldb-evm` and `soldb-rpc` without their `replay` feature, and runs the `soldb-wasm`
+  package build and
   tests. `std::net`, `std::process`, and `std::fs` compile there but fail at runtime, so
   a WebAssembly host does the I/O and hands results over as strings: nothing reachable
-  from a `soldb-wasm` export may open a socket, spawn a process, or read a file. Check a
-  new dependency in one of those crates with `make wasm-check` before proposing it.
+  from a `soldb-wasm` export may open a socket, spawn a process, or read a file. That is
+  why the bindings depend on `soldb-evm` and not on `soldb-rpc`; do not add the transport
+  back. Check a new dependency in one of those crates with `make wasm-check` before
+  proposing it.
   `make wasm` builds both packages and fails when either exceeds its budget
   (`WASM_LEAN_SIZE_BUDGET_BYTES`, `WASM_REPLAY_SIZE_BUDGET_BYTES`); raise a budget
   deliberately, in the change that explains the growth, never to make CI pass.
-  `soldb-rpc` selects `getrandom`'s `js` backend for that target only because REVM's
+  `soldb-evm` selects `getrandom`'s `js` backend for that target only because REVM's
   `k256` needs it to link. See `docs/wasm.md`.
 
 ### Big Files
 
-`crates/soldb-cli/src/main.rs` (~4000 lines) and `crates/soldb-rpc/src/lib.rs` (~3200
+`crates/soldb-cli/src/main.rs` (~4400 lines) and `crates/soldb-evm/src/replay.rs` (~2700
 lines) are the two outliers. Prefer adding to a focused module over growing them further;
 when you touch a coherent region of either, splitting that region into its own module is
-a welcome change as long as it is a pure move with no behavior delta.
+a welcome change as long as it is a pure move with no behavior delta. The transport and
+the engine were separated that way: `soldb-rpc` once held both, and the split into
+`soldb-evm` moved code without changing it.
 
 ## ETHDebug Notes
 
@@ -210,26 +272,55 @@ The compiler attaches a whole-contract range to dispatcher and preamble instruct
 that range intersects every line in the file. Any code that resolves a source line to a
 program counter has to rank candidates — prefer spans that *begin* on the line, and fall
 back to the narrowest intersecting span — or it will resolve every line to the first
-instruction of the contract. `TraceSourceIndex::resolve_breakpoint` in
-`crates/soldb-cli/src/main.rs` is the reference implementation.
+instruction of the contract. `ContractDebugInfo::effective_line` in
+`crates/soldb-debugger/src/stepping.rs` is the reference implementation, and the same
+whole-contract span marks compiler-generated helper code mid-function, which `StepMap`
+attributes to the executing statement rather than to the contract's first line.
 
 ### Variables
 
 `EthdebugInfo::variables_at_pc` reads `context.variables` on each instruction (and the
 artifact's top-level `variables` array). Not every compiler release emits either yet —
-solc 0.8.36 does not — so variable inspection legitimately reports nothing in scope on
-those compilers. That is a debug-info gap, and the correct behavior is to say so rather
-than to guess values from the stack. Do not "fix" it by inferring locations.
+solc 0.8.36 does not — so *local* variable inspection legitimately reports nothing in
+scope on those compilers. That is a debug-info gap, and the correct behavior is to say so
+rather than to guess values from the stack. Do not "fix" it by inferring locations.
+
+*State* variables do not depend on that gap: `solc --storage-layout` has always said where
+they live, so `vars` and `print` read them through `StorageLayout` for ETHDebug and legacy
+artifacts alike, `break <name>` stops where one is written, and the web document carries
+the layout and the final values. A *memory* value is the same kind of fact: the layout of
+a `string`, `bytes`, or array in memory is the language's, so a frame's memory arguments
+are read through it rather than shown as offsets. That is the line to hold when a piece of debug info is missing — take
+what the compiler does emit, prove what you can from the recording, and say plainly what
+is left.
+
+Frame arguments are the worked example of proving it. The order of the parameter words on
+the stack differs between the legacy and via-IR pipelines and no artifact says which
+produced the code, so `prove_argument_layouts` in `soldb-debugger/src/stepping.rs` settles
+it from the trace: the first function entered in an EVM frame whose calldata is known is
+the one that calldata selected, so its arguments are the calldata words, and comparing
+them with the entry stack shows whether the parameters are there and which end the first
+one is at. A frame that disagrees — solc's legacy pipeline enters public functions through
+a dispatcher wrapper that has not decoded them yet — contradicts the contract, and no
+frame of it reports arguments after that. Do not replace this with a version check or a
+pipeline fingerprint.
 
 ### Artifacts
 
 Artifacts produced per contract in the output directory:
 
+- `<Contract>_storage.json` — the storage layout, from `--storage-layout`. Optional debug
+  info: absent, state variables are reported as unavailable; malformed, it is an error.
+  `soldb compile` passes the flag (`CompilerConfig::ethdebug_flags`), and so does
+  `test/deploy-contract.sh` for both ETHDebug flag generations and for the legacy
+  `--combined-json` set, which carries it per contract as `storage-layout` instead.
 - `<Contract>_ethdebug.json` — creation-code debug info.
 - `<Contract>_ethdebug-runtime.json` — runtime debug info; this is what PC-to-source
   mapping uses for an ordinary call.
 - `ethdebug.json` (legacy) / `ethdebug_resources.json` (modern) — the global resource
-  file listing sources.
+  file listing sources. A compile removes whichever of the two it did not write, because
+  a directory holding both — one compiler's output on top of another's — gives a loader
+  no way to tell which describes the programs next to them.
 - `<Contract>.abi`, `<Contract>.bin` — ABI and bytecode.
 
 ### Compiler Channels
@@ -283,8 +374,9 @@ Two layers, with different jobs:
   error messages. Prefer these for anything user-visible.
 - **`test/wasm/replay-live.cjs`** replays a transaction through the replay-capable
   WebAssembly package against a live node and compares it with the node's
-  `debug_traceTransaction`. It needs only `anvil` and Node.js, and the `wasm` CI job runs
-  it; `make wasm-live-test` runs it locally.
+  `debug_traceTransaction`, then simulates a call on the fork and compares it with
+  `debug_traceCall`. It needs only `anvil` and Node.js, and the `wasm` CI job runs it;
+  `make wasm-live-test` runs it locally.
 
 **Backend parity is itself a test target.** `test/trace/replay-*.test` run the same
 transaction through `--backend debug-rpc` and `--backend replay` and diff the opcode
@@ -319,7 +411,8 @@ Conventions:
 - Every test starts with `# REQUIRES: soldb`. Add `# REQUIRES: sepolia-rpc` or
   `# REQUIRES: stylus-bridge` for tests that need those environments.
 - Put the test in the directory that matches the command under test: `test/trace/`,
-  `test/simulate/`, `test/events/`, `test/cli/`, `test/stylus/`.
+  `test/simulate/`, `test/run/`, `test/events/`, `test/cli/`, `test/stylus/`. Tests in
+  `test/run/` need no node, only the compiled artifacts in `%{ethdebug_dir}`.
 - Expect failures explicitly with `not %soldb ...` rather than letting a nonzero exit
   fail the RUN line.
 - Pipe `2>&1` when the assertion covers diagnostics; SolDB writes progress and errors to
@@ -337,7 +430,11 @@ Follow the [FileCheck reference](https://llvm.org/docs/CommandGuide/FileCheck.ht
   (help text flags, event fields), `CHECK-NEXT` when adjacency *is* the contract (call
   stack nesting), and `CHECK-NOT` to pin an absence.
 - Capture varying values with `[[NAME:regex]]` and reuse them as `[[NAME]]`. Gas numbers,
-  addresses, and transaction hashes change between runs — never hardcode them.
+  addresses, and transaction hashes change between runs — never hardcode them. Stay in
+  that syntax: FileCheck's numeric substitution (`[[#NAME+4]]`) is not in every build the
+  suite has to run against, and a test that needs arithmetic to state its expectation is
+  usually pinning a value that belongs in a node-free `test/run/` fixture instead, where
+  the state is deterministic.
 - Use `--check-prefix` only when one file drives several distinct invocations (as
   `test/cli/help.test` does). With a single invocation, use the default `CHECK`.
 - lit substitutions are regular expressions applied to the whole RUN line, and this suite
@@ -470,9 +567,17 @@ Beyond the rule:
 ## Notes
 
 - **Trace steps are the hot loop.** A mainnet transaction is easily hundreds of thousands
-  of `TraceStep`s, each carrying a stack `Vec<String>` and all of memory as a hex string.
+  of `TraceStep`s, each carrying a dozen stack words and all of memory as a hex string.
   Avoid per-step `clone()`, `format!`, and `String`-keyed map lookups in anything that
   walks the full trace; borrow, and hoist allocation out of the loop.
+- **Stack words are shared, not copied.** A stack word is a `soldb_core::Word`
+  (`Arc<str>`), handed out by a `WordInterner`: the replay inspector interns as it
+  records and the trace-file visitor interns as it parses, so the same value costs one
+  allocation for the whole trace rather than one per occurrence. A 614,000-step trace of
+  one loop holds 1.7 million stack words drawn from about 1,200 distinct ones, and
+  interning them took it from 543 MB to 341 MB, mnemonics included: `TraceStep::op` is a
+  `Word` too, since a couple of hundred of them cover every step. Keep new step-building
+  paths interning; what is left per step is the `Vec` itself.
 - **Read a step's state with `TraceStep::snapshot_ref`, never `normalized_snapshot`.**
   The borrowed view costs nothing; the owned one copies the stack, all of memory, and the
   storage map. Reach for `normalized_snapshot` only where ownership is genuinely required.
@@ -486,11 +591,20 @@ Beyond the rule:
   document's `steps` are streamed by `WebSteps` in `soldb-serializer`, one borrowed step
   at a time, with a test pinning the bytes against the former `json!` shape. Do not
   reintroduce a `Vec<serde_json::Value>` of steps.
-- **Known cost, not yet addressed:** a `TraceStep` stores its stack, memory, and storage
-  twice — once in the flat fields and once in `snapshot` — because both are serialized.
-  That duplication dominates peak memory on large traces (a 500k-step trace peaks around
-  8 GiB). Removing it means changing the `soldb-core` serialization contract, so it is a
-  deliberate decision rather than a cleanup.
+- **A `TraceStep` stores its state once and serializes it twice.** The flat `stack`,
+  `memory`, and `storage` fields are the wire format older files and clients read; every
+  constructor leaves them empty, `Serialize` fills them from `snapshot`, and
+  `Deserialize` moves whatever they held into `snapshot`. Build steps with
+  `TraceStep::new` and `StepSnapshot::new`, never by filling the flat fields. Memory and
+  storage in a snapshot are `Arc`s, and `DebugTraceResult::steps` hands the previous
+  step's on when a log did not change them, so a trace holds one copy per change rather
+  than one per step; keep that sharing when you touch step construction. The node's
+  payload is held the same way: `StructLog` memory and storage are `Arc`s shared with the
+  previous log as `structLogs` is parsed and as the replay inspector records, and
+  `build_transaction_trace` takes the result by value so `into_steps` frees each log as
+  its step is built. A trace read from a file shares as its steps are parsed. Loading a
+  20,000-step, 89 MB file through the DAP server peaks at 114 MB; it peaked at 236 MB
+  when every step held two copies.
 - **PC-to-source lookups should be indexed, not scanned.** Build the PC map once per
   contract (`build_pc_to_instruction_map`) and reuse it; a linear scan per step turns a
   trace walk quadratic.
@@ -513,6 +627,7 @@ Beyond the rule:
   `__pycache__`/egg-info from the pre-Rust implementation and are untracked. The runtime
   is Rust-only (`docs/port-to-rust.md`); do not add code there or resurrect the Python
   paths.
-- **Keep the docs honest.** `docs/commands.md` documents REPL commands including the
-  places where behavior is still a stub (`next` and `step` currently advance one
-  instruction). If you change that behavior, change the doc in the same commit.
+- **Keep the docs honest.** `docs/commands.md` documents every REPL command, what a stop
+  shows, and how line breakpoints and internal frames are inferred. If you change that
+  behavior, change the doc in the same commit; the interactive lit tests pin the
+  wording.

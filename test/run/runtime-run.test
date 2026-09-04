@@ -1,0 +1,15 @@
+# `--runtime` installs raw runtime bytecode as it is, and `--storage` seeds a slot. This
+# counter reads slot 0, adds one, and writes it back; with the slot seeded at 0x29 the
+# trace shows the read and the write.
+# REQUIRES: soldb
+# RUN: %soldb run 0x6000405060005460010160005500 --runtime --storage 0x0=0x29 --raw --max-steps 12 2>&1 | FileCheck %s
+# Without a function signature or data the call carries empty calldata, and the raw
+# view lists every instruction of the tiny program.
+# RUN: %soldb run 0x6000405060005460010160005500 --runtime --json | jq -e '.status == "success" and (.steps | length) == 10 and (.steps[8].snapshot.storage["0x0"] == "0x1")'
+
+# CHECK: Installed runtime code at 0x5fbdb2315678afecb367f032d93f642f64180aa3
+# CHECK: SLOAD
+# CHECK-SAME: 0x0
+# CHECK: SSTORE
+# CHECK-SAME: 0x2a
+# CHECK: STOP

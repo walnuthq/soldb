@@ -18,14 +18,22 @@
 //! than trusted to be in range.
 
 pub mod abi;
+pub mod artifacts;
 pub mod events;
 pub mod metadata;
 pub mod source_map;
+pub mod storage_layout;
 
 pub use abi::{
     canonical_abi_input_type, encode_abi_arguments, encode_function_call, function_selector,
     keccak256, match_abi_types, match_single_type, parse_signature, parse_tuple_arg, AbiInput,
     FunctionSignature,
+};
+pub use artifacts::{
+    contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
+    find_program_ethdebug, load_debug_program, load_debug_program_with_sources,
+    load_storage_layout, read_debug_source, read_debug_source_from, read_json_file,
+    source_candidates, DebugProgram,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,
@@ -37,6 +45,12 @@ pub use metadata::{
     EthdebugSpec, FunctionExit, FunctionIdentity, Instruction, SourceLocation, VariableLocation,
 };
 pub use source_map::{
-    build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, parse_srcmap,
-    SourceMapEntry, SourceMapEnvironment, SourceMapInfo, SourceMapProgram,
+    build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program,
+    load_source_map_program_with_sources, parse_srcmap, SourceMapEntry, SourceMapEnvironment,
+    SourceMapInfo, SourceMapProgram,
+};
+pub use storage_layout::{
+    add_word, decode_value, element_place, mapping_slot, parse_word, word_hex, word_to_decimal,
+    DecodedStorage, StorageEncoding, StorageLayout, StorageMember, StorageRef, StorageType,
+    StorageVariable, Word,
 };

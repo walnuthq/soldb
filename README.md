@@ -42,9 +42,23 @@ Compile your contracts with ETHDebug (Solidity 0.8.29+):
 solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime --bin --abi --overwrite -o out examples/Counter.sol
 ```
 
-Legacy source maps are also accepted. For example, compile with Solar using
-`-g source-maps --emit=abi,bin,bin-runtime --out-dir out`; SolDB reads
-`combined.json` when ETHDebug programs are absent.
+Or let SolDB drive the compiler, which also asks for the storage layout the debugger
+reads state variables from:
+```bash
+soldb compile src/Token.sol -o out
+```
+
+Inside a project it resolves imports the way the project does: the nearest directory
+holding a `foundry.toml`, a `remappings.txt`, or a Hardhat config is the base path — the
+search stops at the checkout, so nothing outside it can claim a contract inside — `lib`
+and `node_modules` are searched for non-relative imports, and the project's remappings are
+applied. It prints what it found, and `--base-path`, `--include-path`, `--remapping`, and
+`--no-project` override it.
+
+Legacy source maps are also accepted: SolDB reads `combined.json` when ETHDebug
+programs are absent, so contracts built by pre-ETHDebug compilers still debug by
+source line, function, and frame. When the sources those artifacts name are not next to
+them, pass `--source-path <dir>` — the directory the contract was compiled in.
 
 Trace a transaction:
 ```bash
@@ -161,18 +175,31 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
 
 - ETHDebug-first source debugging with legacy `srcmap`/`srcmap-runtime` fallback
 - Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
-  server, decoded from ETHDebug variable locations
+  server: locals decoded from ETHDebug variable locations, and state variables — including
+  `balances[0xabc…]`, `items[2]`, and `config.owner` — read through the storage layout
+  `solc --storage-layout` emits, for legacy compilers as well. A slot the transaction never
+  touched is read from the node at the block it started from, and says so
+- Call frames carry the arguments they were entered with, once the trace itself has proven
+  where the compiler leaves them; a frame that cannot be proven stays bare rather than
+  naming stack words that may not be the parameters
 - Full transaction traces with internal calls & decoded parameters
 - Dynamic gas profiles by contract, function, source line, opcode, and instruction
 - Folded-stack and interactive SVG flame graph output
-- Transaction simulation with arbitrary calldata (including structs & tuples)
-- Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) – works for both transactions and simulations
-- HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and normal-RPC replay for local Anvil transactions
+- Transaction simulation with arbitrary calldata (including structs & tuples), through
+  `debug_traceCall` or replayed locally as a fork of the chain at any block and transaction index
+- `soldb run`: debug compiled bytecode on a local chain with no node at all
+- Interactive LLDB-like REPL that steps by source line (`next`, `step`, `finish`) and backward as
+  well as forward (`reverse-next`, `reverse-finish`, `goto`) – works for transactions, simulations, and runs
+- Breakpoints on lines, functions, storage writes, reverts, calls, and opcodes, all searches over the
+  recorded trace; `backtrace`, `list`, `stack`, `memory`, `storage`, and `calldata` at any step
+- Debug Adapter Protocol server for editors: line and function breakpoints, step in/over/out, step-back
+- HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and a REVM replay backend for nodes that cannot trace
+- WebAssembly package for browser and Node.js hosts, with host-driven replay
 - Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
 
 ## Architecture
 
-SolDB is split into focused crates so RPC transport, ETHDebug parsing, execution backends, CLI presentation, and interactive debugging can evolve independently.
+SolDB is split into focused crates so the RPC transport, the execution engine, ETHDebug parsing, CLI presentation, and interactive debugging can evolve independently.
 
 ```mermaid
 flowchart TD
@@ -180,18 +207,24 @@ flowchart TD
     solc --> artifacts["ETHDebug + ABI artifacts"]
 
     cli["soldb trace / simulate / profile"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]
+    run["soldb run<br/>compiled bytecode"] --> metadata
+    wasm["soldb-wasm<br/>browser / Node.js host does the RPC"] --> metadata
     artifacts --> metadata
 
-    cli --> selector["soldb-rpc<br/>backend selector"]
+    cli --> selector["soldb-rpc<br/>JSON-RPC transport + backend selector"]
     selector --> debug_rpc["debug-rpc backend<br/>debug_traceTransaction / debug_traceCall"]
-    selector --> replay["replay backend<br/>normal RPC state -> REVM inspectors"]
+    selector --> replay["replay backend<br/>node state at the parent block"]
+    run --> local["LocalChain<br/>synthetic block, no node"]
 
-    debug_rpc --> opcode_trace["opcode trace"]
-    replay --> opcode_trace
+    debug_rpc --> engine["soldb-evm<br/>trace assembly + REVM engine"]
+    replay --> engine
+    local --> engine
+    wasm --> engine
+    engine --> opcode_trace["opcode trace<br/>a complete recording"]
     metadata --> debugger["soldb-debugger<br/>source steps + variables"]
     opcode_trace --> enriched
     debugger --> enriched["source lines<br/>call frames<br/>decoded values"]
-    enriched --> outputs["CLI / JSON / REPL / DAP"]
+    enriched --> outputs["CLI / JSON / REPL and DAP, forward and reverse / WASM"]
     opcode_trace --> profiler["soldb-profiler<br/>gas aggregation"]
     metadata --> profiler
     profiler --> profile_outputs["tables / JSON / flame graph"]
@@ -213,7 +246,7 @@ The `trace` command supports three backend modes:
 
 - `auto` (default): tries `debug-rpc` first, then falls back to `replay` when the node reports that `debug_traceTransaction` is unavailable.
 - `debug-rpc`: calls `debug_traceTransaction` and is the fast path for Anvil, Geth, and other debug-capable nodes.
-- `replay`: loads transaction, receipt, parent-block state, bytecode, balances, nonces, and storage through normal Ethereum JSON-RPC, replays prior transactions in the block when needed, then replays the target transaction in REVM with inspectors. It selects the REVM spec from chain/block/timestamp for mainnet, Sepolia, Holesky, and Hoodi; archive-provider hardening and broader cache tuning are next-stage work.
+- `replay`: loads transaction, receipt, parent-block state, bytecode, balances, nonces, and storage through normal Ethereum JSON-RPC, replays prior transactions in the block when needed, then replays the target transaction in REVM with inspectors. It selects the REVM spec from chain/block/timestamp for mainnet, Sepolia, Holesky, and Hoodi. EVM-equivalent chains such as the OP stack, Base, BNB Smart Chain, or Polygon PoS replay under Ethereum rules at the latest fork, and the trace carries a note that their fee and gas accounting is not modelled; chains whose execution differs from the EVM (Arbitrum, zkSync Era, Polygon zkEVM) are refused with a message naming the chain, so a wrong replay never passes for a right one. Archive-provider hardening and broader cache tuning are next-stage work.
 
 Select the backend explicitly:
 
@@ -223,11 +256,71 @@ soldb trace <tx_hash> --backend debug-rpc --ethdebug-dir <contract_address>:<con
 soldb trace <tx_hash> --backend replay --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545
 ```
 
+`simulate` takes the same flag. With `--backend replay` the call is executed locally
+against the chain as it stood at `--block`, on top of that block or, with
+`--tx-index`, inside it after the transactions before that index: a fork of the chain at any
+point, with full stepping, from any node that serves state at that block, whether or not it
+can trace.
+
+```bash
+soldb simulate <contract> "increment(uint256)" 4 --from <address> --backend replay --block 12345 --rpc <url>
+```
+
+### Replay Files
+
+A replay backend run reads a bounded amount of state from the node. `--save-replay` writes
+everything it read, together with the transaction or call, its block, and the chain id, to
+a file, and `soldb replay` reproduces the same trace from that file on any machine with no
+node at all:
+
+```bash
+soldb trace <tx_hash> --backend replay --save-replay bug.json --rpc <url>
+soldb simulate <contract> "increment(uint256)" 4 --from <address> --backend replay --save-replay bug.json --rpc <url>
+soldb replay bug.json --ethdebug-dir <contract_address>:<contract_name>:./out -i
+```
+
+The file is the reproduction: attach it to a bug report and whoever opens it steps
+through the same execution, archive node or not.
+
+### Running Bytecode Without a Node
+
+`soldb run` debugs compiled bytecode on a chain that exists only for that run. There is no
+node, no deployment transaction, and nothing to clean up: the creation code is deployed
+locally from the first Anvil account, so the contract lands where Anvil would put it, and
+the call runs right after the constructor in the same synthetic block, seeing the state
+it left behind. Everything downstream is `simulate`'s: source mapping through
+`--ethdebug-dir`, the interactive debugger with reverse stepping, the JSON document, and
+the raw view.
+
+```bash
+soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Counter:./out
+soldb run out/Counter.bin --deploy --raw                 # trace the constructor itself
+soldb run 0x6000405060005460010160005500 --runtime --storage 0x0=0x29 --raw   # raw runtime code, a slot seeded
+```
+
+`--constructor-args` are encoded against the ABI next to the ETHDebug artifacts, and
+`--constructor-value` funds a payable constructor when creation code is deployed before the
+call; under `--deploy`, `--value` goes to the constructor. A deployment lands at the CREATE
+address of `--from` at nonce zero; `--address` places `--runtime` code. `--from`,
+`--balance`, `--value`, `--chain-id`, `--block-number`, `--timestamp`, and `--gas-limit`
+shape the caller and the block.
+
+### Time Travel
+
+A trace is a complete recording, so the interactive debugger and the DAP server move
+backward as freely as forward: `reverse-next`, `reverse-step`, `reverse-finish`,
+`reverse-nexti` (or `back`), and `reverse-continue` mirror their forward counterparts,
+`goto <step>` rewinds to any instruction, mid-transaction included, and an editor's
+step-back button works. Breakpoints are predicates on a step, so `break storage 0` or
+`break revert` is a search over the tape in either direction. See
+[docs/commands.md](docs/commands.md).
+
 ### Crates
 
 - `crates/soldb-cli`: command-line interface, output formatting, and command wiring.
 - `crates/soldb-core`: shared error types, trace models, and debugger data structures.
-- `crates/soldb-rpc`: JSON-RPC transport, debug-RPC backend, replay backend, transaction simulation, and event log retrieval.
+- `crates/soldb-evm`: the execution engine: node data shapes, trace assembly, and the REVM replay engine that also runs bytecode on a local chain.
+- `crates/soldb-rpc`: JSON-RPC transport, debug-RPC backend, the node side of the replay backend, transaction simulation, and event log retrieval.
 - `crates/soldb-ethdebug`: ETHDebug metadata loading, ABI helpers, source mapping, event decoding, and call-frame enrichment.
 - `crates/soldb-debugger`: reusable source-step, function, and variable decoding model shared by frontends.
 - `crates/soldb-profiler`: reusable gas attribution and folded-stack model over traces and ETHDebug programs.

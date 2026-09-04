@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
+use crate::storage_layout::StorageLayout;
 use crate::{EthdebugInfo, Instruction};
 
 /// The bytecode environment described by a legacy source map.
@@ -41,6 +42,8 @@ pub struct SourceMapProgram {
     pub info: EthdebugInfo,
     pub resources: Value,
     pub source_contents: BTreeMap<u64, String>,
+    /// The contract's `storage-layout` entry, when the artifact was compiled with it.
+    pub storage_layout: Option<StorageLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +159,16 @@ pub fn load_source_map_program(
     contract_name: &str,
     environment: SourceMapEnvironment,
 ) -> SoldbResult<Option<SourceMapProgram>> {
+    load_source_map_program_with_sources(root, &[], contract_name, environment)
+}
+
+/// The same, also looking for the sources it names in `source_roots`.
+pub fn load_source_map_program_with_sources(
+    root: &Path,
+    source_roots: &[PathBuf],
+    contract_name: &str,
+    environment: SourceMapEnvironment,
+) -> SoldbResult<Option<SourceMapProgram>> {
     let path = root.join("combined.json");
     if !path.exists() {
         return Ok(None);
@@ -167,11 +180,19 @@ pub fn load_source_map_program(
     let combined = serde_json::from_str::<Value>(&input).map_err(|error| {
         SoldbError::Message(format!("invalid JSON in `{}`: {error}", path.display()))
     })?;
-    source_map_program_from_combined(root, &path, &combined, contract_name, environment)
+    source_map_program_from_combined(
+        root,
+        source_roots,
+        &path,
+        &combined,
+        contract_name,
+        environment,
+    )
 }
 
 fn source_map_program_from_combined(
     root: &Path,
+    source_roots: &[PathBuf],
     artifact_path: &Path,
     combined: &Value,
     contract_name: &str,
@@ -229,7 +250,7 @@ fn source_map_program_from_combined(
             .map_err(|_| SoldbError::Message("source index does not fit in `u64`".to_owned()))?;
         sources.insert(source_id, source_path.to_owned());
 
-        let contents = read_source(root, source_path)?;
+        let contents = read_source(root, source_roots, source_path)?;
         if let Some(contents) = &contents {
             source_contents.insert(source_id, contents.clone());
         }
@@ -303,10 +324,22 @@ fn source_map_program_from_combined(
         variable_locations: BTreeMap::new(),
     };
 
+    let storage_layout = contract
+        .get("storage-layout")
+        .map(StorageLayout::parse)
+        .transpose()
+        .map_err(|error| {
+            SoldbError::Message(format!(
+                "legacy artifact `{}` has an invalid `storage-layout` for `{contract_key}`: {error}",
+                artifact_path.display()
+            ))
+        })?;
+
     Ok(Some(SourceMapProgram {
         info,
         resources,
         source_contents,
+        storage_layout,
     }))
 }
 
@@ -392,7 +425,41 @@ fn opcode_operation(opcode: u8) -> Value {
     json!({"mnemonic": mnemonic})
 }
 
+/// The ETHDebug-shaped context of one legacy entry: its source range, and the jump
+/// markers ETHDebug defines (`invoke` for a jump into a function, `return` for a jump
+/// out of one) when the map's jump type carries them. Generated code has no range but
+/// may still jump.
 fn source_context(
+    entry: &SourceMapEntry,
+    source_count: usize,
+    source_contents: &BTreeMap<u64, String>,
+    instruction_index: usize,
+    contract_name: &str,
+) -> SoldbResult<Option<Value>> {
+    let mut context = serde_json::Map::new();
+    if let Some(code) = source_code(
+        entry,
+        source_count,
+        source_contents,
+        instruction_index,
+        contract_name,
+    )? {
+        context.insert("code".to_owned(), code);
+    }
+    match entry.jump_type.as_str() {
+        "i" => {
+            context.insert("invoke".to_owned(), json!({}));
+        }
+        "o" => {
+            context.insert("return".to_owned(), json!({}));
+        }
+        _ => {}
+    }
+    Ok((!context.is_empty()).then_some(Value::Object(context)))
+}
+
+/// The `code` part of an entry's context: the source range it maps to, if any.
+fn source_code(
     entry: &SourceMapEntry,
     source_count: usize,
     source_contents: &BTreeMap<u64, String>,
@@ -414,11 +481,13 @@ fn source_context(
              source index"
         ))
     })?;
+    // solc attributes the Yul it generates (ABI decoding, checked arithmetic, panics) to a
+    // utility source whose index is one past the last entry in `sourceList`, and that
+    // source is never in the artifact. Such an instruction has no user source, the same
+    // as an entry with index -1; treating it as an error would reject every map a modern
+    // legacy-format compiler emits.
     if usize::try_from(source_id).map_or(true, |source_id| source_id >= source_count) {
-        return Err(SoldbError::Message(format!(
-            "legacy source-map entry {instruction_index} for `{contract_name}` references \
-             missing source {source_id}"
-        )));
+        return Ok(None);
     }
     let offset = u64::try_from(entry.offset).map_err(|_| {
         SoldbError::Message(format!(
@@ -450,29 +519,23 @@ fn source_context(
     }
 
     Ok(Some(json!({
-        "code": {
-            "source": {"id": source_id},
-            "range": {
-                "offset": offset,
-                "length": length,
-            },
+        "source": {"id": source_id},
+        "range": {
+            "offset": offset,
+            "length": length,
         },
     })))
 }
 
-fn read_source(root: &Path, source_path: &str) -> SoldbResult<Option<String>> {
-    let source_path = Path::new(source_path);
-    let mut candidates = Vec::<PathBuf>::new();
-    if source_path.is_absolute() {
-        candidates.push(source_path.to_path_buf());
-    } else {
-        candidates.push(root.join(source_path));
-        if let Some(parent) = root.parent() {
-            candidates.push(parent.join(source_path));
-        }
-        candidates.push(source_path.to_path_buf());
-    }
-
+fn read_source(
+    root: &Path,
+    source_roots: &[PathBuf],
+    source_path: &str,
+) -> SoldbResult<Option<String>> {
+    let candidates = source_roots
+        .iter()
+        .flat_map(|extra| crate::artifacts::source_candidates(extra, source_path))
+        .chain(crate::artifacts::source_candidates(root, source_path));
     for candidate in candidates {
         if candidate.exists() {
             return fs::read_to_string(&candidate).map(Some).map_err(|error| {
@@ -543,6 +606,7 @@ fn parse_inherited_string(field: Option<&str>, previous: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::metadata::FunctionExit;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -638,7 +702,24 @@ mod tests {
                 "contracts": {
                     "Counter.sol:Counter": {
                         "bin-runtime": "600100",
-                        "srcmap-runtime": "0:8:0:-:0;9:3:0"
+                        "srcmap-runtime": "0:8:0:-:0;9:3:0",
+                        "storage-layout": {
+                            "storage": [{
+                                "astId": 1,
+                                "contract": "Counter.sol:Counter",
+                                "label": "value",
+                                "offset": 0,
+                                "slot": "0",
+                                "type": "t_uint256"
+                            }],
+                            "types": {
+                                "t_uint256": {
+                                    "encoding": "inplace",
+                                    "label": "uint256",
+                                    "numberOfBytes": "32"
+                                }
+                            }
+                        }
                     }
                 }
             })
@@ -649,6 +730,16 @@ mod tests {
         let program = load_source_map_program(&dir, "Counter", SourceMapEnvironment::Runtime)
             .expect("load source map")
             .expect("runtime program");
+
+        // `solc --combined-json ...,storage-layout` carries the layout per contract, so a
+        // pre-ETHDebug compiler reads state variables by name just as a modern one does.
+        let layout = program.storage_layout.as_ref().expect("storage layout");
+        assert_eq!(layout.variables.len(), 1);
+        assert_eq!(layout.variable("value").expect("value").slot, [0_u8; 32]);
+        assert_eq!(
+            layout.resolve("value").expect("resolve").type_id,
+            "t_uint256"
+        );
 
         assert_eq!(program.info.contract_name, "Counter");
         assert_eq!(program.info.environment, "call");
@@ -676,6 +767,71 @@ mod tests {
             program.resources["compilation"]["compiler"]["version"],
             "0.8.36+commit.test"
         );
+    }
+
+    #[test]
+    fn jump_types_become_call_and_return_markers() {
+        let dir = temp_dir("jump-types");
+        let source = "contract Counter { function add() external {} }";
+        fs::write(dir.join("Counter.sol"), source).expect("write source");
+        fs::write(
+            dir.join("combined.json"),
+            json!({
+                "version": "0.8.16+commit.test",
+                "sourceList": ["Counter.sol"],
+                "contracts": {
+                    "Counter.sol:Counter": {
+                        "bin-runtime": "6001600100",
+                        "srcmap-runtime": "0:8:0:i;9:3:0:o;0:0:-1:-"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined JSON");
+
+        let program = load_source_map_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect("load source map")
+            .expect("runtime program");
+        let at = |pc: u64| program.info.instruction_at_pc(pc).expect("instruction");
+        assert_eq!(at(0).function_invocations().len(), 1);
+        assert_eq!(at(0).function_exit(), None);
+        assert!(at(2).function_invocations().is_empty());
+        assert_eq!(at(2).function_exit(), Some(FunctionExit::Return));
+        // Generated code without a range has no context when it does not jump.
+        assert!(at(4).source_location().is_none());
+        assert!(at(4).function_invocations().is_empty());
+    }
+
+    #[test]
+    fn generated_code_past_the_source_list_has_no_source() {
+        // solc 0.8.x maps its generated Yul to a source index one past `sourceList`;
+        // those instructions are unmapped rather than a reason to reject the map.
+        let dir = temp_dir("utility-source");
+        let source = "contract Counter { function add() external {} }";
+        fs::write(dir.join("Counter.sol"), source).expect("write source");
+        fs::write(
+            dir.join("combined.json"),
+            json!({
+                "version": "0.8.16+commit.test",
+                "sourceList": ["Counter.sol"],
+                "contracts": {
+                    "Counter.sol:Counter": {
+                        "bin-runtime": "600100",
+                        "srcmap-runtime": "0:8:0:-:0;0:5:1"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined JSON");
+
+        let program = load_source_map_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect("load source map")
+            .expect("runtime program");
+        assert_eq!(program.info.source_info(0), Some(("Counter.sol", 0, 8)));
+        assert_eq!(program.info.source_info(2), None);
+        assert!(program.info.instruction_at_pc(2).is_some());
     }
 
     #[test]

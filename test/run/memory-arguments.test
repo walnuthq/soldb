@@ -1,0 +1,11 @@
+# A frame's arguments that live in memory: the stack holds a pointer, and Solidity's
+# memory layout — a length followed by the bytes, or by one word per element — is what
+# turns it into a value. No node: the contract is compiled here and run on a local chain.
+# REQUIRES: soldb
+# RUN: %soldb compile %S/../examples/MemoryArgs.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: printf 'break sum\ncontinue\nbt\nquit\n' | %soldb run %t.out/MemoryArgs.bin "run(string,uint256[],uint256)" "hello" "[7,8,9]" 3 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:MemoryArgs:%t.out -i 2>&1 | FileCheck %s
+
+# The string reads as its text and the array as its elements, not as the offsets they are
+# on the stack.
+# CHECK: #0  sum(values = [7, 8, 9], factor = 3) at {{.*}}MemoryArgs.sol:{{[0-9]+}}
+# CHECK-NEXT: #1  run(label = "hello", values = [7, 8, 9], factor = 3) at {{.*}}MemoryArgs.sol:{{[0-9]+}}

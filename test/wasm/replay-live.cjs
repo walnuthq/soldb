@@ -163,8 +163,60 @@ async function main() {
   traced.free();
   replayed.free();
 
+  // A call simulated on the fork at the latest block must match the node's own
+  // debug_traceCall, step for step, through the same loop.
+  const latest = await rpc("eth_getBlockByNumber", ["latest", false]);
+  const call = Replay.prepareCall(SENDER, contract, "0x", "0", JSON.stringify(latest), chainId);
+  let callStatus = JSON.parse(call.status());
+  let callRounds = 0;
+  while (callStatus.status !== "complete") {
+    const batch = { accounts: {}, storage: {}, blockHashes: {} };
+    for (const request of callStatus.requests) {
+      if (request.kind === "account") {
+        const [balance, nonce, accountCode] = await Promise.all([
+          rpc("eth_getBalance", [request.address, callStatus.block]),
+          rpc("eth_getTransactionCount", [request.address, callStatus.block]),
+          rpc("eth_getCode", [request.address, callStatus.block]),
+        ]);
+        batch.accounts[request.address] = { balance, nonce, code: accountCode };
+      } else if (request.kind === "storage") {
+        (batch.storage[request.address] ??= {})[request.slot] = await rpc("eth_getStorageAt", [
+          request.address,
+          request.slot,
+          callStatus.block,
+        ]);
+      } else if (request.kind === "blockHash") {
+        const header = await rpc("eth_getBlockByNumber", [`0x${request.number.toString(16)}`, false]);
+        batch.blockHashes[request.number] = header.hash;
+      }
+    }
+    call.provideState(JSON.stringify(batch));
+    callStatus = JSON.parse(call.run());
+    callRounds += 1;
+    assert(callRounds < 10, "the call simulation did not converge");
+  }
+  const simulated = call.finish();
+  const simulatedSummary = JSON.parse(simulated.summary());
+  assert(simulatedSummary.txHash === null && simulatedSummary.success === true, "call simulation failed");
+  const nodeCall = await rpc("debug_traceCall", [
+    { from: SENDER, to: contract, data: "0x" },
+    "latest",
+    { enableMemory: true, disableStorage: false },
+  ]);
+  const nodeSimulated = Trace.fromSimulation(SENDER, contract, "0x", "0", JSON.stringify(nodeCall));
+  assert(nodeSimulated.stepCount() === simulated.stepCount(), `call step count ${nodeSimulated.stepCount()} vs ${simulated.stepCount()}`);
+  for (let index = 0; index < simulated.stepCount(); index += 1) {
+    const expected = JSON.parse(nodeSimulated.step(index));
+    const actual = JSON.parse(simulated.step(index));
+    assert(expected.pc === actual.pc && expected.op === actual.op, `call step ${index}: ${expected.op}@${expected.pc} vs ${actual.op}@${actual.pc}`);
+  }
+  // The counter was incremented once by the mined call, so the simulation reads 1 and writes 2.
+  assert(JSON.parse(simulated.step(8)).snapshot.storage["0x0"] === "0x2", "fork state is the latest block's");
+  nodeSimulated.free();
+  simulated.free();
+
   const bundleSize = Buffer.byteLength(bundle);
-  console.log(`replayed ${callHash} in ${rounds} run(s) answering ${requests} state request(s); ${replayedOps.length} steps match debug_traceTransaction; ${bundleSize}-byte state export replays offline`);
+  console.log(`replayed ${callHash} in ${rounds} run(s) answering ${requests} state request(s); ${replayedOps.length} steps match debug_traceTransaction; ${bundleSize}-byte state export replays offline; a call simulated on the fork in ${callRounds} run(s) matches debug_traceCall`);
 }
 
 main().catch((error) => {

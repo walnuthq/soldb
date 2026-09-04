@@ -1,6 +1,7 @@
 # Test tracing of increment function call with solc 0.8.16 (legacy srcmap format)
 # REQUIRES: soldb
-# This test verifies that legacy format does not show nested internal function calls in detail
+# A legacy source map gives the same source-level debugging as ETHDebug: lines, functions,
+# and internal frames come from the map and the source text; only variables need ETHDebug.
 # RUN: SOLC_BIN="" && if command -v solc-0.8.16 >/dev/null 2>&1; then SOLC_BIN=solc-0.8.16; elif [ -f ~/.solc-select/artifacts/solc-0.8.16/solc-0.8.16 ]; then SOLC_BIN=~/.solc-select/artifacts/solc-0.8.16/solc-0.8.16; elif SOLC_VER=$(solc --version 2>&1 | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2) && [ "$SOLC_VER" = "0.8.16" ]; then SOLC_BIN=solc; elif command -v solc-select >/dev/null 2>&1 && solc-select use 0.8.16 >/dev/null 2>&1 && command -v solc >/dev/null 2>&1; then SOLC_BIN=solc; else echo "Error: solc 0.8.16 not found. Install with: solc-select install 0.8.16" && exit 1; fi && cd %S/../examples && rm -rf out_legacy && %S/deploy-contract.sh --solc=$SOLC_BIN --rpc=%{rpc_url} TestContract TestContract.sol --debug-dir=out_legacy >/dev/null 2>&1 && CONTRACT_ADDR=$(cat out_legacy/deployment.json | jq -r '.address') && TX=$(DEBUG_DIR=out_legacy RPC_URL=%{rpc_url} %S/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && sleep 1 && %soldb trace $TX --ethdebug-dir $CONTRACT_ADDR:TestContract:%S/../examples/out_legacy --rpc %{rpc_url} 2>&1 | FileCheck %s
 
 # Check for the specific function calls we expect
@@ -10,6 +11,32 @@
 # CHECK: Contract: TestContract
 # CHECK: Compiler version: 0.8.16
 
-# Check for the call hierarchy with increment function (legacy format - basic structure only)
+# Check for the call hierarchy with increment function, internal calls included
 # CHECK: #0 TestContract::runtime_dispatcher
-# CHECK: #1 increment(uint256 amount = 4)
+# CHECK: #1 increment(uint256 amount = 4) at TestContract.sol:23
+# CHECK: #2 increment2(uint256 amount) [internal] at TestContract.sol:39
+# CHECK: #3 increment3(uint256 amount, uint256 amount2) [internal] at TestContract.sol:54
+
+# The interactive debugger steps the legacy map by source line, breaks on a function, and
+# lists the frames. solc 0.8.16 attributes its generated code to a source index past the
+# source list; that is unmapped code, not a reason to reject the map.
+# RUN: cd %S/../examples && CONTRACT_ADDR=$(cat out_legacy/deployment.json | jq -r '.address') && TX=$(DEBUG_DIR=out_legacy RPC_URL=%{rpc_url} %S/interact-contract.sh send "increment(uint256)" 4 2>&1 | grep -o '0x[a-fA-F0-9]\{64\}' | head -1) && sleep 1 && printf 'next\nnext\nbreak increment2\ncontinue\nbt\nprint counter\nfinish\nquit\n' | %soldb trace $TX --ethdebug-dir $CONTRACT_ADDR:TestContract:%S/../examples/out_legacy --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=INTERACTIVE %s
+
+# INTERACTIVE-NOT: could not load debug metadata
+# The frames carry no argument values here, and that is the point: this compiler enters a
+# public function through a dispatcher wrapper that has not decoded the arguments yet, so
+# the trace never showed that they are on the entry stack. A frame line stays bare rather
+# than naming words that may not be the parameters.
+# INTERACTIVE-NOT: increment2(amount
+# INTERACTIVE: TestContract.sol:23 in increment
+# INTERACTIVE: TestContract.sol:24 in increment
+# INTERACTIVE: Breakpoint #1 hit at step {{[0-9]+}}, function TestContract.increment2 at TestContract.sol:39, PC {{[0-9]+}}
+# INTERACTIVE: #0  increment2 at TestContract.sol:39
+# INTERACTIVE-NEXT: #1  increment at TestContract.sol:30
+# INTERACTIVE-NEXT: #2  TestContract at TestContract.sol:8
+# The legacy `--storage-layout` output reads state variables by name, exactly as the
+# ETHDebug path does. The counter's value depends on how many increments this deployment
+# has seen; that it decodes at all is what this pins.
+# INTERACTIVE: uint256 counter = {{[0-9]+}} [slot 0x0]
+# The map's return markers make `finish` exact: back at the call site in increment.
+# INTERACTIVE: TestContract.sol:30 in increment

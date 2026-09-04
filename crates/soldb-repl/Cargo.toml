@@ -15,6 +15,11 @@ doctest = false
 
 [dependencies]
 soldb-core.workspace = true
+soldb-debugger.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+soldb-ethdebug.workspace = true
 
 [lints]
 workspace = true

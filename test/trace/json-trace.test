@@ -19,3 +19,8 @@
 # CHECK: contract TestContract
 # CHECK: "debugAvailable": true
 # CHECK: "abi": [
+
+# The document carries the storage layout, so a client can decode any slot itself, and the
+# state variables as they stood when the transaction finished, each saying whether its
+# value came from the recording, from a chain, or from neither.
+# RUN: jq -e '.contracts | to_entries[0].value as $c | (($c.storageLayout.storage | length) > 0) and (($c.stateVariables | map(select(.name == "counter")) | length) == 1) and ($c.stateVariables[0].slot == "0x0") and (($c.stateVariables[0].source | test("trace|chain|unknown")))' %t.json

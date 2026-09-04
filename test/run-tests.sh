@@ -17,6 +17,7 @@ NC='\033[0m'
 RUN_TRACE_TESTS=true
 RUN_PROFILE_TESTS=true
 RUN_SIMULATE_TESTS=true
+RUN_RUN_TESTS=true
 RUN_EVENTS_TESTS=true
 RUN_CLI_TESTS=true
 VERBOSE=false
@@ -24,8 +25,9 @@ SEPOLIA_KEY=""
 
 for arg in "$@"; do
     case $arg in
-        SOLC_PATH=*)
+        SOLC_PATH=*|--solc=*)
             SOLC_PATH="${arg#*=}"
+            SOLC_CHOSEN=true
             shift
             ;;
         --sepolia-key=*)
@@ -37,6 +39,7 @@ for arg in "$@"; do
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
             shift
             ;;
         --profile-only)
@@ -44,6 +47,7 @@ for arg in "$@"; do
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
             shift
             ;;
         --simulate-only)
@@ -51,12 +55,22 @@ for arg in "$@"; do
             RUN_PROFILE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
             shift
             ;;
         --events-only)
             RUN_TRACE_TESTS=false
             RUN_PROFILE_TESTS=false
             RUN_SIMULATE_TESTS=false
+            RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
+            shift
+            ;;
+        --run-only)
+            RUN_TRACE_TESTS=false
+            RUN_PROFILE_TESTS=false
+            RUN_SIMULATE_TESTS=false
+            RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
             shift
             ;;
@@ -65,6 +79,7 @@ for arg in "$@"; do
             RUN_PROFILE_TESTS=false
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
+            RUN_RUN_TESTS=false
             shift
             ;;
         -v|--verbose)
@@ -83,8 +98,10 @@ for arg in "$@"; do
             echo "  --trace-only       Run only trace tests (from test/trace/)"
             echo "  --profile-only     Run only profile tests (from test/profile/)"
             echo "  --simulate-only    Run only simulate tests (from test/simulate/)"
+            echo "  --run-only         Run only run tests (from test/run/)"
             echo "  --events-only      Run only events tests (from test/events/)"
             echo "  --cli-only         Run only CLI tests (from test/cli/)"
+            echo "  --solc=PATH        Compiler for both deployment and the tests themselves"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
             echo "  --coverage         Accepted for compatibility; use cargo llvm-cov for coverage"
             echo "  -v, --verbose      Run tests with verbose output"
@@ -94,6 +111,7 @@ for arg in "$@"; do
             echo "  test/trace/        Contains trace command tests"
             echo "  test/profile/      Contains profile command tests"
             echo "  test/simulate/     Contains simulate command tests"
+            echo "  test/run/          Contains run command tests (no node needed)"
             echo "  test/events/       Contains list-events command tests"
             echo "  test/cli/          Contains CLI command and error tests"
             echo ""
@@ -114,7 +132,11 @@ for arg in "$@"; do
             exit 0
             ;;
         *)
-            # Unknown option
+            # A misspelt option must not run the suite with different settings than the
+            # ones asked for.
+            echo -e "${RED}Unknown option: $arg${NC}" >&2
+            echo "Run $0 --help for the options this script takes" >&2
+            exit 2
             ;;
     esac
 done
@@ -125,12 +147,26 @@ RPC_URL="${RPC_URL:-http://127.0.0.1:8545}"
 echo -e "${BLUE}Using RPC: ${RPC_URL}${NC}"
 CHAIN_ID="${CHAIN_ID:-1}"
 PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+# An explicit choice, from `--solc=`/`SOLC_PATH=` or the environment, is never overridden
+# by the search below: a suite that quietly runs a different compiler than the one asked
+# for cannot be used to tell compiler versions apart.
+if [ -n "${SOLC_PATH:-}" ]; then
+    SOLC_CHOSEN=true
+fi
+SOLC_CHOSEN="${SOLC_CHOSEN:-false}"
 SOLC_PATH="${SOLC_PATH:-solc}"
 
 # Function to check and ensure solc version is 0.8.31+ for ETHDebug tests
 ensure_ethdebug_solc() {
     local solc_bin="$1"
-    
+
+    if [ "$SOLC_CHOSEN" = true ]; then
+        local chosen_version
+        chosen_version=$("$solc_bin" --version 2>/dev/null | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2 || echo "")
+        echo -e "${GREEN}Using solc ${chosen_version:-unknown} as asked (${solc_bin})${NC}"
+        return 0
+    fi
+
     # Check if solc-select is available
     if command -v solc-select &> /dev/null; then
         # Try to use solc 0.8.31 if available
@@ -176,6 +212,33 @@ ensure_ethdebug_solc() {
     return 0
 }
 
+# Whether the artifacts next to an existing deployment are everything the tests read.
+#
+# A directory left by an older checkout can be missing what a newer test needs -- the
+# storage layout is the one that has bitten -- and reusing it fails tests for reasons that
+# have nothing to do with the code under test. Anything missing means recompile.
+test_artifacts_complete() {
+    local out_dir="${PROJECT_DIR}/examples/out"
+    local required=(
+        "TestContract.abi"
+        "TestContract.bin"
+        "TestContract_storage.json"
+    )
+    for name in "${required[@]}"; do
+        if [ ! -f "${out_dir}/${name}" ]; then
+            echo -e "${YELLOW}Existing artifacts are missing ${name}; recompiling${NC}"
+            return 1
+        fi
+    done
+    # One of the two ETHDebug program names, depending on the compiler's flag generation.
+    if [ ! -f "${out_dir}/TestContract_ethdebug-runtime.json" ] \
+        && [ ! -f "${out_dir}/combined.json" ]; then
+        echo -e "${YELLOW}Existing artifacts carry no debug program; recompiling${NC}"
+        return 1
+    fi
+    return 0
+}
+
 # Use environment variable if no command line option provided
 SEPOLIA_KEY="${SEPOLIA_KEY:-${SEPOLIA_KEY_ENV:-}}"
 
@@ -192,11 +255,15 @@ fi
 # Note: Individual tests will set their own solc version via solc-select.
 export SOLC_PATH
 
+SOLC_VERSION_IN_USE=$("$SOLC_PATH" --version 2>/dev/null | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2 || echo "unknown")
+echo -e "${GREEN}Compiling tests with solc ${SOLC_VERSION_IN_USE} (${SOLC_PATH})${NC}"
+
 echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
 echo -e "${GREEN}Organized test structure:${NC}"
 echo -e "${GREEN}  - test/trace/     : Trace command tests${NC}"
 echo -e "${GREEN}  - test/profile/   : Profile command tests${NC}"
 echo -e "${GREEN}  - test/simulate/  : Simulate command tests${NC}"
+echo -e "${GREEN}  - test/run/       : Run command tests (local chain, no node)${NC}"
 echo -e "${GREEN}  - test/events/    : List-events command tests${NC}"
 echo -e "${GREEN}  - test/cli/       : CLI command and error tests${NC}"
 
@@ -221,9 +288,13 @@ if [ -f "${DEPLOYMENT_JSON}" ]; then
             if [ -z "$DEPLOYED_CODE" ] || [ "$DEPLOYED_CODE" = "0x" ]; then
                 echo -e "${YELLOW}Found TestContract deployment file, but no code at ${DEPLOYED_ADDRESS}${NC}"
                 NEED_DEPLOY=true
+            elif ! test_artifacts_complete; then
+                NEED_DEPLOY=true
             else
                 echo -e "${GREEN}Found existing TestContract deployment${NC}"
             fi
+        elif ! test_artifacts_complete; then
+            NEED_DEPLOY=true
         else
             echo -e "${GREEN}Found existing TestContract deployment${NC}"
         fi
@@ -484,6 +555,16 @@ if [ "$RUN_SIMULATE_TESTS" = true ]; then
         "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/simulate"
     else
         echo -e "${YELLOW}Warning: simulate directory not found${NC}"
+    fi
+fi
+
+# Run run-command tests: they use only the compiled artifacts, no node
+if [ "$RUN_RUN_TESTS" = true ]; then
+    echo -e "${YELLOW}Running run tests...${NC}"
+    if [ -d "${SCRIPT_DIR}/run" ]; then
+        "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/run"
+    else
+        echo -e "${YELLOW}Warning: run directory not found${NC}"
     fi
 fi
 

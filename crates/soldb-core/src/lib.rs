@@ -14,8 +14,12 @@
 //! new backend does not require changes further up the stack.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -34,27 +38,67 @@ pub enum SoldbError {
 
 pub type SoldbResult<T> = Result<T, SoldbError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One recorded EVM step.
+///
+/// The machine state lives in `snapshot`, once. The flat `stack`, `memory`, and
+/// `storage` fields are the layout older trace files and web clients read: every
+/// constructor in this workspace leaves them empty, serialization fills them from the
+/// snapshot so the wire format is unchanged, and deserialization moves whatever they
+/// hold into the snapshot. Read a step through [`TraceStep::snapshot_ref`], which
+/// handles both shapes; never through the flat fields.
+///
+/// Consecutive steps share their memory and storage when nothing changed between them
+/// (see [`StepSnapshot`]), which is what keeps a trace of hundreds of thousands of steps
+/// resident: memory changes on a handful of opcodes and storage on `SSTORE` alone.
+#[derive(Debug, Clone, Eq)]
 pub struct TraceStep {
     pub pc: u64,
-    pub op: String,
+    /// The mnemonic, shared with every other step running the same opcode: there are a
+    /// couple of hundred of them and hundreds of thousands of steps.
+    pub op: Word,
     pub gas: u64,
     pub gas_cost: u64,
     pub depth: u64,
-    pub stack: Vec<String>,
+    /// Legacy layout; empty unless a caller filled it by hand. See the type docs.
+    pub stack: Vec<Word>,
+    /// Legacy layout; `None` unless a caller filled it by hand. See the type docs.
     pub memory: Option<String>,
+    /// Legacy layout; `None` unless a caller filled it by hand. See the type docs.
     pub storage: Option<BTreeMap<String, String>>,
     pub error: Option<String>,
-    #[serde(default)]
     pub snapshot: StepSnapshot,
 }
 
 impl TraceStep {
+    /// A step whose state lives in `snapshot`, the way every backend builds one.
+    #[must_use]
+    pub fn new(
+        pc: u64,
+        op: Word,
+        gas: u64,
+        gas_cost: u64,
+        depth: u64,
+        error: Option<String>,
+        snapshot: StepSnapshot,
+    ) -> Self {
+        Self {
+            pc,
+            op,
+            gas,
+            gas_cost,
+            depth,
+            stack: Vec::new(),
+            memory: None,
+            storage: None,
+            error,
+            snapshot,
+        }
+    }
+
     /// Borrows the machine state this step captured, without copying it.
     ///
-    /// A step records the same data twice: the flat `stack`/`memory`/`storage` fields, and
-    /// a [`StepSnapshot`] that additionally carries the storage diff. Whichever is
-    /// populated, this returns a view of it.
+    /// Whichever shape the step is in, its snapshot or the legacy flat fields, this
+    /// returns a view of it.
     ///
     /// Prefer this over [`TraceStep::normalized_snapshot`] anywhere that walks a trace.
     /// Traces routinely run to hundreds of thousands of steps and each one's `memory` can
@@ -89,6 +133,151 @@ impl TraceStep {
     pub fn normalized_snapshot(&self) -> StepSnapshot {
         self.snapshot_ref().to_owned_snapshot()
     }
+
+    /// Moves legacy flat fields into the snapshot, so a step read from an older file is
+    /// stored once like every other.
+    fn normalized(mut self) -> Self {
+        if self.snapshot.is_empty() {
+            self.snapshot = StepSnapshot {
+                stack: std::mem::take(&mut self.stack),
+                memory: self.memory.take().map(Arc::from),
+                storage: Arc::new(self.storage.take().unwrap_or_default()),
+                storage_diff: BTreeMap::new(),
+            };
+        } else {
+            self.stack = Vec::new();
+            self.memory = None;
+            self.storage = None;
+        }
+        self
+    }
+}
+
+impl PartialEq for TraceStep {
+    /// Two steps are equal when they record the same thing, whichever shape holds it.
+    fn eq(&self, other: &Self) -> bool {
+        self.pc == other.pc
+            && self.op == other.op
+            && self.gas == other.gas
+            && self.gas_cost == other.gas_cost
+            && self.depth == other.depth
+            && self.error == other.error
+            && self.snapshot_ref() == other.snapshot_ref()
+    }
+}
+
+impl Serialize for TraceStep {
+    /// Writes the step in the wire format every client reads: the flat fields and the
+    /// snapshot, both from the one copy of the state.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let snapshot = self.snapshot_ref();
+        let mut state = serializer.serialize_struct("TraceStep", 10)?;
+        state.serialize_field("pc", &self.pc)?;
+        state.serialize_field("op", &self.op)?;
+        state.serialize_field("gas", &self.gas)?;
+        state.serialize_field("gas_cost", &self.gas_cost)?;
+        state.serialize_field("depth", &self.depth)?;
+        state.serialize_field("stack", snapshot.stack)?;
+        state.serialize_field("memory", &snapshot.memory)?;
+        state.serialize_field("storage", snapshot.storage)?;
+        state.serialize_field("error", &self.error)?;
+        state.serialize_field("snapshot", &snapshot)?;
+        state.end()
+    }
+}
+
+/// The wire shape of a step, read as written by any version and then normalized.
+#[derive(Deserialize)]
+struct TraceStepRepr {
+    pc: u64,
+    op: String,
+    gas: u64,
+    gas_cost: u64,
+    depth: u64,
+    #[serde(default)]
+    stack: Vec<String>,
+    #[serde(default)]
+    memory: Option<String>,
+    #[serde(default)]
+    storage: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    snapshot: StepSnapshot,
+}
+
+impl<'de> Deserialize<'de> for TraceStep {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = TraceStepRepr::deserialize(deserializer)?;
+        Ok(TraceStep {
+            pc: repr.pc,
+            op: Arc::from(repr.op),
+            gas: repr.gas,
+            gas_cost: repr.gas_cost,
+            depth: repr.depth,
+            stack: repr.stack.into_iter().map(Arc::from).collect(),
+            memory: repr.memory,
+            storage: repr.storage,
+            error: repr.error,
+            snapshot: repr.snapshot,
+        }
+        .normalized())
+    }
+}
+
+/// One machine word as a backend spelled it, shared between the steps that hold it.
+///
+/// A trace of hundreds of thousands of steps carries a stack of a dozen words at every
+/// one of them, and the same handful of values — a jump target, a length, a small
+/// constant — appear over and over: a 600,000-step trace of one loop holds 1.7 million
+/// stack words drawn from about 1,200 distinct ones. Holding each as its own `String`
+/// costs a heap allocation per occurrence; holding a shared pointer costs one per
+/// distinct value. [`WordInterner`] is what produces the sharing.
+pub type Word = Arc<str>;
+
+/// Hands out one [`Word`] per distinct value, so repeated stack words are stored once.
+///
+/// One interner covers one trace being built or parsed; it is dropped with the loop that
+/// filled it, and the words it handed out live as long as the steps holding them.
+#[derive(Debug, Default)]
+pub struct WordInterner {
+    words: std::collections::HashMap<Word, Word>,
+}
+
+impl WordInterner {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The shared word equal to `word`, interning it the first time it is seen.
+    #[must_use]
+    pub fn intern(&mut self, word: &str) -> Word {
+        if let Some(shared) = self.words.get(word) {
+            return Arc::clone(shared);
+        }
+        let shared: Word = Arc::from(word);
+        self.words.insert(Arc::clone(&shared), Arc::clone(&shared));
+        shared
+    }
+
+    /// Interns a whole stack, in place.
+    pub fn intern_stack(&mut self, stack: &mut [Word]) {
+        for word in stack {
+            *word = self.intern(word);
+        }
+    }
+
+    /// How many distinct words have been interned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
 }
 
 /// A borrowed view of one step's captured machine state.
@@ -97,7 +286,7 @@ impl TraceStep {
 /// written out. Produced by [`TraceStep::snapshot_ref`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StepSnapshotRef<'a> {
-    pub stack: &'a [String],
+    pub stack: &'a [Word],
     pub memory: Option<&'a str>,
     pub storage: &'a BTreeMap<String, String>,
     pub storage_diff: &'a BTreeMap<String, StorageChange>,
@@ -109,26 +298,46 @@ impl StepSnapshotRef<'_> {
     pub fn to_owned_snapshot(&self) -> StepSnapshot {
         StepSnapshot {
             stack: self.stack.to_vec(),
-            memory: self.memory.map(str::to_owned),
-            storage: self.storage.clone(),
+            memory: self.memory.map(Arc::from),
+            storage: Arc::new(self.storage.clone()),
             storage_diff: self.storage_diff.clone(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// The machine state one step captured.
+///
+/// `memory` and `storage` are shared: a backend building steps hands the previous step's
+/// value on unchanged, so a trace holds one copy of memory per change rather than one
+/// per step. Reads see plain values through `Deref`; a step that changes them gets its
+/// own.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "StepSnapshotRepr")]
 pub struct StepSnapshot {
-    #[serde(default)]
-    pub stack: Vec<String>,
-    #[serde(default)]
-    pub memory: Option<String>,
-    #[serde(default)]
-    pub storage: BTreeMap<String, String>,
-    #[serde(default)]
+    pub stack: Vec<Word>,
+    /// Memory as one unprefixed hex string.
+    pub memory: Option<Arc<str>>,
+    pub storage: Arc<BTreeMap<String, String>>,
     pub storage_diff: BTreeMap<String, StorageChange>,
 }
 
 impl StepSnapshot {
+    /// A snapshot that owns its values, for a backend or a test building one from parts.
+    #[must_use]
+    pub fn new(
+        stack: Vec<Word>,
+        memory: Option<String>,
+        storage: BTreeMap<String, String>,
+        storage_diff: BTreeMap<String, StorageChange>,
+    ) -> Self {
+        Self {
+            stack,
+            memory: memory.map(Arc::from),
+            storage: Arc::new(storage),
+            storage_diff,
+        }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
@@ -138,13 +347,49 @@ impl StepSnapshot {
     }
 }
 
+impl Serialize for StepSnapshot {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("StepSnapshot", 4)?;
+        state.serialize_field("stack", &self.stack)?;
+        state.serialize_field("memory", &self.memory.as_deref())?;
+        state.serialize_field("storage", &*self.storage)?;
+        state.serialize_field("storage_diff", &self.storage_diff)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct StepSnapshotRepr {
+    #[serde(default)]
+    stack: Vec<Word>,
+    #[serde(default)]
+    memory: Option<String>,
+    #[serde(default)]
+    storage: BTreeMap<String, String>,
+    #[serde(default)]
+    storage_diff: BTreeMap<String, StorageChange>,
+}
+
+impl From<StepSnapshotRepr> for StepSnapshot {
+    fn from(repr: StepSnapshotRepr) -> Self {
+        Self::new(repr.stack, repr.memory, repr.storage, repr.storage_diff)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageChange {
     pub before: Option<String>,
     pub after: Option<String>,
 }
 
+/// A complete recording of one execution.
+///
+/// Reading one back from JSON shares unchanged memory and storage between consecutive
+/// steps as they are read, so a trace loaded from a file costs what one built by a
+/// backend costs, at its peak as well as afterwards. [`TransactionTrace::share_unchanged_state`]
+/// does the same for a trace assembled by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TransactionTraceRepr")]
 pub struct TransactionTrace {
     pub tx_hash: Option<String>,
     pub from_addr: String,
@@ -164,6 +409,112 @@ pub struct TransactionTrace {
     #[serde(default)]
     pub artifacts: TraceArtifacts,
     pub steps: Vec<TraceStep>,
+}
+
+impl TransactionTrace {
+    /// Makes consecutive steps whose memory or storage is equal share one copy.
+    ///
+    /// Backends build steps that way; a trace deserialized from a file arrives with a
+    /// copy per step, and this pass, linear in the size of the trace, folds them back.
+    pub fn share_unchanged_state(&mut self) {
+        for index in 1..self.steps.len() {
+            let (before, after) = self.steps.split_at_mut(index);
+            share_snapshot(&before[index - 1], &mut after[0]);
+        }
+    }
+}
+
+/// The wire shape of a trace; `From` restores the sharing between steps.
+#[derive(Deserialize)]
+struct TransactionTraceRepr {
+    tx_hash: Option<String>,
+    from_addr: String,
+    to_addr: Option<String>,
+    value: String,
+    input_data: String,
+    gas_used: u64,
+    output: String,
+    success: bool,
+    error: Option<String>,
+    debug_trace_available: bool,
+    contract_address: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    capabilities: TraceCapabilities,
+    #[serde(default)]
+    artifacts: TraceArtifacts,
+    #[serde(deserialize_with = "deserialize_shared_steps")]
+    steps: Vec<TraceStep>,
+}
+
+/// Deserializes the steps, pointing each one's memory and storage at the previous step's
+/// when they are equal, so the duplicates a file carries are never all resident at once.
+fn deserialize_shared_steps<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<TraceStep>, D::Error> {
+    struct SharedSteps;
+
+    impl<'de> Visitor<'de> for SharedSteps {
+        type Value = Vec<TraceStep>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an array of trace steps")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut steps = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            let mut words = WordInterner::new();
+            while let Some(mut step) = seq.next_element::<TraceStep>()? {
+                if let Some(previous) = steps.last() {
+                    share_snapshot(previous, &mut step);
+                }
+                // The stack words a file repeats are stored once, as they are when a
+                // backend builds the steps itself.
+                words.intern_stack(&mut step.snapshot.stack);
+                steps.push(step);
+            }
+            Ok(steps)
+        }
+    }
+
+    deserializer.deserialize_seq(SharedSteps)
+}
+
+/// Points `step`'s memory and storage at `previous`'s when the values are equal.
+fn share_snapshot(previous: &TraceStep, step: &mut TraceStep) {
+    let previous = &previous.snapshot;
+    let current = &mut step.snapshot;
+    if let (Some(previous_memory), Some(current_memory)) = (&previous.memory, &current.memory) {
+        if !Arc::ptr_eq(previous_memory, current_memory) && **previous_memory == **current_memory {
+            current.memory = Some(Arc::clone(previous_memory));
+        }
+    }
+    if !Arc::ptr_eq(&previous.storage, &current.storage) && *previous.storage == *current.storage {
+        current.storage = Arc::clone(&previous.storage);
+    }
+}
+
+impl From<TransactionTraceRepr> for TransactionTrace {
+    fn from(repr: TransactionTraceRepr) -> Self {
+        Self {
+            tx_hash: repr.tx_hash,
+            from_addr: repr.from_addr,
+            to_addr: repr.to_addr,
+            value: repr.value,
+            input_data: repr.input_data,
+            gas_used: repr.gas_used,
+            output: repr.output,
+            success: repr.success,
+            error: repr.error,
+            debug_trace_available: repr.debug_trace_available,
+            contract_address: repr.contract_address,
+            backend: repr.backend,
+            capabilities: repr.capabilities,
+            artifacts: repr.artifacts,
+            steps: repr.steps,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -298,7 +649,64 @@ pub struct FunctionCall {
 
 #[cfg(test)]
 mod tests {
+    /// Borrows a stack as plain strings, for comparing in assertions.
+
+    #[test]
+    fn repeated_stack_words_are_stored_once() {
+        let mut words = super::WordInterner::new();
+        assert!(words.is_empty());
+        let first = words.intern("0x2a");
+        let again = words.intern("0x2a");
+        let other = words.intern("0x1");
+        assert_eq!(words.len(), 2);
+        assert_eq!(&*first, "0x2a");
+        // The same value is the same allocation, which is the whole point: a trace of a
+        // few hundred thousand steps repeats a few thousand distinct words millions of
+        // times.
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let mut stack = vec![Arc::from("0x2a"), Arc::from("0x2a"), Arc::from("0x1")];
+        words.intern_stack(&mut stack);
+        assert!(Arc::ptr_eq(&stack[0], &stack[1]));
+        assert!(Arc::ptr_eq(&stack[0], &first));
+        assert_eq!(words.len(), 2, "nothing new was seen");
+    }
+
+    #[test]
+    fn a_parsed_trace_shares_its_repeated_stack_words() {
+        // Two steps holding the same words: reading them back leaves one copy of each.
+        let document = serde_json::json!({
+            "tx_hash": "0xabc",
+            "from_addr": "0x1",
+            "to_addr": "0x2",
+            "value": "0x0",
+            "input_data": "0x",
+            "gas_used": 0,
+            "output": "0x",
+            "success": true,
+            "debug_trace_available": true,
+            "steps": [
+                {"pc": 0, "op": "PUSH1", "gas": 1, "gas_cost": 1, "depth": 1,
+                 "stack": ["0x2a", "0x1"]},
+                {"pc": 2, "op": "ADD", "gas": 0, "gas_cost": 1, "depth": 1,
+                 "stack": ["0x2a", "0x1"]}
+            ]
+        })
+        .to_string();
+        let trace: TransactionTrace = serde_json::from_str(&document).expect("trace");
+        let first = &trace.steps[0].snapshot.stack;
+        let second = &trace.steps[1].snapshot.stack;
+        assert_eq!(words(first), ["0x2a", "0x1"]);
+        assert!(Arc::ptr_eq(&first[0], &second[0]));
+        assert!(Arc::ptr_eq(&first[1], &second[1]));
+    }
+    fn words(stack: &[super::Word]) -> Vec<&str> {
+        stack.iter().map(|word| &**word).collect()
+    }
+
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use super::{
         FunctionCall, StepSnapshot, StorageChange, TraceArtifacts, TraceCapabilities, TraceStep,
@@ -308,11 +716,11 @@ mod tests {
     fn step_with(snapshot: StepSnapshot) -> TraceStep {
         TraceStep {
             pc: 3,
-            op: "SSTORE".to_owned(),
+            op: Arc::from("SSTORE"),
             gas: 100,
             gas_cost: 5,
             depth: 1,
-            stack: vec!["0x01".to_owned(), "0x02".to_owned()],
+            stack: vec![Arc::from("0x01"), Arc::from("0x02")],
             memory: Some("aabb".to_owned()),
             storage: Some(BTreeMap::from([("0x00".to_owned(), "0x2a".to_owned())])),
             error: None,
@@ -327,18 +735,18 @@ mod tests {
         // and only the flat fields populated. The serialized forms must match too, because
         // the web JSON document writes a snapshot per step.
         let flat = step_with(StepSnapshot::default());
-        let populated = step_with(StepSnapshot {
-            stack: vec!["0x09".to_owned()],
-            memory: Some("ccdd".to_owned()),
-            storage: BTreeMap::from([("0x01".to_owned(), "0x63".to_owned())]),
-            storage_diff: BTreeMap::from([(
+        let populated = step_with(StepSnapshot::new(
+            vec![Arc::from("0x09")],
+            Some("ccdd".to_owned()),
+            BTreeMap::from([("0x01".to_owned(), "0x63".to_owned())]),
+            BTreeMap::from([(
                 "0x01".to_owned(),
                 StorageChange {
                     before: None,
                     after: Some("0x63".to_owned()),
                 },
             )]),
-        });
+        ));
 
         for step in [&flat, &populated] {
             assert_eq!(
@@ -352,14 +760,168 @@ mod tests {
         }
 
         // The flat shape falls back to the top-level fields and reports no storage diff.
-        assert_eq!(flat.snapshot_ref().stack, ["0x01", "0x02"]);
+        assert_eq!(words(flat.snapshot_ref().stack), ["0x01", "0x02"]);
         assert_eq!(flat.snapshot_ref().memory, Some("aabb"));
         assert!(flat.snapshot_ref().storage_diff.is_empty());
 
         // A populated snapshot wins over the flat fields.
-        assert_eq!(populated.snapshot_ref().stack, ["0x09"]);
+        assert_eq!(words(populated.snapshot_ref().stack), ["0x09"]);
         assert_eq!(populated.snapshot_ref().memory, Some("ccdd"));
         assert_eq!(populated.snapshot_ref().storage_diff.len(), 1);
+    }
+
+    #[test]
+    fn steps_serialize_in_the_wire_format_and_read_back_stored_once() {
+        // A step holds its state once, in the snapshot; the document still carries the
+        // flat fields older readers expect, filled from that one copy.
+        let step = TraceStep::new(
+            3,
+            Arc::from("SSTORE"),
+            100,
+            5,
+            1,
+            None,
+            StepSnapshot::new(
+                vec![Arc::from("0x01")],
+                Some("aabb".to_owned()),
+                BTreeMap::from([("0x00".to_owned(), "0x2a".to_owned())]),
+                BTreeMap::new(),
+            ),
+        );
+        let json: serde_json::Value = serde_json::to_value(&step).expect("json");
+        assert_eq!(json["stack"], serde_json::json!(["0x01"]));
+        assert_eq!(json["memory"], "aabb");
+        assert_eq!(json["storage"]["0x00"], "0x2a");
+        assert_eq!(json["snapshot"]["memory"], "aabb");
+        assert_eq!(json["snapshot"]["storage"]["0x00"], "0x2a");
+        assert_eq!(json["gas_cost"], 5);
+
+        // A step written by hand in the flat shape serializes the same way.
+        let flat = step_with(StepSnapshot::default());
+        let flat_json: serde_json::Value = serde_json::to_value(&flat).expect("json");
+        assert_eq!(
+            flat_json["snapshot"]["stack"],
+            serde_json::json!(["0x01", "0x02"])
+        );
+        assert_eq!(flat_json["stack"], serde_json::json!(["0x01", "0x02"]));
+
+        // Reading back either shape stores the state in the snapshot only, and the
+        // result equals the original because equality compares what was recorded.
+        let restored: TraceStep = serde_json::from_value(json).expect("step");
+        assert_eq!(restored, step);
+        assert!(
+            restored.stack.is_empty() && restored.memory.is_none() && restored.storage.is_none()
+        );
+        let legacy: TraceStep = serde_json::from_str(
+            r#"{"pc":1,"op":"ADD","gas":9,"gas_cost":3,"depth":1,"stack":["0x1"],"memory":"cc","storage":{"0x0":"0x1"},"error":null}"#,
+        )
+        .expect("legacy step");
+        assert_eq!(words(legacy.snapshot_ref().stack), ["0x1"]);
+        assert_eq!(legacy.snapshot_ref().memory, Some("cc"));
+        assert_eq!(legacy.snapshot_ref().storage["0x0"], "0x1");
+        assert!(legacy.stack.is_empty());
+        assert_eq!(legacy, step_with_legacy_fields());
+
+        // Steps share memory and storage by reference when a backend hands them on.
+        let shared = TraceStep::new(
+            4,
+            Arc::from("POP"),
+            95,
+            2,
+            1,
+            None,
+            StepSnapshot {
+                stack: Vec::new(),
+                memory: step.snapshot.memory.clone(),
+                storage: Arc::clone(&step.snapshot.storage),
+                storage_diff: BTreeMap::new(),
+            },
+        );
+        assert!(Arc::ptr_eq(
+            &shared.snapshot.storage,
+            &step.snapshot.storage
+        ));
+        assert_eq!(shared.snapshot_ref().memory, Some("aabb"));
+    }
+
+    fn step_with_legacy_fields() -> TraceStep {
+        TraceStep {
+            pc: 1,
+            op: Arc::from("ADD"),
+            gas: 9,
+            gas_cost: 3,
+            depth: 1,
+            stack: vec![Arc::from("0x1")],
+            memory: Some("cc".to_owned()),
+            storage: Some(BTreeMap::from([("0x0".to_owned(), "0x1".to_owned())])),
+            error: None,
+            snapshot: StepSnapshot::default(),
+        }
+    }
+
+    #[test]
+    fn reading_a_trace_back_shares_unchanged_state_between_steps() {
+        let snapshot = |memory: &str, slot: &str| {
+            StepSnapshot::new(
+                Vec::new(),
+                Some(memory.to_owned()),
+                BTreeMap::from([("0x0".to_owned(), slot.to_owned())]),
+                BTreeMap::new(),
+            )
+        };
+        let step = |pc: u64, snapshot: StepSnapshot| {
+            TraceStep::new(pc, Arc::from("PUSH1"), 1, 1, 1, None, snapshot)
+        };
+        let trace = TransactionTrace {
+            tx_hash: None,
+            from_addr: "0x1".to_owned(),
+            to_addr: None,
+            value: "0x0".to_owned(),
+            input_data: "0x".to_owned(),
+            gas_used: 0,
+            output: "0x".to_owned(),
+            success: true,
+            error: None,
+            debug_trace_available: true,
+            contract_address: None,
+            backend: None,
+            capabilities: TraceCapabilities::default(),
+            artifacts: TraceArtifacts::default(),
+            steps: vec![
+                step(0, snapshot("aa", "0x1")),
+                step(1, snapshot("aa", "0x1")),
+                step(2, snapshot("bb", "0x1")),
+                step(3, snapshot("bb", "0x2")),
+            ],
+        };
+        let json = serde_json::to_string(&trace).expect("json");
+        let restored: TransactionTrace = serde_json::from_str(&json).expect("trace");
+        assert_eq!(restored, trace);
+        let memory = |index: usize| {
+            restored.steps[index]
+                .snapshot
+                .memory
+                .as_ref()
+                .expect("memory")
+        };
+        assert!(Arc::ptr_eq(memory(0), memory(1)));
+        assert!(!Arc::ptr_eq(memory(1), memory(2)));
+        assert!(Arc::ptr_eq(memory(2), memory(3)));
+        let storage = |index: usize| &restored.steps[index].snapshot.storage;
+        assert!(Arc::ptr_eq(storage(0), storage(2)));
+        assert!(!Arc::ptr_eq(storage(2), storage(3)));
+
+        // The same pass is available for a trace assembled by hand.
+        let mut by_hand = trace.clone();
+        assert!(!Arc::ptr_eq(
+            &by_hand.steps[0].snapshot.storage,
+            &by_hand.steps[1].snapshot.storage
+        ));
+        by_hand.share_unchanged_state();
+        assert!(Arc::ptr_eq(
+            &by_hand.steps[0].snapshot.storage,
+            &by_hand.steps[1].snapshot.storage
+        ));
     }
 
     #[test]
@@ -376,7 +938,7 @@ mod tests {
             error: None,
             steps: vec![TraceStep {
                 pc: 0,
-                op: "STOP".to_owned(),
+                op: Arc::from("STOP"),
                 gas: 1,
                 gas_cost: 0,
                 depth: 0,

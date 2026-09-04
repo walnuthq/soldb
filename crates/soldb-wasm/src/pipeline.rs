@@ -24,7 +24,7 @@ use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult, TraceCapabilities, TransactionTrace};
 use soldb_debugger::DebugSession;
 use soldb_ethdebug::{read_compilation_source, EthdebugInfo};
-use soldb_rpc::{DebugTraceResult, RpcReceipt, RpcTransaction, SimulateCallRequest};
+use soldb_evm::{DebugTraceResult, RpcReceipt, RpcTransaction, SimulateCallRequest};
 use soldb_serializer::WebContractMetadata;
 
 /// One contract's compiler output, as the host supplies it.
@@ -175,7 +175,7 @@ impl Trace {
         let transaction =
             parse_json::<RpcTransaction>("`eth_getTransactionByHash` result", transaction_json)?;
         let receipt = parse_json::<RpcReceipt>("`eth_getTransactionReceipt` result", receipt_json)?;
-        let trace = soldb_rpc::debug_rpc_transaction_trace(transaction, receipt, &debug_result)?;
+        let trace = soldb_evm::debug_rpc_transaction_trace(transaction, receipt, debug_result)?;
         Ok(Self::from_trace(trace))
     }
 
@@ -201,7 +201,7 @@ impl Trace {
             block: None,
             tx_index: None,
         };
-        let trace = soldb_rpc::debug_rpc_simulation_trace(&request, &debug_result)?;
+        let trace = soldb_evm::debug_rpc_simulation_trace(&request, debug_result)?;
         Ok(Self::from_trace(trace))
     }
 
@@ -451,7 +451,7 @@ mod tests {
         assert!(inner.capabilities.memory);
         assert!(inner.capabilities.gas_details);
         assert_eq!(inner.steps.len(), 3);
-        assert_eq!(inner.steps[1].memory.as_deref(), Some("aabb"));
+        assert_eq!(inner.steps[1].snapshot_ref().memory, Some("aabb"));
         assert_eq!(trace.step_count(), 3);
         assert!(!trace.has_ethdebug());
     }
@@ -596,7 +596,14 @@ mod tests {
         assert_eq!(step.depth, 1);
         assert_eq!(step.source, None);
         assert_eq!(step.function, None);
-        assert_eq!(step.snapshot.stack, ["0x80", "0x40"]);
+        assert_eq!(
+            step.snapshot
+                .stack
+                .iter()
+                .map(|word| &**word)
+                .collect::<Vec<_>>(),
+            ["0x80", "0x40"]
+        );
         assert_eq!(step.snapshot.memory.as_deref(), Some("aabb"));
         assert!(step.variables.is_empty());
 
@@ -728,7 +735,15 @@ mod tests {
 
         assert_eq!(trace.to_json().expect("json"), before);
         assert_eq!(trace.step_count(), count);
-        assert_eq!(step_at(&trace, 1).snapshot.stack, ["0x80", "0x40"]);
+        assert_eq!(
+            step_at(&trace, 1)
+                .snapshot
+                .stack
+                .iter()
+                .map(|word| &**word)
+                .collect::<Vec<_>>(),
+            ["0x80", "0x40"]
+        );
     }
 
     #[test]

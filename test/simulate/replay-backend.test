@@ -1,0 +1,19 @@
+# Simulating a call by local replay must produce the opcode stream `debug_traceCall`
+# produces: a fork of the chain at the block, stepped through without a tracing node.
+# REQUIRES: soldb
+# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --backend debug-rpc --rpc %{rpc_url} --raw --max-steps 30 > %t.debug
+# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --backend replay --rpc %{rpc_url} --raw --max-steps 30 > %t.replay
+# RUN: sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.debug | head -n 30 > %t.debug.ops
+# RUN: sed -n 's/^[[:space:]]*[0-9][0-9]* |[[:space:]]*\([0-9][0-9]*\) | \([A-Z0-9_][A-Z0-9_]*\).*/\1 \2/p' %t.replay | head -n 30 > %t.replay.ops
+# RUN: diff -u %t.debug.ops %t.replay.ops
+# RUN: FileCheck %s < %t.replay
+# A call placed inside the latest block at index 0 sees the parent state and still runs.
+# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --backend replay --tx-index 0 --rpc %{rpc_url} --raw --max-steps 5 | FileCheck --check-prefix=INSIDE %s
+
+# CHECK: Simulating call to
+# CHECK: Gas details:
+# CHECK: Execution trace
+# CHECK: PUSH1
+
+# INSIDE: Execution trace
+# INSIDE: PUSH1

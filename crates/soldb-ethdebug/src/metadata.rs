@@ -240,7 +240,16 @@ impl EthdebugInfo {
         Some((source_path, source_location.offset, source_location.length))
     }
 
+    /// Whether the artifact carries variable locations at all.
+    ///
+    /// No compiler release emits them yet, so this is usually false, and the difference
+    /// matters to a user: nothing in scope at one program counter is not the same as a
+    /// compiler that describes no variables anywhere.
     #[must_use]
+    pub fn has_variable_locations(&self) -> bool {
+        !self.variable_locations.is_empty()
+    }
+
     pub fn variables_at_pc(&self, pc: u64) -> Vec<&VariableLocation> {
         if let Some(exact) = self.variable_locations.get(&pc) {
             return exact.iter().collect();

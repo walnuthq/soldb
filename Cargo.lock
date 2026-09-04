@@ -2726,6 +2726,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "soldb-evm"
+version = "0.2.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "revm",
+ "ruint",
+ "serde",
+ "serde_json",
+ "soldb-core",
+]
+
+[[package]]
 name = "soldb-profiler"
 version = "0.2.0"
 dependencies = [
@@ -2739,19 +2751,20 @@ dependencies = [
 name = "soldb-repl"
 version = "0.2.0"
 dependencies = [
+ "serde_json",
  "soldb-core",
+ "soldb-debugger",
+ "soldb-ethdebug",
 ]
 
 [[package]]
 name = "soldb-rpc"
 version = "0.2.0"
 dependencies = [
- "getrandom 0.2.17",
- "revm",
- "ruint",
  "serde",
  "serde_json",
  "soldb-core",
+ "soldb-evm",
 ]
 
 [[package]]
@@ -2773,7 +2786,7 @@ dependencies = [
  "soldb-core",
  "soldb-debugger",
  "soldb-ethdebug",
- "soldb-rpc",
+ "soldb-evm",
  "soldb-serializer",
  "wasm-bindgen",
  "wasm-bindgen-test",

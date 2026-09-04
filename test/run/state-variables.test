@@ -1,0 +1,63 @@
+# State variables read by name through the compiler's storage layout: packed value types
+# sharing a slot, a short string, a static and a dynamic array, a struct, and a mapping
+# entry. No node: the contract is compiled here and run on a local chain.
+# REQUIRES: soldb
+# RUN: %soldb compile %S/../examples/StateVars.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: printf 'break total\ncontinue\nvars\nprint items[1]\nprint balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]\nprint config.limit\nprint small[2]\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck %s
+
+# Every variable, in declaration order, at the slot and byte offset solc assigned it.
+# CHECK: State:
+# CHECK-NEXT: uint256 counter = 42 [slot 0x0]
+# CHECK-NEXT: bool active = true [slot 0x1]
+# CHECK-NEXT: address owner = 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266 [slot 0x1 + 1]
+# CHECK-NEXT: int8 delta = -2 [slot 0x1 + 21]
+# CHECK-NEXT: string label = "soldb" [slot 0x2]
+# CHECK-NEXT: uint8[3] small = [1, 0, 3] [slot 0x3]
+# CHECK-NEXT: uint256[] items = <2 element(s); index it with [i]> [slot 0x4]
+# CHECK-NEXT: struct StateVars.Config config = { owner: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266, limit: 99 } [slot 0x5]
+# CHECK-NEXT: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x7]
+
+# A dynamic array element lives at keccak256(slot) + index, a mapping entry at
+# keccak256(key . slot), a struct member at its slot, and a packed element at its offset.
+# CHECK: uint256 items[1] = 9 [slot 0x{{[0-9a-f]+}}]
+# CHECK: uint256 balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266] = 25 [slot 0x{{[0-9a-f]+}}]
+# CHECK: uint256 config.limit = 99 [slot 0x6]
+# CHECK: uint8 small[2] = 3 [slot 0x3 + 2]
+
+# A path that does not name a place in storage says why, and nothing is invented for a
+# variable the run has not touched.
+# RUN: printf 'print nothing\nprint counter[1]\nprint config.missing\nprint counter\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck --check-prefix=UNKNOWN %s
+
+# UNKNOWN: No such variable: `nothing` is not in scope at PC {{[0-9]+}}; no state variable named `nothing` in the storage layout
+# UNKNOWN: No such variable: `counter[1]` is not in scope at PC {{[0-9]+}}; `counter` is a `uint256`, which cannot be indexed
+# UNKNOWN: No such variable: `config.missing` is not in scope at PC {{[0-9]+}}; `struct StateVars.Config` has no member `missing`; it has owner, limit
+# UNKNOWN: uint256 counter = <unknown: slot 0x0 has not been read or written yet> [slot 0x0]
+
+# What a transaction wrote, step by step. This runs on a local chain, which records every
+# storage touch, so the values are exact here in a way they cannot be against an arbitrary
+# node: a backend that reports no per-step storage leaves the same variables readable only
+# from the chain, which is what `trace/interactive-state.test` covers instead.
+# RUN: printf 'break counter\ncontinue\nprint counter\nnexti\nprint counter\nstorage\ncontinue\nnexti\nprint counter\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck --check-prefix=WRITES %s
+
+# `break counter` stops at the write, and the write takes effect after its step.
+# WRITES: Breakpoint #1 set at a write to `counter` (storage slot 0x0)
+# WRITES: Breakpoint #1 hit at step {{[0-9]+}}, a write to `counter` (storage slot 0x0)
+# WRITES: uint256 counter = 0 [slot 0x0]
+# WRITES: uint256 counter = 42 [slot 0x0]
+# The storage view is every slot known at this step, not only the one this opcode touched.
+# WRITES: Storage: {{.*}}0x{{[0-9a-f]+}}
+# WRITES-NEXT: 0x0 = 0x2a
+# The second write is `counter = total()`, which reads the counter back and adds the
+# configured limit: 42 + 99.
+# WRITES: Breakpoint #1 hit at step {{[0-9]+}}, a write to `counter` (storage slot 0x0)
+# WRITES: uint256 counter = 141 [slot 0x0]
+
+# A condition over a state variable is checked only where the target already matched, and
+# reads the value the recording has at that step.
+# RUN: printf 'break op SSTORE if counter == 42\ncontinue\nprint counter\ndelete 1\nbreak op SSTORE if counter > 100000\ncontinue\nquit\n' | %soldb run %t.out/StateVars.bin "touchAll(address)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:StateVars:%t.out -i 2>&1 | FileCheck --check-prefix=CONDITION %s
+
+# CONDITION: Breakpoint #1 hit at step {{[0-9]+}}, opcode SSTORE if counter == 42
+# CONDITION: uint256 counter = 42 [slot 0x0]
+# CONDITION: Breakpoint #2 set at opcode SSTORE if counter > 100000
+# CONDITION: End of trace at step {{[0-9]+}}
+# CONDITION-NOT: Breakpoint #2 hit

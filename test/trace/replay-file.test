@@ -1,0 +1,30 @@
+# `--save-replay` records everything the replay backend read; `soldb replay` reproduces
+# the same trace from that file with no node.
+# REQUIRES: soldb
+# RUN: %soldb trace %{test_tx} --backend replay --save-replay %t.json --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck --check-prefix=SAVE %s
+
+# SAVE: Saved transaction 0x{{[0-9a-f]+}} on chain 31337 with {{[0-9]+}} state item(s) to
+# SAVE: Call Stack:
+
+# RUN: %soldb replay %t.json --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} 2>&1 | FileCheck --check-prefix=REPLAY %s
+
+# REPLAY: Replaying transaction 0x{{[0-9a-f]+}} on chain 31337 with {{[0-9]+}} state item(s) from {{.*}}; no node involved
+# REPLAY: Call Stack:
+
+# The replayed document is the live one, step for step.
+# RUN: %soldb trace %{test_tx} --backend replay --rpc %{rpc_url} --json | jq -S . > %t.live.json
+# RUN: %soldb replay %t.json --json | jq -S . > %t.offline.json
+# RUN: diff %t.live.json %t.offline.json
+
+# The offline replay is a full debugging session.
+# RUN: printf 'next\nquit\n' | %soldb replay %t.json --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} -i 2>&1 | FileCheck --check-prefix=INTERACTIVE %s
+
+# INTERACTIVE: TestContract.sol:23 in increment
+
+# A file that is not a recording is refused by name, and the node's tracer cannot be
+# recorded.
+# RUN: not %soldb replay %{ethdebug_dir}/TestContract.abi 2>&1 | FileCheck --check-prefix=BAD %s
+# RUN: not %soldb trace %{test_tx} --backend debug-rpc --save-replay %t.json --rpc %{rpc_url} 2>&1 | FileCheck --check-prefix=DEBUGRPC %s
+
+# BAD: is not a replay file written by `--save-replay`
+# DEBUGRPC: `--save-replay` records the replay backend; drop `--backend debug-rpc`

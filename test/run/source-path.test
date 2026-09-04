@@ -1,0 +1,20 @@
+# Artifacts whose sources are not next to them: a compiler records the paths it was given,
+# which are relative to the directory it ran in. Without them the debugger says so, and
+# `--source-path` points it at that directory.
+# REQUIRES: soldb
+# RUN: rm -rf %t.legacy && mkdir -p %t.legacy
+# RUN: cd %{project_root} && %{solc_path} --combined-json bin,bin-runtime,abi,srcmap,srcmap-runtime,metadata,storage-layout --overwrite -o %t.legacy --base-path . --allow-paths . examples/Counter.sol > /dev/null 2>&1
+# RUN: cd %{project_root} && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); open(sys.argv[2],'w').write(d['contracts']['examples/Counter.sol:Counter']['bin'])" %t.legacy/combined.json %t.legacy/Counter.bin
+
+# Run from somewhere else entirely: the sources cannot be found, and that is reported
+# rather than silently degrading to an opcode view.
+# RUN: cd %t.legacy && printf 'quit\n' | %soldb run %t.legacy/Counter.bin "increment()" --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Counter:%t.legacy -i 2>&1 | FileCheck --check-prefix=MISSING %s
+
+# MISSING: warning: could not read the source for `Counter`: examples/Counter.sol
+# MISSING: note: source lines and functions are unavailable
+
+# Naming the directory the contract was compiled in resolves them.
+# RUN: cd %t.legacy && printf 'next\nquit\n' | %soldb run %t.legacy/Counter.bin "increment()" --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Counter:%t.legacy --source-path %{project_root} -i 2>&1 | FileCheck --check-prefix=FOUND %s
+
+# FOUND-NOT: could not read the source
+# FOUND: examples/Counter.sol:{{[0-9]+}} in increment

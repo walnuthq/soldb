@@ -1,0 +1,22 @@
+# A mapping entry lives at keccak256(key . slot); simulating a write to one and reading it
+# back by key finds the same slot the contract wrote.
+# REQUIRES: soldb
+# RUN: printf 'break TestContract.sol:74\ncontinue\nbt\nprint balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]\nbreak op SSTORE\ncontinue\nnexti\nprint balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]\nstorage\nquit\n' | %soldb simulate %{contract_address} "updateBalance(address,uint256)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 25 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s
+
+# CHECK: Breakpoint #1 hit at step {{[0-9]+}}
+# This call passes two arguments, which is what proves which stack word is which: the
+# calldata says what they are, and the entry stack says where the compiler put them.
+# CHECK: #0  updateBalance(user = 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266, amount = 25) at TestContract.sol:74
+# Before the write the call has not touched the entry's slot, so its value comes from the
+# chain the call was simulated on.
+# CHECK: uint256 balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266] = {{[0-9]+}} [slot [[SLOT:0x[0-9a-f]+]], from the chain at block {{[0-9]+}}]
+# After the `SSTORE` the same slot holds the value that was passed in.
+# CHECK: uint256 balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266] = 25 [slot [[SLOT]]]
+# CHECK: Storage:
+# CHECK: [[SLOT]] = 0x19
+
+# The entry can be named as a breakpoint target, which resolves through the same layout.
+# RUN: printf 'break balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]\ncontinue\nquit\n' | %soldb simulate %{contract_address} "updateBalance(address,uint256)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 25 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=WATCH %s
+
+# WATCH: Breakpoint #1 set at a write to `balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]` (storage slot [[SLOT:0x[0-9a-f]+]])
+# WATCH: Breakpoint #1 hit at step {{[0-9]+}}, a write to `balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]` (storage slot [[SLOT]])

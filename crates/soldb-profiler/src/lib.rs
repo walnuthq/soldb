@@ -386,7 +386,7 @@ pub fn profile_transaction(
 
         step_metrics.add(step.gas_cost, "total step gas")?;
         opcodes
-            .entry(step.op.as_str())
+            .entry(&*step.op)
             .or_default()
             .add(step.gas_cost, "opcode gas")?;
 
@@ -471,7 +471,7 @@ pub fn profile_transaction(
                 source,
             })
             .or_insert_with(|| HotspotMetrics {
-                opcode: step.op.as_str(),
+                opcode: &step.op,
                 context_matches: context.is_some(),
                 metrics: Metrics::default(),
             });
@@ -1744,7 +1744,7 @@ mod tests {
     fn step(pc: u64, op: &str, gas_cost: u64, depth: u64) -> TraceStep {
         TraceStep {
             pc,
-            op: op.to_owned(),
+            op: op.into(),
             gas: 1_000,
             gas_cost,
             depth,

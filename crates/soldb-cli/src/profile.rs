@@ -30,6 +30,10 @@ pub(crate) struct ProfileArgs {
     backend: TraceBackendArg,
     #[arg(long = "ethdebug-dir", short = 'e')]
     ethdebug_dir: Vec<String>,
+    /// Where the sources named by the debug artifacts are, when they are not next to
+    /// them: the directory the contract was compiled in. Repeatable.
+    #[arg(long = "source-path")]
+    source_path: Vec<String>,
     #[arg(long, short = 'c')]
     contracts: Option<String>,
     #[arg(long, short = 'r', default_value = "http://localhost:8545")]
@@ -104,7 +108,11 @@ fn load_trace(args: &ProfileArgs) -> SoldbResult<TransactionTrace> {
 }
 
 fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Vec<ProfileProgram>> {
-    let specs = resolve_contract_specs(&args.ethdebug_dir, args.contracts.as_deref())?;
+    let specs = resolve_contract_specs(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    )?;
     let single_spec = specs.len() == 1;
     let mut programs = Vec::new();
 
@@ -126,8 +134,8 @@ fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Ve
                 .or_else(|| single_spec.then(|| trace.to_addr.clone()).flatten());
             programs.push(ProfileProgram::new(
                 address,
-                index.info,
-                index.source_contents,
+                index.debug.info,
+                index.debug.source_contents,
             )?);
             loaded = true;
         }
@@ -141,8 +149,8 @@ fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Ve
             });
             programs.push(ProfileProgram::new(
                 address,
-                index.info,
-                index.source_contents,
+                index.debug.info,
+                index.debug.source_contents,
             )?);
             loaded = true;
         }
@@ -440,6 +448,7 @@ mod tests {
             trace_file: None,
             backend: TraceBackendArg::Replay,
             ethdebug_dir: vec![format!("0x2:Counter:{}", dir.display())],
+            source_path: Vec::new(),
             contracts: None,
             rpc: String::new(),
             top: 20,
@@ -464,7 +473,7 @@ mod tests {
             artifacts: Default::default(),
             steps: vec![TraceStep {
                 pc: 0,
-                op: "STOP".to_owned(),
+                op: "STOP".into(),
                 gas: 3,
                 gas_cost: 3,
                 depth: 0,

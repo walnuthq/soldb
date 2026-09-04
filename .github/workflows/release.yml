@@ -3,7 +3,7 @@ name: Release
 # Publishing a GitHub Release publishes the whole workspace to crates.io.
 #
 # The filename is load-bearing: crates.io trusted publishing authorizes this
-# repository *and this workflow filename* for each of the eleven published
+# repository *and this workflow filename* for each of the twelve published
 # crates. Renaming the file breaks publishing until every trusted-publisher
 # config is updated to match.
 #
