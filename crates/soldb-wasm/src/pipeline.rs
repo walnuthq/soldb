@@ -451,7 +451,7 @@ mod tests {
         assert!(inner.capabilities.memory);
         assert!(inner.capabilities.gas_details);
         assert_eq!(inner.steps.len(), 3);
-        assert_eq!(inner.steps[1].memory.as_deref(), Some("aabb"));
+        assert_eq!(inner.steps[1].snapshot_ref().memory, Some("aabb"));
         assert_eq!(trace.step_count(), 3);
         assert!(!trace.has_ethdebug());
     }

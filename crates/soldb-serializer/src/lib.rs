@@ -565,8 +565,11 @@ mod tests {
             error: None,
             snapshot: soldb_core::StepSnapshot {
                 stack: vec!["0x02".to_owned(), "0x01".to_owned()],
-                memory: Some("bb".to_owned()),
-                storage: BTreeMap::from([("0x01".to_owned(), "0x02".to_owned())]),
+                memory: Some("bb".into()),
+                storage: std::sync::Arc::new(BTreeMap::from([(
+                    "0x01".to_owned(),
+                    "0x02".to_owned(),
+                )])),
                 storage_diff: BTreeMap::from([
                     (
                         "0x01".to_owned(),

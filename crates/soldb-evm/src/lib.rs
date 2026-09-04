@@ -19,6 +19,7 @@
 //! backend, and the state provider that reads a node lazily.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -118,39 +119,59 @@ impl StructLog {
     /// Builds a [`TraceStep`] from a borrowed log.
     ///
     /// Prefer this when walking a whole trace: the owning version cannot be used without
-    /// first cloning the log, which doubles the per-step copying for no benefit.
-    ///
-    /// A `TraceStep` records its stack, memory, and storage twice — once in the flat
-    /// fields and once in the snapshot — so two copies of each are unavoidable here. That
-    /// is the floor, and this function stays at it.
+    /// first cloning the log, which doubles the per-step copying for no benefit. When
+    /// walking a whole trace, [`StructLog::to_trace_step_sharing`] also lets consecutive
+    /// steps share unchanged memory and storage.
     #[must_use]
     pub fn to_trace_step_with_previous_storage(
         &self,
         previous_storage: &BTreeMap<String, String>,
     ) -> TraceStep {
-        let memory = joined_memory(&self.memory);
-        let snapshot = StepSnapshot {
-            stack: self.stack.clone(),
-            memory: Some(memory.clone()),
-            storage: self.storage.clone(),
-            storage_diff: if self.storage.is_empty() {
-                BTreeMap::new()
-            } else {
-                storage_diff(previous_storage, &self.storage)
-            },
+        self.to_trace_step_sharing(previous_storage, None)
+    }
+
+    /// Builds a [`TraceStep`] that shares its memory and storage with `previous` when
+    /// this log did not change them.
+    ///
+    /// `previous` is the log before this one and the step built from it. Memory changes
+    /// on a handful of opcodes and storage only on `SSTORE`, so over a whole trace this
+    /// keeps one copy per change instead of one per step, which is what makes a trace
+    /// of hundreds of thousands of steps fit in memory.
+    #[must_use]
+    pub fn to_trace_step_sharing(
+        &self,
+        previous_storage: &BTreeMap<String, String>,
+        previous: Option<(&StructLog, &TraceStep)>,
+    ) -> TraceStep {
+        let memory = match previous {
+            Some((log, step)) if log.memory == self.memory && step.snapshot.memory.is_some() => {
+                step.snapshot.memory.clone()
+            }
+            _ => Some(Arc::from(joined_memory(&self.memory))),
         };
-        TraceStep {
-            pc: self.pc,
-            op: self.op.clone(),
-            gas: self.gas,
-            gas_cost: self.gas_cost,
-            depth: self.depth,
-            stack: self.stack.clone(),
-            memory: Some(memory),
-            storage: Some(self.storage.clone()),
-            error: self.error.clone(),
-            snapshot,
-        }
+        let storage = match previous {
+            Some((log, step)) if log.storage == self.storage => Arc::clone(&step.snapshot.storage),
+            _ => Arc::new(self.storage.clone()),
+        };
+        let storage_diff = if self.storage.is_empty() {
+            BTreeMap::new()
+        } else {
+            storage_diff(previous_storage, &self.storage)
+        };
+        TraceStep::new(
+            self.pc,
+            self.op.clone(),
+            self.gas,
+            self.gas_cost,
+            self.depth,
+            self.error.clone(),
+            StepSnapshot {
+                stack: self.stack.clone(),
+                memory,
+                storage,
+                storage_diff,
+            },
+        )
     }
 
     #[must_use]
@@ -158,30 +179,21 @@ impl StructLog {
         self,
         previous_storage: &BTreeMap<String, String>,
     ) -> TraceStep {
-        let memory = joined_memory(&self.memory);
-        // Clone into the snapshot first, then move the originals into the flat fields.
-        let snapshot = StepSnapshot {
-            stack: self.stack.clone(),
-            memory: Some(memory.clone()),
-            storage: self.storage.clone(),
-            storage_diff: if self.storage.is_empty() {
-                BTreeMap::new()
-            } else {
-                storage_diff(previous_storage, &self.storage)
-            },
+        let storage_diff = if self.storage.is_empty() {
+            BTreeMap::new()
+        } else {
+            storage_diff(previous_storage, &self.storage)
         };
-        TraceStep {
-            pc: self.pc,
-            op: self.op,
-            gas: self.gas,
-            gas_cost: self.gas_cost,
-            depth: self.depth,
-            stack: self.stack,
-            memory: Some(memory),
-            storage: Some(self.storage),
-            error: self.error,
-            snapshot,
-        }
+        let memory = joined_memory(&self.memory);
+        TraceStep::new(
+            self.pc,
+            self.op,
+            self.gas,
+            self.gas_cost,
+            self.depth,
+            self.error,
+            StepSnapshot::new(self.stack, Some(memory), self.storage, storage_diff),
+        )
     }
 }
 
@@ -256,17 +268,20 @@ impl DebugTraceResult {
     pub fn steps(&self) -> Vec<TraceStep> {
         static EMPTY_STORAGE: BTreeMap<String, String> = BTreeMap::new();
 
-        // Borrow the previous log's storage rather than copying it forward: this runs once
-        // per EVM step, and a trace can have hundreds of thousands of them.
+        // Borrow the previous log's storage rather than copying it forward, and hand the
+        // previous step on so unchanged memory and storage are shared rather than copied:
+        // this runs once per EVM step, and a trace can have hundreds of thousands of them.
         let mut previous_storage = &EMPTY_STORAGE;
-        self.struct_logs
-            .iter()
-            .map(|log| {
-                let step = log.to_trace_step_with_previous_storage(previous_storage);
-                previous_storage = &log.storage;
-                step
-            })
-            .collect()
+        let mut previous_log = None::<&StructLog>;
+        let mut steps = Vec::with_capacity(self.struct_logs.len());
+        for log in &self.struct_logs {
+            let previous = previous_log.zip(steps.last());
+            let step = log.to_trace_step_sharing(previous_storage, previous);
+            steps.push(step);
+            previous_storage = &log.storage;
+            previous_log = Some(log);
+        }
+        steps
     }
 
     #[must_use]
@@ -706,6 +721,9 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
     use serde_json::json;
 
     use super::{
@@ -766,7 +784,7 @@ mod tests {
         assert!(trace.capabilities.logs);
         assert_eq!(trace.artifacts.logs.len(), 2);
         assert_eq!(trace.steps.len(), 3);
-        assert_eq!(trace.steps[1].memory.as_deref(), Some("aabb"));
+        assert_eq!(trace.steps[1].snapshot_ref().memory, Some("aabb"));
     }
 
     #[test]
@@ -939,6 +957,68 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_steps_share_unchanged_memory_and_storage() {
+        let log = |op: &str, memory: &[&str], slot_value: &str| StructLog {
+            pc: 0,
+            op: op.to_owned(),
+            gas: 0,
+            gas_cost: 0,
+            depth: 1,
+            stack: Vec::new(),
+            memory: memory.iter().map(|word| (*word).to_owned()).collect(),
+            storage: BTreeMap::from([("0x0".to_owned(), slot_value.to_owned())]),
+            error: None,
+        };
+        let result = DebugTraceResult {
+            struct_logs: vec![
+                log("PUSH1", &["aa"], "0x1"),
+                log("PUSH1", &["aa"], "0x1"),
+                log("MSTORE", &["aa", "bb"], "0x1"),
+                log("SSTORE", &["aa", "bb"], "0x2"),
+            ],
+            return_value: String::new(),
+            error: None,
+            failed: false,
+            gas: None,
+            artifacts: Default::default(),
+        };
+        let steps = result.steps();
+        // Nothing changed between the first two steps: one copy of memory and storage.
+        assert!(Arc::ptr_eq(
+            &steps[0].snapshot.storage,
+            &steps[1].snapshot.storage
+        ));
+        assert!(Arc::ptr_eq(
+            steps[0].snapshot.memory.as_ref().expect("memory"),
+            steps[1].snapshot.memory.as_ref().expect("memory")
+        ));
+        // Memory changed at step 2, storage at step 3; each got its own copy, and the
+        // values are what the log said.
+        assert!(!Arc::ptr_eq(
+            steps[1].snapshot.memory.as_ref().expect("memory"),
+            steps[2].snapshot.memory.as_ref().expect("memory")
+        ));
+        assert!(Arc::ptr_eq(
+            &steps[1].snapshot.storage,
+            &steps[2].snapshot.storage
+        ));
+        assert!(!Arc::ptr_eq(
+            &steps[2].snapshot.storage,
+            &steps[3].snapshot.storage
+        ));
+        assert_eq!(steps[2].snapshot_ref().memory, Some("aabb"));
+        assert_eq!(steps[3].snapshot_ref().storage["0x0"], "0x2");
+        assert_eq!(
+            steps[3].snapshot_ref().storage_diff["0x0"].after.as_deref(),
+            Some("0x2")
+        );
+        // The flat fields stay empty: the state is stored once.
+        assert!(steps
+            .iter()
+            .all(|step| step.stack.is_empty() && step.memory.is_none() && step.storage.is_none()));
+    }
+
+    #[test]
     fn parses_struct_logs_into_trace_steps() {
         let result: DebugTraceResult = serde_json::from_value(json!({
             "returnValue": "2a",
@@ -962,8 +1042,8 @@ mod tests {
         assert_eq!(steps.len(), 2);
         // Memory words are normalized to one unprefixed hex string whether or not the node
         // prefixed them, so byte-offset lookups stay valid and both backends agree.
-        assert_eq!(steps[0].memory.as_deref(), Some("aabb"));
-        assert_eq!(steps[0].storage.as_ref().expect("storage")["0x00"], "0x2a");
+        assert_eq!(steps[0].snapshot_ref().memory, Some("aabb"));
+        assert_eq!(steps[0].snapshot_ref().storage["0x00"], "0x2a");
         assert_eq!(steps[0].snapshot.stack, ["0x01"]);
         assert_eq!(steps[0].snapshot.memory.as_deref(), Some("aabb"));
         assert_eq!(steps[0].snapshot.storage["0x00"], "0x2a");

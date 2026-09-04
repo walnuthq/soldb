@@ -697,7 +697,7 @@ mod tests {
         );
         assert_eq!(trace.steps.len(), 3);
         assert_eq!(trace.steps[0].op, "PUSH1");
-        assert_eq!(trace.steps[1].memory.as_deref(), Some("aabb"));
+        assert_eq!(trace.steps[1].snapshot_ref().memory, Some("aabb"));
     }
 
     #[test]

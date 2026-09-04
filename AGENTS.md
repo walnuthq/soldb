@@ -528,11 +528,16 @@ Beyond the rule:
   document's `steps` are streamed by `WebSteps` in `soldb-serializer`, one borrowed step
   at a time, with a test pinning the bytes against the former `json!` shape. Do not
   reintroduce a `Vec<serde_json::Value>` of steps.
-- **Known cost, not yet addressed:** a `TraceStep` stores its stack, memory, and storage
-  twice — once in the flat fields and once in `snapshot` — because both are serialized.
-  That duplication dominates peak memory on large traces (a 500k-step trace peaks around
-  8 GiB). Removing it means changing the `soldb-core` serialization contract, so it is a
-  deliberate decision rather than a cleanup.
+- **A `TraceStep` stores its state once and serializes it twice.** The flat `stack`,
+  `memory`, and `storage` fields are the wire format older files and clients read; every
+  constructor leaves them empty, `Serialize` fills them from `snapshot`, and
+  `Deserialize` moves whatever they held into `snapshot`. Build steps with
+  `TraceStep::new` and `StepSnapshot::new`, never by filling the flat fields. Memory and
+  storage in a snapshot are `Arc`s, and `DebugTraceResult::steps` hands the previous
+  step's on when a log did not change them, so a trace holds one copy per change rather
+  than one per step; keep that sharing when you touch step construction. The remaining
+  duplicate is `DebugTraceResult` itself, whose `StructLog`s mirror the node's payload
+  with memory per step, alive until `steps()` has run.
 - **PC-to-source lookups should be indexed, not scanned.** Build the PC map once per
   contract (`build_pc_to_instruction_map`) and reuse it; a linear scan per step turns a
   trace walk quadratic.
