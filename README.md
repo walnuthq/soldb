@@ -249,9 +249,12 @@ soldb run out/Counter.bin --deploy --raw                 # trace the constructor
 soldb run 0x6000405060005460010160005500 --runtime --storage 0x0=0x29 --raw   # raw runtime code, a slot seeded
 ```
 
-`--constructor-args` are encoded against the ABI next to the ETHDebug artifacts;
-`--from`, `--balance`, `--value`, `--chain-id`, `--block-number`, `--timestamp`, and
-`--gas-limit` shape the caller and the block.
+`--constructor-args` are encoded against the ABI next to the ETHDebug artifacts, and
+`--constructor-value` funds a payable constructor when creation code is deployed before the
+call; under `--deploy`, `--value` goes to the constructor. A deployment lands at the CREATE
+address of `--from` at nonce zero; `--address` places `--runtime` code. `--from`,
+`--balance`, `--value`, `--chain-id`, `--block-number`, `--timestamp`, and `--gas-limit`
+shape the caller and the block.
 
 ### Time Travel
 

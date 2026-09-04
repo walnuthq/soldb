@@ -1,9 +1,14 @@
 # `--deploy` traces the constructor itself and stops.
 # REQUIRES: soldb
 # RUN: %soldb run %{ethdebug_dir}/TestContract.bin --deploy --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:TestContract:%{ethdebug_dir} --raw --max-steps 6 2>&1 | FileCheck %s
+# Under `--deploy`, `--value` funds the constructor; this one is not payable and reverts.
+# RUN: %soldb run %{ethdebug_dir}/TestContract.bin --deploy --value 1 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:TestContract:%{ethdebug_dir} 2>&1 | FileCheck --check-prefix=PAYABLE %s
 
 # CHECK: Deploying locally to 0x5fbdb2315678afecb367f032d93f642f64180aa3
 # CHECK: Execution trace
 # CHECK: PUSH1
 # CHECK: MSTORE
 # CHECK: CALLVALUE
+
+# PAYABLE: Deploying locally to
+# PAYABLE: Status: REVERTED

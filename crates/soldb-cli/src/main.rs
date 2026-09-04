@@ -297,6 +297,66 @@ struct TraceArgs {
     stylus_contracts: Option<String>,
 }
 
+/// What presenting a simulated call needs, whichever command produced it.
+///
+/// `simulate` and `run` share every output path: source mapping, the interactive
+/// debugger, the JSON document, the raw view. They differ in how the trace is obtained,
+/// so the presentation helpers take this view rather than either command's arguments.
+#[derive(Debug, Clone)]
+struct SimulationView {
+    /// The node the call ran against, or `None` for a chain that exists only for the run.
+    rpc_url: Option<String>,
+    contract_address: String,
+    function_signature: Option<String>,
+    function_args: Vec<String>,
+    raw_data: Option<String>,
+    ethdebug_dir: Vec<String>,
+    contracts: Option<String>,
+    interactive: bool,
+    json: bool,
+    raw: bool,
+    max_steps: i64,
+}
+
+impl SimulationView {
+    fn for_simulate(args: &SimulateArgs, contract_address: &str) -> Self {
+        Self {
+            rpc_url: Some(args.rpc_url.clone()),
+            contract_address: contract_address.to_owned(),
+            function_signature: args.function_signature.clone(),
+            function_args: args.function_args.clone(),
+            raw_data: args.raw_data.clone(),
+            ethdebug_dir: args.ethdebug_dir.clone(),
+            contracts: args.contracts.clone(),
+            interactive: args.interactive,
+            json: args.json,
+            raw: args.raw,
+            max_steps: args.max_steps,
+        }
+    }
+
+    fn for_run(args: &RunArgs, contract_address: &str) -> Self {
+        Self {
+            rpc_url: None,
+            contract_address: contract_address.to_owned(),
+            function_signature: args.function_signature.clone(),
+            function_args: args.function_args.clone(),
+            // A run with neither a signature nor data calls the contract with empty
+            // calldata, which is what plain bytecode without a dispatcher expects.
+            raw_data: args
+                .raw_data
+                .clone()
+                .or_else(|| args.function_signature.is_none().then(|| "0x".to_owned())),
+            ethdebug_dir: args.ethdebug_dir.clone(),
+            contracts: args.contracts.clone(),
+            interactive: args.interactive,
+            json: args.json,
+            raw: args.raw,
+            max_steps: args.max_steps,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct RunArgs {
     /// Bytecode to run: a file such as `out/Counter.bin`, or a hex string. Creation code
@@ -318,11 +378,16 @@ struct RunArgs {
     /// Trace the constructor and stop.
     #[arg(long)]
     deploy: bool,
-    /// Where runtime code lives with `--runtime`.
-    #[arg(long, default_value = "0x5FbDB2315678afecB367f032d93F642f64180aa3")]
-    address: String,
+    /// Where `--runtime` code lives; defaults to the first Anvil deployment address. A
+    /// deployment lands at the CREATE address of `--from` at nonce zero instead.
+    #[arg(long, requires = "runtime")]
+    address: Option<String>,
+    /// Value sent with the call, or with the deployment under `--deploy`.
     #[arg(long, default_value = "0")]
     value: String,
+    /// Value sent to the constructor when creation code is deployed before the call.
+    #[arg(long, default_value = "0")]
+    constructor_value: String,
     #[arg(long)]
     raw_data: Option<String>,
     /// Constructor arguments, encoded against the ABI found through `--ethdebug-dir`.
@@ -724,7 +789,8 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     let contract_name = auto_deploy
         .as_ref()
         .map(|deploy| deploy.contract_name.clone());
-    let calldata = match simulate_calldata(args) {
+    let view = SimulationView::for_simulate(args, &contract_address);
+    let calldata = match simulate_calldata(&view) {
         Ok(calldata) => calldata,
         Err(error) if args.json => {
             print_json_command_error("SimulationError", &error.to_string(), None)?;
@@ -750,52 +816,46 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     };
     let trace =
         soldb_rpc::simulate_call_with_backend(&args.rpc_url, &request, args.backend.into())?;
-    present_simulation(
-        args,
-        trace,
-        &contract_address,
-        contract_name.as_deref(),
-        &calldata,
-    )
+    present_simulation(&view, trace, contract_name.as_deref(), &calldata)
 }
 
 /// Shows a simulated call the way the user asked: interactively, as the web document, as
 /// raw steps, or as the summary. Shared by `simulate` and `run`.
 fn present_simulation(
-    args: &SimulateArgs,
+    view: &SimulationView,
     trace: TransactionTrace,
-    contract_address: &str,
     contract_name: Option<&str>,
     calldata: &str,
 ) -> SoldbResult<()> {
-    let json_function_name = simulate_json_function_name(args, calldata);
-    let display_function_name = simulate_display_function_name(args, calldata);
+    let contract_address = view.contract_address.as_str();
+    let json_function_name = simulate_json_function_name(view, calldata);
+    let display_function_name = simulate_display_function_name(view, calldata);
 
-    if args.interactive {
+    if view.interactive {
         print_simulation_interactive_prelude(
-            args,
+            view,
             contract_address,
             contract_name,
             calldata,
             &display_function_name,
         );
-        let source_index = interactive_simulation_source_index(args, contract_address);
+        let source_index = interactive_simulation_source_index(view, contract_address);
         run_interactive_debugger(trace, "Simulation debugger", source_index)?;
-    } else if args.json {
+    } else if view.json {
         println!(
             "{}",
             soldb_serializer::simulate_to_web_json_with_contracts(
                 &trace,
                 &json_function_name,
-                simulate_web_contracts(args, &trace, contract_address)
+                simulate_web_contracts(view, &trace, contract_address)
             )?
         );
-    } else if args.raw {
-        print_raw_simulation(&trace, args, contract_address);
+    } else if view.raw {
+        print_raw_simulation(&trace, view, contract_address);
     } else {
         print_simulation_summary(
             &trace,
-            args,
+            view,
             contract_address,
             contract_name,
             calldata,
@@ -823,12 +883,22 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         .with_account(&args.from_addr, &args.balance, 0, "0x")?;
 
     let (contract_address, prefix) = if args.runtime {
-        chain = chain.with_account(&args.address, "0", 1, &bytecode)?;
-        (normalize_contract_address_key(&args.address), Vec::new())
+        let address = args
+            .address
+            .clone()
+            .unwrap_or_else(|| "0x5FbDB2315678afecB367f032d93F642f64180aa3".to_owned());
+        chain = chain.with_account(&address, "0", 1, &bytecode)?;
+        (normalize_contract_address_key(&address), Vec::new())
     } else {
         let created = soldb_rpc::LocalChain::created_address(&args.from_addr, 0)?;
-        let init_code = format!("{bytecode}{}", run_constructor_args(args, &created)?);
-        let deployment = chain.deployment(&args.from_addr, &init_code, "0", 0)?;
+        let init_code = format!("{bytecode}{}", run_constructor_args(args)?);
+        // Under `--deploy` the constructor is the whole run, so `--value` is its value.
+        let deployment_value = if args.deploy {
+            &args.value
+        } else {
+            &args.constructor_value
+        };
+        let deployment = chain.deployment(&args.from_addr, &init_code, deployment_value, 0)?;
         (created, vec![deployment])
     };
     for entry in &args.storage {
@@ -840,8 +910,8 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         chain = chain.with_storage(&contract_address, slot.trim(), value.trim())?;
     }
 
-    let simulate_args = simulate_args_for_run(args, &contract_address);
-    let contract_name = simulate_contract_name(&simulate_args);
+    let view = SimulationView::for_run(args, &contract_address);
+    let contract_name = simulate_contract_name(&view);
     if !args.json {
         let what = if args.runtime {
             "Installed runtime code at"
@@ -862,16 +932,10 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         })?;
         let trace = chain.deploy(deployment)?;
         let calldata = deployment.input_data.clone();
-        return present_simulation(
-            &simulate_args,
-            trace,
-            &contract_address,
-            contract_name.as_deref(),
-            &calldata,
-        );
+        return present_simulation(&view, trace, contract_name.as_deref(), &calldata);
     }
 
-    let calldata = simulate_calldata(&simulate_args)?;
+    let calldata = simulate_calldata(&view)?;
     let request = soldb_rpc::SimulateCallRequest {
         from_addr: args.from_addr.clone(),
         to_addr: contract_address.clone(),
@@ -881,13 +945,7 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         tx_index: None,
     };
     let trace = chain.call(&prefix, &request)?;
-    present_simulation(
-        &simulate_args,
-        trace,
-        &contract_address,
-        contract_name.as_deref(),
-        &calldata,
-    )
+    present_simulation(&view, trace, contract_name.as_deref(), &calldata)
 }
 
 /// Reads bytecode from a file when `source` names one, otherwise treats it as hex.
@@ -916,12 +974,11 @@ fn load_bytecode(source: &str) -> SoldbResult<String> {
 
 /// ABI-encodes `--constructor-args` against the constructor found through
 /// `--ethdebug-dir`, or reports that no ABI was found to encode them with.
-fn run_constructor_args(args: &RunArgs, contract_address: &str) -> SoldbResult<String> {
+fn run_constructor_args(args: &RunArgs) -> SoldbResult<String> {
     if args.constructor_args.is_empty() {
         return Ok(String::new());
     }
-    let simulate_args = simulate_args_for_run(args, contract_address);
-    let abi = resolve_contract_specs_reporting(&simulate_args.ethdebug_dir, args.contracts.as_deref())
+    let abi = resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
         .iter()
         .find_map(abi_value_for_spec)
         .and_then(|abi| abi.as_array().cloned())
@@ -933,52 +990,6 @@ fn run_constructor_args(args: &RunArgs, contract_address: &str) -> SoldbResult<S
         })?;
     let encoded = soldb_compiler::encode_constructor_args(&abi, &args.constructor_args)?;
     Ok(encoded.trim_start_matches("0x").to_owned())
-}
-
-/// The `simulate` view of a `run`, so every presentation path is shared.
-fn simulate_args_for_run(args: &RunArgs, contract_address: &str) -> SimulateArgs {
-    SimulateArgs {
-        backend: TraceBackendArg::Replay,
-        from_addr: args.from_addr.clone(),
-        interactive: args.interactive,
-        contract_address: contract_address.to_owned(),
-        function_signature: args.function_signature.clone(),
-        function_args: args.function_args.clone(),
-        block: None,
-        tx_index: None,
-        value: args.value.clone(),
-        ethdebug_dir: args.ethdebug_dir.clone(),
-        contracts: args.contracts.clone(),
-        multi_contract: args.multi_contract,
-        rpc_url: String::new(),
-        json: args.json,
-        raw: args.raw,
-        max_steps: args.max_steps,
-        // A run with neither a signature nor data calls the contract with empty calldata,
-        // which is what plain bytecode without a dispatcher expects.
-        raw_data: args
-            .raw_data
-            .clone()
-            .or_else(|| args.function_signature.is_none().then(|| "0x".to_owned())),
-        constructor_args: args.constructor_args.clone(),
-        solc_path: "solc".to_owned(),
-        dual_compile: false,
-        keep_build: false,
-        output_dir: "./out".to_owned(),
-        production_dir: "./build/contracts".to_owned(),
-        save_config: false,
-        verify_version: false,
-        no_cache: false,
-        cache_dir: ".soldb_cache".to_owned(),
-        fork_url: None,
-        fork_block: None,
-        fork_port: 8545,
-        keep_fork: false,
-        reuse_fork: false,
-        no_snapshot: false,
-        cross_env_bridge: None,
-        stylus_contracts: None,
-    }
 }
 
 fn maybe_auto_deploy(args: &SimulateArgs) -> SoldbResult<Option<soldb_compiler::AutoDeployResult>> {
@@ -1008,7 +1019,7 @@ fn maybe_auto_deploy(args: &SimulateArgs) -> SoldbResult<Option<soldb_compiler::
 }
 
 fn print_simulation_interactive_prelude(
-    args: &SimulateArgs,
+    args: &SimulationView,
     contract_address: &str,
     auto_contract_name: Option<&str>,
     calldata: &str,
@@ -1069,7 +1080,7 @@ fn interactive_trace_source_index(
 }
 
 fn interactive_simulation_source_index(
-    args: &SimulateArgs,
+    args: &SimulationView,
     contract_address: &str,
 ) -> Option<TraceSourceIndex> {
     source_index_for_specs(
@@ -1742,7 +1753,7 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceArgs) {
     }
 }
 
-fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_address: &str) {
+fn print_raw_simulation(trace: &TransactionTrace, args: &SimulationView, contract_address: &str) {
     println!(
         "{} {}",
         info("Simulating call to"),
@@ -1785,7 +1796,7 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulateArgs, contract_
 
 fn print_simulation_summary(
     trace: &TransactionTrace,
-    args: &SimulateArgs,
+    args: &SimulationView,
     contract_address: &str,
     auto_contract_name: Option<&str>,
     raw_data: &str,
@@ -1797,11 +1808,10 @@ fn print_simulation_summary(
         .unwrap_or_else(|| contract_address.to_owned());
     let has_debug_info = !args.ethdebug_dir.is_empty() || args.contracts.is_some();
     if !has_debug_info {
-        println!(
-            "{} {}",
-            info("Connecting to RPC:"),
-            address_color(&args.rpc_url)
-        );
+        match &args.rpc_url {
+            Some(rpc_url) => println!("{} {}", info("Connecting to RPC:"), address_color(rpc_url)),
+            None => println!("{}", info("Running on a local chain; no node involved")),
+        }
         if let Some(signature) = &args.function_signature {
             println!(
                 "{} {}",
@@ -2297,7 +2307,7 @@ fn build_trace_call_frames(
 
 fn build_simulation_call_frames(
     trace: &TransactionTrace,
-    args: &SimulateArgs,
+    args: &SimulationView,
     raw_data: &str,
     fallback: Option<CallDescriptor>,
 ) -> Vec<CallFrame> {
@@ -2383,7 +2393,7 @@ fn call_descriptor_for_calldata(
 }
 
 fn simulated_call_descriptor(
-    args: &SimulateArgs,
+    args: &SimulationView,
     raw_data: &str,
     function_name: &str,
 ) -> Option<CallDescriptor> {
@@ -3080,7 +3090,7 @@ fn trace_event_registry(args: &TraceArgs) -> EventRegistry {
     ))
 }
 
-fn simulate_event_registry(args: &SimulateArgs) -> EventRegistry {
+fn simulate_event_registry(args: &SimulationView) -> EventRegistry {
     event_registry_reporting(resolve_contract_specs_reporting(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
@@ -3485,7 +3495,7 @@ fn trace_web_contracts(
 }
 
 fn simulate_web_contracts(
-    args: &SimulateArgs,
+    args: &SimulationView,
     trace: &TransactionTrace,
     contract_address: &str,
 ) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
@@ -3635,14 +3645,14 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
     }
 }
 
-fn simulate_contract_name(args: &SimulateArgs) -> Option<String> {
+fn simulate_contract_name(args: &SimulationView) -> Option<String> {
     resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
         .into_iter()
         .next()
         .map(|spec| spec.name)
 }
 
-fn simulate_calldata(args: &SimulateArgs) -> SoldbResult<String> {
+fn simulate_calldata(args: &SimulationView) -> SoldbResult<String> {
     if let Some(raw_data) = &args.raw_data {
         if args.function_signature.is_some() || !args.function_args.is_empty() {
             return Err(soldb_core::SoldbError::Message(
@@ -3727,7 +3737,7 @@ fn print_json_command_error(
     })
 }
 
-fn format_simulated_call(args: &SimulateArgs, function_name: &str) -> String {
+fn format_simulated_call(args: &SimulationView, function_name: &str) -> String {
     if args.function_args.is_empty() {
         return args
             .function_signature
@@ -3738,7 +3748,7 @@ fn format_simulated_call(args: &SimulateArgs, function_name: &str) -> String {
     format!("{}({})", function_name, args.function_args.join(", "))
 }
 
-fn simulation_source_file(args: &SimulateArgs, contract_name: &str) -> Option<String> {
+fn simulation_source_file(args: &SimulationView, contract_name: &str) -> Option<String> {
     resolve_contract_specs_reporting(&args.ethdebug_dir, args.contracts.as_deref())
         .into_iter()
         .find(|spec| spec.name == contract_name)
@@ -3757,7 +3767,7 @@ fn simulation_source_file(args: &SimulateArgs, contract_name: &str) -> Option<St
         })
 }
 
-fn simulate_json_function_name(args: &SimulateArgs, calldata: &str) -> String {
+fn simulate_json_function_name(args: &SimulationView, calldata: &str) -> String {
     if let Some(signature) = &args.function_signature {
         return signature.clone();
     }
@@ -3765,7 +3775,7 @@ fn simulate_json_function_name(args: &SimulateArgs, calldata: &str) -> String {
     simulate_display_function_name(args, calldata)
 }
 
-fn simulate_display_function_name(args: &SimulateArgs, calldata: &str) -> String {
+fn simulate_display_function_name(args: &SimulationView, calldata: &str) -> String {
     if let Some(signature) = &args.function_signature {
         if let Some(parsed) = parse_signature(signature) {
             return parsed.name;
@@ -4546,32 +4556,40 @@ contract C {
     #[test]
     fn simulate_and_format_helpers_cover_error_paths() {
         let mut args = simulate_args();
+        let view_of =
+            |args: &SimulateArgs| SimulationView::for_simulate(args, &args.contract_address);
         assert!(maybe_auto_deploy(&args).expect("auto deploy").is_none());
-        assert!(simulate_calldata(&args).is_err());
+        assert!(simulate_calldata(&view_of(&args)).is_err());
 
         args.function_signature = Some("increment(uint256)".to_owned());
         args.function_args = vec!["4".to_owned()];
-        let calldata = simulate_calldata(&args).expect("encoded calldata");
+        let calldata = simulate_calldata(&view_of(&args)).expect("encoded calldata");
         assert!(calldata.starts_with("0x7cf5dab0"));
         assert_eq!(
-            simulate_json_function_name(&args, &calldata),
+            simulate_json_function_name(&view_of(&args), &calldata),
             "increment(uint256)"
         );
         assert_eq!(
-            simulate_display_function_name(&args, &calldata),
+            simulate_display_function_name(&view_of(&args), &calldata),
             "increment"
         );
         let descriptor =
-            simulated_call_descriptor(&args, &calldata, "increment").expect("descriptor");
+            simulated_call_descriptor(&view_of(&args), &calldata, "increment").expect("descriptor");
         assert_eq!(descriptor.name, "increment(uint256)");
         assert_eq!(descriptor.params[0].value, "4");
-        assert_eq!(format_simulated_call(&args, "increment"), "increment(4)");
+        assert_eq!(
+            format_simulated_call(&view_of(&args), "increment"),
+            "increment(4)"
+        );
 
         args.raw_data = Some("0x1234".to_owned());
-        assert!(simulate_calldata(&args).is_err());
+        assert!(simulate_calldata(&view_of(&args)).is_err());
         args.function_signature = None;
         args.function_args.clear();
-        assert_eq!(simulate_calldata(&args).expect("raw calldata"), "0x1234");
+        assert_eq!(
+            simulate_calldata(&view_of(&args)).expect("raw calldata"),
+            "0x1234"
+        );
 
         assert!(validate_simulate_value("0x2a").is_ok());
         assert!(validate_simulate_value("42").is_ok());

@@ -5,8 +5,11 @@
 # RUN: not %soldb run %{ethdebug_dir}/TestContract.bin --constructor-args 1 2>&1 | FileCheck --check-prefix=ABI %s
 # RUN: not %soldb run 0x60 --runtime --deploy 2>&1 | FileCheck --check-prefix=DEPLOY %s
 # RUN: not %soldb run 0x60 --runtime --storage bad 2>&1 | FileCheck --check-prefix=STORAGE %s
+# A deployment lands at the CREATE address; `--address` only places `--runtime` code.
+# RUN: not %soldb run 0x60 --address 0x0000000000000000000000000000000000000001 2>&1 | FileCheck --check-prefix=ADDRESS %s
 
 # MISSING: is not hex bytecode; pass a `.bin` file or a hex string
 # ABI: `--constructor-args` need the contract ABI
 # DEPLOY: `--deploy` traces creation code
 # STORAGE: invalid `--storage` entry `bad`; expected `<slot>=<value>`
+# ADDRESS: --runtime
