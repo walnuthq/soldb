@@ -168,9 +168,11 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
 - Transaction simulation with arbitrary calldata (including structs & tuples), through
   `debug_traceCall` or replayed locally as a fork of the chain at any block and transaction index
 - `soldb run`: debug compiled bytecode on a local chain with no node at all
-- Interactive LLDB-like REPL (`step`, `break`, `print`, etc.) that moves backward as well as
-  forward (`reverse-next`, `reverse-continue`, `goto`) – works for transactions, simulations, and runs
-- Debug Adapter Protocol server for editors, step-back included
+- Interactive LLDB-like REPL that steps by source line (`next`, `step`, `finish`) and backward as
+  well as forward (`reverse-next`, `reverse-finish`, `goto`) – works for transactions, simulations, and runs
+- Breakpoints on lines, functions, storage writes, reverts, calls, and opcodes, all searches over the
+  recorded trace; `backtrace`, `list`, `stack`, `memory`, `storage`, and `calldata` at any step
+- Debug Adapter Protocol server for editors: line and function breakpoints, step in/over/out, step-back
 - HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and a REVM replay backend for nodes that cannot trace
 - WebAssembly package for browser and Node.js hosts, with host-driven replay
 - Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
@@ -270,9 +272,11 @@ shape the caller and the block.
 ### Time Travel
 
 A trace is a complete recording, so the interactive debugger and the DAP server move
-backward as freely as forward: `reverse-nexti` (or `back`), `reverse-next`, `reverse-step`,
-and `reverse-continue` mirror their forward counterparts, `goto <step>` rewinds to any
-instruction, mid-transaction included, and an editor's step-back button works. See
+backward as freely as forward: `reverse-next`, `reverse-step`, `reverse-finish`,
+`reverse-nexti` (or `back`), and `reverse-continue` mirror their forward counterparts,
+`goto <step>` rewinds to any instruction, mid-transaction included, and an editor's
+step-back button works. Breakpoints are predicates on a step, so `break storage 0` or
+`break revert` is a search over the tape in either direction. See
 [docs/commands.md](docs/commands.md).
 
 ### Crates

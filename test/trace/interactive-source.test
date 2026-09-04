@@ -1,0 +1,64 @@
+# Source-level debugging of the increment transaction: line breakpoints, `step` into an
+# internal call, `bt`, `finish`, `next`, and `list` all move and report by source line.
+# REQUIRES: soldb
+# RUN: printf 'break TestContract.sol:30\ncontinue\nstep\nbt\nfinish\nnext\nlist\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s
+
+# CHECK: Breakpoint #1 set at TestContract.sol:30
+# CHECK: Breakpoint #1 hit at step {{[0-9]+}}, TestContract.sol:30, PC {{[0-9]+}}
+# CHECK: TestContract.sol:30 in increment
+# CHECK: 30 |         increment2(amount);
+# `step` enters increment2; the backtrace shows it above increment and the contract.
+# CHECK: TestContract.sol:{{[0-9]+}} in increment2
+# CHECK: #0  increment2 at TestContract.sol:{{[0-9]+}}
+# CHECK-NEXT: #1  increment at TestContract.sol:30
+# CHECK-NEXT: #2  TestContract at TestContract.sol:{{[0-9]+}}
+# `finish` returns to the call site; `next` moves to the following line; `list` marks it.
+# CHECK: TestContract.sol:30 in increment
+# CHECK: TestContract.sol:32 in increment
+# CHECK: TestContract.sol:32
+# CHECK: => {{ *}}32 |         emit CounterIncremented(counter);
+
+# A storage breakpoint is a search over the tape: it stops at the SSTORE that writes the
+# slot, `storage` shows the slot, and `reverse-finish` goes back to the caller.
+# RUN: printf 'break storage 0\ncontinue\nstorage\nreverse-finish\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=STORAGE %s
+
+# STORAGE: Breakpoint #1 set at storage slot 0x0
+# STORAGE: Breakpoint #1 hit at step {{[0-9]+}}, storage slot 0x0, PC {{[0-9]+}}
+# STORAGE: TestContract.sol:28 in increment
+# STORAGE: 28 |         counter += amount;
+# STORAGE: Storage:
+# STORAGE: TestContract.sol:8
+
+# A function breakpoint stops where the function is entered, breakpoints are numbered,
+# and `delete` removes one by number.
+# RUN: printf 'break increment3\ncontinue\nbt\ninfo breakpoints\ndelete 1\ninfo breakpoints\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=FUNC %s
+
+# FUNC: Breakpoint #1 set at function TestContract.increment3 at TestContract.sol:54
+# FUNC: Breakpoint #1 hit at step {{[0-9]+}}, function TestContract.increment3 at TestContract.sol:54, PC {{[0-9]+}}
+# FUNC: #0  increment3 at TestContract.sol:{{[0-9]+}}
+# FUNC-NEXT: #1  increment2 at TestContract.sol:48
+# FUNC-NEXT: #2  increment at TestContract.sol:30
+# FUNC-NEXT: #3  TestContract at TestContract.sol:{{[0-9]+}}
+# FUNC: #1 function TestContract.increment3 at TestContract.sol:54
+# FUNC: Breakpoint #1 cleared at function TestContract.increment3 at TestContract.sol:54
+# FUNC: No breakpoints set.
+
+# Inspection commands read the recording at the current step.
+# RUN: printf 'calldata\nstack\nmemory\nnexti\nnexti\nnexti\nmemory 0 32\nmode asm\nnexti\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=INSPECT %s
+
+# INSPECT: Calldata: 36 bytes
+# INSPECT-NEXT: 0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004
+# INSPECT: Stack: empty
+# INSPECT: Memory is empty at this step.
+# INSPECT: Memory: {{[0-9]+}} bytes, showing bytes 0..32
+# INSPECT-NEXT: 0x0000: {{[0-9a-f]+}}
+# INSPECT: Mode: asm
+# INSPECT: Stack:
+
+# Without debug info the line commands fall back to instructions and say what is missing.
+# RUN: printf 'next\nbreak TestContract.sol:30\nbreak increment\nlist\nquit\n' | %soldb trace %{test_tx} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=NOMETA %s
+
+# NOMETA: Step 1/
+# NOMETA: Could not set breakpoint: source breakpoints require compiler debug metadata
+# NOMETA: Could not set breakpoint: function breakpoints require compiler debug metadata
+# NOMETA: Cannot list source: no ETHDebug metadata is loaded

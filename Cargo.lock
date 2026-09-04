@@ -2751,7 +2751,10 @@ dependencies = [
 name = "soldb-repl"
 version = "0.2.0"
 dependencies = [
+ "serde_json",
  "soldb-core",
+ "soldb-debugger",
+ "soldb-ethdebug",
 ]
 
 [[package]]

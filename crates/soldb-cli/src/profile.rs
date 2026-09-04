@@ -126,8 +126,8 @@ fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Ve
                 .or_else(|| single_spec.then(|| trace.to_addr.clone()).flatten());
             programs.push(ProfileProgram::new(
                 address,
-                index.info,
-                index.source_contents,
+                index.debug.info,
+                index.debug.source_contents,
             )?);
             loaded = true;
         }
@@ -141,8 +141,8 @@ fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Ve
             });
             programs.push(ProfileProgram::new(
                 address,
-                index.info,
-                index.source_contents,
+                index.debug.info,
+                index.debug.source_contents,
             )?);
             loaded = true;
         }

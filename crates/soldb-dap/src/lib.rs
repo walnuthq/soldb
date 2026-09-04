@@ -137,6 +137,8 @@ pub fn initialize_body(adapter_id: &str) -> Value {
         "supportsConfigurationDoneRequest": true,
         "supportsEvaluateForHovers": true,
         "supportsStepBack": true,
+        "supportsFunctionBreakpoints": true,
+        "supportsSteppingGranularity": true,
         "supportsSetVariable": false,
         "supportsRestartRequest": false,
     })

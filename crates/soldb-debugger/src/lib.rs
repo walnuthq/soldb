@@ -16,8 +16,17 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
 use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
 use soldb_ethdebug::{EthdebugInfo, VariableLocation};
+
+pub mod stepping;
+
+pub use stepping::{
+    address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
+    Frame, FunctionId, LineKey, ResolvedFunction, ResolvedLine, SourceListing, StepLocation,
+    StepMap,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugSession {
@@ -167,9 +176,14 @@ pub struct SourceSpan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFunction {
     pub source_id: u64,
+    /// The declared name; `constructor`, `fallback`, and `receive` for those, and the
+    /// modifier's name for a modifier.
     pub name: String,
     pub params: Vec<SourceParam>,
     pub declaration_start: u64,
+    /// The one-based line the declaration begins on.
+    #[serde(default)]
+    pub declaration_line: u64,
     pub body_end: u64,
 }
 
@@ -393,18 +407,43 @@ fn line_column_for_offset(source: &str, offset: usize) -> SourcePosition {
     SourcePosition { line, column }
 }
 
+/// The declarations that open a body of executable code in a Solidity source.
+const DECLARATION_KEYWORDS: [&str; 5] =
+    ["function", "modifier", "constructor", "fallback", "receive"];
+
+/// Finds every function-like declaration in a source file by scanning its text:
+/// functions, modifiers, constructors, `fallback`, and `receive`. This is what the
+/// debugger attributes steps to when the compiler emits no function boundaries.
 #[must_use]
 pub fn parse_source_functions(source_id: u64, source: &str) -> Vec<SourceFunction> {
     let mut functions = Vec::new();
+    for keyword in DECLARATION_KEYWORDS {
+        collect_declarations(source_id, source, keyword, &mut functions);
+    }
+    functions.sort_by_key(|function| function.declaration_start);
+    functions
+}
+
+fn collect_declarations(
+    source_id: u64,
+    source: &str,
+    keyword: &str,
+    functions: &mut Vec<SourceFunction>,
+) {
+    let named = matches!(keyword, "function" | "modifier");
     let mut cursor = 0;
-    while let Some(keyword_start) = find_solidity_keyword(source, "function", cursor) {
-        let mut index = keyword_start + "function".len();
-        index = skip_ascii_whitespace(source, index);
-        let Some((name, name_end)) = parse_identifier(source, index) else {
-            cursor = index;
-            continue;
+    while let Some(keyword_start) = find_solidity_keyword(source, keyword, cursor) {
+        let mut index = skip_ascii_whitespace(source, keyword_start + keyword.len());
+        let name = if named {
+            let Some((name, name_end)) = parse_identifier(source, index) else {
+                cursor = index;
+                continue;
+            };
+            index = skip_ascii_whitespace(source, name_end);
+            name
+        } else {
+            keyword
         };
-        index = skip_ascii_whitespace(source, name_end);
         if source.as_bytes().get(index) != Some(&b'(') {
             cursor = index;
             continue;
@@ -418,6 +457,12 @@ pub fn parse_source_functions(source_id: u64, source: &str) -> Vec<SourceFunctio
             cursor = params_end + 1;
             continue;
         };
+        // A call such as `token.receive(x);` has a `;` before the next `{`; only a
+        // declaration runs straight from its parameter list into a body.
+        if source[params_end + 1..body_start].contains(';') {
+            cursor = params_end + 1;
+            continue;
+        }
         let Some(body_end) = find_matching_delimiter(source, body_start, b'{', b'}') else {
             cursor = body_start + 1;
             continue;
@@ -428,11 +473,15 @@ pub fn parse_source_functions(source_id: u64, source: &str) -> Vec<SourceFunctio
             name: name.to_owned(),
             params,
             declaration_start: keyword_start as u64,
+            declaration_line: source[..keyword_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u64
+                + 1,
             body_end: body_end as u64,
         });
         cursor = body_end + 1;
     }
-    functions
 }
 
 fn parse_source_params(params: &str) -> Vec<SourceParam> {

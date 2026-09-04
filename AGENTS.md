@@ -96,7 +96,7 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | `soldb-ethdebug` | core, `revm-bytecode` |
 | `soldb-evm` | core, `ruint`, `revm` (behind the default-on `replay` feature) |
 | `soldb-rpc` | core, evm |
-| `soldb-repl` | core |
+| `soldb-repl` | core, debugger |
 | `soldb-serializer` | core, ethdebug |
 | `soldb-debugger` | core, ethdebug |
 | `soldb-profiler` | core, ethdebug |
@@ -109,12 +109,13 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
 `cargo install soldb`; the directory keeps the `soldb-cli` name to match its siblings.
 
-`soldb-debugger` is the shared frontend model, and both `soldb-cli` and `soldb-dap` go
-through it for variable decoding so the terminal and an editor report the same values.
-The CLI still carries its own source-stepping and frame-building logic in `main.rs`,
-including a near-verbatim copy of `soldb-debugger`'s Solidity source-function parser.
-Prefer moving CLI logic *into* `soldb-debugger` over growing that second implementation;
-new frontend logic that both would want belongs there.
+`soldb-debugger` is the shared frontend model: both `soldb-cli` and `soldb-dap` go
+through it for variable decoding, and both drive `soldb-repl`, whose stepping and
+breakpoints rest on `soldb-debugger`'s `StepMap`, so the terminal and an editor stop at
+the same steps and report the same values. Debug artifacts are found and read through
+`soldb_ethdebug::load_debug_program` in both frontends. The CLI still builds the `trace`
+command's call-frame summary itself in `main.rs`; new frontend logic that both would want
+belongs in `soldb-debugger`, not in a second copy.
 
 - **soldb-core**: the shared vocabulary — `TraceStep`, `StepSnapshot`,
   `TransactionTrace`, `TraceCapabilities`, `TraceArtifacts`, `SoldbError`. It has no
@@ -145,11 +146,22 @@ new frontend logic that both would want belongs there.
   surface so frontends see one crate. This is the only crate that talks to a node.
 - **soldb-debugger**: source-step, function, and variable decoding over a
   `TransactionTrace` plus `EthdebugInfo`. Frontend-agnostic; shared by CLI, REPL, and DAP.
+  `ContractDebugInfo` is one contract's metadata prepared for stepping (line index, PC
+  index, parsed functions), and `StepMap` maps every step of a trace through the loaded
+  contracts once: the line it belongs to, its frame depth (EVM depth plus internal
+  Solidity functions inferred from the source spans, since compilers emit no function
+  boundaries yet), and the searches behind `next`, `step`, `finish`, their reverse forms,
+  line and function breakpoints, and `backtrace`. Compiler-generated helpers carry the
+  whole-contract span; the map attributes them to the executing statement and marks them
+  `generated`. All of it is a search over the recording; nothing re-executes.
 - **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
   programs. Frontend-agnostic; returns tables and folded stacks without printing or I/O.
 - **soldb-repl**: the interactive debugger *state machine* — breakpoints, stepping,
-  display mode. It owns no I/O; the CLI drives it and prints. Keep it that way, because
-  it is what makes REPL behavior unit-testable without a terminal.
+  display mode, and the inspection queries (`frames`, `source_listing`, `calldata`). It
+  owns no I/O; the CLI drives it and prints. Keep it that way, because it is what makes
+  REPL behavior unit-testable without a terminal. Breakpoints are predicates on a step
+  (`BreakpointKind`: PC, line entry, function entry, `SSTORE` to a slot, revert, call,
+  opcode), checked on every step a movement passes through, forward or backward.
 - **soldb-serializer**: the versioned web/JSON projection of traces and simulations,
   including the per-contract `contracts` entry built from `EthdebugInfo`.
 - **soldb-compiler**: `solc` invocation, ETHDebug artifact discovery, deploy helpers.
@@ -204,7 +216,7 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
 
 ### Big Files
 
-`crates/soldb-cli/src/main.rs` (~4000 lines) and `crates/soldb-evm/src/replay.rs` (~2700
+`crates/soldb-cli/src/main.rs` (~4400 lines) and `crates/soldb-evm/src/replay.rs` (~2700
 lines) are the two outliers. Prefer adding to a focused module over growing them further;
 when you touch a coherent region of either, splitting that region into its own module is
 a welcome change as long as it is a pure move with no behavior delta. The transport and
@@ -231,8 +243,10 @@ The compiler attaches a whole-contract range to dispatcher and preamble instruct
 that range intersects every line in the file. Any code that resolves a source line to a
 program counter has to rank candidates — prefer spans that *begin* on the line, and fall
 back to the narrowest intersecting span — or it will resolve every line to the first
-instruction of the contract. `TraceSourceIndex::resolve_breakpoint` in
-`crates/soldb-cli/src/main.rs` is the reference implementation.
+instruction of the contract. `ContractDebugInfo::effective_line` in
+`crates/soldb-debugger/src/stepping.rs` is the reference implementation, and the same
+whole-contract span marks compiler-generated helper code mid-function, which `StepMap`
+attributes to the executing statement rather than to the contract's first line.
 
 ### Variables
 
@@ -536,6 +550,7 @@ Beyond the rule:
   `__pycache__`/egg-info from the pre-Rust implementation and are untracked. The runtime
   is Rust-only (`docs/port-to-rust.md`); do not add code there or resurrect the Python
   paths.
-- **Keep the docs honest.** `docs/commands.md` documents REPL commands including the
-  places where behavior is still a stub (`next` and `step` currently advance one
-  instruction). If you change that behavior, change the doc in the same commit.
+- **Keep the docs honest.** `docs/commands.md` documents every REPL command, what a stop
+  shows, and how line breakpoints and internal frames are inferred. If you change that
+  behavior, change the doc in the same commit; the interactive lit tests pin the
+  wording.

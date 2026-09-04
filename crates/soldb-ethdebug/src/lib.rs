@@ -18,6 +18,7 @@
 //! than trusted to be in range.
 
 pub mod abi;
+pub mod artifacts;
 pub mod events;
 pub mod metadata;
 pub mod source_map;
@@ -26,6 +27,10 @@ pub use abi::{
     canonical_abi_input_type, encode_abi_arguments, encode_function_call, function_selector,
     keccak256, match_abi_types, match_single_type, parse_signature, parse_tuple_arg, AbiInput,
     FunctionSignature,
+};
+pub use artifacts::{
+    contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
+    find_program_ethdebug, load_debug_program, read_debug_source, read_json_file, DebugProgram,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,

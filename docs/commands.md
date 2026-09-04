@@ -1,14 +1,18 @@
 # SolDB REPL Commands
 
-This document lists the commands available inside the SolDB interactive
-debugger REPL.
+This document lists the commands available inside the SolDB interactive debugger REPL.
 
 Start the REPL with one of:
 
 ```console
 soldb trace <tx_hash> --interactive
 soldb simulate <contract_address> <function_signature> [args...] --from <sender> --interactive
+soldb run <bytecode> [<function_signature> [args...]] --interactive
 ```
+
+Pass `--ethdebug-dir <address>:<contract>:<dir>` to load the compiler's debug metadata.
+Source-level stepping, line and function breakpoints, `list`, `vars`, and `print` need it;
+everything else works on the bare trace.
 
 The prompt is:
 
@@ -16,109 +20,96 @@ The prompt is:
 soldb>
 ```
 
+## What a Stop Shows
+
+Every stop prints the step, its program counter, opcode, and remaining gas. In source mode
+(the default) it also prints where the step is in the source and the line's text:
+
+```text
+Step 156/1071 | PC 1872 | PUSH2 | gas 978188
+TestContract.sol:28 in increment
+   28 |         counter += amount;
+```
+
+Compilers attach helper code they generate (checked arithmetic, `require` reverts, storage
+updates) to the contract as a whole rather than to a line. The debugger attributes such a
+step to the statement that was executing and marks it:
+
+```text
+TestContract.sol:28 in increment  (compiler-generated code for this line)
+```
+
+In assembly mode (`mode asm`) the stop prints the EVM stack instead of the source.
+
 ## Stepping
+
+A trace is a complete recording, so every command below is a search over it. Nothing is
+re-executed, and a breakpoint anywhere in the code a command runs through stops it early.
 
 ### `next`
 
 Aliases: `n`
 
-Advance to the next source step.
+Run to the start of the next source line in the current function or a caller, stepping
+over calls: internal Solidity calls as well as calls into other contracts.
 
 ```text
 soldb> next
-soldb> n
 ```
 
-Current implementation note: source-level stepping currently advances one EVM
-instruction, the same as `nexti`. This keeps the REPL command shape in place
-while source-aware stepping is still being built.
-
-### `nexti`
-
-Aliases: `ni`, `stepi`, `si`
-
-Advance to the next EVM instruction.
-
-```text
-soldb> nexti
-soldb> ni
-soldb> stepi
-soldb> si
-```
+From the dispatcher, where no function is executing yet, `next` enters the function the
+transaction calls. Without debug metadata `next` moves one EVM instruction.
 
 ### `step`
 
 Aliases: `s`
 
-Step into the next operation.
+Run to the start of the next source line anywhere, entering calls. A call into a contract
+without debug metadata stops at its first step and says that it has no source.
 
 ```text
 soldb> step
-soldb> s
 ```
 
-Current implementation note: `step` currently advances one EVM instruction, the
-same as `nexti`.
+### `nexti`
+
+Aliases: `ni`, `stepi`, `si`
+
+Advance one EVM instruction.
+
+### `finish`
+
+Aliases: `fin`
+
+Run until the current frame returns to its caller: the end of the current internal
+function, or of the current external call. At the root, `finish` runs to the end of the
+trace.
 
 ### `continue`
 
 Aliases: `c`
 
-Continue execution until the next breakpoint or the end of the trace.
-
-```text
-soldb> continue
-soldb> c
-```
+Run to the next breakpoint, or to the end of the trace.
 
 ## Reverse Stepping
 
-The trace is a complete recording of every instruction with its stack, memory, and
-storage, so the debugger moves backward exactly as it moves forward, from any step,
-including the middle of a transaction. Nothing is re-executed.
+Each stepping command has a reverse form that moves backward through the recording from any
+step, including the middle of a transaction.
 
-### `reverse-next`
-
-Aliases: `rnext`, `rn`
-
-Step back to the previous source step.
-
-```text
-soldb> reverse-next
-soldb> rn
-```
-
-Current implementation note: like `next`, this currently moves one EVM instruction.
-
-### `reverse-nexti`
-
-Aliases: `rnexti`, `rni`, `reverse-stepi`, `rsi`, `back`
-
-Step back one EVM instruction.
-
-```text
-soldb> reverse-nexti
-soldb> back
-```
-
-### `reverse-step`
-
-Aliases: `rstep`, `rs`
-
-Step back into the previous instruction, the mirror of `step`.
-
-### `reverse-continue`
-
-Aliases: `rcontinue`, `rc`
-
-Run backward until the nearest earlier breakpoint, or the first step of the trace.
+| command | aliases | moves to |
+| --- | --- | --- |
+| `reverse-next` | `rnext`, `rn` | the start of the previous line in this frame or a caller, skipping calls it made; from the middle of a line, the start of that line |
+| `reverse-step` | `rstep`, `rs` | the start of the previous line anywhere, entering calls |
+| `reverse-nexti` | `rnexti`, `rni`, `reverse-stepi`, `rsi`, `back` | the previous EVM instruction |
+| `reverse-finish` | `rfinish`, `rfin` | the step in the caller that entered the current frame |
+| `reverse-continue` | `rcontinue`, `rc` | the nearest earlier breakpoint, or the first step |
 
 ```text
 soldb> break 42
 soldb> reverse-continue
-Breakpoint hit at step 17, pc 42
+Breakpoint #1 hit at step 17, PC 42
 soldb> rc
-Start of trace: step 0
+Start of trace at step 0
 ```
 
 The DAP server exposes the same capability as `stepBack` and `reverseContinue`, so an
@@ -134,40 +125,183 @@ Jump to a trace step index.
 soldb> goto 42
 ```
 
-If the requested step is outside the loaded trace, SolDB prints the valid
-maximum step.
+If the requested step is outside the loaded trace, SolDB prints the valid maximum step.
 
-## Display Mode
+## Breakpoints
 
-### `mode`
+A breakpoint is a predicate on a step. Setting one prints its number; `continue` and
+`reverse-continue` stop at the first step that satisfies any breakpoint, and so do `next`,
+`step`, and `finish` when they run through one.
 
-Print the current display mode.
+### `break <pc>`
 
-```text
-soldb> mode
-```
+Aliases: `b <pc>`
 
-### `mode source`
-
-Aliases: `mode src`
-
-Switch to source display mode.
+Stop at an EVM program counter. `<pc>` accepts decimal or hex.
 
 ```text
-soldb> mode source
-soldb> mode src
+soldb> break 141
+soldb> b 0x8d
 ```
 
-### `mode asm`
+### `break <file>:<line>`
 
-Aliases: `mode assembly`
+Aliases: `b <file>:<line>`
 
-Switch to assembly display mode.
+Stop when execution enters a source line. The file may be given as a name, a trailing part
+of its path, or the whole path.
+
+A line breakpoint hits once each time the line is entered, not on every instruction the
+line compiles to, and not when a call made from the line returns into the middle of it. A
+line inside a multi-line statement resolves to the statement: `break Counter.sol:12` on the
+second line of a call spanning lines 11 to 13 reports `Counter.sol:11 (the statement
+containing line 12)`.
+
+Among the instructions whose ETHDebug span touches the line, SolDB prefers those whose span
+*begins* on it. Compilers attach a whole-contract span to the dispatcher and to generated
+helpers, and that span technically contains every line, so without this preference every
+source breakpoint would resolve to the start of the contract.
 
 ```text
-soldb> mode asm
-soldb> mode assembly
+soldb> break Counter.sol:7
+soldb> b contracts/Counter.sol:7
 ```
+
+### `break line <line>`
+
+Aliases: `b line <line>`
+
+Set a source-line breakpoint without naming a file. This works only when the loaded debug
+metadata has a single source file; otherwise SolDB asks for the `<file>:<line>` form.
+
+### `break <function>`
+
+Aliases: `b <function>`, `b <Contract>.<function>`
+
+Stop when a function is entered, each time it is entered. Functions come from the source
+text: `function`, `modifier`, `constructor`, `fallback`, and `receive` declarations. Qualify
+the name with the contract when several loaded contracts declare it.
+
+```text
+soldb> break increment3
+Breakpoint #1 set at function TestContract.increment3 at TestContract.sol:54
+```
+
+### `break storage <slot>`
+
+Stop at an `SSTORE` to a storage slot, given in decimal or hex.
+
+```text
+soldb> break storage 0
+Breakpoint #1 set at storage slot 0x0
+soldb> continue
+Breakpoint #1 hit at step 296, storage slot 0x0, PC 1520
+```
+
+### `break revert`
+
+Stop at a `REVERT`, or at any step the backend marked as failing.
+
+### `break call [<address>]`
+
+Stop at a `CALL`, `CALLCODE`, `DELEGATECALL`, or `STATICCALL`: any of them, or one whose
+target is the given address.
+
+### `break op <OPCODE>`
+
+Stop at every execution of one opcode, for example `break op SSTORE` or `break op LOG1`.
+
+### `clear <target>`
+
+Remove the breakpoint that was set with the same target: `clear 141`, `clear Counter.sol:7`,
+`clear line 7`, `clear increment`, `clear storage 0`, `clear revert`, `clear call`,
+`clear op SSTORE`.
+
+### `delete <n>`
+
+Aliases: `d <n>`
+
+Remove breakpoint number `n`, as printed when it was set or by `info breakpoints`.
+
+### `info breakpoints`
+
+Aliases: `info break`, `i b`
+
+List every breakpoint with its number.
+
+```text
+soldb> info breakpoints
+#1 TestContract.sol:30
+#2 storage slot 0x0
+```
+
+## Inspection
+
+### `backtrace`
+
+Aliases: `bt`, `where`
+
+Print the call frames at the current step, innermost first. A frame is an external call or
+an internal Solidity function; each shows its function (or, without source, the contract or
+address executing), where it is, and the step and program counter it sits at. Frames above
+the innermost one show the call site.
+
+```text
+soldb> bt
+#0  increment3 at TestContract.sol:54  step 596, PC 1522
+#1  increment2 at TestContract.sol:48  step 595, PC 1770
+#2  increment at TestContract.sol:30  step 300, PC 1902
+#3  TestContract at TestContract.sol:8  step 103, PC 824
+```
+
+Compilers do not yet emit function boundaries in ETHDebug, so internal frames are inferred
+from the source spans and the functions parsed from the source text: landing in a function
+that is not on the stack enters it, landing in one that is returns to it.
+
+### `list`
+
+Aliases: `l`
+
+Print five lines of source on each side of the current step's line, marking the current one.
+
+```text
+soldb> list
+TestContract.sol:32
+      27 |         uint256 oldValue = counter;
+      28 |         counter += amount;
+      29 |
+      30 |         increment2(amount);
+      31 |
+=>    32 |         emit CounterIncremented(counter);
+      33 |     }
+```
+
+### `stack`
+
+Print the EVM stack at the current step.
+
+### `memory [offset [length]]`
+
+Print memory at the current step in 32-byte words: all of it, or `length` bytes from
+`offset`. Both accept decimal or hex.
+
+```text
+soldb> memory 0x40 32
+Memory: 96 bytes, showing bytes 64..96
+0x0040: 0000000000000000000000000000000000000000000000000000000000000080
+```
+
+### `storage`
+
+Aliases: `info storage`
+
+Print the contract's storage as captured at the current step, marking slots written at
+this step with their previous value. Says so when the backend did not capture storage.
+
+### `calldata`
+
+Print the calldata of the current frame: the transaction input at the root, or the
+recorded call's input in a nested frame when the backend recorded calls.
 
 ## Variables
 
@@ -193,7 +327,7 @@ uint256 oldValue = 0 [stack+1]
 ```
 
 A value shown as `<unavailable>` means the backend did not capture the stack, memory, or
-storage the variable lives in — not that the variable is unset.
+storage the variable lives in, not that the variable is unset.
 
 ### `print <variable>`
 
@@ -204,8 +338,6 @@ Print one variable by name.
 ```text
 soldb> print amount
 uint256 amount = 5 [stack+2]
-soldb> p oldValue
-uint256 oldValue = 0 [stack+1]
 ```
 
 If the name is not live at the current program counter, SolDB says so and names the PC it
@@ -227,79 +359,25 @@ Use JSON output when scripting the REPL:
 soldb> info resources --json
 ```
 
-This command requires the interactive session to be started with ETHDebug
-metadata, for example `--ethdebug-dir <address>:<contract>:<dir>`.
+This command requires the interactive session to be started with ETHDebug metadata.
 
-## Breakpoints
+## Display Mode
 
-### `break <pc>`
+### `mode`
 
-Aliases: `b <pc>`
+Print the current display mode.
 
-Set a breakpoint at an EVM program counter.
+### `mode source`
 
-```text
-soldb> break 141
-soldb> b 0x8d
-```
+Aliases: `mode src`
 
-`<pc>` accepts decimal or hex.
+Show the source location and line at each stop (the default).
 
-### `break <file>:<line>`
+### `mode asm`
 
-Aliases: `b <file>:<line>`
+Aliases: `mode assembly`
 
-Set a breakpoint at the first executed EVM program counter generated for a source line.
-
-Among the instructions whose ETHDebug span touches the line, SolDB prefers those whose
-span *begins* on it. Compilers attach a whole-contract span to the dispatcher preamble,
-and that span technically contains every line, so without this preference every source
-breakpoint would resolve to the start of the contract.
-
-```text
-soldb> break Counter.sol:7
-soldb> b contracts/Counter.sol:7
-```
-
-### `break line <line>`
-
-Aliases: `b line <line>`
-
-Set a source-line breakpoint without naming a file. This works only when the
-loaded compiler debug metadata has a single source file; otherwise SolDB asks
-for the explicit `<file>:<line>` form.
-
-```text
-soldb> break line 7
-soldb> b line 7
-```
-
-### `clear <pc>`
-
-Clear a breakpoint at an EVM program counter.
-
-```text
-soldb> clear 141
-soldb> clear 0x8d
-```
-
-`<pc>` accepts decimal or hex.
-
-### `clear <file>:<line>`
-
-Clear a source-line breakpoint.
-
-```text
-soldb> clear Counter.sol:7
-```
-
-### `clear line <line>`
-
-Clear a source-line breakpoint in a single-source debug session.
-
-```text
-soldb> clear line 7
-```
+Show the EVM stack at each stop instead of the source.
 
 ## Help
 
@@ -309,61 +387,16 @@ Print the REPL command summary.
 
 ```text
 soldb> help
+Stepping: next (n), step (s), nexti (ni), finish (fin), continue (c), goto <step>
+Reverse:  reverse-next (rn), reverse-step (rs), reverse-nexti (back), reverse-finish (rfin), reverse-continue (rc)
+Break:    break <pc>|<file>:<line>|line <line>|<function>|storage <slot>|revert|call [<address>]|op <OPCODE>
+          clear <target>, delete <n>, info breakpoints
+Inspect:  backtrace (bt), list (l), vars, print <variable>, stack, memory [offset [length]], storage, calldata
+Other:    info resources [--json], mode source|asm, help <command>, quit
 ```
 
-Current output:
-
-```text
-Commands: next, nexti, step, continue, goto <step>
-          break <pc>|<file>:<line>|line <line>
-          clear <pc>|<file>:<line>|line <line>
-          vars, print <variable>
-          info resources [--json]
-          mode source|asm, help, quit
-```
-
-### `help vars`
-
-Print help for variable inspection. `help locals` and `help print` show the same text.
-
-```text
-soldb> help vars
-```
-
-Current output:
-
-```text
-vars - print every source variable live at the current PC
-print <variable> - print one source variable by name
-```
-
-### `help info`
-
-Print help for metadata inspection.
-
-```text
-soldb> help info
-```
-
-Current output:
-
-```text
-info resources [--json] - print loaded ETHDebug resources
-```
-
-### `help mode`
-
-Print help for display modes.
-
-```text
-soldb> help mode
-```
-
-Current output:
-
-```text
-mode source|asm - switch display mode
-```
+`help <command>` prints the details for a command group: `help next`, `help break`,
+`help backtrace`, `help vars`, `help info`, `help mode`.
 
 ## Exit
 
@@ -373,23 +406,32 @@ Aliases: `exit`, `q`
 
 Exit the interactive debugger.
 
-```text
-soldb> quit
-soldb> exit
-soldb> q
-```
-
 ## Example Session
 
 ```text
-soldb> break Counter.sol:7
-Breakpoint set at Counter.sol:7, PC 141
+soldb> break TestContract.sol:30
+Breakpoint #1 set at TestContract.sol:30
 soldb> continue
-Breakpoint hit at step 181, Counter.sol:7, PC 141
-soldb> mode asm
-Mode: asm
-soldb> nexti
-Step 182/186 | PC 142 | POP | gas 13
+Breakpoint #1 hit at step 299, TestContract.sol:30, PC 1899
+Step 299/1071 | PC 1899 | PUSH2 | gas 955476
+TestContract.sol:30 in increment
+   30 |         increment2(amount);
+soldb> step
+Step 301/1071 | PC 1678 | JUMPDEST | gas 955465
+TestContract.sol:39 in increment2
+   39 |     function increment2(uint256 amount) public {
+soldb> finish
+Step 962/1071 | PC 1903 | JUMPDEST | gas 950160
+TestContract.sol:30 in increment
+   30 |         increment2(amount);
+soldb> next
+Step 963/1071 | PC 1904 | PUSH2 | gas 950159
+TestContract.sol:32 in increment
+   32 |         emit CounterIncremented(counter);
+soldb> reverse-next
+Step 962/1071 | PC 1903 | JUMPDEST | gas 950160
+TestContract.sol:30 in increment
+   30 |         increment2(amount);
 soldb> q
 Exiting debugger.
 ```

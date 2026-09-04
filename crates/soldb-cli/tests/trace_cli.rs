@@ -429,8 +429,8 @@ fn trace_interactive_accepts_repl_commands() {
     assert!(stdout.contains("Transaction trace debugger"));
     assert!(stdout.contains("Loaded trace with 4 steps"));
     assert!(stdout.contains("Step 1/3 | PC 2 | MSTORE | gas 97"));
-    assert!(stdout.contains("Breakpoint set at PC 3"));
-    assert!(stdout.contains("Breakpoint hit at step 2, PC 3"));
+    assert!(stdout.contains("Breakpoint #1 set at PC 3"));
+    assert!(stdout.contains("Breakpoint #1 hit at step 2, PC 3"));
     assert!(stdout.contains("Exiting debugger."));
 }
 
@@ -457,9 +457,9 @@ fn trace_interactive_accepts_source_line_breakpoints() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("Breakpoint set at Counter.sol:3, PC 3"));
-    assert!(stdout.contains("Breakpoint hit at step 2, Counter.sol:3, PC 3"));
-    assert!(stdout.contains("Breakpoint cleared at Counter.sol:3, PC 3"));
+    assert!(stdout.contains("Breakpoint #1 set at Counter.sol:3"));
+    assert!(stdout.contains("Breakpoint #1 hit at step 2, Counter.sol:3, PC 3"));
+    assert!(stdout.contains("Breakpoint #1 cleared at Counter.sol:3"));
 }
 
 #[test]
