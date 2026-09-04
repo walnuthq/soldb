@@ -2783,7 +2783,7 @@ dependencies = [
  "soldb-core",
  "soldb-debugger",
  "soldb-ethdebug",
- "soldb-rpc",
+ "soldb-evm",
  "soldb-serializer",
  "wasm-bindgen",
  "wasm-bindgen-test",

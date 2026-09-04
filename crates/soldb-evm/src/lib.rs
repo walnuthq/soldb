@@ -44,6 +44,16 @@ pub use revm::primitives::{Address, B256};
 pub use revm::state::AccountInfo;
 pub use ruint::aliases::U256;
 
+/// Whether the REVM replay engine was compiled into this build.
+///
+/// The engine sits behind the `replay` cargo feature (on by default) because it is the
+/// only part of the crate that links REVM. A build without it, such as the lean
+/// WebAssembly package, keeps the node data shapes and the trace assembly.
+#[must_use]
+pub fn replay_available() -> bool {
+    cfg!(feature = "replay")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceBackend {
     Auto,

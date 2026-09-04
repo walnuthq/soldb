@@ -65,14 +65,14 @@ fn reports_the_workspace_version() {
 fn the_lean_package_links_without_the_replay_backend() {
     // The lean package's size rests on this: REVM is only reachable through the
     // `replay` feature, which `make wasm-lean` leaves off.
-    assert!(!soldb_rpc::replay_backend_available());
+    assert!(!soldb_evm::replay_available());
     assert!(!replay_available());
 }
 
 #[cfg(feature = "replay")]
 #[wasm_bindgen_test]
 fn the_replay_package_reports_the_backend() {
-    assert!(soldb_rpc::replay_backend_available());
+    assert!(soldb_evm::replay_available());
     assert!(replay_available());
 }
 

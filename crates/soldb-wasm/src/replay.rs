@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
-use soldb_rpc::{
+use soldb_evm::{
     replay_prefix_with_state, replay_simulation_trace, replay_target_with_state,
     replay_transaction_trace, PrefetchedReplayState, ReplayInputs, ReplayPrefix,
     RpcBlockWithTransactions, RpcReceipt, RpcTransaction, SimulateCallRequest, StateBatch,
@@ -293,7 +293,7 @@ fn parse_chain_id(text: &str) -> SoldbResult<u64> {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
-    use soldb_rpc::StateRequest;
+    use soldb_evm::StateRequest;
 
     use super::{parse_chain_id, Replay, ReplayStatus};
 

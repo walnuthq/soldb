@@ -230,7 +230,7 @@ impl Replay {
         self.inner.status_json().map_err(js_error)
     }
 
-    /// Supplies parent-block state as JSON (see `soldb_rpc::StateBatch`): `accounts`
+    /// Supplies parent-block state as JSON (see `soldb_evm::StateBatch`): `accounts`
     /// keyed by address with `balance`, `nonce`, and `code`; `storage` keyed by address
     /// then slot; `blockHashes` keyed by block number.
     #[wasm_bindgen(js_name = provideState)]

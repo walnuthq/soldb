@@ -104,7 +104,7 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | `soldb-compiler` | core, ethdebug, rpc |
 | `soldb-dap` | core, ethdebug, rpc, repl, debugger |
 | `soldb-cli` | core, ethdebug, rpc, repl, debugger, profiler, serializer, compiler, bridge, `inferno` |
-| `soldb-wasm` | core, ethdebug, rpc (without `replay`), debugger, serializer, `wasm-bindgen` |
+| `soldb-wasm` | core, ethdebug, evm (without `replay`), debugger, serializer, `wasm-bindgen` |
 
 The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
 `cargo install soldb`; the directory keeps the `soldb-cli` name to match its siblings.
@@ -192,8 +192,10 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
   package build and
   tests. `std::net`, `std::process`, and `std::fs` compile there but fail at runtime, so
   a WebAssembly host does the I/O and hands results over as strings: nothing reachable
-  from a `soldb-wasm` export may open a socket, spawn a process, or read a file. Check a
-  new dependency in one of those crates with `make wasm-check` before proposing it.
+  from a `soldb-wasm` export may open a socket, spawn a process, or read a file. That is
+  why the bindings depend on `soldb-evm` and not on `soldb-rpc`; do not add the transport
+  back. Check a new dependency in one of those crates with `make wasm-check` before
+  proposing it.
   `make wasm` builds both packages and fails when either exceeds its budget
   (`WASM_LEAN_SIZE_BUDGET_BYTES`, `WASM_REPLAY_SIZE_BUDGET_BYTES`); raise a budget
   deliberately, in the change that explains the growth, never to make CI pass.

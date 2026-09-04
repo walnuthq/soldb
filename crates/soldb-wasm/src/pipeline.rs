@@ -24,7 +24,7 @@ use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult, TraceCapabilities, TransactionTrace};
 use soldb_debugger::DebugSession;
 use soldb_ethdebug::{read_compilation_source, EthdebugInfo};
-use soldb_rpc::{DebugTraceResult, RpcReceipt, RpcTransaction, SimulateCallRequest};
+use soldb_evm::{DebugTraceResult, RpcReceipt, RpcTransaction, SimulateCallRequest};
 use soldb_serializer::WebContractMetadata;
 
 /// One contract's compiler output, as the host supplies it.
@@ -175,7 +175,7 @@ impl Trace {
         let transaction =
             parse_json::<RpcTransaction>("`eth_getTransactionByHash` result", transaction_json)?;
         let receipt = parse_json::<RpcReceipt>("`eth_getTransactionReceipt` result", receipt_json)?;
-        let trace = soldb_rpc::debug_rpc_transaction_trace(transaction, receipt, &debug_result)?;
+        let trace = soldb_evm::debug_rpc_transaction_trace(transaction, receipt, &debug_result)?;
         Ok(Self::from_trace(trace))
     }
 
@@ -201,7 +201,7 @@ impl Trace {
             block: None,
             tx_index: None,
         };
-        let trace = soldb_rpc::debug_rpc_simulation_trace(&request, &debug_result)?;
+        let trace = soldb_evm::debug_rpc_simulation_trace(&request, &debug_result)?;
         Ok(Self::from_trace(trace))
     }
 

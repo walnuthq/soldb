@@ -23,8 +23,8 @@ spawn `solc`, listen on sockets, and read the filesystem, none of which a
 | `soldb-repl` | yes | breakpoint and stepping state machine |
 | `soldb-serializer` | yes | the web JSON document and its per-contract metadata |
 | `soldb-evm` | yes | node data shapes and trace assembly in both packages; the REVM engine, behind the `replay` feature, only in the replay-capable one |
-| `soldb-rpc` | yes | the JSON-RPC transport and the node-backed backends; linked through the bindings' dependency, never called |
 | `soldb-wasm` | yes | the bindings described below |
+| `soldb-rpc` | no | the JSON-RPC transport; the bindings take the engine directly |
 | `soldb-cli`, `soldb-dap` | no | terminal and editor frontends |
 | `soldb-compiler` | no | invokes `solc` |
 | `soldb-bridge` | no | TCP bridge server |
@@ -415,9 +415,9 @@ twiggy top -n 40 target/wasm32-unknown-unknown/release/soldb_wasm.wasm
 - Adding a dependency to a crate in the WebAssembly set means checking it against the
   target. Run `make wasm-check` before proposing the change; CI runs it too.
 - `std::net`, `std::process`, and `std::fs` compile for `wasm32-unknown-unknown` but every
-  operation fails at runtime. That is why `soldb-rpc`'s HTTP transport builds there and
-  why the bindings never call it. New code paths reachable from the exports must not
-  touch them.
+  operation fails at runtime. The bindings therefore depend on `soldb-evm`, which does no
+  I/O, and not on `soldb-rpc`, whose transport would build there and fail on first use.
+  New code paths reachable from the exports must not touch them.
 - `soldb-evm` keeps REVM behind its `replay` feature, on by default. Code that needs REVM
   belongs in its `replay` module, and the crate has no I/O at all:
   `replay_prefix_with_state` and `replay_target_with_state` run over any

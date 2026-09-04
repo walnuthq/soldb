@@ -22,7 +22,7 @@ doctest = false
 # so `cargo test --workspace` and the coverage gate exercise it; `make wasm` builds the
 # lean package with `--no-default-features` and the replay-capable one with it on.
 default = ["replay"]
-replay = ["soldb-rpc/replay"]
+replay = ["soldb-evm/replay"]
 
 [dependencies]
 serde.workspace = true
@@ -30,9 +30,11 @@ serde_json.workspace = true
 soldb-core.workspace = true
 soldb-debugger.workspace = true
 soldb-ethdebug.workspace = true
-# Without `replay` the package links no REVM: a WebAssembly host has no network to fetch
-# state over, so only the transport types and trace assembly are reachable from here.
-soldb-rpc = { path = "../soldb-rpc", version = "0.2.0", default-features = false }
+# The engine, never the transport: a WebAssembly host has no network, so it fetches over
+# `fetch` and hands the answers in. The workspace entry turns the engine's default
+# features off; without `replay` the package links no REVM, only the node data shapes and
+# trace assembly.
+soldb-evm.workspace = true
 soldb-serializer.workspace = true
 wasm-bindgen = "0.2"
 
