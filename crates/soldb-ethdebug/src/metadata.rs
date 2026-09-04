@@ -104,6 +104,12 @@ impl Instruction {
             None
         }
     }
+
+    /// Legacy source-map modifier depth, when this instruction was adapted from one.
+    #[must_use]
+    pub fn modifier_depth(&self) -> Option<i64> {
+        self.context.as_ref()?.get("modifierDepth")?.as_i64()
+    }
 }
 
 fn collect_source_locations(context: &Value, locations: &mut Vec<SourceLocation>) {

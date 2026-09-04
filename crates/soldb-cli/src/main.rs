@@ -18,6 +18,7 @@
 //!   [`soldb_core::SoldbError::AlreadyReported`] so the exit path does not print it
 //!   twice. Failures exit with code 2.
 
+mod debug_diff;
 mod profile;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -46,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Mutex, OnceLock};
 
+use debug_diff::DebugDiffArgs;
 use profile::ProfileArgs;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -178,6 +180,8 @@ enum Command {
     Bridge(BridgeArgs),
     #[command(about = "Compile Solidity contracts with ETHDebug artifacts")]
     Compile(CompileArgs),
+    #[command(about = "Compare two source-level debugging experiences")]
+    DebugDiff(DebugDiffArgs),
     #[command(about = "Inspect compiler debug metadata")]
     Info(InfoArgs),
     #[command(name = "list-contracts", about = "List all contracts in the project")]
@@ -722,6 +726,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Trace(args) => trace_command(&args),
         Command::Replay(args) => replay_command(&args),
+        Command::DebugDiff(args) => debug_diff::command(&args),
         Command::Profile(args) => profile::command(&args),
         Command::Simulate(args) => simulate_command(&args),
         Command::Run(args) => run_command(&args),

@@ -216,6 +216,13 @@ impl ContractDebugInfo {
         self.info.instructions.get(index)?.source_location()
     }
 
+    /// Legacy source-map modifier depth at `pc`, when the artifact carries it.
+    #[must_use]
+    pub fn modifier_depth_at_pc(&self, pc: u64) -> Option<i64> {
+        let index = *self.pc_index.get(&pc)?;
+        self.info.instructions.get(index)?.modifier_depth()
+    }
+
     /// The narrowest parsed function whose declaration contains the span.
     #[must_use]
     pub fn function_for_location(&self, location: &SourceLocation) -> Option<usize> {
