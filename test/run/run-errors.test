@@ -21,3 +21,12 @@
 # CHAIN: --backend debug-rpc
 # NOTE: Capability note: OP Mainnet (chain id 10) is replayed with Ethereum mainnet rules
 # NOTE: Status: SUCCESS
+
+# A constructor whose arguments are missing reverts, which leaves no code for the call to
+# run against. The deployment is checked before the run reports the contract is there, so
+# this fails with the reason rather than showing a trace of nothing.
+# RUN: %soldb compile %S/../examples/SimpleAuction.sol -o %t.auction.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: not %soldb run %t.auction.out/SimpleAuction.bin "bid()" --value 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:SimpleAuction:%t.auction.out 2>&1 | FileCheck --check-prefix=CONSTRUCTOR %s
+
+# CONSTRUCTOR: the contract was not deployed
+# CONSTRUCTOR: pass the constructor's arguments with `--constructor-args`

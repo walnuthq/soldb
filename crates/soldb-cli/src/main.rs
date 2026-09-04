@@ -1203,6 +1203,32 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         chain = chain.with_storage(&contract_address, slot.trim(), value.trim())?;
     }
 
+    // Before saying the contract is there: a constructor that reverted leaves no code,
+    // and the call would run against an empty account. The constructor runs again as the
+    // call's prefix, which for a local run costs less than reporting a deployment that
+    // did not happen.
+    if !args.runtime && !args.deploy {
+        if let Some(deployment) = prefix.first() {
+            let deployed = chain.deploy(deployment)?;
+            if !deployed.success {
+                let reason = deployed
+                    .error
+                    .clone()
+                    .or_else(|| {
+                        deployed
+                            .artifacts
+                            .revert_data
+                            .as_deref()
+                            .and_then(soldb_rpc::decode_revert_reason)
+                    })
+                    .unwrap_or_else(|| "the constructor reverted".to_owned());
+                return Err(soldb_core::SoldbError::Message(format!(
+                    "the contract was not deployed: {reason}\nnote: pass the constructor's arguments with `--constructor-args`, one per argument"
+                )));
+            }
+        }
+    }
+
     let view = SimulationView::for_run(args, &contract_address);
     let contract_name = simulate_contract_name(&view);
     if !args.json {
@@ -1238,6 +1264,13 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         tx_index: None,
     };
     let trace = chain.call(&prefix, &request)?;
+    if trace.steps.is_empty() {
+        // The code is there — the deployment was checked — so the call reached nothing:
+        // an address with no code, or runtime bytes that are not a contract.
+        return Err(soldb_core::SoldbError::Message(format!(
+            "the call executed no instructions; there is no code at `{contract_address}`\nnote: pass creation code, or `--runtime` with the deployed code"
+        )));
+    }
     present_simulation(&view, trace, contract_name.as_deref(), &calldata)
 }
 
