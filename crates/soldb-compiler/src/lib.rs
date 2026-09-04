@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -254,6 +254,7 @@ impl CompilerConfig {
     ) -> SoldbResult<CompilationResult> {
         let output_dir = output_dir.unwrap_or(&self.debug_output_dir);
         self.ensure_directories()?;
+        let started = SystemTime::now();
         // solc >= ~0.8.32 dropped the `--ethdebug`/`--ethdebug-runtime` flags in favor of
         // `--ethdebug-program`/`--ethdebug-program-runtime` (gated behind `--experimental`).
         // Try the configured (legacy) flags first for compatibility with older/pinned solc
@@ -267,7 +268,10 @@ impl CompilerConfig {
             contract_file.as_ref(),
             output_dir,
         ) {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                drop_stale_metadata(output_dir, started);
+                Ok(result)
+            }
             Err(SoldbError::Message(legacy_error))
                 if is_unrecognised_ethdebug_option(&legacy_error) =>
             {
@@ -279,6 +283,7 @@ impl CompilerConfig {
                     contract_file.as_ref(),
                     output_dir,
                 )
+                .inspect(|_| drop_stale_metadata(output_dir, started))
                 .map_err(|modern_error| {
                     SoldbError::Message(format!(
                         "Compilation failed with legacy ETHDebug flags ({legacy_error}); \
@@ -584,6 +589,26 @@ fn run_solc(
     })
 }
 
+/// Removes a global ETHDebug metadata file this compilation did not write.
+///
+/// solc names it `ethdebug.json` under the flags it used to take and
+/// `ethdebug_resources.json` under the ones it takes now, so compiling into a directory
+/// that a different compiler already wrote leaves both. A loader has no way to tell which
+/// one describes the programs sitting next to them, so the stale one goes.
+fn drop_stale_metadata(output_dir: &Path, started: SystemTime) {
+    for name in ["ethdebug.json", "ethdebug_resources.json"] {
+        let path = output_dir.join(name);
+        // Only a file that is certainly older than this run is removed; a timestamp that
+        // cannot be read leaves it alone.
+        let stale = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified < started);
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 /// solc's replacement names for the ETHDebug flags it dropped (see
 /// `CompilerConfig::compile_with_ethdebug`). Kept as an explicit table rather than a
 /// string-pattern rewrite so it's obvious exactly which flags are affected.
@@ -839,6 +864,37 @@ fn write_deployment_json(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn recompiling_with_another_compiler_leaves_one_metadata_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "soldb-compiler-metadata-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        // What a run with the other flag generation left behind.
+        let stale = dir.join("ethdebug.json");
+        std::fs::write(&stale, "{}").expect("write stale");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fresh = dir.join("ethdebug_resources.json");
+        std::fs::write(&fresh, "{}").expect("write fresh");
+
+        super::drop_stale_metadata(&dir, started);
+        assert!(!stale.exists(), "the older name is removed");
+        assert!(fresh.exists(), "the one this run wrote stays");
+
+        // A directory holding only what this run wrote is left alone.
+        super::drop_stale_metadata(&dir, started);
+        assert!(fresh.exists());
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -25,8 +25,9 @@ SEPOLIA_KEY=""
 
 for arg in "$@"; do
     case $arg in
-        SOLC_PATH=*)
+        SOLC_PATH=*|--solc=*)
             SOLC_PATH="${arg#*=}"
+            SOLC_CHOSEN=true
             shift
             ;;
         --sepolia-key=*)
@@ -100,6 +101,7 @@ for arg in "$@"; do
             echo "  --run-only         Run only run tests (from test/run/)"
             echo "  --events-only      Run only events tests (from test/events/)"
             echo "  --cli-only         Run only CLI tests (from test/cli/)"
+            echo "  --solc=PATH        Compiler for both deployment and the tests themselves"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
             echo "  --coverage         Accepted for compatibility; use cargo llvm-cov for coverage"
             echo "  -v, --verbose      Run tests with verbose output"
@@ -130,7 +132,11 @@ for arg in "$@"; do
             exit 0
             ;;
         *)
-            # Unknown option
+            # A misspelt option must not run the suite with different settings than the
+            # ones asked for.
+            echo -e "${RED}Unknown option: $arg${NC}" >&2
+            echo "Run $0 --help for the options this script takes" >&2
+            exit 2
             ;;
     esac
 done
@@ -141,12 +147,26 @@ RPC_URL="${RPC_URL:-http://127.0.0.1:8545}"
 echo -e "${BLUE}Using RPC: ${RPC_URL}${NC}"
 CHAIN_ID="${CHAIN_ID:-1}"
 PRIVATE_KEY="${PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+# An explicit choice, from `--solc=`/`SOLC_PATH=` or the environment, is never overridden
+# by the search below: a suite that quietly runs a different compiler than the one asked
+# for cannot be used to tell compiler versions apart.
+if [ -n "${SOLC_PATH:-}" ]; then
+    SOLC_CHOSEN=true
+fi
+SOLC_CHOSEN="${SOLC_CHOSEN:-false}"
 SOLC_PATH="${SOLC_PATH:-solc}"
 
 # Function to check and ensure solc version is 0.8.31+ for ETHDebug tests
 ensure_ethdebug_solc() {
     local solc_bin="$1"
-    
+
+    if [ "$SOLC_CHOSEN" = true ]; then
+        local chosen_version
+        chosen_version=$("$solc_bin" --version 2>/dev/null | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2 || echo "")
+        echo -e "${GREEN}Using solc ${chosen_version:-unknown} as asked (${solc_bin})${NC}"
+        return 0
+    fi
+
     # Check if solc-select is available
     if command -v solc-select &> /dev/null; then
         # Try to use solc 0.8.31 if available
@@ -207,6 +227,9 @@ fi
 # Export SOLC_PATH so it is available to deployment and lit helpers.
 # Note: Individual tests will set their own solc version via solc-select.
 export SOLC_PATH
+
+SOLC_VERSION_IN_USE=$("$SOLC_PATH" --version 2>/dev/null | grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2 || echo "unknown")
+echo -e "${GREEN}Compiling tests with solc ${SOLC_VERSION_IN_USE} (${SOLC_PATH})${NC}"
 
 echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
 echo -e "${GREEN}Organized test structure:${NC}"

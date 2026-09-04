@@ -58,6 +58,12 @@ cargo build --bin soldb                                # run-tests.sh picks up t
 ./test/run-tests.sh                                    # or SOLC_PATH=/path/to/solc ./test/run-tests.sh
 ```
 
+`run-tests.sh` compiles the tests with the compiler it prints on startup: `--solc=PATH`
+or `SOLC_PATH` when given — an explicit choice is never overridden by the solc-select
+search — and the `solc` on `PATH` otherwise. An unrecognised option stops the run rather
+than being ignored, so a suite never quietly answers for a different setup than the one
+asked for.
+
 `run-tests.sh` generates `test/lit.site.cfg.py` (gitignored) with the freshly deployed
 contract address and transaction hashes. **Run it at least once before invoking `lit`
 directly**, otherwise every substitution such as `%{test_tx}` is empty and tests fail for
@@ -306,7 +312,9 @@ Artifacts produced per contract in the output directory:
 - `<Contract>_ethdebug-runtime.json` — runtime debug info; this is what PC-to-source
   mapping uses for an ordinary call.
 - `ethdebug.json` (legacy) / `ethdebug_resources.json` (modern) — the global resource
-  file listing sources.
+  file listing sources. A compile removes whichever of the two it did not write, because
+  a directory holding both — one compiler's output on top of another's — gives a loader
+  no way to tell which describes the programs next to them.
 - `<Contract>.abi`, `<Contract>.bin` — ABI and bytecode.
 
 ### Compiler Channels

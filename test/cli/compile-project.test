@@ -21,3 +21,13 @@
 # RUN: not %soldb compile %t.project/src/token/Token.sol -o %t.out --no-project --solc %{solc_path} 2>&1 | FileCheck --check-prefix=NOPROJECT %s
 
 # NOPROJECT: not found
+
+# Compiling into a directory another compiler already wrote must not leave both of solc's
+# global metadata names behind: a loader cannot tell which one describes the programs
+# sitting next to them.
+# RUN: rm -rf %t.mixed && %soldb compile %S/../examples/Counter.sol -o %t.mixed --solc %{solc_path} > /dev/null 2>&1
+# RUN: touch -t 200001010000 %t.mixed/ethdebug.json 2>/dev/null || printf '{}' > %t.mixed/ethdebug.json
+# RUN: %soldb compile %S/../examples/Counter.sol -o %t.mixed --solc %{solc_path} > /dev/null 2>&1
+# RUN: ls %t.mixed | grep -c '^ethdebug' | FileCheck --check-prefix=ONEMETA %s
+
+# ONEMETA: 1
