@@ -1,0 +1,12 @@
+# Bad inputs fail with guidance and exit code 2.
+# REQUIRES: soldb
+# RUN: not %soldb run missing.bin 2>&1 | FileCheck --check-prefix=MISSING %s
+# RUN: not %soldb run 0xzz --runtime 2>&1 | FileCheck --check-prefix=MISSING %s
+# RUN: not %soldb run %{ethdebug_dir}/TestContract.bin --constructor-args 1 2>&1 | FileCheck --check-prefix=ABI %s
+# RUN: not %soldb run 0x60 --runtime --deploy 2>&1 | FileCheck --check-prefix=DEPLOY %s
+# RUN: not %soldb run 0x60 --runtime --storage bad 2>&1 | FileCheck --check-prefix=STORAGE %s
+
+# MISSING: is not hex bytecode; pass a `.bin` file or a hex string
+# ABI: `--constructor-args` need the contract ABI
+# DEPLOY: `--deploy` traces creation code
+# STORAGE: invalid `--storage` entry `bad`; expected `<slot>=<value>`

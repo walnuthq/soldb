@@ -617,7 +617,9 @@ fn read_bytecode(path: &Path) -> SoldbResult<String> {
     Ok(format!("0x{}", bytecode.to_ascii_lowercase()))
 }
 
-fn encode_constructor_args(abi: &[Value], args: &[String]) -> SoldbResult<String> {
+/// ABI-encodes constructor arguments against the `constructor` entry of `abi`, as they are
+/// appended to creation bytecode. An ABI without a constructor accepts no arguments.
+pub fn encode_constructor_args(abi: &[Value], args: &[String]) -> SoldbResult<String> {
     let constructor = abi
         .iter()
         .find(|item| item.get("type").and_then(Value::as_str) == Some("constructor"));

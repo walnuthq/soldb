@@ -233,6 +233,26 @@ can trace.
 soldb simulate <contract> "increment(uint256)" 4 --from <address> --backend replay --block 12345 --rpc <url>
 ```
 
+### Running Bytecode Without a Node
+
+`soldb run` debugs compiled bytecode on a chain that exists only for that run. There is no
+node, no deployment transaction, and nothing to clean up: the creation code is deployed
+locally from the first Anvil account, so the contract lands where Anvil would put it, and
+the call runs right after the constructor in the same synthetic block, seeing the state
+it left behind. Everything downstream is `simulate`'s: source mapping through
+`--ethdebug-dir`, the interactive debugger with reverse stepping, the JSON document, and
+the raw view.
+
+```bash
+soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Counter:./out
+soldb run out/Counter.bin --deploy --raw                 # trace the constructor itself
+soldb run 0x6000405060005460010160005500 --runtime --storage 0x0=0x29 --raw   # raw runtime code, a slot seeded
+```
+
+`--constructor-args` are encoded against the ABI next to the ETHDebug artifacts;
+`--from`, `--balance`, `--value`, `--chain-id`, `--block-number`, `--timestamp`, and
+`--gas-limit` shape the caller and the block.
+
 ### Time Travel
 
 A trace is a complete recording, so the interactive debugger and the DAP server move

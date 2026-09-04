@@ -459,6 +459,227 @@ impl ReplayInputs {
     }
 }
 
+/// A chain that exists only for one run.
+///
+/// `soldb run` debugs bytecode with no node: the contract, the caller, and the block are
+/// described here, [`PrefetchedReplayState`] answers from them, and the replay engine
+/// executes. Everything a node would supply is synthetic, so the trace is exactly as real
+/// as the state given, and accounts not described are empty, as on a fresh chain.
+#[derive(Debug, Clone)]
+pub struct LocalChain {
+    chain_id: u64,
+    block_number: u64,
+    timestamp: u64,
+    gas_limit: u64,
+    state: StateBatch,
+}
+
+impl Default for LocalChain {
+    fn default() -> Self {
+        Self {
+            chain_id: 31_337,
+            block_number: 1,
+            timestamp: 0,
+            gas_limit: 30_000_000,
+            state: StateBatch::default(),
+        }
+    }
+}
+
+impl LocalChain {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The chain id, which selects the hardfork rules together with the block.
+    #[must_use]
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = chain_id;
+        self
+    }
+
+    /// The block the run happens in; it must be past genesis so a deployment has a
+    /// parent state to start from.
+    #[must_use]
+    pub fn with_block_number(mut self, block_number: u64) -> Self {
+        self.block_number = block_number.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_timestamp(mut self, timestamp: u64) -> Self {
+        self.timestamp = timestamp;
+        self
+    }
+
+    #[must_use]
+    pub fn with_gas_limit(mut self, gas_limit: u64) -> Self {
+        self.gas_limit = gas_limit;
+        self
+    }
+
+    /// Puts an account on the chain. `balance` takes the forms `soldb simulate --value`
+    /// does, `code` is hex and may be empty.
+    pub fn with_account(
+        mut self,
+        address: &str,
+        balance: &str,
+        nonce: u64,
+        code: &str,
+    ) -> SoldbResult<Self> {
+        let address = address_hex(parse_address(address)?);
+        self.state.accounts.insert(
+            address,
+            AccountState {
+                balance: parse_value_quantity(balance)?,
+                nonce: format_quantity(nonce),
+                code: normalize_hex_output(code),
+            },
+        );
+        Ok(self)
+    }
+
+    /// Sets a storage slot on an account before the run.
+    pub fn with_storage(mut self, address: &str, slot: &str, value: &str) -> SoldbResult<Self> {
+        let address = address_hex(parse_address(address)?);
+        let slot = format_u256_quantity(parse_u256_quantity(slot)?);
+        let value = format_u256_quantity(parse_u256_quantity(value)?);
+        self.state
+            .storage
+            .entry(address)
+            .or_default()
+            .insert(slot, value);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    #[must_use]
+    pub fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    #[must_use]
+    pub fn gas_limit(&self) -> u64 {
+        self.gas_limit
+    }
+
+    /// The address a deployment from `from` at `nonce` creates, as `CREATE` computes it.
+    pub fn created_address(from: &str, nonce: u64) -> SoldbResult<String> {
+        Ok(address_hex(parse_address(from)?.create(nonce)))
+    }
+
+    /// A transaction that deploys `init_code` from `from`, the way `eth_sendTransaction`
+    /// without `to` would: zero gas price, the block's gas limit.
+    pub fn deployment(
+        &self,
+        from: &str,
+        init_code: &str,
+        value: &str,
+        nonce: u64,
+    ) -> SoldbResult<RpcTransaction> {
+        parse_address(from)?;
+        Ok(RpcTransaction {
+            hash: format!("0xlocal-deployment-{nonce}"),
+            from_addr: from.to_owned(),
+            to: None,
+            value: parse_value_quantity(value)?,
+            input_data: normalize_hex_output(init_code),
+            gas: Some(format_quantity(self.gas_limit)),
+            gas_price: Some("0x0".to_owned()),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            nonce: Some(format_quantity(nonce)),
+            block_number: Some(format_quantity(self.block_number)),
+            transaction_index: Some("0x0".to_owned()),
+            transaction_type: Some("0x0".to_owned()),
+            chain_id: Some(format_quantity(self.chain_id)),
+        })
+    }
+
+    /// Traces a deployment: the constructor's execution. The trace's `contract_address`
+    /// is the created address and its `output` the runtime code the constructor returned.
+    pub fn deploy(&self, deployment: &RpcTransaction) -> SoldbResult<TransactionTrace> {
+        let block = self.block(std::slice::from_ref(deployment));
+        let inputs = ReplayInputs::new(deployment.clone(), block, self.chain_id)?;
+        let state = self.state()?;
+        let result = replay_debug_trace_with_state(&inputs, &state)?;
+        let nonce = deployment
+            .nonce
+            .as_deref()
+            .map(parse_quantity)
+            .transpose()?
+            .unwrap_or(0);
+        let receipt = RpcReceipt {
+            gas_used: format_quantity(result.gas.unwrap_or(0)),
+            status: Some(if result.failed { "0x0" } else { "0x1" }.to_owned()),
+            contract_address: Some(Self::created_address(&deployment.from_addr, nonce)?),
+            logs: Vec::new(),
+        };
+        let mut trace = replay_transaction_trace(deployment.clone(), receipt, &result)?;
+        // Nothing was mined, so there is no hash to report.
+        trace.tx_hash = None;
+        Ok(trace)
+    }
+
+    /// Simulates `request` after `prefix` ran in the same block. A caller that deployed
+    /// first passes the deployment as the prefix, so the constructor's state is what the
+    /// call sees.
+    pub fn call(
+        &self,
+        prefix: &[RpcTransaction],
+        request: &SimulateCallRequest,
+    ) -> SoldbResult<TransactionTrace> {
+        let mut request = request.clone();
+        request.block = Some(self.block_number);
+        request.tx_index = (!prefix.is_empty()).then_some(prefix.len() as u64);
+        let inputs = ReplayInputs::for_call(
+            &request,
+            self.block(prefix),
+            self.block_number,
+            self.chain_id,
+        )?;
+        let state = self.state()?;
+        let result = replay_debug_trace_with_state(&inputs, &state)?;
+        replay_simulation_trace(&request, &result)
+    }
+
+    /// The synthetic block the run happens in, carrying `transactions` in full.
+    #[must_use]
+    pub fn block(&self, transactions: &[RpcTransaction]) -> RpcBlockWithTransactions {
+        RpcBlockWithTransactions {
+            header: RpcBlockHeader {
+                hash: Some(format!("0x{}", "11".repeat(32))),
+                number: Some(format_quantity(self.block_number)),
+                timestamp: format_quantity(self.timestamp),
+                gas_limit: format_quantity(self.gas_limit),
+                base_fee_per_gas: Some("0x0".to_owned()),
+                difficulty: None,
+                mix_hash: Some(format!("0x{}", "00".repeat(32))),
+                prevrandao: None,
+                miner: None,
+                beneficiary: None,
+            },
+            transactions: transactions
+                .iter()
+                .cloned()
+                .map(|transaction| RpcBlockTransaction::Full(Box::new(transaction)))
+                .collect(),
+        }
+    }
+
+    /// The state provider for the described accounts; anything else reads as empty.
+    pub fn state(&self) -> SoldbResult<PrefetchedReplayState> {
+        let mut state = PrefetchedReplayState::default();
+        state.provide(&self.state)?;
+        Ok(state)
+    }
+}
+
 /// Re-executes the block prefix and the target transaction in REVM over `provider` and
 /// records the target's execution as a `debug_traceTransaction`-shaped result.
 ///
@@ -1935,7 +2156,7 @@ mod tests {
         replay_debug_trace_with_state, replay_full_block_transactions, replay_prefix_with_state,
         replay_preflight_parent_state, replay_simulation_trace, replay_spec_for_chain,
         replay_target_index, replay_target_with_state, replay_transaction_trace, AccountState,
-        PrefetchedReplayState, ReplayInputs, ReplayStateDb, ReplayStateProvider,
+        LocalChain, PrefetchedReplayState, ReplayInputs, ReplayStateDb, ReplayStateProvider,
         RpcBlockTransaction, RpcBlockWithTransactions, RpcReplayStateProvider, SpecId, StateBatch,
         StateRequest,
     };
@@ -2623,6 +2844,124 @@ mod tests {
         let mut bad_value = counter_call(None);
         bad_value.value = "lots".to_owned();
         assert!(ReplayInputs::for_call(&bad_value, counter_block(vec![]), 1, 31_337).is_err());
+    }
+
+    // PUSH1 0x29 PUSH1 0 SSTORE, then copy the counter runtime out and return it: a
+    // constructor that seeds slot 0 before handing over the counter.
+    const COUNTER_INIT_CODE: &str =
+        "0x6029600055600e6011600039600e6000f36000405060005460010160005500";
+    const ANVIL_SENDER: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    fn local_call(to: &str) -> SimulateCallRequest {
+        SimulateCallRequest {
+            from_addr: SENDER.to_owned(),
+            to_addr: to.to_owned(),
+            calldata: "0x".to_owned(),
+            value: "0".to_owned(),
+            block: None,
+            tx_index: None,
+        }
+    }
+
+    #[test]
+    fn a_local_chain_runs_runtime_code_without_a_node() {
+        let chain = LocalChain::new()
+            .with_account(SENDER, "1ether", 0, "0x")
+            .expect("sender")
+            .with_account(
+                &COUNTER.to_uppercase().replace("0X", "0x"),
+                "0",
+                1,
+                COUNTER_CODE,
+            )
+            .expect("counter")
+            .with_storage(COUNTER, "0x0", "0x29")
+            .expect("slot");
+        assert_eq!(chain.chain_id(), 31_337);
+        assert_eq!(chain.block_number(), 1);
+
+        let trace = chain.call(&[], &local_call(COUNTER)).expect("call");
+        assert_eq!(trace.tx_hash, None);
+        assert_eq!(trace.backend.as_deref(), Some("replay"));
+        assert!(trace.success, "{:?}", trace.error);
+        assert_eq!(trace.steps.len(), 10);
+        assert_eq!(trace.steps[4].snapshot.storage["0x0"], "0x29");
+        assert_eq!(trace.steps[8].snapshot.storage["0x0"], "0x2a");
+        // Accounts never described, the fee recipient here, are simply empty.
+        assert!(chain.state().expect("state").missing().is_empty());
+    }
+
+    #[test]
+    fn a_local_chain_deploys_then_calls_with_the_constructor_state() {
+        let chain = LocalChain::new()
+            .with_account(SENDER, "1ether", 0, "0x")
+            .expect("sender");
+        let deployment = chain
+            .deployment(SENDER, COUNTER_INIT_CODE, "0", 0)
+            .expect("deployment");
+        let created = LocalChain::created_address(SENDER, 0).expect("address");
+
+        let constructor = chain.deploy(&deployment).expect("deploy");
+        assert!(constructor.success, "{:?}", constructor.error);
+        assert_eq!(constructor.tx_hash, None);
+        assert_eq!(
+            constructor.contract_address.as_deref(),
+            Some(created.as_str())
+        );
+        assert_eq!(constructor.output, COUNTER_CODE);
+        let ops: Vec<&str> = constructor
+            .steps
+            .iter()
+            .map(|step| step.op.as_str())
+            .collect();
+        assert_eq!(&ops[..3], ["PUSH1", "PUSH1", "SSTORE"]);
+        assert_eq!(*ops.last().expect("last"), "RETURN");
+
+        // The call runs after the deployment in the same block and sees slot 0 == 0x29.
+        let trace = chain
+            .call(&[deployment], &local_call(&created))
+            .expect("call");
+        assert!(trace.success, "{:?}", trace.error);
+        assert_eq!(trace.to_addr.as_deref(), Some(created.as_str()));
+        assert_eq!(trace.steps[4].snapshot.storage["0x0"], "0x29");
+        assert_eq!(trace.steps[8].snapshot.storage["0x0"], "0x2a");
+    }
+
+    #[test]
+    fn created_addresses_follow_create_and_deployments_can_fail() {
+        assert_eq!(
+            LocalChain::created_address(ANVIL_SENDER, 0).expect("address"),
+            "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+        );
+        assert!(LocalChain::created_address("0x12", 0).is_err());
+
+        let chain = LocalChain::new()
+            .with_account(SENDER, "1ether", 0, "0x")
+            .expect("sender")
+            .with_block_number(0)
+            .with_timestamp(1_700_000_000)
+            .with_gas_limit(1_000_000)
+            .with_chain_id(1);
+        assert_eq!(
+            chain.block_number(),
+            1,
+            "genesis has no parent; the run moves to block 1"
+        );
+        assert_eq!(chain.gas_limit(), 1_000_000);
+        // INVALID as the whole constructor: the deployment fails and says so.
+        let deployment = chain
+            .deployment(SENDER, "0xfe", "0", 0)
+            .expect("deployment");
+        let trace = chain.deploy(&deployment).expect("trace");
+        assert!(!trace.success);
+        assert!(trace.error.is_some());
+        assert!(chain.deployment("0x12", "0x", "0", 0).is_err());
+        assert!(LocalChain::new()
+            .with_account(SENDER, "lots", 0, "0x")
+            .is_err());
+        assert!(LocalChain::new()
+            .with_storage(COUNTER, "0x0", "nope")
+            .is_err());
     }
 
     #[test]

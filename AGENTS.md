@@ -6,7 +6,7 @@ Guidance for AI coding agents working in this repository.
 
 SolDB is an ETHDebug-first, LLDB-style debugger for Solidity and the EVM, written in
 Rust. It maps EVM execution back to Solidity source using compiler-generated debug
-information, and exposes that as a CLI (`trace`, `simulate`, `list-events`,
+information, and exposes that as a CLI (`trace`, `simulate`, `run`, `list-events`,
 `list-contracts`, `bridge`), an interactive REPL, a versioned JSON document for web
 clients, a DAP server for editors, and a WebAssembly module for browser and Node.js
 hosts.
@@ -21,7 +21,9 @@ Two premises drive most design decisions:
 - **The node is the execution oracle.** We do not maintain chain state. Either the node
   replays the transaction for us (`debug_traceTransaction`), or we pull the state a
   transaction touched over normal RPC and replay it in REVM. Both paths must produce the
-  same `TransactionTrace` shape.
+  same `TransactionTrace` shape. The one exception is deliberate: `soldb run` executes
+  bytecode on a `LocalChain` that exists only for that run, with every account the user
+  described and nothing else, so what it shows is exactly as real as the state given.
 
 Do not describe SolDB in the third person in code comments, docs, or commit messages.
 This repository is the project: say "we", "this codebase", or "the debugger" instead of
@@ -66,7 +68,8 @@ lit test/trace/basic-trace.test -v
 lit test/simulate/ -v
 ```
 
-Scope a full run with `--trace-only`, `--simulate-only`, `--events-only`, or `--cli-only`.
+Scope a full run with `--trace-only`, `--simulate-only`, `--run-only`, `--events-only`, or
+`--cli-only`.
 Tests run with `-j1` on purpose: they share one node, one contract deployment, and the
 `examples/out` artifact directory.
 
@@ -323,7 +326,8 @@ Conventions:
 - Every test starts with `# REQUIRES: soldb`. Add `# REQUIRES: sepolia-rpc` or
   `# REQUIRES: stylus-bridge` for tests that need those environments.
 - Put the test in the directory that matches the command under test: `test/trace/`,
-  `test/simulate/`, `test/events/`, `test/cli/`, `test/stylus/`.
+  `test/simulate/`, `test/run/`, `test/events/`, `test/cli/`, `test/stylus/`. Tests in
+  `test/run/` need no node, only the compiled artifacts in `%{ethdebug_dir}`.
 - Expect failures explicitly with `not %soldb ...` rather than letting a nonzero exit
   fail the RUN line.
 - Pipe `2>&1` when the assertion covers diagnostics; SolDB writes progress and errors to

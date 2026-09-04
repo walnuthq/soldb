@@ -147,6 +147,8 @@ enum Command {
     ListEvents(ListEventsArgs),
     #[command(about = "Trace and debug an Ethereum transaction")]
     Trace(TraceArgs),
+    #[command(about = "Run bytecode on a local chain that exists only for this run, with no node")]
+    Run(RunArgs),
     #[command(about = "Profile gas by contract, function, and source line")]
     Profile(ProfileArgs),
     #[command(about = "Simulate and debug an Ethereum transaction")]
@@ -296,6 +298,67 @@ struct TraceArgs {
 }
 
 #[derive(Debug, Args)]
+struct RunArgs {
+    /// Bytecode to run: a file such as `out/Counter.bin`, or a hex string. Creation code
+    /// unless `--runtime`; it is deployed locally first, so the constructor's state is
+    /// what the call sees.
+    bytecode: String,
+    function_signature: Option<String>,
+    function_args: Vec<String>,
+    /// The caller. Defaults to the first Anvil account, so a deployment lands at the
+    /// address Anvil would give it.
+    #[arg(
+        long = "from",
+        default_value = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    )]
+    from_addr: String,
+    /// The bytecode is runtime code: install it at `--address` instead of deploying.
+    #[arg(long)]
+    runtime: bool,
+    /// Trace the constructor and stop.
+    #[arg(long)]
+    deploy: bool,
+    /// Where runtime code lives with `--runtime`.
+    #[arg(long, default_value = "0x5FbDB2315678afecB367f032d93F642f64180aa3")]
+    address: String,
+    #[arg(long, default_value = "0")]
+    value: String,
+    #[arg(long)]
+    raw_data: Option<String>,
+    /// Constructor arguments, encoded against the ABI found through `--ethdebug-dir`.
+    #[arg(long)]
+    constructor_args: Vec<String>,
+    /// A storage slot to set on the contract before the run, as `slot=value`.
+    #[arg(long = "storage")]
+    storage: Vec<String>,
+    /// The caller's balance.
+    #[arg(long, default_value = "10000ether")]
+    balance: String,
+    #[arg(long, default_value_t = 31_337)]
+    chain_id: u64,
+    #[arg(long, default_value_t = 1)]
+    block_number: u64,
+    #[arg(long, default_value_t = 0)]
+    timestamp: u64,
+    #[arg(long, default_value_t = 30_000_000)]
+    gas_limit: u64,
+    #[arg(long = "ethdebug-dir", short = 'e')]
+    ethdebug_dir: Vec<String>,
+    #[arg(long, short = 'c')]
+    contracts: Option<String>,
+    #[arg(long)]
+    multi_contract: bool,
+    #[arg(long, short = 'i')]
+    interactive: bool,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    raw: bool,
+    #[arg(long, short = 'm', default_value_t = 50)]
+    max_steps: i64,
+}
+
+#[derive(Debug, Args)]
 struct SimulateArgs {
     #[arg(long = "from", required = true)]
     from_addr: String,
@@ -379,6 +442,7 @@ fn main() -> ExitCode {
         Command::Trace(args) => trace_command(&args),
         Command::Profile(args) => profile::command(&args),
         Command::Simulate(args) => simulate_command(&args),
+        Command::Run(args) => run_command(&args),
         Command::ListEvents(args) => list_events_command(&args),
         Command::ListContracts(args) => list_contracts_command(&args),
         Command::Bridge(args) => bridge_command(&args),
@@ -686,18 +750,36 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     };
     let trace =
         soldb_rpc::simulate_call_with_backend(&args.rpc_url, &request, args.backend.into())?;
-    let json_function_name = simulate_json_function_name(args, &calldata);
-    let display_function_name = simulate_display_function_name(args, &calldata);
+    present_simulation(
+        args,
+        trace,
+        &contract_address,
+        contract_name.as_deref(),
+        &calldata,
+    )
+}
+
+/// Shows a simulated call the way the user asked: interactively, as the web document, as
+/// raw steps, or as the summary. Shared by `simulate` and `run`.
+fn present_simulation(
+    args: &SimulateArgs,
+    trace: TransactionTrace,
+    contract_address: &str,
+    contract_name: Option<&str>,
+    calldata: &str,
+) -> SoldbResult<()> {
+    let json_function_name = simulate_json_function_name(args, calldata);
+    let display_function_name = simulate_display_function_name(args, calldata);
 
     if args.interactive {
         print_simulation_interactive_prelude(
             args,
-            &contract_address,
-            contract_name.as_deref(),
-            &calldata,
+            contract_address,
+            contract_name,
+            calldata,
             &display_function_name,
         );
-        let source_index = interactive_simulation_source_index(args, &contract_address);
+        let source_index = interactive_simulation_source_index(args, contract_address);
         run_interactive_debugger(trace, "Simulation debugger", source_index)?;
     } else if args.json {
         println!(
@@ -705,23 +787,198 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
             soldb_serializer::simulate_to_web_json_with_contracts(
                 &trace,
                 &json_function_name,
-                simulate_web_contracts(args, &trace, &contract_address)
+                simulate_web_contracts(args, &trace, contract_address)
             )?
         );
     } else if args.raw {
-        print_raw_simulation(&trace, args, &contract_address);
+        print_raw_simulation(&trace, args, contract_address);
     } else {
         print_simulation_summary(
             &trace,
             args,
-            &contract_address,
-            contract_name.as_deref(),
-            &calldata,
+            contract_address,
+            contract_name,
+            calldata,
             &display_function_name,
         );
     }
 
     Ok(())
+}
+
+/// Runs bytecode on a chain that exists only for this run.
+///
+/// Creation code is deployed first, from the caller at nonce zero, and the call runs in
+/// the same synthetic block right after it, so whatever the constructor stored is what
+/// the call sees. `--runtime` installs the bytes as they are instead, and `--deploy`
+/// traces the constructor and stops. Everything after execution is `simulate`'s: the same
+/// ETHDebug mapping, REPL, JSON document, and raw view.
+fn run_command(args: &RunArgs) -> SoldbResult<()> {
+    let bytecode = load_bytecode(&args.bytecode)?;
+    let mut chain = soldb_rpc::LocalChain::new()
+        .with_chain_id(args.chain_id)
+        .with_block_number(args.block_number)
+        .with_timestamp(args.timestamp)
+        .with_gas_limit(args.gas_limit)
+        .with_account(&args.from_addr, &args.balance, 0, "0x")?;
+
+    let (contract_address, prefix) = if args.runtime {
+        chain = chain.with_account(&args.address, "0", 1, &bytecode)?;
+        (normalize_contract_address_key(&args.address), Vec::new())
+    } else {
+        let created = soldb_rpc::LocalChain::created_address(&args.from_addr, 0)?;
+        let init_code = format!("{bytecode}{}", run_constructor_args(args, &created)?);
+        let deployment = chain.deployment(&args.from_addr, &init_code, "0", 0)?;
+        (created, vec![deployment])
+    };
+    for entry in &args.storage {
+        let Some((slot, value)) = entry.split_once('=') else {
+            return Err(soldb_core::SoldbError::Message(format!(
+                "invalid `--storage` entry `{entry}`; expected `<slot>=<value>`"
+            )));
+        };
+        chain = chain.with_storage(&contract_address, slot.trim(), value.trim())?;
+    }
+
+    let simulate_args = simulate_args_for_run(args, &contract_address);
+    let contract_name = simulate_contract_name(&simulate_args);
+    if !args.json {
+        let what = if args.runtime {
+            "Installed runtime code at"
+        } else if args.deploy {
+            "Deploying locally to"
+        } else {
+            "Deployed locally at"
+        };
+        println!("{} {}", info(what), address_color(&contract_address));
+    }
+
+    if args.deploy {
+        let deployment = prefix.first().ok_or_else(|| {
+            soldb_core::SoldbError::Message(
+                "`--deploy` traces creation code; drop `--runtime` or pass creation bytecode"
+                    .to_owned(),
+            )
+        })?;
+        let trace = chain.deploy(deployment)?;
+        let calldata = deployment.input_data.clone();
+        return present_simulation(
+            &simulate_args,
+            trace,
+            &contract_address,
+            contract_name.as_deref(),
+            &calldata,
+        );
+    }
+
+    let calldata = simulate_calldata(&simulate_args)?;
+    let request = soldb_rpc::SimulateCallRequest {
+        from_addr: args.from_addr.clone(),
+        to_addr: contract_address.clone(),
+        calldata: calldata.clone(),
+        value: args.value.clone(),
+        block: None,
+        tx_index: None,
+    };
+    let trace = chain.call(&prefix, &request)?;
+    present_simulation(
+        &simulate_args,
+        trace,
+        &contract_address,
+        contract_name.as_deref(),
+        &calldata,
+    )
+}
+
+/// Reads bytecode from a file when `source` names one, otherwise treats it as hex.
+fn load_bytecode(source: &str) -> SoldbResult<String> {
+    let path = Path::new(source);
+    let text = if path.is_file() {
+        fs::read_to_string(path).map_err(|error| {
+            soldb_core::SoldbError::Message(format!("failed to read `{}`: {error}", path.display()))
+        })?
+    } else {
+        source.to_owned()
+    };
+    let hex = text.trim().trim_start_matches("0x");
+    if hex.is_empty() {
+        return Err(soldb_core::SoldbError::Message(format!(
+            "`{source}` holds no bytecode"
+        )));
+    }
+    if hex.len() % 2 != 0 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(soldb_core::SoldbError::Message(format!(
+            "`{source}` is not hex bytecode; pass a `.bin` file or a hex string"
+        )));
+    }
+    Ok(hex.to_ascii_lowercase())
+}
+
+/// ABI-encodes `--constructor-args` against the constructor found through
+/// `--ethdebug-dir`, or reports that no ABI was found to encode them with.
+fn run_constructor_args(args: &RunArgs, contract_address: &str) -> SoldbResult<String> {
+    if args.constructor_args.is_empty() {
+        return Ok(String::new());
+    }
+    let simulate_args = simulate_args_for_run(args, contract_address);
+    let abi = resolve_contract_specs_reporting(&simulate_args.ethdebug_dir, args.contracts.as_deref())
+        .iter()
+        .find_map(abi_value_for_spec)
+        .and_then(|abi| abi.as_array().cloned())
+        .ok_or_else(|| {
+            soldb_core::SoldbError::Message(
+                "`--constructor-args` need the contract ABI; pass `--ethdebug-dir <address>:<name>:<dir>` with a `<name>.abi` in it"
+                    .to_owned(),
+            )
+        })?;
+    let encoded = soldb_compiler::encode_constructor_args(&abi, &args.constructor_args)?;
+    Ok(encoded.trim_start_matches("0x").to_owned())
+}
+
+/// The `simulate` view of a `run`, so every presentation path is shared.
+fn simulate_args_for_run(args: &RunArgs, contract_address: &str) -> SimulateArgs {
+    SimulateArgs {
+        backend: TraceBackendArg::Replay,
+        from_addr: args.from_addr.clone(),
+        interactive: args.interactive,
+        contract_address: contract_address.to_owned(),
+        function_signature: args.function_signature.clone(),
+        function_args: args.function_args.clone(),
+        block: None,
+        tx_index: None,
+        value: args.value.clone(),
+        ethdebug_dir: args.ethdebug_dir.clone(),
+        contracts: args.contracts.clone(),
+        multi_contract: args.multi_contract,
+        rpc_url: String::new(),
+        json: args.json,
+        raw: args.raw,
+        max_steps: args.max_steps,
+        // A run with neither a signature nor data calls the contract with empty calldata,
+        // which is what plain bytecode without a dispatcher expects.
+        raw_data: args
+            .raw_data
+            .clone()
+            .or_else(|| args.function_signature.is_none().then(|| "0x".to_owned())),
+        constructor_args: args.constructor_args.clone(),
+        solc_path: "solc".to_owned(),
+        dual_compile: false,
+        keep_build: false,
+        output_dir: "./out".to_owned(),
+        production_dir: "./build/contracts".to_owned(),
+        save_config: false,
+        verify_version: false,
+        no_cache: false,
+        cache_dir: ".soldb_cache".to_owned(),
+        fork_url: None,
+        fork_block: None,
+        fork_port: 8545,
+        keep_fork: false,
+        reuse_fork: false,
+        no_snapshot: false,
+        cross_env_bridge: None,
+        stylus_contracts: None,
+    }
 }
 
 fn maybe_auto_deploy(args: &SimulateArgs) -> SoldbResult<Option<soldb_compiler::AutoDeployResult>> {

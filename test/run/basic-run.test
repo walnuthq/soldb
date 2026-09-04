@@ -1,0 +1,14 @@
+# Run compiled bytecode on a chain that exists only for this run: no node, no deployment
+# transaction. The creation code is deployed locally from the first Anvil account, so the
+# contract lands where Anvil would put it, and the call sees the constructor's state.
+# REQUIRES: soldb
+# RUN: %soldb run %{ethdebug_dir}/TestContract.bin "increment(uint256)" 4 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:TestContract:%{ethdebug_dir} 2>&1 | FileCheck %s
+
+# CHECK: Deployed locally at 0x5fbdb2315678afecb367f032d93f642f64180aa3
+# CHECK: Contract: TestContract
+# CHECK: Gas used:
+# CHECK: Status: SUCCESS
+# CHECK: Call Stack:
+# CHECK: #0 TestContract::runtime_dispatcher
+# CHECK: #1 increment(uint256 amount = 4)
+# CHECK: emit TestContract::CounterIncremented

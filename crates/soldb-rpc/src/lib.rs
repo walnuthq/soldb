@@ -46,7 +46,7 @@ mod test_support;
 pub use replay::{
     replay_debug_trace_with_state, replay_prefix_with_state, replay_simulation_trace,
     replay_target_with_state, replay_transaction_trace, simulate_call_with_replay, AccountState,
-    PrefetchedReplayState, ReplayBackend, ReplayDbError, ReplayInputs, ReplayPrefix,
+    LocalChain, PrefetchedReplayState, ReplayBackend, ReplayDbError, ReplayInputs, ReplayPrefix,
     ReplayStateProvider, RpcBlockHeader, RpcBlockTransaction, RpcBlockWithTransactions,
     RpcReplayStateProvider, StateBatch, StateRequest,
 };

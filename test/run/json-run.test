@@ -1,0 +1,5 @@
+# The run command emits the same versioned web document as simulate, with the contract
+# metadata filled from the ETHDebug directory, and nothing but JSON on stdout.
+# REQUIRES: soldb
+# RUN: %soldb run %{ethdebug_dir}/TestContract.bin "increment(uint256)" 4 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:TestContract:%{ethdebug_dir} --json > %t.json
+# RUN: jq -e '.schemaVersion == 1 and .backend == "replay" and .status == "success" and (.steps | length) > 100 and .function_name == "increment(uint256)" and (.contracts["0x5fbdb2315678afecb367f032d93f642f64180aa3"].debugAvailable == true)' %t.json

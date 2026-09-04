@@ -17,6 +17,7 @@ NC='\033[0m'
 RUN_TRACE_TESTS=true
 RUN_PROFILE_TESTS=true
 RUN_SIMULATE_TESTS=true
+RUN_RUN_TESTS=true
 RUN_EVENTS_TESTS=true
 RUN_CLI_TESTS=true
 VERBOSE=false
@@ -37,6 +38,7 @@ for arg in "$@"; do
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
             shift
             ;;
         --profile-only)
@@ -44,6 +46,7 @@ for arg in "$@"; do
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
             shift
             ;;
         --simulate-only)
@@ -51,12 +54,22 @@ for arg in "$@"; do
             RUN_PROFILE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
             shift
             ;;
         --events-only)
             RUN_TRACE_TESTS=false
             RUN_PROFILE_TESTS=false
             RUN_SIMULATE_TESTS=false
+            RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
+            shift
+            ;;
+        --run-only)
+            RUN_TRACE_TESTS=false
+            RUN_PROFILE_TESTS=false
+            RUN_SIMULATE_TESTS=false
+            RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
             shift
             ;;
@@ -65,6 +78,7 @@ for arg in "$@"; do
             RUN_PROFILE_TESTS=false
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
+            RUN_RUN_TESTS=false
             shift
             ;;
         -v|--verbose)
@@ -83,6 +97,7 @@ for arg in "$@"; do
             echo "  --trace-only       Run only trace tests (from test/trace/)"
             echo "  --profile-only     Run only profile tests (from test/profile/)"
             echo "  --simulate-only    Run only simulate tests (from test/simulate/)"
+            echo "  --run-only         Run only run tests (from test/run/)"
             echo "  --events-only      Run only events tests (from test/events/)"
             echo "  --cli-only         Run only CLI tests (from test/cli/)"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
@@ -94,6 +109,7 @@ for arg in "$@"; do
             echo "  test/trace/        Contains trace command tests"
             echo "  test/profile/      Contains profile command tests"
             echo "  test/simulate/     Contains simulate command tests"
+            echo "  test/run/          Contains run command tests (no node needed)"
             echo "  test/events/       Contains list-events command tests"
             echo "  test/cli/          Contains CLI command and error tests"
             echo ""
@@ -197,6 +213,7 @@ echo -e "${GREEN}Organized test structure:${NC}"
 echo -e "${GREEN}  - test/trace/     : Trace command tests${NC}"
 echo -e "${GREEN}  - test/profile/   : Profile command tests${NC}"
 echo -e "${GREEN}  - test/simulate/  : Simulate command tests${NC}"
+echo -e "${GREEN}  - test/run/       : Run command tests (local chain, no node)${NC}"
 echo -e "${GREEN}  - test/events/    : List-events command tests${NC}"
 echo -e "${GREEN}  - test/cli/       : CLI command and error tests${NC}"
 
@@ -484,6 +501,16 @@ if [ "$RUN_SIMULATE_TESTS" = true ]; then
         "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/simulate"
     else
         echo -e "${YELLOW}Warning: simulate directory not found${NC}"
+    fi
+fi
+
+# Run run-command tests: they use only the compiled artifacts, no node
+if [ "$RUN_RUN_TESTS" = true ]; then
+    echo -e "${YELLOW}Running run tests...${NC}"
+    if [ -d "${SCRIPT_DIR}/run" ]; then
+        "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/run"
+    else
+        echo -e "${YELLOW}Warning: run directory not found${NC}"
     fi
 fi
 
