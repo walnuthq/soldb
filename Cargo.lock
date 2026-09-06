@@ -2645,7 +2645,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "soldb"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "inferno",
@@ -2664,7 +2664,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-bridge"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-compiler"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-dap"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-debugger"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-ethdebug"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "revm-bytecode",
  "serde",
@@ -2727,7 +2727,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-evm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.2.17",
  "revm",
@@ -2739,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-profiler"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2749,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-repl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "soldb-core",
@@ -2759,7 +2759,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-rpc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2769,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-serializer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2779,7 +2779,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
