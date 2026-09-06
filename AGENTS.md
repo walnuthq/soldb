@@ -333,6 +333,15 @@ CI runs the lit suite against three compilers, for three different reasons:
 | solc 0.8.36 (pinned) | the modern `--experimental --ethdebug-program …` generation |
 | solc `develop`, built from source | where ETHDebug output changes first |
 
+A separate non-blocking `solar-main` job builds `paradigmxyz/solar@main` and
+runs `lit test/solar` over Standard JSON artifacts in local REVM. This standalone
+lit/FileCheck suite needs no node or generated site configuration. Pass
+`--param optimization=none`, `gas`, or `size`; CI runs all three. Missing tools
+and missing source checkpoints fail, with no expected-failure allowlist. Keep
+CLI assertions in `.test` files; `prepare.py` only compiles and adapts artifacts.
+See `docs/debug-diff.md` for local commands and retained reports. The adapter's
+unit tests run with `python3 -m unittest discover -s test/solar -p '*_test.py'`.
+
 The `develop` job builds `argotorg/solidity@develop`, caches the binary by commit, and is
 **non-blocking** (`continue-on-error: true`): that branch moves without us, so a break
 there is an early warning, not a reason to hold up a pull request. It also runs on a daily

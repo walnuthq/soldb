@@ -113,3 +113,51 @@ The library entry points are `soldb_debugger::capture_debug_trace` and
 `soldb_debugger::compare_debug_traces`. They take already loaded
 `TransactionTrace` and `ContractDebugInfo` values and perform no file or network
 I/O.
+
+## Solar Main Compatibility
+
+CI builds `paradigmxyz/solar` at `main` and exercises its Standard JSON
+artifacts through local REVM, debug comparisons, and both profiling formats.
+The job runs on pull requests, pushes to `main`, the daily schedule, and manual
+dispatch. It is non-blocking, like the solc development job: upstream compiler
+changes can expose gaps independently of a debugger change. Failing steps stay
+visible, and the job summary lists failed checks.
+
+Run the same lit/FileCheck suite locally with a built Solar binary, solc
+0.8.36, `lit`, `jq`, and LLVM's `FileCheck` on `PATH`:
+
+```console
+cargo build --bin soldb
+export SOLAR=/path/to/solar
+export SOLC_PATH=/path/to/solc
+for optimization in none gas size; do
+  lit -v -j2 test/solar --param optimization="$optimization" || break
+done
+```
+
+On macOS, Homebrew's FileCheck may need
+`export PATH="$(brew --prefix llvm)/bin:$PATH"`. Set `SOLDB_BIN` to override
+`target/debug/soldb`. No node, deployment script, or generated lit site
+configuration is needed.
+
+The `baseline/` tests cover creation, arithmetic, branching, and storage
+reads. The `capabilities/` tests cover modifiers, loops, internal calls,
+`require`, and dynamic calldata. Each `.test` file runs the CLI directly and
+uses jq/FileCheck to assert runtime results, cross-format debug equivalence,
+solc checkpoint coverage, source-attributed gas, and flamegraph output.
+Python only prepares Standard JSON artifacts and named source checkpoints.
+
+There is no expected-failure allowlist. Compiler errors and missing source
+steps fail the test while independent cases continue. In particular,
+checkpoints must appear in both compilers: two debug formats dropping the
+same statement cannot make the test pass. These are source-coverage checks,
+not a claim of exact function-frame, variable-location, or full span parity.
+
+The `solar-main-compatibility` artifact contains the exact Solar revision,
+compiler versions, Standard JSON inputs and outputs, command logs, REVM
+traces, comparison reports, profiles, SVGs, and lit results. Local output
+defaults to `target/solar-lit/<optimization>`; change its parent with
+`--param output=/path/to/results`. CI still tracks main, so compiler fixes
+must land there before its run becomes green. This suite is separate from
+the solc-specific live-node tests and does not imply that
+`soldb compile --solc /path/to/solar` accepts Solar's CLI.
