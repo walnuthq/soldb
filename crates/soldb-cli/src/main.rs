@@ -571,6 +571,9 @@ struct RunArgs {
     /// unless `--runtime`; it is deployed locally first, so the constructor's state is
     /// what the call sees.
     bytecode: String,
+    /// Save the complete TransactionTrace for offline debug-diff and profiling.
+    #[arg(long, value_name = "FILE")]
+    save_trace: Option<PathBuf>,
     function_signature: Option<String>,
     function_args: Vec<String>,
     /// The caller. Defaults to the first Anvil account, so a deployment lands at the
@@ -1338,6 +1341,7 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         })?;
         let trace = chain.deploy(deployment)?;
         let calldata = deployment.input_data.clone();
+        save_run_trace(args, &trace)?;
         return present_simulation(&view, trace, contract_name.as_deref(), &calldata);
     }
 
@@ -1358,7 +1362,22 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
             "the call executed no instructions; there is no code at `{contract_address}`\nnote: pass creation code, or `--runtime` with the deployed code"
         )));
     }
+    save_run_trace(args, &trace)?;
     present_simulation(&view, trace, contract_name.as_deref(), &calldata)
+}
+
+/// Writes the raw trace format used by offline consumers, independently of display mode.
+fn save_run_trace(args: &RunArgs, trace: &TransactionTrace) -> SoldbResult<()> {
+    if let Some(path) = &args.save_trace {
+        let output = soldb_serializer::trace_to_json(trace)?;
+        fs::write(path, output).map_err(|error| {
+            soldb_core::SoldbError::Message(format!(
+                "failed to save trace `{}`: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Reads bytecode from a file when `source` names one, otherwise treats it as hex.

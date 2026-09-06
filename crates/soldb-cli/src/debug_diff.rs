@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, ValueEnum};
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
 use soldb_debugger::{
-    capture_debug_trace, compare_debug_traces, ContractDebugInfo, DebugDiffMode, DebugDiffReport,
-    DebugDifference, DebugTraceEvent,
+    capture_debug_trace, compare_debug_traces, ContractDebugInfo, DebugCheckpoint, DebugDiffMode,
+    DebugDiffReport, DebugDifference, DebugTraceEvent,
 };
 use soldb_ethdebug::SourceMapEnvironment;
 
@@ -91,6 +91,15 @@ pub(crate) struct DebugDiffArgs {
     /// Candidate multi-contract mapping file.
     #[arg(long = "candidate-contracts", value_name = "PATH")]
     candidate_contracts: Option<String>,
+    /// Encoded reference constructor arguments, including `0x` for no arguments.
+    #[arg(long, value_name = "HEX")]
+    reference_constructor_args: Option<String>,
+    /// Encoded candidate constructor arguments, including `0x` for no arguments.
+    #[arg(long, value_name = "HEX")]
+    candidate_constructor_args: Option<String>,
+    /// JSON source/line checkpoints that both executions must reach.
+    #[arg(long, value_name = "PATH")]
+    checkpoints_file: Option<PathBuf>,
     /// Compare ordered steps, exact spans, or reached source coverage.
     #[arg(long, value_enum, default_value_t = DebugDiffModeArg::Steps)]
     mode: DebugDiffModeArg,
@@ -142,8 +151,28 @@ fn command_inner(args: &DebugDiffArgs) -> SoldbResult<()> {
         args.candidate_contracts.as_deref(),
         &args.candidate_source_path,
     )?;
-    let reference = capture_debug_trace(&reference_trace, reference_contracts);
-    let candidate = capture_debug_trace(&candidate_trace, candidate_contracts);
+    let mut reference = capture_debug_trace(&reference_trace, reference_contracts);
+    let mut candidate = capture_debug_trace(&candidate_trace, candidate_contracts);
+    if let Some(arguments) = &args.reference_constructor_args {
+        reference.set_constructor_args(arguments)?;
+    }
+    if let Some(arguments) = &args.candidate_constructor_args {
+        candidate.set_constructor_args(arguments)?;
+    }
+    if let Some(path) = &args.checkpoints_file {
+        let contents = fs::read_to_string(path).map_err(|error| {
+            SoldbError::Message(format!(
+                "failed to read checkpoints `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        let checkpoints =
+            serde_json::from_str::<Vec<DebugCheckpoint>>(&contents).map_err(|error| {
+                SoldbError::Message(format!("invalid checkpoints `{}`: {error}", path.display()))
+            })?;
+        reference.retain_checkpoints(&checkpoints);
+        candidate.retain_checkpoints(&checkpoints);
+    }
     let report = compare_debug_traces(
         &reference,
         &candidate,

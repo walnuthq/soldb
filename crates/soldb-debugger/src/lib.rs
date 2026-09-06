@@ -27,8 +27,9 @@ pub mod stepping;
 
 pub use condition::{Condition, ConditionContext, Evaluation};
 pub use debug_diff::{
-    capture_debug_trace, compare_debug_traces, DebugDiffMode, DebugDiffReport, DebugDifference,
-    DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent, DebugTraceSummary,
+    capture_debug_trace, compare_debug_traces, DebugCheckpoint, DebugDiffMode, DebugDiffReport,
+    DebugDifference, DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent,
+    DebugTraceSummary,
 };
 pub use soldb_ethdebug::StorageLayout;
 pub use state::{

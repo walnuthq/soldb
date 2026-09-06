@@ -46,7 +46,7 @@ fn help_and_version_are_served_by_rust_cli() {
 
 #[test]
 fn debug_diff_compares_source_level_traces() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/profile");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/debug-diff");
     let trace = fixture.join("trace.json");
     let spec = format!(
         "0x000000000000000000000000000000000000cafe:Counter:{}",
@@ -83,7 +83,7 @@ fn debug_diff_compares_source_level_traces() {
 
 #[test]
 fn debug_diff_fails_when_the_candidate_loses_source_steps() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/profile");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/debug-diff");
     let reference_trace = fixture.join("trace.json");
     let trace = fs::read_to_string(&reference_trace).expect("read trace");
     let mut candidate = serde_json::from_str::<serde_json::Value>(&trace).expect("trace JSON");
@@ -124,7 +124,7 @@ fn debug_diff_fails_when_the_candidate_loses_source_steps() {
 
 #[test]
 fn debug_diff_compares_ethdebug_with_legacy_maps() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/profile");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/debug-diff");
     let trace = fixture.join("trace.json");
     let legacy = temp_dir("debug-diff-legacy");
     let source =
@@ -178,6 +178,37 @@ fn debug_diff_compares_ethdebug_with_legacy_maps() {
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("diff JSON");
     assert_eq!(report["equivalent"], true);
+}
+
+#[test]
+fn run_exports_a_trace_that_debug_diff_can_read() {
+    let dir = temp_dir("run-save-trace");
+    let path = dir.join("trace.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "run",
+            "600160005260206000f3",
+            "--runtime",
+            "--raw-data",
+            "0x",
+            "--json",
+            "--save-trace",
+        ])
+        .arg(&path)
+        .output()
+        .expect("run runtime code");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace = serde_json::from_slice::<soldb_core::TransactionTrace>(
+        &fs::read(&path).expect("saved trace"),
+    )
+    .expect("raw transaction trace");
+    assert!(trace.success);
+    assert!(!trace.steps.is_empty());
+    assert!(trace.output.ends_with("01"));
 }
 
 #[test]

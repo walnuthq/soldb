@@ -1,0 +1,17 @@
+{
+  "tx_hash": null,
+  "from_addr": "0x0000000000000000000000000000000000000001",
+  "to_addr": "0x000000000000000000000000000000000000cafe",
+  "value": "0",
+  "input_data": "0x",
+  "gas_used": 21006,
+  "output": "0x",
+  "success": true,
+  "error": null,
+  "debug_trace_available": true,
+  "contract_address": null,
+  "steps": [
+    {"pc": 0, "op": "PUSH1", "gas": 1000, "gas_cost": 3, "depth": 0, "stack": [], "memory": null, "storage": null, "error": null},
+    {"pc": 2, "op": "ADD", "gas": 997, "gas_cost": 3, "depth": 0, "stack": [], "memory": null, "storage": null, "error": null}
+  ]
+}

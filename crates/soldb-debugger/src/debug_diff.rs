@@ -2,17 +2,19 @@
 //!
 //! Compilers need not emit the same bytecode for the same source, so comparing raw
 //! source maps or program counters says little about what a user sees. This module maps
-//! each execution through [`StepMap`], records the source stops exposed by `step`, and
-//! compares those normalized traces. The result is suitable for a test harness: it is
+//! each execution through [`StepMap::for_debug_diff`], keeping single-instruction
+//! source stops that interactive stepping can smooth over, and compares the traces.
+//! The result is suitable for a test harness: it is
 //! deterministic, serializable, and separates execution differences from debug-info
 //! differences.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use soldb_core::TransactionTrace;
+use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
+use soldb_ethdebug::{keccak256, parse_word, word_hex};
 
-use crate::{source_path_matches, ContractDebugInfo, StepMap};
+use crate::{ContractDebugInfo, StepMap};
 
 /// How strictly two source-level traces are compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +37,9 @@ pub struct DebugExecution {
     pub value: String,
     pub success: bool,
     pub output: String,
+    /// ABI-encoded arguments supplied separately from compiler-specific initcode.
+    #[serde(default)]
+    pub constructor_args: Option<String>,
 }
 
 /// Aggregate mapping quality for one side of a comparison.
@@ -47,7 +52,7 @@ pub struct DebugTraceSummary {
     pub frame_entries: usize,
 }
 
-/// One user-visible source stop in an execution.
+/// One compiler-mapped source stop in an execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugTraceEvent {
@@ -57,6 +62,9 @@ pub struct DebugTraceEvent {
     pub pc: u64,
     pub contract: String,
     pub source: String,
+    /// Keccak-256 of the exact source bytes, independent of checkout location.
+    #[serde(default)]
+    pub source_hash: Option<[u8; 32]>,
     pub line: u64,
     pub column: u64,
     pub offset: u64,
@@ -76,6 +84,73 @@ pub struct DebugTrace {
     pub execution: DebugExecution,
     pub summary: DebugTraceSummary,
     pub events: Vec<DebugTraceEvent>,
+    /// Artifact or trace inconsistencies that make a comparison inconclusive.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+/// A source stop required by a test, independent of compiler-generated entry steps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugCheckpoint {
+    pub source: String,
+    /// One-based source line.
+    pub line: u64,
+}
+
+impl DebugTrace {
+    /// Restricts comparison to explicit test checkpoints and diagnoses unreached ones.
+    ///
+    /// This is a test expectation, not source recovery: only existing mapped stops can
+    /// satisfy a checkpoint. Each side must reach every checkpoint at least once.
+    pub fn retain_checkpoints(&mut self, checkpoints: &[DebugCheckpoint]) {
+        let mut by_line = BTreeMap::<u64, Vec<(usize, String)>>::new();
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            by_line
+                .entry(checkpoint.line)
+                .or_default()
+                .push((index, normalize_source_path(&checkpoint.source)));
+        }
+        let mut reached = BTreeSet::new();
+        self.events.retain(|event| {
+            let mut matched = false;
+            for (index, source) in by_line.get(&event.line).into_iter().flatten() {
+                if source_paths_match(&event.source, source) {
+                    reached.insert(*index);
+                    matched = true;
+                }
+            }
+            matched
+        });
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            if !reached.contains(&index) {
+                self.diagnostics.push(format!(
+                    "checkpoint {}:{} was not reached",
+                    checkpoint.source, checkpoint.line
+                ));
+            }
+        }
+        self.summary.source_steps = self.events.len();
+    }
+
+    /// Supplies encoded constructor arguments when comparing creation executions.
+    ///
+    /// Their boundary cannot be recovered from source maps: initcode contains embedded
+    /// runtime code and data too. The caller must supply the known ABI payload.
+    pub fn set_constructor_args(&mut self, arguments: &str) -> SoldbResult<()> {
+        let arguments = normalize_hex_data(arguments);
+        let hex = arguments.strip_prefix("0x").unwrap_or(&arguments);
+        if !self.execution.creation
+            || !hex.len().is_multiple_of(2)
+            || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !self.execution.input.ends_with(hex)
+        {
+            return Err(SoldbError::Message(
+                "constructor arguments must be hex matching the end of creation input".to_owned(),
+            ));
+        }
+        self.execution.constructor_args = Some(arguments);
+        Ok(())
+    }
 }
 
 /// The kind of one sampled difference.
@@ -117,18 +192,74 @@ pub struct DebugDiffReport {
     pub differences_truncated: bool,
 }
 
-/// Maps one execution to the source stops a debugger exposes.
+/// Maps one execution to source stops without interactive line smoothing.
 #[must_use]
 pub fn capture_debug_trace(
     trace: &TransactionTrace,
     contracts: Vec<ContractDebugInfo>,
 ) -> DebugTrace {
-    let map = StepMap::new(trace, contracts);
+    let mut diagnostics = BTreeSet::new();
+    let source_hashes = contracts
+        .iter()
+        .enumerate()
+        .flat_map(|(index, contract)| {
+            contract
+                .source_contents
+                .iter()
+                .map(move |(source, content)| ((index, *source), keccak256(content.as_bytes())))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for contract in &contracts {
+        let mut pcs = BTreeSet::new();
+        for instruction in &contract.info.instructions {
+            if !pcs.insert(instruction.offset) {
+                diagnostics.insert(format!(
+                    "duplicate instruction at PC {} in `{}`",
+                    instruction.offset, contract.name
+                ));
+            }
+            for source in instruction.source_locations() {
+                let valid = contract
+                    .source_contents
+                    .get(&source.source_id)
+                    .is_some_and(|text| {
+                        source
+                            .offset
+                            .checked_add(source.length)
+                            .is_some_and(|end| end <= text.len() as u64)
+                    });
+                if !valid {
+                    diagnostics.insert(format!(
+                        "missing source or invalid source range at PC {} in `{}`",
+                        instruction.offset, contract.name
+                    ));
+                }
+            }
+        }
+    }
+    let map = StepMap::for_debug_diff(trace, contracts);
     let mut mapped_instructions = 0;
     let mut frame_entries = 0;
     let mut events = Vec::new();
 
     for instruction in 0..map.step_count() {
+        let step = &trace.steps[instruction];
+        if let Some(contract) = map.contract_at_step(instruction) {
+            let opcode = contract
+                .instruction_at_pc(step.pc)
+                .and_then(|inst| inst.mnemonic());
+            if !opcode.is_some_and(|opcode| opcodes_match(opcode, &step.op)) {
+                diagnostics.insert(format!(
+                    "trace opcode `{}` at PC {} disagrees with artifact `{}` in `{}`",
+                    step.op,
+                    step.pc,
+                    opcode.unwrap_or("<missing>"),
+                    contract.name
+                ));
+            }
+        } else {
+            diagnostics.insert("trace has steps without a matching contract artifact".to_owned());
+        }
         if map.line_key(instruction).is_some() {
             mapped_instructions += 1;
         }
@@ -142,9 +273,6 @@ pub fn capture_debug_trace(
         let Some(location) = map.location(instruction) else {
             continue;
         };
-        let Some(step) = trace.steps.get(instruction) else {
-            continue;
-        };
         let modifier_depth = map
             .contract_at_step(instruction)
             .and_then(|contract| contract.modifier_depth_at_pc(step.pc));
@@ -153,6 +281,9 @@ pub fn capture_debug_trace(
             pc: step.pc,
             contract: location.contract_name,
             source: normalize_source_path(&location.path),
+            source_hash: source_hashes
+                .get(&(location.key.contract, location.key.source_id))
+                .copied(),
             line: location.line,
             column: location.column,
             offset: location.offset,
@@ -169,9 +300,16 @@ pub fn capture_debug_trace(
         execution: DebugExecution {
             creation: trace.to_addr.is_none(),
             input: normalize_hex_data(&trace.input_data),
-            value: normalize_quantity(&trace.value),
+            value: match parse_word(&trace.value) {
+                Ok(value) => word_hex(&value),
+                Err(error) => {
+                    diagnostics.insert(format!("invalid call value: {error}"));
+                    trace.value.clone()
+                }
+            },
             success: trace.success,
             output: normalize_hex_data(&trace.output),
+            constructor_args: None,
         },
         summary: DebugTraceSummary {
             instructions: map.step_count(),
@@ -180,6 +318,7 @@ pub fn capture_debug_trace(
             frame_entries,
         },
         events,
+        diagnostics: diagnostics.into_iter().collect(),
     }
 }
 
@@ -193,6 +332,17 @@ pub fn compare_debug_traces(
     difference_limit: usize,
 ) -> DebugDiffReport {
     let mut diagnostics = Vec::new();
+    for (side, trace) in [("reference", reference), ("candidate", candidate)] {
+        diagnostics.extend(
+            trace
+                .diagnostics
+                .iter()
+                .map(|message| format!("{side}: {message}")),
+        );
+        if trace.events.iter().any(|event| event.source_hash.is_none()) {
+            diagnostics.push(format!("{side}: source identity is unavailable"));
+        }
+    }
     if reference.events.is_empty() {
         diagnostics.push("reference trace has no source steps".to_owned());
     }
@@ -232,7 +382,15 @@ fn compare_execution(reference: &DebugExecution, candidate: &DebugExecution) -> 
     if reference.creation != candidate.creation {
         differences.push("execution kind differs".to_owned());
     }
-    if reference.input != candidate.input {
+    if reference.creation && candidate.creation {
+        match (&reference.constructor_args, &candidate.constructor_args) {
+            (Some(left), Some(right)) if left != right => {
+                differences.push("constructor arguments differ".to_owned());
+            }
+            (Some(_), Some(_)) => {}
+            _ => differences.push("encoded constructor arguments were not supplied".to_owned()),
+        }
+    } else if reference.input != candidate.input {
         differences.push("calldata differs".to_owned());
     }
     if reference.value != candidate.value {
@@ -243,7 +401,9 @@ fn compare_execution(reference: &DebugExecution, candidate: &DebugExecution) -> 
     }
     // Creation returns compiler-specific runtime bytecode, so differing output is not a
     // behavioral mismatch between the constructors.
-    if !reference.creation && !candidate.creation && reference.output != candidate.output {
+    let deployed =
+        reference.creation && candidate.creation && reference.success && candidate.success;
+    if !deployed && reference.output != candidate.output {
         differences.push("return data differs".to_owned());
     }
     differences
@@ -309,8 +469,9 @@ fn compare_coverage(
             .find_map(|candidate_index| {
                 let right = candidate[*candidate_index];
                 (!matched_candidate.contains(candidate_index)
-                    && source_path_matches(&left.source, &right.source))
-                .then_some((*candidate_index, right))
+                    && source_paths_match(&left.source, &right.source)
+                    && left.source_hash == right.source_hash)
+                    .then_some((*candidate_index, right))
             });
         if let Some((candidate_index, _)) = right {
             matched_candidate.insert(candidate_index);
@@ -349,7 +510,13 @@ fn unique_coverage(events: &[DebugTraceEvent]) -> Vec<&DebugTraceEvent> {
     let mut keys = BTreeSet::new();
     let mut unique = Vec::new();
     for event in events {
-        if keys.insert((&event.contract, &event.source, event.line, &event.function)) {
+        if keys.insert((
+            &event.contract,
+            &event.source,
+            event.source_hash,
+            event.line,
+            &event.function,
+        )) {
             unique.push(event);
         }
     }
@@ -379,7 +546,8 @@ fn events_match(
     mode: DebugDiffMode,
 ) -> bool {
     let source_step = reference.contract == candidate.contract
-        && source_path_matches(&reference.source, &candidate.source)
+        && source_paths_match(&reference.source, &candidate.source)
+        && reference.source_hash == candidate.source_hash
         && reference.line == candidate.line
         && reference.function == candidate.function;
     if mode == DebugDiffMode::Coverage {
@@ -410,20 +578,23 @@ fn normalize_hex_data(value: &str) -> String {
     format!("0x{}", value.to_ascii_lowercase())
 }
 
-fn normalize_quantity(value: &str) -> String {
-    if let Some(value) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        let value = value.trim_start_matches('0');
-        return format!("0x{}", if value.is_empty() { "0" } else { value });
-    }
-    let value = value.trim_start_matches('0');
-    if value.is_empty() {
-        "0".to_owned()
-    } else {
-        value.to_owned()
-    }
+fn source_paths_match(left: &str, right: &str) -> bool {
+    let absolute = |path: &str| path.starts_with('/') || path.as_bytes().get(1) == Some(&b':');
+    let suffix = |long: &str, short: &str| {
+        long.strip_suffix(short)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+    };
+    left == right
+        || (absolute(left) != absolute(right) && (suffix(left, right) || suffix(right, left)))
+}
+
+fn opcodes_match(left: &str, right: &str) -> bool {
+    let canonical = |opcode| match opcode {
+        "DIFFICULTY" => "PREVRANDAO",
+        "SHA3" => "KECCAK256",
+        other => other,
+    };
+    canonical(left).eq_ignore_ascii_case(canonical(right))
 }
 
 #[cfg(test)]
@@ -434,7 +605,10 @@ mod tests {
     use soldb_core::{TraceStep, TransactionTrace};
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
-    use super::{capture_debug_trace, compare_debug_traces, DebugDiffMode, DebugDifferenceKind};
+    use super::{
+        capture_debug_trace, compare_debug_traces, DebugCheckpoint, DebugDiffMode,
+        DebugDifferenceKind,
+    };
     use crate::ContractDebugInfo;
 
     const SOURCE: &str = "contract C {\n    function f() external {\n        uint256 x = 1;\n        x++;\n    }\n}\n";
@@ -569,7 +743,10 @@ mod tests {
 
         assert!(!report.equivalent);
         assert!(!report.comparable);
-        assert_eq!(report.diagnostics.len(), 2);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message == "reference trace has no source steps"));
     }
 
     #[test]
@@ -598,5 +775,131 @@ mod tests {
             capture_debug_trace(&candidate_trace, vec![contract(&[20], &[offset], "C.sol")]);
 
         assert!(compare_debug_traces(&reference, &candidate, DebugDiffMode::Steps, 8).equivalent);
+    }
+
+    #[test]
+    fn mismatched_opcodes_and_missing_programs_cannot_pass() {
+        let offset = SOURCE.find("uint256").expect("statement");
+        let reference =
+            capture_debug_trace(&trace(&[0], "0x"), vec![contract(&[0], &[offset], "C.sol")]);
+        let mut wrong = trace(&[0], "0x");
+        wrong.steps[0].op = "INVALID".into();
+        let candidate = capture_debug_trace(&wrong, vec![contract(&[0], &[offset], "C.sol")]);
+        let report = compare_debug_traces(&reference, &candidate, DebugDiffMode::Steps, 8);
+        assert!(!report.equivalent);
+        assert!(!report.comparable);
+        assert_eq!(report.difference_count, 0);
+        assert!(report.diagnostics[0].contains("trace opcode `INVALID`"));
+    }
+
+    #[test]
+    fn source_paths_and_contents_both_participate_in_identity() {
+        let offset = SOURCE.find("uint256").expect("statement");
+        let reference = capture_debug_trace(
+            &trace(&[0], "0x"),
+            vec![contract(&[0], &[offset], "a/C.sol")],
+        );
+        let candidate = capture_debug_trace(
+            &trace(&[0], "0x"),
+            vec![contract(&[0], &[offset], "b/C.sol")],
+        );
+        for mode in [DebugDiffMode::Steps, DebugDiffMode::Coverage] {
+            assert!(!compare_debug_traces(&reference, &candidate, mode, 8).equivalent);
+        }
+        let mut changed = contract(&[0], &[offset], "a/C.sol");
+        changed
+            .source_contents
+            .insert(0, SOURCE.replace("x = 1", "x = 2"));
+        let candidate = capture_debug_trace(&trace(&[0], "0x"), vec![changed]);
+        assert!(!compare_debug_traces(&reference, &candidate, DebugDiffMode::Steps, 8).equivalent);
+    }
+
+    #[test]
+    fn constructors_compare_arguments_and_revert_data_not_initcode() {
+        let offset = SOURCE.find("uint256").expect("statement");
+        let mut left = trace(&[0], "0x6000");
+        left.to_addr = None;
+        left.input_data = "0x60000042".to_owned();
+        let mut right = left.clone();
+        right.input_data = "0x60010042".to_owned();
+        right.output = "0x6001".to_owned();
+        let mut reference = capture_debug_trace(&left, vec![contract(&[0], &[offset], "C.sol")]);
+        let mut candidate = capture_debug_trace(&right, vec![contract(&[0], &[offset], "C.sol")]);
+        assert!(!compare_debug_traces(&reference, &candidate, DebugDiffMode::Steps, 8).equivalent);
+        assert!(candidate.set_constructor_args("0x99").is_err());
+        reference.set_constructor_args("0x0042").expect("arguments");
+        candidate.set_constructor_args("0x0042").expect("arguments");
+        assert!(compare_debug_traces(&reference, &candidate, DebugDiffMode::Steps, 8).equivalent);
+        reference.execution.success = false;
+        candidate.execution.success = false;
+        assert!(
+            !compare_debug_traces(&reference, &candidate, DebugDiffMode::Steps, 8)
+                .execution_equivalent
+        );
+    }
+
+    #[test]
+    fn checkpoints_cannot_hide_an_unreached_statement() {
+        let first = SOURCE.find("uint256").expect("statement");
+        let second = SOURCE.find("x++").expect("statement");
+        let mut reference = capture_debug_trace(
+            &trace(&[0, 1], "0x"),
+            vec![contract(&[0, 1], &[first, second], "C.sol")],
+        );
+        let mut candidate =
+            capture_debug_trace(&trace(&[0], "0x"), vec![contract(&[0], &[first], "C.sol")]);
+        let checkpoints = [DebugCheckpoint {
+            source: "C.sol".to_owned(),
+            line: 4,
+        }];
+        reference.retain_checkpoints(&checkpoints);
+        candidate.retain_checkpoints(&checkpoints);
+        let report = compare_debug_traces(&reference, &candidate, DebugDiffMode::Coverage, 8);
+        assert!(!report.equivalent);
+        assert!(!report.comparable);
+        assert_eq!(reference.events.len(), 1);
+        assert_eq!(candidate.events.len(), 0);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message == "candidate: checkpoint C.sol:4 was not reached"));
+    }
+
+    #[test]
+    fn partial_artifacts_and_invalid_ranges_cannot_pass() {
+        let offset = SOURCE.find("uint256").expect("statement");
+        let reference =
+            capture_debug_trace(&trace(&[0], "0x"), vec![contract(&[0], &[offset], "C.sol")]);
+        let partial = capture_debug_trace(
+            &trace(&[0, 99], "0x"),
+            vec![contract(&[0], &[offset], "C.sol")],
+        );
+        assert!(!compare_debug_traces(&reference, &partial, DebugDiffMode::Steps, 8).comparable);
+        let invalid = capture_debug_trace(
+            &trace(&[0], "0x"),
+            vec![contract(&[0], &[SOURCE.len() + 1], "C.sol")],
+        );
+        assert!(!compare_debug_traces(&reference, &invalid, DebugDiffMode::Steps, 8).comparable);
+    }
+
+    #[test]
+    fn a_single_instruction_body_is_not_smoothed_out() {
+        let declaration = SOURCE.find("function").expect("declaration");
+        let statement = SOURCE.find("uint256").expect("statement");
+        let mut captured = capture_debug_trace(
+            &trace(&[0, 1, 2], "0x"),
+            vec![contract(
+                &[0, 1, 2],
+                &[declaration, statement, declaration],
+                "C.sol",
+            )],
+        );
+        captured.retain_checkpoints(&[DebugCheckpoint {
+            source: "C.sol".to_owned(),
+            line: 3,
+        }]);
+        assert!(captured.diagnostics.is_empty());
+        assert_eq!(captured.events.len(), 1);
+        assert_eq!(captured.events[0].pc, 1);
     }
 }

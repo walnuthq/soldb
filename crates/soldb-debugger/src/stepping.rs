@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use soldb_core::{TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{
-    function_selector, EthdebugInfo, FunctionExit, SourceLocation, StorageLayout,
+    function_selector, EthdebugInfo, FunctionExit, Instruction, SourceLocation, StorageLayout,
 };
 
 use crate::{
@@ -214,6 +214,12 @@ impl ContractDebugInfo {
     pub fn location_at_pc(&self, pc: u64) -> Option<SourceLocation> {
         let index = *self.pc_index.get(&pc)?;
         self.info.instructions.get(index)?.source_location()
+    }
+
+    /// The compiler's instruction at `pc`, using the prepared index.
+    #[must_use]
+    pub fn instruction_at_pc(&self, pc: u64) -> Option<&Instruction> {
+        self.info.instructions.get(*self.pc_index.get(&pc)?)
     }
 
     /// Legacy source-map modifier depth at `pc`, when the artifact carries it.
@@ -587,6 +593,19 @@ impl StepMap {
     /// it names, so a single `--ethdebug-dir` applies to the transaction it was passed for.
     #[must_use]
     pub fn new(trace: &TransactionTrace, contracts: Vec<ContractDebugInfo>) -> Self {
+        Self::build(trace, contracts, true)
+    }
+
+    /// Keeps single-instruction source stops when testing compiler debug information.
+    ///
+    /// Interactive stepping smooths brief line excursions. A compiler regression test
+    /// must observe them: an optimized getter can map its entire body to one `SLOAD`.
+    #[must_use]
+    pub fn for_debug_diff(trace: &TransactionTrace, contracts: Vec<ContractDebugInfo>) -> Self {
+        Self::build(trace, contracts, false)
+    }
+
+    fn build(trace: &TransactionTrace, contracts: Vec<ContractDebugInfo>, smooth: bool) -> Self {
         let mut addresses = Vec::<String>::new();
         let mut address_index = HashMap::<String, usize>::new();
         let mut intern = |address: &str| -> usize {
@@ -869,7 +888,9 @@ impl StepMap {
             reverted,
             argument_layouts,
         };
-        map.smooth_single_step_excursions();
+        if smooth {
+            map.smooth_single_step_excursions();
+        }
         map.mark_line_starts();
         map
     }
