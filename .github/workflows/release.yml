@@ -9,6 +9,16 @@ name: Release
 #
 # `soldb-wasm` sets `publish = false` and ships through `wasm-pack` instead, so
 # `cargo publish --workspace` skips it.
+#
+# A crate added to the workspace does not publish from here on its first release.
+# A trusted-publishing token cannot create a crate, so the upload fails with
+# `403 Trusted Publishing tokens do not support creating new crates`, and every
+# crate cargo had not reached yet is left unpublished. Before tagging a release
+# that introduces one, publish it once by hand from the release commit
+# (`cargo publish -p <crate>`, with a token carrying the `publish-new` scope),
+# give it the same owners as its siblings, and add its trusted-publisher config
+# on crates.io for this repository, this workflow filename, and the `release`
+# environment. `soldb-evm` was added in 0.3.0 and hit exactly this.
 
 on:
   release:
