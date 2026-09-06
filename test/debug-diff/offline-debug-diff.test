@@ -1,0 +1,20 @@
+# Compare debugger-visible source steps without a node.
+# REQUIRES: soldb
+# RUN: %soldb debug-diff --reference-trace-file %{project_root}/test/fixtures/debug-diff/trace.json --candidate-trace-file %{project_root}/test/fixtures/debug-diff/trace.json --reference-ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/debug-diff --candidate-ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/debug-diff 2>&1 | FileCheck %s --check-prefix=MATCH
+# RUN: jq '.steps[].pc = 99' %{project_root}/test/fixtures/debug-diff/trace.json > %t.trace
+# RUN: not %soldb debug-diff --reference-trace-file %{project_root}/test/fixtures/debug-diff/trace.json --candidate-trace-file %t.trace --reference-ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/debug-diff --candidate-ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/debug-diff --json | jq '{equivalent, differenceCount, kind: .differences[0].kind}' | FileCheck %s --check-prefix=DIFFERENT
+
+# MATCH: Debug Info Differential
+# MATCH: Reference: 1 source steps
+# MATCH: Candidate: 1 source steps
+# MATCH: Result: MATCH
+
+# DIFFERENT: "equivalent": false
+# DIFFERENT: "differenceCount": 1
+# DIFFERENT: "kind": "missing"
+
+# RUN: jq '.steps[].op = "INVALID"' %{project_root}/test/fixtures/debug-diff/trace.json > %t.trace
+# RUN: not %soldb debug-diff --reference-trace-file %{project_root}/test/fixtures/debug-diff/trace.json --candidate-trace-file %t.trace --reference-ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/debug-diff --candidate-ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/debug-diff --json | jq '{equivalent, comparable, diagnostic: .diagnostics[0]}' | FileCheck %s --check-prefix=INVALID
+# INVALID: "equivalent": false
+# INVALID: "comparable": false
+# INVALID: trace opcode `INVALID`

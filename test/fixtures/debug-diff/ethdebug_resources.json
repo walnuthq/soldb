@@ -1,0 +1,13 @@
+{
+  "compilation": {
+    "id": "debug-diff-fixture",
+    "compiler": {"name": "fixture", "version": "1"},
+    "sources": [{
+      "id": 0,
+      "path": "Counter.sol",
+      "contents": "contract Counter {\n    function add() external {\n        uint256 x = 1;\n    }\n}\n"
+    }]
+  },
+  "types": {},
+  "pointers": {}
+}

@@ -18,6 +18,7 @@
 //!   [`soldb_core::SoldbError::AlreadyReported`] so the exit path does not print it
 //!   twice. Failures exit with code 2.
 
+mod debug_diff;
 mod profile;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -46,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Mutex, OnceLock};
 
+use debug_diff::DebugDiffArgs;
 use profile::ProfileArgs;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -178,6 +180,8 @@ enum Command {
     Bridge(BridgeArgs),
     #[command(about = "Compile Solidity contracts with ETHDebug artifacts")]
     Compile(CompileArgs),
+    #[command(about = "Compare two source-level debugging experiences")]
+    DebugDiff(DebugDiffArgs),
     #[command(about = "Inspect compiler debug metadata")]
     Info(InfoArgs),
     #[command(name = "list-contracts", about = "List all contracts in the project")]
@@ -567,6 +571,9 @@ struct RunArgs {
     /// unless `--runtime`; it is deployed locally first, so the constructor's state is
     /// what the call sees.
     bytecode: String,
+    /// Save the complete TransactionTrace for offline debug-diff and profiling.
+    #[arg(long, value_name = "FILE")]
+    save_trace: Option<PathBuf>,
     function_signature: Option<String>,
     function_args: Vec<String>,
     /// The caller. Defaults to the first Anvil account, so a deployment lands at the
@@ -722,6 +729,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Trace(args) => trace_command(&args),
         Command::Replay(args) => replay_command(&args),
+        Command::DebugDiff(args) => debug_diff::command(&args),
         Command::Profile(args) => profile::command(&args),
         Command::Simulate(args) => simulate_command(&args),
         Command::Run(args) => run_command(&args),
@@ -1333,6 +1341,7 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         })?;
         let trace = chain.deploy(deployment)?;
         let calldata = deployment.input_data.clone();
+        save_run_trace(args, &trace)?;
         return present_simulation(&view, trace, contract_name.as_deref(), &calldata);
     }
 
@@ -1353,7 +1362,22 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
             "the call executed no instructions; there is no code at `{contract_address}`\nnote: pass creation code, or `--runtime` with the deployed code"
         )));
     }
+    save_run_trace(args, &trace)?;
     present_simulation(&view, trace, contract_name.as_deref(), &calldata)
+}
+
+/// Writes the raw trace format used by offline consumers, independently of display mode.
+fn save_run_trace(args: &RunArgs, trace: &TransactionTrace) -> SoldbResult<()> {
+    if let Some(path) = &args.save_trace {
+        let output = soldb_serializer::trace_to_json(trace)?;
+        fs::write(path, output).map_err(|error| {
+            soldb_core::SoldbError::Message(format!(
+                "failed to save trace `{}`: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Reads bytecode from a file when `source` names one, otherwise treats it as hex.

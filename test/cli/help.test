@@ -4,6 +4,7 @@
 # RUN: %soldb --version 2>&1 | FileCheck %s --check-prefix=VERSION
 # RUN: %soldb trace --help 2>&1 | FileCheck %s --check-prefix=TRACE
 # RUN: %soldb profile --help 2>&1 | FileCheck %s --check-prefix=PROFILE
+# RUN: %soldb debug-diff --help 2>&1 | FileCheck %s --check-prefix=DEBUG-DIFF
 # RUN: %soldb simulate --help 2>&1 | FileCheck %s --check-prefix=SIMULATE
 # RUN: %soldb list-events --help 2>&1 | FileCheck %s --check-prefix=EVENTS
 # RUN: %soldb list-contracts --help 2>&1 | FileCheck %s --check-prefix=CONTRACTS
@@ -15,6 +16,7 @@
 # MAIN-DAG: list-events
 # MAIN-DAG: trace
 # MAIN-DAG: profile
+# MAIN-DAG: debug-diff
 # MAIN-DAG: simulate
 
 # VERSION: soldb {{[0-9]+\.[0-9]+\.[0-9]+}}
@@ -34,6 +36,14 @@
 # PROFILE-DAG: --json
 # PROFILE-DAG: --folded
 # PROFILE-DAG: --flamegraph
+
+# DEBUG-DIFF-DAG: Usage:
+# DEBUG-DIFF-DAG: --reference-trace-file
+# DEBUG-DIFF-DAG: --candidate-trace-file
+# DEBUG-DIFF-DAG: --reference-ethdebug-dir
+# DEBUG-DIFF-DAG: --candidate-ethdebug-dir
+# DEBUG-DIFF-DAG: --mode
+# DEBUG-DIFF-DAG: --json
 
 # SIMULATE-DAG: Usage:
 # SIMULATE-DAG: --from

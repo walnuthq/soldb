@@ -16,6 +16,7 @@ NC='\033[0m'
 # Parse command line arguments
 RUN_TRACE_TESTS=true
 RUN_PROFILE_TESTS=true
+RUN_DEBUG_DIFF_TESTS=true
 RUN_SIMULATE_TESTS=true
 RUN_RUN_TESTS=true
 RUN_EVENTS_TESTS=true
@@ -36,6 +37,7 @@ for arg in "$@"; do
             ;;
         --trace-only)
             RUN_PROFILE_TESTS=false
+            RUN_DEBUG_DIFF_TESTS=false
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
@@ -44,6 +46,16 @@ for arg in "$@"; do
             ;;
         --profile-only)
             RUN_TRACE_TESTS=false
+            RUN_DEBUG_DIFF_TESTS=false
+            RUN_SIMULATE_TESTS=false
+            RUN_EVENTS_TESTS=false
+            RUN_CLI_TESTS=false
+            RUN_RUN_TESTS=false
+            shift
+            ;;
+        --debug-diff-only)
+            RUN_TRACE_TESTS=false
+            RUN_PROFILE_TESTS=false
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
@@ -53,6 +65,7 @@ for arg in "$@"; do
         --simulate-only)
             RUN_TRACE_TESTS=false
             RUN_PROFILE_TESTS=false
+            RUN_DEBUG_DIFF_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
             RUN_RUN_TESTS=false
@@ -61,6 +74,7 @@ for arg in "$@"; do
         --events-only)
             RUN_TRACE_TESTS=false
             RUN_PROFILE_TESTS=false
+            RUN_DEBUG_DIFF_TESTS=false
             RUN_SIMULATE_TESTS=false
             RUN_CLI_TESTS=false
             RUN_RUN_TESTS=false
@@ -69,6 +83,7 @@ for arg in "$@"; do
         --run-only)
             RUN_TRACE_TESTS=false
             RUN_PROFILE_TESTS=false
+            RUN_DEBUG_DIFF_TESTS=false
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
@@ -77,6 +92,7 @@ for arg in "$@"; do
         --cli-only)
             RUN_TRACE_TESTS=false
             RUN_PROFILE_TESTS=false
+            RUN_DEBUG_DIFF_TESTS=false
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_RUN_TESTS=false
@@ -97,6 +113,7 @@ for arg in "$@"; do
             echo "Options:"
             echo "  --trace-only       Run only trace tests (from test/trace/)"
             echo "  --profile-only     Run only profile tests (from test/profile/)"
+            echo "  --debug-diff-only  Run only debug-diff tests (from test/debug-diff/)"
             echo "  --simulate-only    Run only simulate tests (from test/simulate/)"
             echo "  --run-only         Run only run tests (from test/run/)"
             echo "  --events-only      Run only events tests (from test/events/)"
@@ -110,6 +127,7 @@ for arg in "$@"; do
             echo "Test Structure:"
             echo "  test/trace/        Contains trace command tests"
             echo "  test/profile/      Contains profile command tests"
+            echo "  test/debug-diff/   Contains debug-info differential tests"
             echo "  test/simulate/     Contains simulate command tests"
             echo "  test/run/          Contains run command tests (no node needed)"
             echo "  test/events/       Contains list-events command tests"
@@ -126,6 +144,7 @@ for arg in "$@"; do
             echo "  $0                           # Run all tests"
             echo "  $0 --trace-only              # Run only trace tests"
             echo "  $0 --profile-only            # Run only profile tests"
+            echo "  $0 --debug-diff-only         # Run only debug-info differential tests"
             echo "  $0 --simulate-only           # Run only simulate tests"
             echo "  $0 --events-only             # Run only events tests"
             echo "  $0 -v                        # Run all tests with verbose output"
@@ -262,6 +281,7 @@ echo -e "${GREEN}=== SolDB Test Suite ===${NC}"
 echo -e "${GREEN}Organized test structure:${NC}"
 echo -e "${GREEN}  - test/trace/     : Trace command tests${NC}"
 echo -e "${GREEN}  - test/profile/   : Profile command tests${NC}"
+echo -e "${GREEN}  - test/debug-diff/: Debug-info differential tests${NC}"
 echo -e "${GREEN}  - test/simulate/  : Simulate command tests${NC}"
 echo -e "${GREEN}  - test/run/       : Run command tests (local chain, no node)${NC}"
 echo -e "${GREEN}  - test/events/    : List-events command tests${NC}"
@@ -545,6 +565,17 @@ if [ "$RUN_PROFILE_TESTS" = true ]; then
         "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/profile"
     else
         echo -e "${YELLOW}Warning: profile directory not found${NC}"
+    fi
+fi
+
+# Run source-level debug-info differentials. These fixtures are hermetic and use
+# serialized traces, but share the lit configuration with the rest of the suite.
+if [ "$RUN_DEBUG_DIFF_TESTS" = true ]; then
+    echo -e "${YELLOW}Running debug-info differential tests...${NC}"
+    if [ -d "${SCRIPT_DIR}/debug-diff" ]; then
+        "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/debug-diff"
+    else
+        echo -e "${YELLOW}Warning: debug-diff directory not found${NC}"
     fi
 fi
 

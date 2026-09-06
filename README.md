@@ -82,6 +82,20 @@ soldb profile <tx_hash> --backend replay \
 See [docs/profiling.md](docs/profiling.md) for captured traces, folded stacks,
 multi-contract attribution, and the reusable library API.
 
+Compare the source-level debugging experience of two compiler outputs:
+
+```bash
+soldb debug-diff \
+  --reference-tx <solc_tx_hash> \
+  --candidate-tx <candidate_tx_hash> \
+  --reference-ethdebug-dir <solc_address>:<contract>:<solc_out> \
+  --candidate-ethdebug-dir <candidate_address>:<contract>:<candidate_out> \
+  --rpc http://localhost:8545
+```
+
+See [docs/debug-diff.md](docs/debug-diff.md) for strict source-step, exact-span,
+and optimization-tolerant coverage comparisons.
+
 ---
 
 ## Example: Debugging a Transaction
@@ -171,6 +185,18 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
 
 ---
 
+## Debug Information Differentials
+
+`soldb debug-diff` executes a Dexter-style check of what a debugger observes.
+It maps two EVM traces through their compiler artifacts and compares normalized
+source steps instead of raw bytecode offsets. ETHDebug and legacy source maps
+can be compared in any combination.
+
+See the [debug-info differential guide](docs/debug-diff.md) for CI and offline
+usage.
+
+---
+
 ## Features
 
 - ETHDebug-first source debugging with legacy `srcmap`/`srcmap-runtime` fallback
@@ -184,6 +210,7 @@ See the [profiling guide](docs/profiling.md) for usage and integration details.
   naming stack words that may not be the parameters
 - Full transaction traces with internal calls & decoded parameters
 - Dynamic gas profiles by contract, function, source line, opcode, and instruction
+- Differential source-step, source-span, and coverage checks for compiler debug info
 - Folded-stack and interactive SVG flame graph output
 - Transaction simulation with arbitrary calldata (including structs & tuples), through
   `debug_traceCall` or replayed locally as a fork of the chain at any block and transaction index

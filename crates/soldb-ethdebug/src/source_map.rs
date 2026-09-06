@@ -437,6 +437,7 @@ fn source_context(
     contract_name: &str,
 ) -> SoldbResult<Option<Value>> {
     let mut context = serde_json::Map::new();
+    context.insert("modifierDepth".to_owned(), json!(entry.modifier_depth));
     if let Some(code) = source_code(
         entry,
         source_count,
@@ -455,7 +456,7 @@ fn source_context(
         }
         _ => {}
     }
-    Ok((!context.is_empty()).then_some(Value::Object(context)))
+    Ok(Some(Value::Object(context)))
 }
 
 /// The `code` part of an entry's context: the source range it maps to, if any.
@@ -795,10 +796,11 @@ mod tests {
             .expect("runtime program");
         let at = |pc: u64| program.info.instruction_at_pc(pc).expect("instruction");
         assert_eq!(at(0).function_invocations().len(), 1);
+        assert_eq!(at(0).modifier_depth(), Some(0));
         assert_eq!(at(0).function_exit(), None);
         assert!(at(2).function_invocations().is_empty());
         assert_eq!(at(2).function_exit(), Some(FunctionExit::Return));
-        // Generated code without a range has no context when it does not jump.
+        // Generated code without a range still retains its modifier depth.
         assert!(at(4).source_location().is_none());
         assert!(at(4).function_invocations().is_empty());
     }
