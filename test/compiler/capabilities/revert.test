@@ -1,0 +1,56 @@
+# REQUIRES: soldb
+# RUN: rm -rf %t
+# RUN: mkdir -p %t/solar %t/solc %t/ethdebug
+# RUN: %if compiler-solar %{ cd %S/.. && %solar ControlFlow.sol --emit=abi,bin,bin-runtime,ethdebug,ethdebug-runtime,srcmap,srcmap-runtime --out-dir %t/solar > %t/solar/compile.stdout 2> %t/solar/compile.stderr %}
+# RUN: %if compiler-solc %{ cd %S/.. && %solc ControlFlow.sol --bin --abi --combined-json abi,bin,bin-runtime,srcmap,srcmap-runtime -o %t/solc > %t/solc/compile.stdout 2> %t/solc/compile.stderr %}
+# RUN: %if compiler-solar %{ cp %S/../ControlFlow.sol %t/solar/ControlFlow.sol %}
+# RUN: %if compiler-solc %{ cp %S/../ControlFlow.sol %t/solc/ControlFlow.sol %}
+# RUN: %if compiler-solar %{ jq -er '.contracts["ControlFlow.sol:ControlFlow"].bin | strings | select(length > 0)' %t/solar/combined.json > %t/solar/ControlFlow.bin %}
+# RUN: %if compiler-solar %{ jq -e '.contracts["ControlFlow.sol:ControlFlow"].abi' %t/solar/combined.json > %t/solar/ControlFlow.abi %}
+# RUN: %if compiler-solar %{ jq -e '.ethdebug' %t/solar/combined.json > %t/ethdebug/ethdebug_resources.json %}
+# RUN: %if compiler-solar %{ jq -e '.contracts["ControlFlow.sol:ControlFlow"].ethdebug' %t/solar/combined.json > %t/ethdebug/ControlFlow_ethdebug.json %}
+# RUN: %if compiler-solar %{ jq -e '.contracts["ControlFlow.sol:ControlFlow"]["ethdebug-runtime"]' %t/solar/combined.json > %t/ethdebug/ControlFlow_ethdebug-runtime.json %}
+# RUN: jq -eRs --arg source ControlFlow.sol --argjson names '["require"]' -f %S/../checkpoints.jq %S/../ControlFlow.sol > %t/checkpoints.json
+
+# Check each compiler's execution before comparing debug information.
+# RUN: %if compiler-solar %{ %soldb run %t/solar/ControlFlow.bin "checked(uint256)" "0" --save-trace %t/solar.trace.json --json > %t/solar.run.json %}
+# RUN: %if compiler-solc %{ %soldb run %t/solc/ControlFlow.bin "checked(uint256)" "0" --save-trace %t/solc.trace.json --json > %t/solc.run.json %}
+# RUN: %if compiler-solar %{ jq -c '.success' %t/solar.trace.json | FileCheck %s --check-prefix=EXEC %}
+# RUN: %if compiler-solc %{ jq -c '.success' %t/solc.trace.json | FileCheck %s --check-prefix=EXEC %}
+# EXEC: false
+
+# Legacy maps and ETHDebug must agree on the same machine trace.
+# RUN: %if compiler-solar %{ %soldb debug-diff --reference-trace-file %t/solar.trace.json --candidate-trace-file %t/solar.trace.json --reference-ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/solar --candidate-ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/ethdebug --mode coverage --json > %t/formats.diff.json %}
+# RUN: %if compiler-solar %{ jq -c '[.comparable, .equivalent]' %t/formats.diff.json | FileCheck %s --check-prefix=DIFF %}
+
+# Explicit checkpoints must survive in both compilers, even if both formats lost them.
+# RUN: %if compiler-diff %{ %soldb debug-diff --reference-trace-file %t/solc.trace.json --candidate-trace-file %t/solar.trace.json --reference-ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/solc --candidate-ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/ethdebug --mode coverage --checkpoints-file %t/checkpoints.json --json > %t/solc.diff.json %}
+# RUN: %if compiler-diff %{ jq -c '[.comparable, .equivalent]' %t/solc.diff.json | FileCheck %s --check-prefix=DIFF %}
+# DIFF: [true,true]
+
+# Both formats must attribute gas and produce a flamegraph.
+# RUN: %if compiler-solar %{ %soldb profile --trace-file %t/solar.trace.json --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/ethdebug --flamegraph %t/ethdebug.svg --json > %t/ethdebug.profile.json %}
+# RUN: %if compiler-solar %{ %soldb profile --trace-file %t/solar.trace.json --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/solar --flamegraph %t/source-maps.svg --json > %t/source-maps.profile.json %}
+# RUN: %if compiler-solar %{ jq -c '[.totals.unmappedGas, (.totals.sourceGas > 0)]' %t/ethdebug.profile.json | FileCheck %s --check-prefix=PROFILE %}
+# RUN: %if compiler-solar %{ jq -c '[.totals.unmappedGas, (.totals.sourceGas > 0)]' %t/source-maps.profile.json | FileCheck %s --check-prefix=PROFILE %}
+# PROFILE: [0,true]
+# RUN: %if compiler-solar %{ FileCheck %s --check-prefix=SVG < %t/ethdebug.svg %}
+# RUN: %if compiler-solar %{ FileCheck %s --check-prefix=SVG < %t/source-maps.svg %}
+# SVG: <svg
+
+# Required checkpoints are checked even when only one compiler is selected.
+# RUN: %if compiler-solc %{ %soldb debug-diff --reference-trace-file %t/solc.trace.json --candidate-trace-file %t/solc.trace.json --reference-ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/solc --candidate-ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/solc --mode coverage --checkpoints-file %t/checkpoints.json --json > %t/solc.checkpoints.json %}
+# RUN: %if compiler-solc %{ jq -c '[.executionEquivalent, .comparable, .equivalent]' %t/solc.checkpoints.json | FileCheck %s --check-prefix=CHECK %}
+# RUN: %if compiler-solar %{ %soldb debug-diff --reference-trace-file %t/solar.trace.json --candidate-trace-file %t/solar.trace.json --reference-ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/ethdebug --candidate-ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/ethdebug --mode coverage --checkpoints-file %t/checkpoints.json --json > %t/solar.checkpoints.json %}
+# RUN: %if compiler-solar %{ jq -c '[.executionEquivalent, .comparable, .equivalent]' %t/solar.checkpoints.json | FileCheck %s --check-prefix=CHECK %}
+# CHECK: [true,true,true]
+
+# Legacy solc artifacts use the same profile and flamegraph checks.
+# RUN: %if compiler-solc %{ %soldb profile --trace-file %t/solc.trace.json --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:ControlFlow:%t/solc --flamegraph %t/solc.svg --json > %t/solc.profile.json %}
+# RUN: %if compiler-solc %{ jq -c '[.totals.unmappedGas, (.totals.sourceGas > 0)]' %t/solc.profile.json | FileCheck %s --check-prefix=PROFILE %}
+# RUN: %if compiler-solc %{ FileCheck %s --check-prefix=SVG < %t/solc.svg %}
+
+# Gas accounting is independent of compiler-specific source attribution.
+# RUN: %if compiler-solc %{ jq -c '[.totals.unmappedGas, (.totals.programGas > 0), (.totals.sourceGas + .totals.sourcelessGas == .totals.programGas), (.totals.programGas == .totals.stepGas)]' %t/solc.profile.json | FileCheck %s --check-prefix=ACCOUNTING %}
+# RUN: %if compiler-solar %{ jq -c '[.totals.unmappedGas, (.totals.programGas > 0), (.totals.sourceGas + .totals.sourcelessGas == .totals.programGas), (.totals.programGas == .totals.stepGas)]' %t/ethdebug.profile.json | FileCheck %s --check-prefix=ACCOUNTING %}
+# ACCOUNTING: [0,true,true,true]

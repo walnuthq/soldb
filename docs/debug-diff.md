@@ -113,3 +113,73 @@ The library entry points are `soldb_debugger::capture_debug_trace` and
 `soldb_debugger::compare_debug_traces`. They take already loaded
 `TransactionTrace` and `ContractDebugInfo` values and perform no file or network
 I/O.
+
+## Shared Compiler Tests
+
+CI builds `paradigmxyz/solar` at `main` and exercises its CLI debug artifacts
+through local REVM, debug comparisons, and both profiling formats. The solc CI
+jobs run the same test files against their selected compiler. One Solidity
+fixture and one `.test` file cover each behavior, with common FileCheck checks
+and compiler-specific prefixes only for genuine differences.
+The job runs on pull requests, pushes to `main`, the daily schedule, and manual
+dispatch. It is non-blocking, like the solc development job: upstream compiler
+changes can expose gaps independently of a debugger change. Failing steps stay
+visible, and the job summary lists failed checks.
+
+Run the same lit/FileCheck suite locally with a Solar binary supporting
+`--emit=ethdebug,ethdebug-runtime,srcmap,srcmap-runtime`, solc 0.8.36,
+`lit`, `jq`, and LLVM's `FileCheck` on `PATH`:
+
+```console
+cargo build --bin soldb
+export SOLAR=/path/to/solar
+export SOLC_PATH=/path/to/solc
+for optimization in none gas size; do
+  lit -v -j2 test/compiler --param compiler=both --param optimization="$optimization" || break
+done
+```
+
+For independent runs, use `--param compiler=solar` or `--param compiler=solc`.
+Only the selected compiler is required. Each mode checks runtime results,
+explicit source checkpoints, gas attribution, and flamegraphs; `both` also
+compares the compiler outputs. The default is `compiler=both`.
+
+On macOS, Homebrew's FileCheck may need
+`export PATH="$(brew --prefix llvm)/bin:$PATH"`. Set `SOLDB_BIN` to override
+`target/debug/soldb`. No node, deployment script, or generated lit site
+configuration is needed.
+
+The `baseline/` tests cover creation, arithmetic, branching, and storage
+reads. The `capabilities/` tests cover modifiers, loops, internal calls,
+`require`, and dynamic calldata. Each `.test` file runs the CLI directly and
+uses jq/FileCheck to assert runtime results, cross-format debug equivalence,
+solc checkpoint coverage, source-attributed gas, and flamegraph output.
+Both compilers run directly in the lit `RUN` lines: Solar uses `--emit`,
+and solc uses `--combined-json`, `--bin`, and `--abi`. Their legacy
+`combined.json` files are consumed as emitted, without format conversion.
+`jq` extracts Solar's ETHDebug programs/resources into separate files and
+selects named source checkpoints. There is no Python preparation adapter.
+Compilation diagnostics remain beside the artifacts, and a failed compiler
+or missing requested JSON field stops the test.
+
+There is no expected-failure allowlist. Positive checkpoint tests require the
+specified stops in both compilers: two debug formats dropping the same
+statement cannot make the comparison pass. The gas-mode `bytes-length` case
+instead verifies an intentional unknown location after return-tail sharing
+and fallthrough elimination. It requires failed comparisons with the exact
+missing-source diagnostics, correct execution, and sourceless legacy profiling.
+ETHDebug may retain alternatives the profiler can resolve with compiler-authored
+function identity; any attributed source gas must belong to the executed
+checkpoint. Both profiles must account for all program gas. The `none` and
+`size` versions still require the checkpoint. This does not change codegen or
+relax `debug-diff`'s handling of empty traces. These are source-coverage checks,
+not a claim of exact function-frame, variable-location, or full span parity.
+
+The `solar-main-compatibility` artifact contains the exact Solar revision,
+compiler versions, CLI artifacts and diagnostics, REVM traces, comparison
+reports, profiles, SVGs, and lit results with the failing commands. Local output
+defaults to `target/compiler-lit/<compiler>/<optimization>`; change its parent with
+`--param output=/path/to/results`. CI still tracks main, so compiler fixes
+and the debug-output CLI must land there before its run becomes green.
+This suite is separate from the solc-specific live-node tests and does not imply that
+`soldb compile --solc /path/to/solar` accepts Solar's CLI.

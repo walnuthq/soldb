@@ -5,8 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # The solc development branch moves without us, so check against it on a schedule as
-  # well as per pull request.
+  # Moving compiler branches need scheduled checks as well as per-PR checks.
   schedule:
     - cron: "0 5 * * *"
   workflow_dispatch:
@@ -175,6 +174,15 @@ jobs:
 
       - name: Build Rust binaries
         run: cargo build --bin soldb --bin soldb-dap-server
+
+      - name: Run shared compiler tests
+        run: |
+          compiler_lit_status=0
+          for optimization in none gas size; do
+            lit -v -j2 test/compiler --param compiler=solc \
+              --param optimization="$optimization" || compiler_lit_status=1
+          done
+          exit "$compiler_lit_status"
 
       - name: Run lit tests
         run: |
@@ -348,6 +356,15 @@ jobs:
       - name: Build Rust binaries
         run: cargo build --bin soldb --bin soldb-dap-server
 
+      - name: Run shared compiler tests
+        run: |
+          compiler_lit_status=0
+          for optimization in none gas size; do
+            lit -v -j2 test/compiler --param compiler=solc \
+              --param optimization="$optimization" || compiler_lit_status=1
+          done
+          exit "$compiler_lit_status"
+
       - name: Run lit tests
         run: |
           set -euo pipefail
@@ -367,6 +384,110 @@ jobs:
           done
 
           RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh
+
+  solar-main:
+    # Like solc develop, this is an upstream compatibility signal, not a release gate.
+    # Keep real failures red and upload their reproducers; do not bless missing metadata.
+    name: debug and profile (Solar main)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out Solar main
+        uses: actions/checkout@v4
+        with:
+          repository: paradigmxyz/solar
+          ref: main
+          path: target/solar-main
+          persist-credentials: false
+
+      - name: Record the exact compiler revision
+        run: |
+          mkdir -p target/solar-ci
+          git -C target/solar-main rev-parse HEAD | tee target/solar-ci/solar-commit.txt
+          echo "Solar main: $(cat target/solar-ci/solar-commit.txt)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version > target/solar-ci/rust-version.txt
+
+      - name: Install lit and FileCheck
+        run: |
+          python3 -m pip install lit
+          sudo apt-get update
+          sudo apt-get install -y llvm jq
+          llvm-config --bindir >> "$GITHUB_PATH"
+
+      - name: Install the pinned solc oracle
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl --retry 3 -fsSL -o "$HOME/.local/bin/solc-0.8.36" \
+            https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.36+commit.8a079791
+          echo "c8d35afdddc3cd2743ee88b8f25e0fecd16e2bdd5f2120f37e52cd9cc45ae0e6  $HOME/.local/bin/solc-0.8.36" | sha256sum -c -
+          chmod +x "$HOME/.local/bin/solc-0.8.36"
+          echo "SOLC_PATH=$HOME/.local/bin/solc-0.8.36" >> "$GITHUB_ENV"
+          echo "SOLAR=$GITHUB_WORKSPACE/target/solar-main/target/debug/solar" >> "$GITHUB_ENV"
+
+      - name: Build Solar
+        id: build-solar
+        working-directory: target/solar-main
+        run: |
+          set -euo pipefail
+          cargo build --locked -p solar-compiler --bin solar 2>&1 | tee "$GITHUB_WORKSPACE/target/solar-ci/solar-build.log"
+
+      - name: Build the debugger
+        id: build-soldb
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin soldb 2>&1 | tee target/solar-ci/soldb-build.log
+          target/debug/soldb --version > target/solar-ci/soldb-version.txt
+
+      - name: Run debug and profile lit tests
+        run: |
+          "$SOLAR" --version > target/solar-ci/solar-version.txt
+          "$SOLC_PATH" --version > target/solar-ci/solc-version.txt
+          solar_lit_status=0
+          for optimization in none gas size; do
+            lit -v -j2 test/compiler --param compiler=both --param optimization="$optimization" \
+              --param output="$GITHUB_WORKSPACE/target/solar-ci/lit" \
+              -o "target/solar-ci/$optimization.json" || solar_lit_status=1
+          done
+          exit "$solar_lit_status"
+
+      - name: Summarize compatibility results
+        if: always()
+        run: |
+          for optimization in none gas size; do
+            echo "### Solar / $optimization" >> "$GITHUB_STEP_SUMMARY"
+            report="target/solar-ci/$optimization.json"
+            if test -f "$report"; then
+              jq -r '.tests | group_by(.code)[] | "\(.[0].code): \(length)"' "$report" >> "$GITHUB_STEP_SUMMARY"
+              jq -r '.tests[] | select(.code != "PASS") | "- \(.name): \(.code)"' "$report" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "No test report produced; see the build logs." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: solar-main-compatibility
+          path: target/solar-ci/
+          retention-days: 14
+          if-no-files-found: warn
 
   coverage:
     name: coverage

@@ -193,7 +193,9 @@ source steps instead of raw bytecode offsets. ETHDebug and legacy source maps
 can be compared in any combination.
 
 See the [debug-info differential guide](docs/debug-diff.md) for CI and offline
-usage.
+usage. A non-blocking CI job also tracks Solar `main`, testing its ETHDebug and
+legacy source maps through local debugging and profiling, with saved failure
+reports and flamegraphs.
 
 ---
 

@@ -333,6 +333,26 @@ CI runs the lit suite against three compilers, for three different reasons:
 | solc 0.8.36 (pinned) | the modern `--experimental --ethdebug-program …` generation |
 | solc `develop`, built from source | where ETHDebug output changes first |
 
+A separate non-blocking `solar-main` job builds `paradigmxyz/solar@main` and
+runs `lit test/compiler --param compiler=both` over CLI debug artifacts in local
+REVM. The solc jobs run the same files with `--param compiler=solc`, without
+requiring Solar. Use `--param compiler=solar` for Solar-only coverage. This
+standalone lit/FileCheck suite needs no node or generated site configuration.
+Pass `--param optimization=none`, `gas`, or `size`; CI runs all three. Missing
+selected compilers and missing required source checkpoints fail, with no
+expected-failure allowlist. Keep shared Solidity fixtures and `.test` files for
+both compilers, with feature-guarded `RUN` lines and common FileCheck assertions.
+Use compiler-specific check prefixes only for genuine differences. Each compiler
+must check explicit checkpoints and profiles even when selected on its own.
+Tests for intentionally unknown locations must assert the failed comparison's
+specific diagnostics and sourceless profiling, never skip tests or accept arbitrary
+failures. Keep compilation and CLI assertions in the `.test` RUN lines. Use
+Solar's `--emit` and solc's `--combined-json` outputs directly; `jq` extracts
+ETHDebug program/resource files and selects named checkpoints. Do not add a
+Python compiler-preparation adapter. The Solar binary must support the debug
+output selectors; CI still tracks main and does not fall back to Standard JSON.
+See `docs/debug-diff.md` for local commands and retained reports.
+
 The `develop` job builds `argotorg/solidity@develop`, caches the binary by commit, and is
 **non-blocking** (`continue-on-error: true`): that branch moves without us, so a break
 there is an early warning, not a reason to hold up a pull request. It also runs on a daily

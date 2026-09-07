@@ -1,0 +1,13 @@
+# REQUIRES: soldb
+
+# Names select source lines in the requested order, including CRLF and lone CR.
+# RUN: jq -nr '"// café\r\ncontract C {\r\n  // debug-check: first\r  // debug-check: second\n}"' | jq -ecRs --arg source C.sol --argjson names '["second","first"]' -f %S/checkpoints.jq | FileCheck %s --check-prefix=LINES
+# LINES: [{"source":"C.sol","line":4},{"source":"C.sol","line":3}]
+
+# Do not silently drop misspelled, duplicate, or empty checkpoint names.
+# RUN: not jq -eRs --arg source Arithmetic.sol --argjson names '["missing"]' -f %S/checkpoints.jq %S/Arithmetic.sol 2>&1 | FileCheck %s --check-prefix=MISSING
+# MISSING: unknown checkpoint: missing
+# RUN: jq -nr '"// debug-check: duplicate\n// debug-check: duplicate"' | not jq -eRs --arg source C.sol --argjson names '["duplicate"]' -f %S/checkpoints.jq 2>&1 | FileCheck %s --check-prefix=DUPLICATE
+# DUPLICATE: duplicate checkpoint name
+# RUN: jq -nr '"// debug-check:   "' | not jq -eRs --arg source C.sol --argjson names '["empty"]' -f %S/checkpoints.jq 2>&1 | FileCheck %s --check-prefix=EMPTY
+# EMPTY: empty checkpoint name
