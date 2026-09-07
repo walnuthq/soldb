@@ -28,7 +28,7 @@ config.test_format = lit.formats.ShTest(True, **sh_test_options)
 # suffixes: A list of file extensions to treat as test files.
 config.suffixes = ['.test']
 # The node-free compiler compatibility suite has its own tools and configuration.
-config.excludes = ['solar']
+config.excludes = ['compiler']
 
 # test_source_root: The root path where tests are located.
 config.test_source_root = os.path.dirname(__file__)

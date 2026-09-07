@@ -35,9 +35,6 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
 
-      - name: Test the Solar artifact adapter
-        run: python3 -m unittest discover -s test/solar -p '*_test.py' -v
-
   wasm:
     # The library crates and the `soldb-wasm` bindings must keep building for
     # `wasm32-unknown-unknown`. Linting on the target catches code that only compiles
@@ -177,6 +174,15 @@ jobs:
 
       - name: Build Rust binaries
         run: cargo build --bin soldb --bin soldb-dap-server
+
+      - name: Run shared compiler tests
+        run: |
+          compiler_lit_status=0
+          for optimization in none gas size; do
+            lit -v -j2 test/compiler --param compiler=solc \
+              --param optimization="$optimization" || compiler_lit_status=1
+          done
+          exit "$compiler_lit_status"
 
       - name: Run lit tests
         run: |
@@ -350,6 +356,15 @@ jobs:
       - name: Build Rust binaries
         run: cargo build --bin soldb --bin soldb-dap-server
 
+      - name: Run shared compiler tests
+        run: |
+          compiler_lit_status=0
+          for optimization in none gas size; do
+            lit -v -j2 test/compiler --param compiler=solc \
+              --param optimization="$optimization" || compiler_lit_status=1
+          done
+          exit "$compiler_lit_status"
+
       - name: Run lit tests
         run: |
           set -euo pipefail
@@ -442,9 +457,11 @@ jobs:
 
       - name: Run debug and profile lit tests
         run: |
+          "$SOLAR" --version > target/solar-ci/solar-version.txt
+          "$SOLC_PATH" --version > target/solar-ci/solc-version.txt
           solar_lit_status=0
           for optimization in none gas size; do
-            lit -v -j2 test/solar --param optimization="$optimization" \
+            lit -v -j2 test/compiler --param compiler=both --param optimization="$optimization" \
               --param output="$GITHUB_WORKSPACE/target/solar-ci/lit" \
               -o "target/solar-ci/$optimization.json" || solar_lit_status=1
           done
