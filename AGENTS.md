@@ -337,8 +337,11 @@ A separate non-blocking `solar-main` job builds `paradigmxyz/solar@main` and
 runs `lit test/solar` over Standard JSON artifacts in local REVM. This standalone
 lit/FileCheck suite needs no node or generated site configuration. Pass
 `--param optimization=none`, `gas`, or `size`; CI runs all three. Missing tools
-and missing source checkpoints fail, with no expected-failure allowlist. Keep
-CLI assertions in `.test` files; `prepare.py` only compiles and adapts artifacts.
+and missing required source checkpoints fail, with no expected-failure allowlist.
+Tests for intentionally unknown locations must assert the failed comparison's
+specific diagnostics and sourceless profiling, never skip tests or accept arbitrary
+failures. Keep CLI assertions in `.test` files; `prepare.py` only compiles and
+adapts artifacts.
 See `docs/debug-diff.md` for local commands and retained reports. The adapter's
 unit tests run with `python3 -m unittest discover -s test/solar -p '*_test.py'`.
 

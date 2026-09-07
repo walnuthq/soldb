@@ -44,3 +44,4 @@ config.substitutions = [
     ("FileCheck", filecheck),
 ]
 config.available_features.add("soldb")
+config.available_features.add(f"optimization-{optimization}")

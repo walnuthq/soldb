@@ -147,10 +147,17 @@ uses jq/FileCheck to assert runtime results, cross-format debug equivalence,
 solc checkpoint coverage, source-attributed gas, and flamegraph output.
 Python only prepares Standard JSON artifacts and named source checkpoints.
 
-There is no expected-failure allowlist. Compiler errors and missing source
-steps fail the test while independent cases continue. In particular,
-checkpoints must appear in both compilers: two debug formats dropping the
-same statement cannot make the test pass. These are source-coverage checks,
+There is no expected-failure allowlist. Positive checkpoint tests require the
+specified stops in both compilers: two debug formats dropping the same
+statement cannot make the comparison pass. The gas-mode `bytes-length` case
+instead verifies an intentional unknown location after return-tail sharing
+and fallthrough elimination. It requires failed comparisons with the exact
+missing-source diagnostics, correct execution, and sourceless legacy profiling.
+ETHDebug may retain alternatives the profiler can resolve with compiler-authored
+function identity; any attributed source gas must belong to the executed
+checkpoint. Both profiles must account for all program gas. The `none` and
+`size` versions still require the checkpoint. This does not change codegen or
+relax `debug-diff`'s handling of empty traces. These are source-coverage checks,
 not a claim of exact function-frame, variable-location, or full span parity.
 
 The `solar-main-compatibility` artifact contains the exact Solar revision,
