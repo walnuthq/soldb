@@ -792,8 +792,12 @@ fn collect_declarations(
     }
 }
 
+/// The words that may follow a parameter's type without naming it.
+const PARAM_KEYWORDS: [&str; 4] = ["memory", "calldata", "storage", "payable"];
+
 fn parse_source_params(params: &str) -> Vec<SourceParam> {
-    split_top_level_commas(params)
+    let params = strip_param_comments(params);
+    split_top_level_commas(&params)
         .into_iter()
         .enumerate()
         .filter_map(|(index, param)| {
@@ -802,26 +806,91 @@ fn parse_source_params(params: &str) -> Vec<SourceParam> {
                 return None;
             }
             let mut tokens = param.split_whitespace().collect::<Vec<_>>();
-            let name = tokens
-                .last()
-                .copied()
-                .filter(|token| is_identifier(token))
-                .map_or_else(|| format!("arg{index}"), str::to_owned);
-            if tokens.last().copied() == Some(name.as_str()) && tokens.len() > 1 {
-                tokens.pop();
-            }
+            // A parameter is `<type> [location] [name]`, and the name is optional:
+            // `function f(address, uint256 amount)` leaves the first one unnamed. A
+            // trailing token names the parameter only when it is an identifier, is not
+            // the whole parameter, and is not one of the words that may follow a type
+            // without naming it; otherwise the parameter is unnamed and takes `argN`.
+            let trailing = tokens.last().copied();
+            let name = match trailing {
+                Some(token)
+                    if tokens.len() > 1
+                        && is_identifier(token)
+                        && !PARAM_KEYWORDS.contains(&token) =>
+                {
+                    tokens.pop();
+                    token.to_owned()
+                }
+                _ => format!("arg{index}"),
+            };
             let location = tokens
                 .iter()
                 .find(|token| matches!(**token, "memory" | "calldata" | "storage"))
                 .map(|token| (*token).to_owned());
             let ty = tokens
                 .into_iter()
-                .filter(|token| !matches!(*token, "memory" | "calldata" | "storage" | "payable"))
+                .filter(|token| !PARAM_KEYWORDS.contains(token))
                 .collect::<Vec<_>>()
                 .join(" ");
             (!ty.is_empty()).then_some(SourceParam { name, ty, location })
         })
         .collect()
+}
+
+/// A parameter list with its comments removed.
+///
+/// Solidity allows a comment anywhere in a parameter list, and an unnamed parameter is
+/// commonly documented with one:
+///
+/// ```solidity
+/// function burnFrom_withCaller(
+///     address caller,
+///     address, //from
+///     uint256, //amount
+/// ) external {}
+/// ```
+///
+/// Left in, a comment's words are split on whitespace like any other token, so `//from`
+/// parses as a type and the type on the following line parses as its name. Only the text
+/// between the parentheses is stripped, so no byte offset recorded for a declaration
+/// moves.
+fn strip_param_comments(params: &str) -> String {
+    let mut output = String::with_capacity(params.len());
+    let mut chars = params.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    // Drop to the end of the line, keeping the newline so the tokens on
+                    // either side of it stay separate.
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut previous = None;
+                    for next in chars.by_ref() {
+                        if previous == Some('*') && next == '/' {
+                            break;
+                        }
+                        previous = Some(next);
+                    }
+                    // A block comment can sit between a type and its name, so it leaves
+                    // a separator behind rather than joining them.
+                    output.push(' ');
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        output.push(character);
+    }
+    output
 }
 
 fn split_top_level_commas(input: &str) -> Vec<&str> {
@@ -1121,6 +1190,111 @@ mod tests {
         assert_eq!(functions[0].params[0].ty, "Person");
         assert_eq!(functions[0].params[1].name, "xs");
         assert_eq!(functions[0].params[1].ty, "uint256[2]");
+    }
+
+    #[test]
+    fn unnamed_params_documented_by_comments_do_not_become_parameters() {
+        // The shape this comes from, verbatim: unnamed parameters whose names live in
+        // trailing comments. Before comments were stripped, `//from` parsed as a type and
+        // the type on the next line parsed as its name.
+        let functions = parse_source_functions(
+            0,
+            "contract C {\n    function burnFrom_withCaller(\n        address caller,\n                     address, //from\n        uint256, //amount\n        bytes32 //h\n    ) external              view returns (bool) {}\n}",
+        );
+        let params = &functions[0].params;
+        assert_eq!(functions[0].name, "burnFrom_withCaller");
+        assert_eq!(params.len(), 4);
+        assert_eq!(
+            (params[0].ty.as_str(), params[0].name.as_str()),
+            ("address", "caller")
+        );
+        assert_eq!(
+            (params[1].ty.as_str(), params[1].name.as_str()),
+            ("address", "arg1")
+        );
+        assert_eq!(
+            (params[2].ty.as_str(), params[2].name.as_str()),
+            ("uint256", "arg2")
+        );
+        assert_eq!(
+            (params[3].ty.as_str(), params[3].name.as_str()),
+            ("bytes32", "arg3")
+        );
+    }
+
+    #[test]
+    fn unnamed_params_take_positional_names_not_their_type() {
+        let functions = parse_source_functions(
+            0,
+            "contract C { function burn(address from, uint256 amount, bytes32, bytes memory              signature) public {} }",
+        );
+        let params = &functions[0].params;
+        assert_eq!(
+            (params[1].ty.as_str(), params[1].name.as_str()),
+            ("uint256", "amount")
+        );
+        // Previously reported as `bytes32 bytes32`, the type standing in as the name.
+        assert_eq!(
+            (params[2].ty.as_str(), params[2].name.as_str()),
+            ("bytes32", "arg2")
+        );
+        assert_eq!(
+            (params[3].ty.as_str(), params[3].name.as_str()),
+            ("bytes", "signature")
+        );
+        assert_eq!(params[3].location.as_deref(), Some("memory"));
+    }
+
+    #[test]
+    fn a_trailing_declaration_keyword_does_not_name_a_param() {
+        let functions = parse_source_functions(
+            0,
+            "contract C { function f(string memory, address payable, bytes calldata data) public              {} }",
+        );
+        let params = &functions[0].params;
+        assert_eq!(
+            (params[0].ty.as_str(), params[0].name.as_str()),
+            ("string", "arg0")
+        );
+        assert_eq!(params[0].location.as_deref(), Some("memory"));
+        assert_eq!(
+            (params[1].ty.as_str(), params[1].name.as_str()),
+            ("address", "arg1")
+        );
+        assert_eq!(
+            (params[2].ty.as_str(), params[2].name.as_str()),
+            ("bytes", "data")
+        );
+        assert_eq!(params[2].location.as_deref(), Some("calldata"));
+    }
+
+    #[test]
+    fn block_comments_in_a_param_list_separate_rather_than_join() {
+        let functions = parse_source_functions(
+            0,
+            "contract C { function f(uint256 /* wei */ amount, address /*to*/) public {} }",
+        );
+        let params = &functions[0].params;
+        assert_eq!(
+            (params[0].ty.as_str(), params[0].name.as_str()),
+            ("uint256", "amount")
+        );
+        assert_eq!(
+            (params[1].ty.as_str(), params[1].name.as_str()),
+            ("address", "arg1")
+        );
+    }
+
+    #[test]
+    fn stripping_comments_leaves_declaration_offsets_alone() {
+        // Only the text between the parentheses is stripped, so the offsets the PC
+        // mapping reads still point into the original source.
+        let source = "contract C {\n    function f(address, //from\n        uint256 amount\n                          ) public {}\n}";
+        let functions = parse_source_functions(0, source);
+        let start = functions[0].declaration_start as usize;
+        assert!(source[start..].starts_with("function f("));
+        assert_eq!(functions[0].declaration_line, 2);
+        assert_eq!(source.as_bytes()[functions[0].body_end as usize], b'}');
     }
 
     fn sample_trace() -> TransactionTrace {

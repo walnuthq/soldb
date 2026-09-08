@@ -5,7 +5,6 @@ import os
 import platform
 import shlex
 import subprocess
-import sys
 
 import lit.formats
 
@@ -163,4 +162,11 @@ for env_var in ('COVERAGE_FILE', 'COVERAGE_RCFILE'):
     if env_var in os.environ:
         config.environment[env_var] = os.environ[env_var]
 
-config.environment['PYTHONPATH'] = os.pathsep.join(sys.path)
+# Do not export lit's own sys.path as PYTHONPATH. Tests run `solc`, and a solc-select
+# install is a Python script with its own interpreter; handing it the stdlib of the
+# interpreter running lit makes it import that stdlib instead of its own, which fails at
+# `assert _sre.MAGIC == MAGIC` the moment the two versions differ. The result is a compile
+# that dies for a reason having nothing to do with the test, and `increment-trace.test`
+# recompiles into `examples/out` after deleting it, so every later test that reads those
+# artifacts fails too. Nothing here needs the variable: the tests that run Python use only
+# the standard library.
