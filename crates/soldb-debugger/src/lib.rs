@@ -507,6 +507,7 @@ pub fn decode_arguments(
     state: FrameState<'_>,
     layout: ArgumentLayout,
     types: &SourceTypes,
+    scope: Option<&str>,
 ) -> Vec<FrameArgument> {
     let stack = state.stack;
     if params.is_empty() || stack.len() < params.len() {
@@ -529,7 +530,7 @@ pub fn decode_arguments(
             FrameArgument {
                 name: param.name.clone(),
                 ty: param.ty.clone(),
-                value: argument_value(param, word, state.memory, types),
+                value: argument_value(param, word, state.memory, types, scope),
             }
         })
         .collect()
@@ -540,6 +541,7 @@ fn argument_value(
     word: &str,
     memory: Option<&str>,
     types: &SourceTypes,
+    scope: Option<&str>,
 ) -> DebugValue {
     let Ok(parsed) = parse_word(&format!("0x{}", word.trim_start_matches("0x"))) else {
         return DebugValue {
@@ -554,6 +556,7 @@ fn argument_value(
         storage: None,
         layout: None,
         types,
+        scope,
     };
     let raw = Some(short_hex(&parsed));
     match param.location.as_deref() {
@@ -1528,6 +1531,7 @@ mod tests {
             storage: None,
             layout: None,
             types: &types,
+            scope: None,
         };
         let read = |offset: usize, ty: &str| reader.read_memory(offset, ty, 0);
         assert_eq!(read(0, "string").as_deref(), Some("\"hello\""));

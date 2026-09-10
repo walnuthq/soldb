@@ -1,0 +1,25 @@
+# A small internal function the legacy optimizer inlines: its body runs inside the
+# caller's without a jump onto its entry. The frame is still shown, so a breakpoint in it
+# stops there with the caller behind it in the backtrace, but its variables have no stack
+# slots of their own and the debugger says so rather than reading the caller's words as
+# them. Without the optimizer the call is a call, and the callee's variables are read.
+# Solar lays its stack out as its optimizer sees fit and is expected to fail until it
+# emits ETHDebug variable locations.
+# REQUIRES: soldb
+# XFAIL: compiler-solar
+# RUN: rm -rf %t
+# RUN: mkdir -p %t/solar %t/solc
+# RUN: %if compiler-solar %{ cd %S/.. && %solar Inline.sol --emit=abi,bin,bin-runtime,srcmap,srcmap-runtime --out-dir %t/solar > %t/solar/compile.stdout 2> %t/solar/compile.stderr %}
+# RUN: %if compiler-solc %{ cd %S/.. && %solc Inline.sol --bin --abi --combined-json abi,bin,bin-runtime,srcmap,srcmap-runtime,storage-layout -o %t/solc > %t/solc/compile.stdout 2> %t/solc/compile.stderr %}
+# RUN: %if compiler-solar %{ cp %S/../Inline.sol %t/solar/Inline.sol %}
+# RUN: %if compiler-solc %{ cp %S/../Inline.sol %t/solc/Inline.sol %}
+# RUN: %if compiler-solar %{ jq -er '.contracts["Inline.sol:Inline"].bin | strings | select(length > 0)' %t/solar/combined.json > %t/solar/Inline.bin %}
+
+# RUN: %if compiler-solc %{ printf 'break Inline.sol:8\ncontinue\nbt\nvars\nquit\n' | %soldb run %t/solc/Inline.bin "run(uint256)" 5 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Inline:%t/solc -i 2>&1 | FileCheck %s --check-prefixes=CHECK,%if optimization-none %{CALLED%} %else %{INLINED%} %}
+# RUN: %if compiler-solar %{ printf 'break Inline.sol:8\ncontinue\nbt\nvars\nquit\n' | %soldb run %t/solar/Inline.bin "run(uint256)" 5 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Inline:%t/solar -i 2>&1 | FileCheck %s --check-prefixes=CHECK,%if optimization-none %{CALLED%} %else %{INLINED%} %}
+# CHECK: Breakpoint #1 hit at step {{[0-9]+}}, Inline.sol:8
+# CHECK: #0  twice at Inline.sol:8
+# CHECK-NEXT: #1  run at Inline.sol:1{{[12]}}
+# CALLED: uint256 x = 5 [stack+{{[0-9]+}}]
+# CALLED-NEXT: uint256 r = 0 [stack+{{[0-9]+}}]
+# INLINED: Variables: locals are unavailable here: this function was inlined by the optimizer, so its variables have no stack slots of their own

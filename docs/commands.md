@@ -250,8 +250,10 @@ soldb> break op SSTORE if depth == 1 && gas > 0
 
 A condition compares values the debugger can read at that step:
 
-- the local variables in scope, by name, wherever [`vars`](#vars) can read them: a value
-  type as its word, a `string memory` as its text, a `bytes memory` as its hex text;
+- the local variables in scope, by name, wherever [`vars`](#vars) can read them, and
+  paths through them — `item.color`, `item.tags[1]`, `stored.owners[0xabc]`,
+  `blob.length` — with a value type as its word, a `string` as its text, a `bytes` as
+  its hex text;
 - state variables through the storage layout, including `balances[0xabc…]`,
   `items[2]`, and `config.limit`;
 - the arguments of the frame being entered, by name, when the trace has proven them
@@ -503,7 +505,31 @@ Item storage stored = { id: 5, name: "widget", color: 2, tags: <1 element(s); in
 
 Enums show as `Color.Blue`, user-defined value types as the value they wrap, and contract
 types as addresses, from the `enum`, `type ... is`, and `struct` declarations found in
-the loaded sources (the storage layout carries a struct's members itself).
+the loaded sources (the storage layout carries a struct's members itself, and is handed
+the enum declarations so an enum in storage shows by name too). A bare type name resolves
+the way the language resolves it: in the contract whose code is executing, then in the
+contracts it inherits from, then at file level.
+
+`print` reaches into a local the way it reaches into a state variable: a struct member,
+an array element, a mapping entry of a storage pointer, or `length`, in any chain.
+
+```text
+soldb> print item.color
+Color item.color = Color.Blue [stack+9]
+soldb> print item.tags[1]
+uint256 item.tags[1] = 8 [stack+9]
+soldb> print stored.owners[0xabc]
+uint256 storage stored.owners[0xabc] = 3 [stack+13]
+soldb> print blob.length
+uint256 blob.length = 3 [stack+11]
+soldb> print item.tags[5]
+Cannot read variable: index 5 is out of range; `item.tags` has 2 elements
+```
+
+A function the optimizer inlined — a small internal function whose body runs inside the
+caller's without a call — still appears as a frame, so a breakpoint in it stops there
+with the caller behind it, but its variables have no stack slots of their own and `vars`
+says so rather than reading the caller's words as them.
 
 Code from the via-IR pipeline, and from any IR-based compiler, lays the stack out as its
 optimizer sees fit, so nothing is inferred for it: a program loaded from ETHDebug is taken

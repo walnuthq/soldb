@@ -2270,6 +2270,18 @@ fn print_debugger_variables(
             print_variable(variable);
             return;
         }
+        // A path through a local: `item.tags[1]`, `stored.owners[0xabc]`, `blob.length`.
+        match state.local_path(name) {
+            Some(Ok(variable)) => {
+                print_variable(&variable);
+                return;
+            }
+            Some(Err(reason)) => {
+                println!("{} {reason}", warning("Cannot read variable:"));
+                return;
+            }
+            None => {}
+        }
         let (Some(layout), Some(words)) = (layout, words) else {
             println!(
                 "{} `{name}` is not in scope at PC {}; state variables need a storage layout, compile with `--storage-layout`",

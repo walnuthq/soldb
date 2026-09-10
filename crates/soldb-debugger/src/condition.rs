@@ -15,13 +15,12 @@
 //! condition would be a false positive, and silently treating it as false would hide the
 //! reason it never fires.
 
-use soldb_core::Word as StackWord;
+use soldb_core::TransactionTrace;
 use soldb_ethdebug::{parse_word, StorageLayout, Word};
 
-use crate::decode::split_location;
 use crate::state::{state_value, StorageWords};
-use crate::stepping::{ContractDebugInfo, Frame, LocalsStatus, StepMap};
-use crate::{memory_bytes, memory_word, word_as_usize, DebugValueStatus};
+use crate::stepping::{ContractDebugInfo, Frame, StepMap};
+use crate::DebugValueStatus;
 
 /// A parsed breakpoint condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,10 +313,8 @@ pub struct ConditionContext<'a> {
     pc: u64,
     gas: u64,
     depth: u64,
-    /// The stack at the step, which the inferred locals are read off.
-    stack: &'a [StackWord],
-    /// Memory at the step, for a `string memory` local.
-    memory: Option<&'a str>,
+    /// The whole trace, for reading the locals in scope at the step.
+    trace: Option<&'a TransactionTrace>,
     /// The frame being entered or executing, for reading its arguments by name.
     frame: Option<&'a Frame>,
 }
@@ -331,7 +328,6 @@ impl<'a> ConditionContext<'a> {
         trace_step: &'a soldb_core::TraceStep,
         words: Option<StorageWords<'a>>,
     ) -> Self {
-        let snapshot = trace_step.snapshot_ref();
         Self {
             map,
             step,
@@ -340,10 +336,17 @@ impl<'a> ConditionContext<'a> {
             pc: trace_step.pc,
             gas: trace_step.gas,
             depth: trace_step.depth,
-            stack: snapshot.stack,
-            memory: snapshot.memory,
+            trace: None,
             frame: None,
         }
+    }
+
+    /// Reads the local variables in scope at the step, and paths through them, from
+    /// the trace; see [`StepMap::local_condition_value`].
+    #[must_use]
+    pub fn with_trace(mut self, trace: &'a TransactionTrace) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     /// Reads the arguments of this frame by name, when the trace proved them.
@@ -388,10 +391,11 @@ impl<'a> ConditionContext<'a> {
                 .map_err(|error| error.to_string())?;
             return Ok(Value::Word(word, argument.ty.starts_with("int")));
         }
-        if let Some(index) = self
-            .contract()
-            .and_then(|contract| contract.types.enum_literal(name))
-        {
+        if let Some(index) = self.contract().and_then(|contract| {
+            contract
+                .types
+                .enum_literal(self.map.scope_at_step(self.step), name)
+        }) {
             return Ok(Value::Word(word_of_u64(index), false));
         }
         let Some(layout) = self.layout() else {
@@ -418,72 +422,15 @@ impl<'a> ConditionContext<'a> {
         Ok(Value::Word(word, variable.ty.starts_with("int")))
     }
 
-    /// A local variable in scope at the step, read off the stack: a value type as its
-    /// word, a `string memory` as its text, a `bytes memory` as its hex. `None` when no
-    /// local of that name is in scope; `Some(Err)` when one is but cannot be compared.
+    /// A local variable in scope at the step, or a path through one such as
+    /// `item.tags[1]`, read off the stack and through memory, storage, or calldata as its
+    /// type says: a value type as its word, a `string` as its text, a `bytes` as its hex
+    /// text. `None` when no local of that name is in scope; `Some(Err)` when one is but
+    /// cannot be compared.
     fn local(&self, name: &str) -> Option<Result<Value, String>> {
-        let LocalsStatus::Inferred(layout) = self.map.locals_at(self.step) else {
-            return None;
-        };
-        // The last declared wins, as the innermost scope's does in the language.
-        let variable = layout.iter().rev().find(|variable| variable.name == name)?;
-        let Some(word) = variable.slot.and_then(|slot| self.stack.get(slot)) else {
-            return Some(Err(format!(
-                "`{name}` is in scope but its stack slot could not be placed here"
-            )));
-        };
-        let word = match parse_word(&format!("0x{}", word.trim_start_matches("0x"))) {
-            Ok(word) => word,
-            Err(error) => return Some(Err(error.to_string())),
-        };
-        let (base, location) = split_location(&variable.ty);
-        let types = self.contract().map(|contract| &contract.types);
-        let mut base = base;
-        if let Some(types) = types {
-            for _ in 0..4 {
-                match types.underlying(base) {
-                    Some(underlying) => base = underlying,
-                    None => break,
-                }
-            }
-        }
-        Some(match location {
-            None if base == "bool" => Ok(Value::Bool(word != [0_u8; 32])),
-            None if variable.words == 1 => Ok(Value::Word(word, base.starts_with("int"))),
-            Some("memory") if base == "string" || base == "bytes" => {
-                let Some(memory) = self.memory else {
-                    return Some(Err(format!(
-                        "`{name}` lives in memory, which this backend did not capture"
-                    )));
-                };
-                let bytes = word_as_usize(&word).and_then(|pointer| {
-                    let length = word_as_usize(&memory_word(memory, pointer)?)?;
-                    memory_bytes(memory, pointer.checked_add(32)?, length)
-                });
-                let Some(bytes) = bytes else {
-                    return Some(Err(format!(
-                        "`{name}` points beyond the memory this step captured"
-                    )));
-                };
-                if base == "string" {
-                    String::from_utf8(bytes)
-                        .map(Value::Text)
-                        .map_err(|_| format!("`{name}` is not valid UTF-8 text"))
-                } else {
-                    Ok(Value::Text(format!(
-                        "0x{}",
-                        bytes
-                            .iter()
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect::<String>()
-                    )))
-                }
-            }
-            _ => Err(format!(
-                "`{name}` is a {}, which a condition cannot compare",
-                variable.ty
-            )),
-        })
+        let trace = self.trace?;
+        self.map
+            .local_condition_value(trace, self.step, self.words.as_ref(), name)
     }
 
     fn contract(&self) -> Option<&ContractDebugInfo> {

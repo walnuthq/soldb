@@ -33,6 +33,11 @@ pub struct StorageLayout {
     /// The layout exactly as the compiler wrote it, for handing to a client that decodes
     /// slots itself.
     pub source: Value,
+    /// The variants of each enum, in declaration order, keyed by the name a type label
+    /// spells (`Shop.Color`) and by its bare name (`Color`). The layout itself only
+    /// numbers enum values; whoever has the sources fills this in, and a value then
+    /// decodes as `Color.Blue` rather than `2`.
+    pub enum_variants: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +141,7 @@ impl StorageLayout {
             variables,
             types,
             source: value.clone(),
+            enum_variants: BTreeMap::new(),
         })
     }
 
@@ -175,16 +181,51 @@ impl StorageLayout {
                 "no state variable named `{name}` in the storage layout"
             ))
         })?;
-        let mut current = StorageRef {
+        let start = StorageRef {
             path: name.clone(),
             slot: variable.slot,
             offset: variable.offset,
             type_id: variable.type_id.clone(),
         };
+        self.walk(start, segments)
+    }
+
+    /// Follows `segments` from `start`: a mapping entry (`[key]`), an array element
+    /// (`[i]`), a struct member (`.member`), or any chain of those. This is how a path
+    /// continues from a place that is not a state variable, such as a storage pointer
+    /// held by a local variable.
+    pub fn walk(
+        &self,
+        start: StorageRef,
+        segments: impl IntoIterator<Item = PathSegment>,
+    ) -> SoldbResult<StorageRef> {
+        let mut current = start;
         for segment in segments {
             current = self.step(current, segment)?;
         }
         Ok(current)
+    }
+
+    /// `Color.Blue` for an enum value whose variants are known; see
+    /// [`StorageLayout::enum_variants`].
+    fn enum_display(&self, label: &str, bytes: &[u8]) -> Option<String> {
+        let name = label.strip_prefix("enum ")?;
+        let short = name.rsplit('.').next().unwrap_or(name);
+        let variants = self
+            .enum_variants
+            .get(name)
+            .or_else(|| self.enum_variants.get(short))?;
+        let significant = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .map_or(&[][..], |first| &bytes[first..]);
+        if significant.len() > 8 {
+            return None;
+        }
+        let index = significant
+            .iter()
+            .fold(0_usize, |value, byte| (value << 8) | usize::from(*byte));
+        Some(format!("{short}.{}", variants.get(index)?))
     }
 
     fn step(&self, current: StorageRef, segment: PathSegment) -> SoldbResult<StorageRef> {
@@ -415,7 +456,9 @@ impl StorageLayout {
                 let end = 32 - offset;
                 let bytes = &word[end - size..end];
                 Ok(DecodedStorage {
-                    display: decode_value(bytes, &ty.label),
+                    display: self
+                        .enum_display(&ty.label, bytes)
+                        .unwrap_or_else(|| decode_value(bytes, &ty.label)),
                     raw: Some(word_hex(&word)),
                 })
             }
@@ -423,15 +466,17 @@ impl StorageLayout {
     }
 }
 
-/// One step of a storage path.
+/// One step of a path such as `balances[0xabc].total`: the name it starts with, an index
+/// or key in brackets, or a member after a dot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PathSegment {
+pub enum PathSegment {
     Name(String),
     Index(String),
     Member(String),
 }
 
-fn parse_path(path: &str) -> SoldbResult<Vec<PathSegment>> {
+/// Splits `name`, `name[key]`, `name.member`, or any chain of those into its segments.
+pub fn parse_path(path: &str) -> SoldbResult<Vec<PathSegment>> {
     let path = path.trim();
     let bytes = path.as_bytes();
     let mut segments = Vec::new();

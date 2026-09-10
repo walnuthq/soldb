@@ -211,8 +211,9 @@ reports and flamegraphs.
   state variables — including `balances[0xabc…]`, `items[2]`, and `config.owner` — read
   through the storage layout `solc --storage-layout` emits, for legacy compilers as well.
   A slot the transaction never touched is read from the node at the block it started from,
-  and says so. Breakpoint conditions read the same locals: `break Shop.sol:40 if price > 10
-  && color == Color.Blue`
+  and says so. `print` follows paths into locals (`item.tags[1]`, `stored.owners[0xabc]`,
+  `blob.length`), and breakpoint conditions read the same locals and paths: `break
+  Shop.sol:40 if price > 10 && item.color == Color.Blue`
 - Call frames carry the arguments they were entered with, once the trace itself has proven
   where the compiler leaves them; a frame that cannot be proven stays bare rather than
   naming stack words that may not be the parameters

@@ -939,7 +939,9 @@ impl DebuggerState {
             .map(|tape| tape.at_step(map, step));
         let frames = self.frames_at(step);
         let frame = frames.iter().find(|frame| !frame.arguments.is_empty());
-        let context = ConditionContext::new(map, step, trace_step, words).with_frame(frame);
+        let context = ConditionContext::new(map, step, trace_step, words)
+            .with_frame(frame)
+            .with_trace(trace);
         let outcome = condition.evaluate(&context);
         if let Evaluation::Unavailable(reason) = &outcome {
             self.push_note(format!(
@@ -1035,6 +1037,22 @@ impl DebuggerState {
             }
             LocalsStatus::Unavailable(reason) => Err(reason.to_owned()),
         }
+    }
+
+    /// The value of `path` at the current step when its first name is a local variable
+    /// in scope: the variable itself, or a member, element, mapping entry, or `length`
+    /// reached from it, such as `item.tags[1]` or `stored.owners[0xabc]`. `None` when no
+    /// local has that name, so the caller can look the path up as a state variable.
+    #[must_use]
+    pub fn local_path(&self, path: &str) -> Option<Result<DebugVariable, String>> {
+        let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
+            return None;
+        };
+        let words = self
+            .storage_tape
+            .as_ref()
+            .map(|tape| tape.at_step(map, self.current_step));
+        map.local_path(trace, self.current_step, words.as_ref(), path)
     }
 
     /// The innermost recorded call that contains the current step, when the backend

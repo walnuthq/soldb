@@ -52,7 +52,7 @@ pub use source_map::{
     SourceMapInfo, SourceMapProgram,
 };
 pub use storage_layout::{
-    add_word, decode_value, element_place, mapping_slot, parse_word, word_hex, word_to_decimal,
-    DecodedStorage, StorageEncoding, StorageLayout, StorageMember, StorageRef, StorageType,
-    StorageVariable, Word,
+    add_word, decode_value, element_place, mapping_slot, parse_path, parse_word, word_hex,
+    word_to_decimal, DecodedStorage, PathSegment, StorageEncoding, StorageLayout, StorageMember,
+    StorageRef, StorageType, StorageVariable, Word,
 };

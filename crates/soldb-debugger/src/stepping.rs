@@ -33,11 +33,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use soldb_core::{TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{
-    function_selector, CodeGenerator, EthdebugInfo, FunctionExit, Instruction, SourceLocation,
-    StorageLayout,
+    function_selector, parse_path, CodeGenerator, EthdebugInfo, FunctionExit, Instruction,
+    PathSegment, SourceLocation, StorageLayout,
 };
 
-use crate::decode::ValueReader;
+use crate::condition::Value;
+use crate::decode::{Place, ValueReader};
 use crate::state::StorageWords;
 use crate::types::SourceTypes;
 use crate::{
@@ -122,8 +123,8 @@ impl ContractDebugInfo {
             .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
             .collect::<Vec<SourceFunction>>();
         let mut types = SourceTypes::default();
-        for source in source_contents.values() {
-            types.add_source(source);
+        for (source_id, source) in &source_contents {
+            types.add_source(*source_id, source);
         }
         let line_starts = source_contents
             .iter()
@@ -176,9 +177,14 @@ impl ContractDebugInfo {
     }
 
     /// Attaches the contract's storage layout, so state variables can be read by name.
+    /// The sources' enum declarations are handed to it, so an enum in storage shows by
+    /// its variant's name.
     #[must_use]
     pub fn with_storage_layout(mut self, storage_layout: Option<StorageLayout>) -> Self {
-        self.storage_layout = storage_layout;
+        self.storage_layout = storage_layout.map(|mut layout| {
+            layout.enum_variants = self.types.enum_variants_by_name();
+            layout
+        });
         self
     }
 
@@ -530,6 +536,8 @@ pub struct StepMap {
 }
 
 const NO_LAYOUT: u32 = u32::MAX;
+/// The layout of a frame the optimizer inlined: its variables have no slots of their own.
+const INLINED_LAYOUT: u32 = u32::MAX - 1;
 
 /// What a variable is to the function whose frame holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,6 +736,11 @@ struct FrameVariables {
     /// parameters, and the locals each has declared by its `_`. `None` when a modifier's
     /// declaration was not found, so the body's first instruction places the locals.
     modifier_slots: Option<usize>,
+    /// Whether the frame was reached without a jump onto the function's entry: the
+    /// optimizer inlined the call, and the function's variables have no slots of their
+    /// own — its parameters are the caller's expressions, its results the caller's
+    /// temporaries.
+    inlined: bool,
 }
 
 impl FrameVariables {
@@ -743,6 +756,7 @@ impl FrameVariables {
             body_seen: false,
             layout: None,
             modifier_slots,
+            inlined: false,
         }
     }
 
@@ -772,6 +786,10 @@ impl FrameVariables {
         height: usize,
         layouts: &mut Vec<Vec<InferredVariable>>,
     ) -> u32 {
+        if self.inlined {
+            self.layout = Some(INLINED_LAYOUT);
+            return INLINED_LAYOUT;
+        }
         let length = span.end - span.start;
         let param_slots = parameter_slots(&function.params);
         // Known parameters place everything else before any instruction is read.
@@ -1031,11 +1049,16 @@ impl InternalFrame {
     }
 }
 
-/// Places the parameters of `function` when the step at `index` is its body's entry
-/// tag, jumped to by the dispatcher: the parameters it decoded are the top words of the
-/// stack there, under the calling convention the optimizer keeps. The frame's calldata,
-/// when it names this function, must agree with those words, or nothing is placed.
-fn place_at_body_tag(
+/// Places the parameters of `function` when the step at `index` lands on a `JUMPDEST`
+/// carrying its declaration with the decoded parameters as the top words of the stack:
+/// its body's entry tag, jumped to by the dispatcher (`from_call`), or the dispatcher's
+/// landing back from the decoder, which is where the body follows directly when the
+/// optimizer inlined it. That is the calling convention, which the optimizer keeps. The
+/// frame's calldata, when it names this function, must agree with those words, or
+/// nothing is placed; nor is anything placed once the body has run, which rules out the
+/// dispatcher's return tag.
+#[allow(clippy::too_many_arguments)]
+fn place_at_entry_landing(
     frame: &mut InternalFrame,
     contract: &ContractDebugInfo,
     function: usize,
@@ -1043,15 +1066,16 @@ fn place_at_body_tag(
     index: usize,
     own: LocationRef,
     height: usize,
+    from_call: bool,
 ) {
     let Some(declared) = contract.functions.get(function) else {
         return;
     };
-    let from_dispatcher = index > 0
-        && framed_declaration(trace, contract, index - 1, declared)
-        && contract.is_jumpdest(trace.steps[index].pc)
-        && own.offset == declared.declaration_start;
-    if !from_dispatcher {
+    let at_declaration =
+        contract.is_jumpdest(trace.steps[index].pc) && own.offset == declared.declaration_start;
+    let from_dispatcher =
+        !from_call || (index > 0 && framed_declaration(trace, contract, index - 1, declared));
+    if !at_declaration || !from_dispatcher {
         return;
     }
     let entry = frame
@@ -1062,7 +1086,7 @@ fn place_at_body_tag(
     let Some(variables) = entry.and_then(|entry| entry.variables.as_mut()) else {
         return;
     };
-    if variables.params_base.is_some() {
+    if variables.params_base.is_some() || variables.body_seen {
         return;
     }
     let stack = trace.steps[index].snapshot_ref().stack;
@@ -1344,6 +1368,14 @@ impl StepMap {
             let landed_by_jump = index > 0
                 && framed[index - 1].evm_depth == step.evm_depth
                 && &*trace.steps[index - 1].op == "JUMP";
+            // Whether the previous step ran another function's own code in this EVM
+            // frame, as opposed to the dispatcher's.
+            let from_function_code = index > 0
+                && framed[index - 1].evm_depth == step.evm_depth
+                && framed[index - 1].location.is_some_and(|location| {
+                    location.function.is_some()
+                        && location.function != step.location.and_then(|own| own.function)
+                });
             let previous_marker = if landed_by_jump {
                 framed[index - 1].marker
             } else {
@@ -1398,6 +1430,19 @@ impl StepMap {
                 Some(own) => match own.function {
                     Some(function) => {
                         let entering = landed_by_jump && step.entry == Some(function);
+                        // Back from the decoder in the function's own frame: the
+                        // parameters are on top, whether a jump to the body follows or
+                        // the body was inlined here.
+                        if landed_by_jump
+                            && previous_marker == JumpMarker::Return
+                            && frame.is_active(function)
+                        {
+                            if let Some(contract) = contract_info {
+                                place_at_entry_landing(
+                                    frame, contract, function, trace, index, own, height, false,
+                                );
+                            }
+                        }
                         if entering || (pending_call && !frame.is_active(function)) {
                             // A call: onto the entry point, or marked and into a function
                             // other than the active one.
@@ -1414,8 +1459,8 @@ impl StepMap {
                             // parameters it decoded, which places them, or a generated
                             // helper whose span is the calling line.
                             if let Some(contract) = contract_info {
-                                place_at_body_tag(
-                                    frame, contract, function, trace, index, own, height,
+                                place_at_entry_landing(
+                                    frame, contract, function, trace, index, own, height, true,
                                 );
                             }
                             frame.push_placeholder();
@@ -1437,20 +1482,32 @@ impl StepMap {
                                     }
                                 }
                                 None => {
-                                    let mut variables = frame
-                                        .remembered
-                                        .remove(&function)
-                                        .or_else(|| frame_variables(function));
-                                    // A modifier's parameters sit right above the
-                                    // parameters and return parameters of the function
-                                    // it runs for, and the slots of the modifiers before
-                                    // it; a placed function places its modifiers.
-                                    if let (Some(variables), Some(contract)) =
-                                        (variables.as_mut(), contract_info)
-                                    {
-                                        if variables.params_base.is_none() {
-                                            variables.params_base =
-                                                modifier_base(frame, contract, function);
+                                    let mut variables = frame.remembered.remove(&function);
+                                    if variables.is_none() {
+                                        variables = frame_variables(function);
+                                        if let (Some(variables), Some(contract)) =
+                                            (variables.as_mut(), contract_info)
+                                        {
+                                            let declared = &contract.functions[function];
+                                            if declared.placeholder.is_some() {
+                                                // A modifier's parameters sit right above
+                                                // the parameters and return parameters of
+                                                // the function it runs for, and the slots
+                                                // of the modifiers before it; a placed
+                                                // function places its modifiers.
+                                                if variables.params_base.is_none() {
+                                                    variables.params_base =
+                                                        modifier_base(frame, contract, function);
+                                                }
+                                            } else if declared.name != "constructor"
+                                                && from_function_code
+                                                && step.entry != Some(function)
+                                            {
+                                                // A function reached from inside another
+                                                // without a jump onto its entry: the
+                                                // optimizer inlined the call.
+                                                variables.inlined = true;
+                                            }
                                         }
                                     }
                                     frame.push_function(function, None, variables);
@@ -1773,11 +1830,150 @@ impl StepMap {
             return LocalsStatus::Unavailable(reason);
         }
         match self.step_variables.get(step).copied() {
+            Some(INLINED_LAYOUT) => LocalsStatus::Unavailable(
+                "this function was inlined by the optimizer, so its variables have no stack \
+                 slots of their own",
+            ),
             Some(id) if id != NO_LAYOUT => {
                 LocalsStatus::Inferred(&self.variable_layouts[id as usize])
             }
             _ => LocalsStatus::Unavailable("no function is executing at this step"),
         }
+    }
+
+    /// The contract whose code declares the function executing at `step`: where a bare
+    /// type name written in that function resolves.
+    pub(crate) fn scope_at_step(&self, step: usize) -> Option<&str> {
+        let info = self.steps.get(step)?;
+        let contract = self.contracts.get(info.contract?)?;
+        let function = contract.functions.get(info.location?.function?)?;
+        contract
+            .types
+            .scope_at(function.source_id, function.declaration_start)
+    }
+
+    /// The value of `path` at `step`: a local variable in scope, or a member, element,
+    /// mapping entry, or `length` reached from one, such as `item.tags[1]` or
+    /// `stored.owners[0xabc]`. `None` when no local in scope has the path's first name,
+    /// so the caller can look it up as a state variable instead; `Some(Err)` says why a
+    /// local's path could not be followed.
+    #[must_use]
+    pub fn local_path(
+        &self,
+        trace: &TransactionTrace,
+        step: usize,
+        words: Option<&StorageWords<'_>>,
+        path: &str,
+    ) -> Option<Result<DebugVariable, String>> {
+        let found = match self.local_place(trace, step, words, path)? {
+            Ok(found) => found,
+            Err(reason) => return Some(Err(reason)),
+        };
+        let (reader, slot, place) = found;
+        let (ty, value) = match place {
+            Ok(place) => (place.ty(), reader.show(&place)),
+            Err((ty, shown)) => (ty, shown),
+        };
+        Some(Ok(DebugVariable {
+            name: path.trim().to_owned(),
+            ty,
+            location: DebugLocation {
+                kind: "stack".to_owned(),
+                offset: slot as u64,
+            },
+            value,
+        }))
+    }
+
+    /// The value of `path` as a breakpoint condition compares it; see
+    /// [`StepMap::local_path`].
+    #[must_use]
+    pub fn local_condition_value(
+        &self,
+        trace: &TransactionTrace,
+        step: usize,
+        words: Option<&StorageWords<'_>>,
+        path: &str,
+    ) -> Option<Result<Value, String>> {
+        let (reader, _, place) = match self.local_place(trace, step, words, path)? {
+            Ok(found) => found,
+            Err(reason) => return Some(Err(reason)),
+        };
+        Some(match place {
+            Ok(place) => reader.condition_value(&place, path.trim()),
+            Err((_, shown)) => Err(format!("`{}` is {}", path.trim(), shown.display)),
+        })
+    }
+
+    /// Follows `path` from the local its first name names. The place is `Err` with the
+    /// value to show when the variable's own words lead nowhere readable (memory the
+    /// backend did not capture, a storage pointer without a layout), so a bare name still
+    /// shows what `vars` would.
+    #[allow(clippy::type_complexity)]
+    fn local_place<'a>(
+        &'a self,
+        trace: &'a TransactionTrace,
+        step: usize,
+        words: Option<&'a StorageWords<'a>>,
+        path: &str,
+    ) -> Option<Result<(ValueReader<'a>, usize, Result<Place, (String, DebugValue)>), String>> {
+        let LocalsStatus::Inferred(layout) = self.locals_at(step) else {
+            return None;
+        };
+        let segments = parse_path(path).ok()?;
+        let Some(PathSegment::Name(name)) = segments.first() else {
+            return None;
+        };
+        // The last declared wins, as the innermost scope's does in the language.
+        let variable = layout
+            .iter()
+            .rev()
+            .find(|variable| variable.name == *name)?;
+        let contract = self.contract_at_step(step)?;
+        let snapshot = trace
+            .steps
+            .get(step)
+            .map(soldb_core::TraceStep::snapshot_ref);
+        let stack = snapshot.map_or(&[][..], |snapshot| snapshot.stack);
+        let reader = ValueReader {
+            memory: snapshot.and_then(|snapshot| snapshot.memory),
+            calldata: calldata_for_step(trace, step),
+            storage: words,
+            layout: contract.storage_layout.as_ref(),
+            types: &contract.types,
+            scope: self.scope_at_step(step),
+        };
+        let Some(slot) = variable.slot else {
+            return Some(Err(format!(
+                "`{name}` is in scope but its stack slot could not be placed here"
+            )));
+        };
+        let Some(stack_words) = stack.get(slot..slot + variable.words) else {
+            return Some(Err(format!(
+                "`{name}` is in scope but its stack slot is above the stack here"
+            )));
+        };
+        let stack_words = stack_words.iter().map(|word| &**word).collect::<Vec<_>>();
+        let mut place = match reader.root(&variable.ty, &stack_words) {
+            Ok(place) => place,
+            Err(shown) if segments.len() == 1 => {
+                return Some(Ok((reader, slot, Err((variable.ty.clone(), shown)))));
+            }
+            Err(shown) => return Some(Err(format!("`{name}` is {}", shown.display))),
+        };
+        let mut so_far = name.clone();
+        for segment in &segments[1..] {
+            place = match reader.follow(place, segment, &so_far) {
+                Ok(place) => place,
+                Err(reason) => return Some(Err(reason)),
+            };
+            match segment {
+                PathSegment::Member(member) => so_far = format!("{so_far}.{member}"),
+                PathSegment::Index(key) => so_far = format!("{so_far}[{key}]"),
+                PathSegment::Name(_) => {}
+            }
+        }
+        Some(Ok((reader, slot, Ok(place))))
     }
 
     /// The inferred variables at `step`, read off its stack and decoded by type: a value
@@ -1811,6 +2007,7 @@ impl StepMap {
             storage: words,
             layout: contract.storage_layout.as_ref(),
             types: &contract.types,
+            scope: self.scope_at_step(step),
         };
         let unavailable = || DebugValue {
             display: "<unavailable>".to_owned(),
@@ -1871,7 +2068,15 @@ impl StepMap {
         let Some(layout) = self.argument_layout(location.key.contract) else {
             return Vec::new();
         };
-        decode_arguments(&function.params, state, layout, &contract.types)
+        decode_arguments(
+            &function.params,
+            state,
+            layout,
+            &contract.types,
+            contract
+                .types
+                .scope_at(function.source_id, function.declaration_start),
+        )
     }
 
     #[must_use]
@@ -3709,6 +3914,50 @@ contract P {
         let values = map.inferred_variables(&trace, 7, None);
         assert_eq!(values[0].value.display, "9");
         assert_eq!(values[1].value.display, "9");
+    }
+
+    #[test]
+    fn a_function_reached_by_fallthrough_was_inlined_and_has_no_slots() {
+        // `helper`'s body runs inside `outer` without a jump onto its entry: the
+        // optimizer inlined the call. The frame is shown, its variables are not read,
+        // and the caller's own placement survives the excursion.
+        let ret = "0x9";
+        let trace = trace(vec![
+            step(0, 1, "PUSH1", &[]),
+            step(10, 1, "JUMPDEST", &[ret, "0x5"]),
+            step(11, 1, "PUSH0", &[ret, "0x5"]),
+            step(12, 1, "PUSH0", &[ret, "0x5", "0x0"]),
+            step(21, 1, "PUSH0", &[ret, "0x5", "0x0", "0xa"]),
+            step(22, 1, "DUP1", &[ret, "0x5", "0x0", "0xa", "0xb"]),
+            step(18, 1, "ADD", &[ret, "0x5", "0x0", "0xa", "0xb"]),
+        ]);
+        let map = StepMap::new(&trace, vec![legacy_contract(Some(CodeGenerator::Legacy))]);
+        assert_eq!(
+            map.location(4).and_then(|location| location.function_name),
+            Some("helper".to_owned())
+        );
+        assert_eq!(
+            map.locals_at(4),
+            LocalsStatus::Unavailable(
+                "this function was inlined by the optimizer, so its variables have no stack \
+                 slots of their own"
+            )
+        );
+        assert_eq!(
+            map.location(6).and_then(|location| location.function_name),
+            Some("outer".to_owned())
+        );
+        let LocalsStatus::Inferred(back) = map.locals_at(6) else {
+            panic!("{:?}", map.locals_at(6));
+        };
+        assert_eq!(
+            named(back),
+            [
+                ("a", VariableKind::Parameter, Some(1)),
+                ("sum", VariableKind::Return, Some(2)),
+                ("twice", VariableKind::Local, Some(3))
+            ]
+        );
     }
 
     #[test]

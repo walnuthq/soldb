@@ -827,15 +827,13 @@ impl DapServer {
         }
     }
 
-    /// A local variable in scope at the current step, by name.
+    /// A local variable in scope at the current step, by name, or a path through one
+    /// such as `item.tags[1]`.
     fn evaluate_local(&self, name: &str) -> Option<String> {
-        let variables = self.debugger.variables().ok()?;
-        variables
-            .variables
-            .iter()
-            .rev()
-            .find(|variable| variable.name == name)
-            .map(|variable| variable.value.display.clone())
+        match self.debugger.local_path(name)? {
+            Ok(variable) => Some(variable.value.display),
+            Err(reason) => Some(format!("<{reason}>")),
+        }
     }
 
     /// A storage path such as `counter` or `balances[0xabc]`, read through the storage
