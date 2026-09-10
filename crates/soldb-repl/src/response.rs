@@ -37,9 +37,12 @@ pub enum Output {
         breakpoints: Vec<BreakpointInfo>,
     },
     Backtrace {
-        /// Said once a session, when frames carry arguments read off the stack.
+        /// Said once a session, when frames carry arguments read off the stack: a
+        /// warning line and the note under it.
         #[serde(skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
         frames: Vec<FrameInfo>,
     },
     Listing {

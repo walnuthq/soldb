@@ -35,8 +35,8 @@
 # RUN: printf 'help\nhelp vars\nquit\n' | %soldb trace %{test_tx} --rpc %{rpc_url} -i 2>&1 | FileCheck %s --check-prefix=HELP
 
 # HELP: Variables:
-# HELP-NEXT: vars {{ +}}the variables in scope at the current step, and every state variable
-# HELP-NEXT: print <variable>|<path> {{ +}}one variable, or a path into one
+# HELP-NEXT: vars the variables in scope at the current step, and every state variable
+# HELP-NEXT: print <variable>|<path> one variable, or a path into one
 # HELP: vars  the variables in scope at the current step, and every state variable
 # HELP-NEXT: aliases: locals
 # HELP: For solc's legacy pipeline they are read off the stack

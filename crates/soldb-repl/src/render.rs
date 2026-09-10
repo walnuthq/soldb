@@ -69,7 +69,7 @@ impl Renderer {
                 let mut lines = vec![match level {
                     Level::Info => self.info_message(text),
                     Level::Warning => self.warning(text),
-                    Level::Note => format!("{} {text}", self.dim("note:")),
+                    Level::Note => format!("{} {text}", self.warning("Note:")),
                 }];
                 if let Some(note) = note {
                     lines.push(format!("{} {note}", self.dim("note:")));
@@ -98,10 +98,17 @@ impl Renderer {
                         .collect()
                 }
             }
-            Output::Backtrace { warning, frames } => {
+            Output::Backtrace {
+                warning,
+                note,
+                frames,
+            } => {
                 let mut lines = Vec::new();
                 if let Some(warning) = warning {
                     lines.push(self.warning(format!("warning: {warning}")));
+                }
+                if let Some(note) = note {
+                    lines.push(format!("{} {note}", self.dim("note:")));
                 }
                 for frame in frames {
                     let mut line = format!("#{:<2} {}", frame.index, self.name(&frame.name));
@@ -380,7 +387,7 @@ impl Renderer {
             ));
         }
         if let Some(note) = &stop.note {
-            lines.push(format!("{} {note}", self.dim("note:")));
+            lines.push(format!("{} {note}", self.warning("Note:")));
         }
         lines
     }
@@ -529,7 +536,7 @@ mod tests {
             "Breakpoint #1 hit at step 12, Counter.sol:7\n\
              Counter.sol:7 in increment  (step 12/99, pc 34, PUSH1, gas 5000)\n    \
              7 |         count += 1;\n\
-             note: something\n"
+             Note: something\n"
         );
         let bare = Stop {
             reason: StopReason::Moved,

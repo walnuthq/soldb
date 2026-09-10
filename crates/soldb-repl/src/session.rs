@@ -24,8 +24,11 @@ use crate::{
 
 /// What `backtrace` says once about arguments read off the stack.
 pub const FRAME_ARGUMENTS_WARNING: &str = "frame arguments are read off the stack, not from \
-compiler-reported variable locations; the calling convention was proved from this trace's \
-calldata";
+compiler-reported variable locations";
+
+/// The note under [`FRAME_ARGUMENTS_WARNING`].
+pub const FRAME_ARGUMENTS_NOTE: &str = "the calling convention was proved from this trace's \
+calldata; ETHDebug variable locations will replace this once the compiler emits them";
 
 /// How many lines `list` shows on each side of the current one.
 pub const LISTING_RADIUS: u64 = 5;
@@ -286,12 +289,17 @@ impl Session {
         if frames.is_empty() {
             return message(Level::Warning, "No trace loaded.");
         }
-        let warning = (!self.arguments_warning_shown
-            && frames.iter().any(|frame| !frame.arguments.is_empty()))
-        .then(|| {
+        let show_warning =
+            !self.arguments_warning_shown && frames.iter().any(|frame| !frame.arguments.is_empty());
+        let (warning, note) = if show_warning {
             self.arguments_warning_shown = true;
-            FRAME_ARGUMENTS_WARNING.to_owned()
-        });
+            (
+                Some(FRAME_ARGUMENTS_WARNING.to_owned()),
+                Some(FRAME_ARGUMENTS_NOTE.to_owned()),
+            )
+        } else {
+            (None, None)
+        };
         let frames = frames
             .iter()
             .enumerate()
@@ -322,7 +330,11 @@ impl Session {
                 pc: frame.pc,
             })
             .collect();
-        Output::Backtrace { warning, frames }
+        Output::Backtrace {
+            warning,
+            note,
+            frames,
+        }
     }
 
     /// `radius` lines of source on each side of the current step's line.
@@ -334,7 +346,7 @@ impl Session {
             } else {
                 message(
                     Level::Warning,
-                    "Cannot list source: no debug metadata is loaded; start the session with \
+                    "Cannot list source: no ETHDebug metadata is loaded; start the session with \
                      `--ethdebug-dir <address>:<contract>:<dir>`",
                 )
             };
@@ -497,10 +509,17 @@ impl Session {
             return message(Level::Warning, "Cannot read variables: no trace is loaded");
         };
         let pc = step.pc;
-        if self.state.step_map().is_none() {
+        // No contract sources loaded at all: the same "load debug info" answer `list`
+        // gives, rather than a per-step "no variables here".
+        let no_metadata = self.state.step_map().is_none_or(|map| {
+            map.contracts()
+                .iter()
+                .all(|c| c.info.instructions.is_empty())
+        });
+        if no_metadata {
             return message(
                 Level::Warning,
-                "Cannot read variables: no debug metadata is loaded; start the session with \
+                "Cannot read variables: no ETHDebug metadata is loaded; start the session with \
                  `--ethdebug-dir <address>:<contract>:<dir>`",
             );
         }

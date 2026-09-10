@@ -526,10 +526,10 @@ impl View {
                 };
                 "mode ".to_owned() + mode.as_str()
             }
-            KeyCode::Char('b') => match session.state().location() {
-                Some(location) => format!("break {}:{}", location.path, location.line),
-                None => return None,
-            },
+            KeyCode::Char('b') => {
+                let location = session.state().location()?;
+                format!("break {}:{}", location.path, location.line)
+            }
             KeyCode::Char('n') => "next".to_owned(),
             KeyCode::Char('s') => "step".to_owned(),
             KeyCode::Char('c') => "continue".to_owned(),

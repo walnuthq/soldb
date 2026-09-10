@@ -30,7 +30,7 @@
 # INTERACTIVE-NOT: increment2(amount
 # INTERACTIVE: TestContract.sol:23 in increment
 # INTERACTIVE: TestContract.sol:24 in increment
-# INTERACTIVE: Breakpoint #1 hit at step {{[0-9]+}}, function TestContract.increment2 at TestContract.sol:39, PC {{[0-9]+}}
+# INTERACTIVE: Breakpoint #1 hit at step {{[0-9]+}}, function TestContract.increment2 at TestContract.sol:39
 # INTERACTIVE: #0  increment2 at TestContract.sol:39
 # INTERACTIVE-NEXT: #1  increment at TestContract.sol:30
 # INTERACTIVE-NEXT: #2  TestContract at TestContract.sol:8

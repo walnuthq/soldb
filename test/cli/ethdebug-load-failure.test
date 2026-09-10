@@ -18,8 +18,8 @@
 # UNRESOLVED: warning: could not resolve the requested contracts
 # UNRESOLVED-SAME: no contracts found for
 
-# The report goes to stderr, so `--json` still emits one valid document on stdout.
-# RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{project_root}/test/missing-ethdebug --rpc %{rpc_url} --json 2>/dev/null | jq -e '.schemaVersion == 1 and (.steps | length) > 0' > /dev/null
+# The report goes to stderr, so `--save-trace` still writes one valid trace.
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{project_root}/test/missing-ethdebug --rpc %{rpc_url} --save-trace %t.trace 2>/dev/null >/dev/null && jq -e '(.steps | length) > 0' %t.trace > /dev/null
 
 # A healthy ETHDebug directory reports nothing at all.
 # RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} 2>&1 >/dev/null --rpc %{rpc_url} | FileCheck %s --check-prefix=QUIET --allow-empty

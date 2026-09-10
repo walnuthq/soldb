@@ -35,7 +35,9 @@ pub use response::{
     MemoryInfo, MemoryWord, Output, ResourceInfo, SlotInfo, StateInfo, Stop, StopLocation,
     StopReason, ValueStatus, VariableInfo,
 };
-pub use session::{breakpoint_lines, Session, FRAME_ARGUMENTS_WARNING, LISTING_RADIUS};
+pub use session::{
+    breakpoint_lines, Session, FRAME_ARGUMENTS_NOTE, FRAME_ARGUMENTS_WARNING, LISTING_RADIUS,
+};
 use soldb_debugger::{
     call_target, normalize_address, variables_for_step, ChainStorage, Condition, ConditionContext,
     ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState, LocalsStatus,
