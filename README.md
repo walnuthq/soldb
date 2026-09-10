@@ -341,7 +341,7 @@ speak the Debug Adapter Protocol get the same engine through `soldb-dap`. See
   recorded trace; `backtrace`, `list`, `stack`, `memory`, `storage`, and `calldata` at any step
 - Debug Adapter Protocol server for editors: line and function breakpoints, step in/over/out, step-back
 - HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and a REVM replay backend for nodes that cannot trace
-- WebAssembly package for browser and Node.js hosts, with host-driven replay
+- Scriptable and machine-readable: `-x <command>` runs a session non-interactively, `--json` answers every command as one JSON object per line, and `--save-trace` writes the full trace for offline `debug-diff` and `profile`
 - Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
 
 ## Architecture

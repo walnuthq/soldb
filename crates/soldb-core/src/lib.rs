@@ -733,7 +733,7 @@ mod tests {
         // `snapshot_ref` is what every trace walk uses, so it has to be indistinguishable
         // from `normalized_snapshot` in both shapes a step can take: snapshot populated,
         // and only the flat fields populated. The serialized forms must match too, because
-        // the web JSON document writes a snapshot per step.
+        // a saved trace (`--save-trace`) writes a snapshot per step.
         let flat = step_with(StepSnapshot::default());
         let populated = step_with(StepSnapshot::new(
             vec![Arc::from("0x09")],

@@ -387,8 +387,8 @@ pub fn trace_transaction_with_client_and_resolved_backend(
 /// Whether the `replay` backend was compiled into this build.
 ///
 /// The backend sits behind the `replay` cargo feature (on by default) because it links
-/// REVM. A build without it, such as the WebAssembly package, still has the JSON-RPC
-/// transport, the `debug-rpc` backend, and trace assembly.
+/// REVM. A build without it still has the JSON-RPC transport, the `debug-rpc` backend,
+/// and trace assembly.
 #[must_use]
 pub fn replay_backend_available() -> bool {
     cfg!(feature = "replay")

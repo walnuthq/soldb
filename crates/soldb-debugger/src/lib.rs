@@ -85,8 +85,8 @@ impl DebugSession {
     /// was attached before.
     ///
     /// The trace is left in place rather than rebuilt, so a frontend that keeps a large
-    /// trace resident, such as the WebAssembly module, can add or swap the contract's
-    /// artifacts without copying hundreds of thousands of steps.
+    /// trace resident can add or swap the contract's artifacts without copying hundreds
+    /// of thousands of steps.
     pub fn attach_ethdebug(
         &mut self,
         ethdebug: EthdebugInfo,

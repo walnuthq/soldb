@@ -12,8 +12,8 @@
 //!   stderr for warnings, decided separately so a redirected log never collects escape
 //!   codes and a warning on a terminal keeps its color when the result is piped away.
 //!   Emitting escapes directly breaks the lit tests.
-//! - `--json` and `--json-events` print only their JSON document, so the output stays
-//!   pipeable into `jq`. Progress lines must stay gated on those flags.
+//! - A debugging session under `--json`, and `--json-events`, print only JSON, so the
+//!   output stays pipeable into `jq`. Progress lines must stay gated on those flags.
 //! - A command that has already rendered a failure returns
 //!   [`soldb_core::SoldbError::AlreadyReported`] so the exit path does not print it
 //!   twice. Failures exit with code 2.
