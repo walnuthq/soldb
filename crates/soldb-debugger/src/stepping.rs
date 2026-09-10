@@ -66,6 +66,14 @@ pub struct ContractDebugInfo {
     function_entries: HashMap<u64, usize>,
 }
 
+/// Which of a contract's two programs a frame executes: the creation code, run once by a
+/// `CREATE`, or the deployed code, run by every call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeEnvironment {
+    Create,
+    Call,
+}
+
 /// What an artifact says about the jump an instruction makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JumpMarker {
@@ -137,6 +145,16 @@ impl ContractDebugInfo {
     pub fn with_storage_layout(mut self, storage_layout: Option<StorageLayout>) -> Self {
         self.storage_layout = storage_layout;
         self
+    }
+
+    /// The program this info describes, when the artifact says: ETHDebug programs and legacy
+    /// source maps name their environment `create` or `call`. `None` describes either.
+    fn code_environment(&self) -> Option<CodeEnvironment> {
+        match self.info.environment.as_str() {
+            "create" => Some(CodeEnvironment::Create),
+            "call" => Some(CodeEnvironment::Call),
+            _ => None,
+        }
     }
 
     /// The function whose entry point `pc` is, when it is one.
@@ -530,6 +548,62 @@ struct EvmFrame {
     entry_step: usize,
 }
 
+/// What is known about an EVM frame as it is entered.
+struct FrameEntered {
+    /// The address whose code the frame runs; `None` when nothing recorded it, or for a
+    /// creation whose address the backend did not report.
+    address: Option<String>,
+    environment: CodeEnvironment,
+    /// Whether the frame runs against its caller's storage.
+    delegated: bool,
+}
+
+impl FrameEntered {
+    /// The call or creation the backend recorded as entered at `step`, when it recorded
+    /// calls at all. A call that ran no steps, such as one to a precompile, ends at the
+    /// step it started and is not a frame in the trace.
+    fn recorded(trace: &TransactionTrace, step: usize) -> Option<Self> {
+        let spans_steps = |entry: Option<usize>, exit: Option<usize>| {
+            entry == Some(step) && exit.is_none_or(|exit| exit > step)
+        };
+        let artifacts = &trace.artifacts;
+        if let Some(call) = artifacts
+            .calls
+            .iter()
+            .find(|call| spans_steps(call.entry_step, call.exit_step))
+        {
+            return Some(Self {
+                address: Some(call.bytecode_address.clone()),
+                environment: CodeEnvironment::Call,
+                delegated: matches!(call.call_type.as_str(), "DELEGATECALL" | "CALLCODE"),
+            });
+        }
+        let creation = artifacts
+            .creations
+            .iter()
+            .find(|creation| spans_steps(creation.entry_step, creation.exit_step))?;
+        Some(Self {
+            address: creation.address.clone(),
+            environment: CodeEnvironment::Create,
+            delegated: false,
+        })
+    }
+
+    /// What the call instruction at `caller` says about the frame it entered.
+    fn from_call(trace: &TransactionTrace, caller: Option<usize>) -> Self {
+        let op = caller.map(|caller| &*trace.steps[caller].op);
+        Self {
+            address: caller.and_then(|caller| call_target(&trace.steps[caller])),
+            environment: if matches!(op, Some("CREATE" | "CREATE2")) {
+                CodeEnvironment::Create
+            } else {
+                CodeEnvironment::Call
+            },
+            delegated: matches!(op, Some("DELEGATECALL" | "CALLCODE")),
+        }
+    }
+}
+
 /// One internal frame: a function, or a placeholder for a compiler-generated helper
 /// entered through a marked call, which absorbs the matching marked return and counts as
 /// no frame of its own.
@@ -615,30 +689,47 @@ impl StepMap {
                 addresses.len() - 1
             })
         };
-        let contract_for = |address: Option<&str>, root: bool| -> Option<usize> {
-            let address = address.map(normalize_address);
-            if let Some(address) = &address {
-                if let Some(index) = contracts
-                    .iter()
-                    .position(|contract| contract.address.as_deref() == Some(address))
-                {
-                    return Some(index);
+        // The contract describing the code a frame at `address` runs. A contract's creation
+        // and deployed programs are separate artifacts at the same address, so the one for
+        // the frame's environment is preferred, and one that names no environment describes
+        // both. When only the other program is loaded it still names the address's sources,
+        // and is used as before.
+        let contract_for =
+            |address: Option<&str>, environment: CodeEnvironment, root: bool| -> Option<usize> {
+                let address = address.map(normalize_address);
+                if let Some(address) = &address {
+                    let mut at_address = contracts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, contract)| contract.address.as_deref() == Some(address));
+                    let exact = at_address.clone().find(|(_, contract)| {
+                        contract
+                            .code_environment()
+                            .is_none_or(|candidate| candidate == environment)
+                    });
+                    if let Some((index, _)) = exact.or_else(|| at_address.next()) {
+                        return Some(index);
+                    }
                 }
-            }
-            (root && contracts.len() == 1).then_some(0)
-        };
+                (root && contracts.len() == 1).then_some(0)
+            };
 
         // Pass 1: EVM frames, executing addresses, and each step's own span.
         let root_address = trace
             .to_addr
             .as_deref()
             .or(trace.contract_address.as_deref());
+        let root_environment = if trace.to_addr.is_none() && trace.contract_address.is_some() {
+            CodeEnvironment::Create
+        } else {
+            CodeEnvironment::Call
+        };
         let root_depth = trace.steps.first().map_or(0, |step| step.depth);
         let mut next_frame_id = 1_u32;
         let root_storage = root_address.map(&mut intern);
         let mut evm_frames = vec![EvmFrame {
             id: 0,
-            contract: contract_for(root_address, true),
+            contract: contract_for(root_address, root_environment, true),
             address: root_storage,
             storage: root_storage,
             entry_step: 0,
@@ -649,26 +740,27 @@ impl StepMap {
             let evm_depth = step.depth.saturating_sub(root_depth) as usize;
             evm_frames.truncate(evm_depth + 1);
             while evm_frames.len() <= evm_depth {
-                // A new EVM frame: the callee's code address is on the caller's stack at
-                // the call instruction, the step before this one.
+                // A new EVM frame. The backend's record of the call or creation entered at
+                // this step names the code it runs; without one, the callee's code address
+                // is on the caller's stack at the call instruction, the step before this
+                // one, and a `CREATE` leaves no address there at all.
                 let call = (evm_frames.len() == evm_depth)
                     .then(|| index.checked_sub(1))
                     .flatten();
-                let target = call.and_then(|caller| call_target(&trace.steps[caller]));
-                let address = target.as_deref().map(&mut intern);
+                let entered = FrameEntered::recorded(trace, index)
+                    .filter(|_| evm_frames.len() == evm_depth)
+                    .unwrap_or_else(|| FrameEntered::from_call(trace, call));
+                let address = entered.address.as_deref().map(&mut intern);
                 // A `DELEGATECALL` or `CALLCODE` runs the callee's code against the
                 // caller's storage; every other call has the callee's own.
-                let delegated = call.is_some_and(|caller| {
-                    matches!(&*trace.steps[caller].op, "DELEGATECALL" | "CALLCODE")
-                });
-                let storage = if delegated {
+                let storage = if entered.delegated {
                     evm_frames.last().and_then(|frame| frame.storage)
                 } else {
                     address
                 };
                 evm_frames.push(EvmFrame {
                     id: next_frame_id,
-                    contract: contract_for(target.as_deref(), false),
+                    contract: contract_for(entered.address.as_deref(), entered.environment, false),
                     address,
                     storage,
                     entry_step: index,
@@ -1270,7 +1362,7 @@ impl StepMap {
             }
         }
 
-        let resolved = sources
+        let mut resolved = sources
             .into_iter()
             .filter_map(|(contract_index, source_id, path)| {
                 let effective = self.contracts[contract_index].effective_line(source_id, line)?;
@@ -1290,6 +1382,13 @@ impl StepMap {
                 Some(file) => format!("no instruction maps to {file}:{line}"),
                 None => format!("no instruction maps to line {line}"),
             });
+        }
+        // A contract's creation and deployed programs share their sources but map different
+        // lines: a constructor body has code only in the creation program. Where any program
+        // maps the line itself, the others' fallback to the statement containing it would
+        // stop somewhere the user did not ask for, so only the exact matches are kept.
+        if resolved.iter().any(|candidate| candidate.key.line == line) {
+            resolved.retain(|candidate| candidate.key.line == line);
         }
         Ok(resolved)
     }
@@ -1621,7 +1720,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
-    use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
+    use soldb_core::{ContractCreation, ExecutionCall, StepSnapshot, TraceStep, TransactionTrace};
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
     use soldb_core::Word as StackWord;
@@ -2181,6 +2280,228 @@ contract P {
         assert!(frames[1].external);
         assert_eq!(frames[1].address.as_deref(), Some(callee));
         assert_eq!(frames[0].function_name.as_deref(), Some("inner"));
+    }
+
+    /// A program at `address` for one environment, mapping each listed program counter to
+    /// the span of a source snippet.
+    fn program(address: &str, environment: &str, spans: &[(u64, &str)]) -> ContractDebugInfo {
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: environment.to_owned(),
+            instructions: spans
+                .iter()
+                .map(|(pc, needle)| instruction(*pc, offset_of(needle), needle.len() as u64))
+                .collect(),
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        ContractDebugInfo::new(
+            Some(address),
+            "C",
+            info,
+            BTreeMap::from([(0, SOURCE.to_owned())]),
+        )
+    }
+
+    const ROOT: &str = "0xaaaa000000000000000000000000000000000001";
+    const CREATED: &str = "0xcccc000000000000000000000000000000000003";
+
+    fn creation(entry_step: usize, exit_step: usize, address: Option<&str>) -> ContractCreation {
+        ContractCreation {
+            id: 0,
+            parent_id: None,
+            depth: 2,
+            entry_step: Some(entry_step),
+            exit_step: Some(exit_step),
+            create_type: "CREATE".to_owned(),
+            caller: ROOT.to_owned(),
+            address: address.map(str::to_owned),
+            value: "0x0".to_owned(),
+            init_code: "0x".to_owned(),
+            gas_limit: 0,
+            gas_used: None,
+            output: None,
+            success: Some(address.is_some()),
+            error: None,
+        }
+    }
+
+    fn call(
+        id: usize,
+        entry_step: usize,
+        exit_step: usize,
+        call_type: &str,
+        bytecode_address: &str,
+    ) -> ExecutionCall {
+        ExecutionCall {
+            id,
+            parent_id: None,
+            depth: 2,
+            entry_step: Some(entry_step),
+            exit_step: Some(exit_step),
+            call_type: call_type.to_owned(),
+            from: ROOT.to_owned(),
+            to: ROOT.to_owned(),
+            bytecode_address: bytecode_address.to_owned(),
+            value: "0x0".to_owned(),
+            input: "0x".to_owned(),
+            gas_limit: 0,
+            gas_used: None,
+            output: None,
+            success: Some(true),
+            error: None,
+        }
+    }
+
+    /// The root creates a contract, then calls it: steps 2 and 3 run the creation code,
+    /// step 6 the deployed code.
+    fn root_creates_then_calls() -> TransactionTrace {
+        let word = format!("0x{:0>64}", CREATED.trim_start_matches("0x"));
+        let mut trace = trace(vec![
+            step(0, 1, "PUSH1", &[]),
+            // A `CREATE` leaves no code address on the stack.
+            step(12, 1, "CREATE", &["0x0", "0x0", "0x0"]),
+            step(21, 2, "JUMPDEST", &[]),
+            step(21, 2, "RETURN", &[]),
+            step(13, 1, "JUMPDEST", &[]),
+            step(
+                14,
+                1,
+                "CALL",
+                &["0x0", "0x0", "0x0", "0x0", "0x0", &word, "0x0"],
+            ),
+            step(21, 2, "JUMPDEST", &[]),
+            step(30, 1, "STOP", &[]),
+        ]);
+        trace
+            .artifacts
+            .creations
+            .push(creation(2, 4, Some(CREATED)));
+        trace.artifacts.calls.push(call(0, 6, 7, "CALL", CREATED));
+        trace
+    }
+
+    #[test]
+    fn creations_map_through_the_created_contracts_creation_program() {
+        let trace = root_creates_then_calls();
+        // The creation program maps pc 21 into `inner`, the deployed program into `outer`,
+        // so which one a step went through shows in its line. The order they are given in
+        // does not decide it: the environment does.
+        let deployed = program(CREATED, "call", &[(21, "b = 0;")]);
+        let creation = program(CREATED, "create", &[(21, "x += 1;")]);
+        let map = StepMap::new(&trace, vec![contract(Some(ROOT)), deployed, creation]);
+
+        assert_eq!(map.executing_address(2), Some(CREATED));
+        assert_eq!(map.storage_address(2), Some(CREATED));
+        assert_eq!(
+            map.line_key(2).map(|key| (key.contract, key.line)),
+            Some((2, 8))
+        );
+        assert_eq!(
+            map.line_key(6).map(|key| (key.contract, key.line)),
+            Some((1, 5))
+        );
+        // Innermost first: `inner`, then the creation frame that entered it.
+        let frames = map.frames(2);
+        assert_eq!(frames[0].function_name.as_deref(), Some("inner"));
+        assert!(frames[1].external);
+        assert_eq!(frames[1].address.as_deref(), Some(CREATED));
+        assert_eq!(map.frame_depth(4), Some(1));
+    }
+
+    #[test]
+    fn a_line_resolves_only_in_the_programs_that_map_it() {
+        // Both programs of the created contract see `C.sol`; only the creation program has
+        // code on line 8, and the deployed program's whole-contract span must not turn the
+        // breakpoint into a stop on line 1.
+        let trace = root_creates_then_calls();
+        let whole = SOURCE.len() as u64;
+        let mut deployed = program(CREATED, "call", &[(21, "b = 0;")]);
+        deployed.info.instructions.push(instruction(20, 0, whole));
+        let mut creation = program(CREATED, "create", &[(21, "x += 1;")]);
+        creation.info.instructions.push(instruction(20, 0, whole));
+        let map = StepMap::new(&trace, vec![deployed, creation]);
+        let resolved = map.resolve_line(Some("C.sol"), 8).expect("line 8");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].key.contract, 1);
+        assert_eq!(resolved[0].key.line, 8);
+        // A line no program maps still resolves to the statements containing it.
+        let resolved = map.resolve_line(Some("C.sol"), 10).expect("line 10");
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|line| line.key.line == 1));
+    }
+
+    #[test]
+    fn a_creation_uses_the_only_program_at_its_address() {
+        // Only the deployed program is loaded: it still names the address's sources, and
+        // describes the creation frame the way it did before environments were told apart.
+        let trace = root_creates_then_calls();
+        let deployed = program(CREATED, "call", &[(21, "b = 0;")]);
+        let map = StepMap::new(&trace, vec![contract(Some(ROOT)), deployed]);
+        assert_eq!(
+            map.line_key(2).map(|key| (key.contract, key.line)),
+            Some((1, 5))
+        );
+    }
+
+    #[test]
+    fn a_creation_the_backend_did_not_record_has_no_contract() {
+        let mut trace = root_creates_then_calls();
+        trace.artifacts.creations.clear();
+        let creation = program(CREATED, "create", &[(21, "x += 1;")]);
+        let map = StepMap::new(&trace, vec![contract(Some(ROOT)), creation]);
+        assert_eq!(map.executing_address(2), None);
+        assert_eq!(map.line_key(2), None);
+        // The call is still resolved from the stack.
+        assert_eq!(map.executing_address(6), Some(CREATED));
+    }
+
+    #[test]
+    fn a_deployment_root_prefers_the_creation_program() {
+        let mut trace = trace(vec![step(21, 1, "JUMPDEST", &[]), step(30, 1, "STOP", &[])]);
+        trace.to_addr = None;
+        trace.contract_address = Some(CREATED.to_owned());
+        let deployed = program(CREATED, "call", &[(21, "b = 0;")]);
+        let creation = program(CREATED, "create", &[(21, "x += 1;")]);
+        let map = StepMap::new(&trace, vec![deployed, creation]);
+        assert_eq!(
+            map.line_key(0).map(|key| (key.contract, key.line)),
+            Some((1, 8))
+        );
+    }
+
+    #[test]
+    fn frames_are_resolved_from_recorded_calls_before_the_stack() {
+        let callee = "0xbbbb000000000000000000000000000000000002";
+        let precompile = "0x0000000000000000000000000000000000000001";
+        // No stack was recorded, so nothing can be read off the call instructions.
+        let mut trace = trace(vec![
+            step(0, 1, "PUSH1", &[]),
+            step(11, 1, "STATICCALL", &[]),
+            step(12, 1, "DELEGATECALL", &[]),
+            step(21, 2, "JUMPDEST", &[]),
+            step(21, 2, "ADD", &[]),
+            step(13, 1, "JUMPDEST", &[]),
+        ]);
+        // The precompile ran no steps: it starts and ends at the caller's next step, and is
+        // not the frame entered there.
+        trace
+            .artifacts
+            .calls
+            .push(call(0, 2, 2, "STATICCALL", precompile));
+        trace
+            .artifacts
+            .calls
+            .push(call(1, 3, 5, "DELEGATECALL", callee));
+        let map = StepMap::new(&trace, vec![contract(Some(ROOT)), contract(Some(callee))]);
+
+        assert_eq!(map.executing_address(2), Some(ROOT));
+        assert_eq!(map.frame_depth(2), Some(1));
+        assert_eq!(map.executing_address(3), Some(callee));
+        assert_eq!(map.line_key(3).map(|key| key.contract), Some(1));
+        // A delegated frame keeps its caller's storage.
+        assert_eq!(map.storage_address(3), Some(ROOT));
     }
 
     #[test]
