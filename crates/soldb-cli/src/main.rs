@@ -2669,6 +2669,9 @@ fn decode_calldata_word(calldata: &str, index: usize, ty: &str) -> Option<Decode
     let data = calldata.trim_start_matches("0x");
     let start = 8 + index * 64;
     let word = data.get(start..start + 64)?;
+    if let Some(dynamic) = decode_dynamic_argument(data, word, ty) {
+        return Some(dynamic);
+    }
     decode_static_word(word, ty).map_or_else(
         || {
             Some(DecodedWord {
@@ -2678,6 +2681,62 @@ fn decode_calldata_word(calldata: &str, index: usize, ty: &str) -> Option<Decode
         },
         |value| Some(DecodedWord { value, raw: false }),
     )
+}
+
+/// A `string`, `bytes`, or dynamic array argument, whose head word is the offset of its
+/// data: the text, the bytes, or the element count.
+fn decode_dynamic_argument(data: &str, head: &str, ty: &str) -> Option<DecodedWord> {
+    let ty = ty.trim();
+    if ty != "string" && ty != "bytes" && !ty.ends_with("[]") {
+        return None;
+    }
+    let offset = usize::from_str_radix(head.trim_start_matches('0'), 16)
+        .ok()
+        .or_else(|| head.bytes().all(|byte| byte == b'0').then_some(0))?;
+    let length_start = 8 + offset * 2;
+    let length = usize::from_str_radix(
+        data.get(length_start..length_start + 64)?
+            .trim_start_matches('0'),
+        16,
+    )
+    .ok()
+    .or_else(|| {
+        data.get(length_start..length_start + 64)?
+            .bytes()
+            .all(|byte| byte == b'0')
+            .then_some(0)
+    })?;
+    if ty.ends_with("[]") {
+        return Some(DecodedWord {
+            value: format!("[{length} element(s)]"),
+            raw: false,
+        });
+    }
+    let hex = data.get(length_start + 64..length_start + 64 + length * 2)?;
+    let bytes = (0..length)
+        .map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if ty == "string" {
+        if let Ok(text) = String::from_utf8(bytes.clone()) {
+            if text.chars().all(|character| !character.is_control()) {
+                return Some(DecodedWord {
+                    value: text,
+                    raw: false,
+                });
+            }
+        }
+    }
+    Some(DecodedWord {
+        value: format!(
+            "0x{}",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+        raw: false,
+    })
 }
 
 fn decode_static_word(word: &str, ty: &str) -> Option<String> {
@@ -4359,11 +4418,9 @@ contract Counter {
         let descriptor = abi_descriptor_for_calldata(&legacy, &raw).expect("combined descriptor");
         assert_eq!(descriptor.name, "set");
         assert_eq!(descriptor.params[0].name, "value");
-        assert!(descriptor.params[0].raw);
-        assert_eq!(
-            descriptor.params[0].value,
-            "0x0000000000000000000000000000000000000000000000000000000000000020"
-        );
+        // A dynamic argument is read from where its head word points, not shown as it.
+        assert!(!descriptor.params[0].raw);
+        assert_eq!(descriptor.params[0].value, "hi");
     }
 
     #[test]

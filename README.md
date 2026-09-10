@@ -10,8 +10,73 @@
 
 SolDB is an open-source, ETHDebug-first, LLDB-style debugger for Solidity and the EVM.
 
-![soldb demo 11 sept 2025](https://github.com/user-attachments/assets/7376da04-96b0-4aae-8c9b-154680ffe6b4)
+![SolDB full-screen view](docs/assets/soldb-tui.png)
 
+---
+
+## Try It in Two Minutes
+
+No node, no project: `soldb run` deploys a contract on a chain that exists only for the
+run and calls it. [`examples/Shop.sol`](examples/Shop.sol) has one of everything the
+debugger can show. Compile it with solc's legacy pipeline, whose fixed stack layout is
+what lets the debugger read local variables (see [Variables](docs/commands.md#variables)):
+
+```bash
+cargo install soldb
+cd examples
+solc --evm-version cancun Shop.sol --bin --abi --combined-json abi,bin,bin-runtime,srcmap,srcmap-runtime,storage-layout -o out_shop --overwrite
+soldb run out_shop/Shop.bin "place(string,uint128,uint256)" widget 5 3 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Shop:out_shop -i
+```
+
+Then, at the prompt:
+
+```text
+soldb> break Shop.sol:40
+Breakpoint #1 set at Shop.sol:40
+soldb> continue
+Breakpoint #1 hit at step 1444, Shop.sol:40
+Shop.sol:40 in place  (step 1444/2142, pc 699, PUSH2, gas 29795966)
+   40 |         revenue += total(order);
+soldb> vars
+string memory item = "widget" [stack+2]
+uint128 unitPrice = 5 [stack+3]
+uint256 count = 3 [stack+4]
+uint256 id = 1 [stack+5]
+Order memory order = { id: 1, item: "widget", price: 5, status: Status.Open, quantities: [1, 2, 3] } [stack+6]
+State:
+mapping(uint256 => struct Shop.Order) orders = <mapping; index it with [key]> [slot 0x0]
+uint256 nextId = 1 [slot 0x1]
+...
+soldb> print order.quantities[2]
+uint256 order.quantities[2] = 3 [stack+6]
+soldb> print orders[1].status
+enum Shop.Status orders[1].status = Status.Paid [slot 0xada5…e7f + 16]
+soldb> step
+Shop.sol:69 in total  (step 1448/2142, pc 1376, JUMPDEST, gas 29795949)
+   69 |     function total(Order memory order) internal pure returns (uint256 sum) {
+soldb> break Shop.sol:72 if sum > 10
+soldb> continue
+Breakpoint #2 hit at step 1826, Shop.sol:72 if sum > 10
+Shop.sol:72 in total  (step 1826/2142, pc 1404, DUP4, gas 29794734)
+   72 |             sum += unit * order.quantities[i];
+soldb> bt
+#0  total at Shop.sol:72  step 1826, PC 1404
+#1  place at Shop.sol:40  step 1447, PC 706
+#2  Shop at Shop.sol:8  step 33, PC 62
+soldb> reverse-next
+soldb> tui
+```
+
+The same session as one command, and as JSON:
+
+```bash
+soldb run out_shop/Shop.bin "place(string,uint128,uint256)" widget 5 3 --ethdebug-dir 0x5fbd…:Shop:out_shop \
+    -x 'break Shop.sol:72 if sum > 10' -x continue -x vars -x bt --batch
+soldb run out_shop/Shop.bin "place(string,uint128,uint256)" widget 5 3 --ethdebug-dir 0x5fbd…:Shop:out_shop \
+    -x 'break Shop.sol:72 if sum > 10' -x continue -x 'print sum' --batch --json
+```
+
+`--tui` starts in the full-screen view instead.
 
 ---
 
