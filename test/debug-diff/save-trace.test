@@ -1,6 +1,6 @@
 # Local execution exports the raw trace format consumed by debug-diff.
 # REQUIRES: soldb
-# RUN: %soldb run 600160005260206000f3 --runtime --raw-data 0x --save-trace %t.trace --json > %t.web
+# RUN: %soldb run 600160005260206000f3 --runtime --raw-data 0x --save-trace %t.trace > /dev/null
 # RUN: jq '{success, input_data, steps: (.steps | length)}' %t.trace | FileCheck %s
 # CHECK: "success": true
 # CHECK: "input_data": "0x"

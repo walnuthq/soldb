@@ -191,7 +191,6 @@ fn run_exports_a_trace_that_debug_diff_can_read() {
             "--runtime",
             "--raw-data",
             "0x",
-            "--json",
             "--save-trace",
         ])
         .arg(&path)
@@ -463,38 +462,6 @@ fn info_resources_json_reads_ethdebug_resources() {
 }
 
 #[test]
-fn trace_json_uses_rpc_trace_data() {
-    let rpc_url = start_rpc_server(3);
-    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
-        .args([
-            "trace",
-            "0xabc",
-            "--rpc",
-            &rpc_url,
-            "--ethdebug-dir",
-            "0x2:TestContract:out",
-            "--json",
-        ])
-        .output()
-        .expect("run soldb");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    let value: serde_json::Value = serde_json::from_str(&stdout).expect("trace json");
-    assert_eq!(value["schemaVersion"], 1);
-    assert_eq!(value["traceCall"]["callId"], 0);
-    assert_eq!(value["steps"][0]["traceCallIndex"], 0);
-    assert!(stdout.contains("\"status\": \"success\""));
-    assert!(stdout.contains("\"traceCall\""));
-    assert!(stdout.contains("\"gasUsed\": 21000"));
-    assert!(stdout.contains("\"contracts\""));
-}
-
-#[test]
 fn trace_raw_prints_instruction_table() {
     let rpc_url = start_rpc_server(3);
     let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
@@ -662,44 +629,6 @@ fn trace_interactive_prints_ethdebug_resources() {
 }
 
 #[test]
-fn simulate_json_labels_raw_data_without_metadata() {
-    let rpc_url = start_rpc_server(1);
-    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
-        .args([
-            "simulate",
-            "0x2",
-            "--from",
-            "0x1",
-            "--rpc",
-            &rpc_url,
-            "--ethdebug-dir",
-            "0x2:TestContract:out",
-            "--raw-data",
-            "0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004",
-            "--json",
-        ])
-        .output()
-        .expect("run soldb");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    let value: serde_json::Value = serde_json::from_str(&stdout).expect("simulate json");
-    assert_eq!(value["schemaVersion"], 1);
-    assert_eq!(value["traceCall"]["callId"], 0);
-    assert_eq!(value["traceCall"]["functionName"], "raw_data");
-    assert_eq!(value["steps"][0]["traceCallIndex"], 0);
-    assert!(stdout.contains("\"status\": \"success\""));
-    assert!(stdout.contains("\"type\": \"ENTRY\""));
-    assert!(stdout.contains("\"callId\": 0"));
-    assert!(stdout.contains("\"function_name\": \"raw_data\""));
-    assert!(stdout.contains("\"isVerified\": false"));
-}
-
-#[test]
 fn simulate_interactive_accepts_repl_commands() {
     let rpc_url = start_rpc_server(1);
     let output = run_with_stdin(
@@ -734,40 +663,9 @@ fn simulate_interactive_accepts_repl_commands() {
 }
 
 #[test]
-fn simulate_json_encodes_static_abi_call() {
+fn simulate_summary_encodes_dynamic_array_abi_call() {
     let rpc_url = start_rpc_server(1);
-    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
-        .args([
-            "simulate",
-            "0x2",
-            "increment(uint256)",
-            "4",
-            "--from",
-            "0x1",
-            "--rpc",
-            &rpc_url,
-            "--ethdebug-dir",
-            "0x2:TestContract:out",
-            "--json",
-        ])
-        .output()
-        .expect("run soldb");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains(
-        "\"input\": \"0x7cf5dab00000000000000000000000000000000000000000000000000000000000000004\""
-    ));
-    assert!(stdout.contains("\"function_name\": \"increment(uint256)\""));
-}
-
-#[test]
-fn simulate_json_encodes_dynamic_array_abi_call() {
-    let rpc_url = start_rpc_server(1);
+    let trace = temp_dir("array-call").join("call.trace");
     let expected_input =
         encode_function_call("set(uint256[])", &["[1,2,3]".to_owned()]).expect("calldata");
     let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
@@ -782,7 +680,8 @@ fn simulate_json_encodes_dynamic_array_abi_call() {
             &rpc_url,
             "--ethdebug-dir",
             "0x2:TestContract:out",
-            "--json",
+            "--save-trace",
+            trace.to_str().expect("path"),
         ])
         .output()
         .expect("run soldb");
@@ -793,8 +692,46 @@ fn simulate_json_encodes_dynamic_array_abi_call() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains(&format!("\"input\": \"{expected_input}\"")));
-    assert!(stdout.contains("\"function_name\": \"set(uint256[])\""));
+    assert!(stdout.contains("Status: SUCCESS"), "{stdout}");
+    // The saved trace carries the encoded call.
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&trace).expect("saved trace"))
+            .expect("trace json");
+    assert_eq!(saved["input_data"], expected_input);
+    assert!(saved["steps"]
+        .as_array()
+        .is_some_and(|steps| !steps.is_empty()));
+}
+
+#[test]
+fn json_outside_a_session_is_refused() {
+    let rpc_url = start_rpc_server(3);
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args(["trace", "0xabc", "--rpc", &rpc_url, "--json"])
+        .output()
+        .expect("run soldb");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`--json` formats the answers of a debugging session"),
+        "{stderr}"
+    );
+    // With a session it answers one JSON object per line.
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "trace", "0xabc", "--rpc", &rpc_url, "--json", "-x", "nexti", "--batch",
+        ])
+        .output()
+        .expect("run soldb");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let kinds = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("json line")["kind"].clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["loaded", "stop", "stop"]);
 }
 
 #[test]
@@ -1064,37 +1001,6 @@ fn list_events_prints_raw_receipt_logs() {
     assert!(
         stdout.contains("data: 0x0000000000000000000000000000000000000000000000000000000000000004")
     );
-}
-
-#[test]
-fn simulate_json_encodes_dynamic_abi_call() {
-    let rpc_url = start_rpc_server(1);
-    let expected_input = encode_function_call("set(string)", &["hi".to_owned()]).expect("calldata");
-    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
-        .args([
-            "simulate",
-            "0x2",
-            "set(string)",
-            "hi",
-            "--from",
-            "0x1",
-            "--rpc",
-            &rpc_url,
-            "--ethdebug-dir",
-            "0x2:TestContract:out",
-            "--json",
-        ])
-        .output()
-        .expect("run soldb");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains(&format!("\"input\": \"{expected_input}\"")));
-    assert!(stdout.contains("\"function_name\": \"set(string)\""));
 }
 
 #[test]

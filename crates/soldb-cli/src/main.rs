@@ -35,7 +35,7 @@ use soldb_ethdebug::{
 };
 use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
 use soldb_rpc::{RpcLog, TraceBackend};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Display;
 use std::fs;
@@ -370,8 +370,13 @@ struct TraceArgs {
     interactive: bool,
     #[arg(long)]
     raw: bool,
+    /// Answer every debugger command as JSON, one object per line; needs `-i`, `-x`, or
+    /// `--tui`.
     #[arg(long)]
     json: bool,
+    /// Save the complete trace as JSON for offline `debug-diff` and `profile`.
+    #[arg(long, value_name = "FILE")]
+    save_trace: Option<PathBuf>,
     /// A debugger command to run before any is read from stdin, such as
     /// `-x 'break Counter.sol:12' -x continue -x vars`; repeatable, and implies `-i`.
     #[arg(short = 'x', long = "command", value_name = "COMMAND")]
@@ -408,6 +413,8 @@ struct TraceView {
     json: bool,
     raw: bool,
     session: SessionOptions,
+    /// Where to save the trace as JSON, for offline `debug-diff` and `profile`.
+    save_trace: Option<PathBuf>,
 }
 
 impl TraceView {
@@ -423,6 +430,7 @@ impl TraceView {
             json: args.json,
             raw: args.raw,
             session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 
@@ -438,6 +446,7 @@ impl TraceView {
             json: args.json,
             raw: args.raw,
             session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 
@@ -479,6 +488,8 @@ struct SimulationView {
     raw: bool,
     max_steps: i64,
     session: SessionOptions,
+    /// Where to save the trace as JSON, for offline `debug-diff` and `profile`.
+    save_trace: Option<PathBuf>,
     /// The block the call ran on top of, when it ran on a node and the block is fixed:
     /// its end state is exactly what the call started from. `None` when the call ran at a
     /// position inside a block, where neither that block nor its parent is that state.
@@ -508,6 +519,7 @@ impl SimulationView {
             raw: args.raw,
             max_steps: args.max_steps,
             session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 
@@ -533,6 +545,7 @@ impl SimulationView {
             raw: args.raw,
             max_steps: args.max_steps,
             session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 
@@ -559,6 +572,7 @@ impl SimulationView {
             raw: args.raw,
             max_steps: args.max_steps,
             session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 }
@@ -584,8 +598,13 @@ struct ReplayArgs {
     interactive: bool,
     #[arg(long)]
     raw: bool,
+    /// Answer every debugger command as JSON, one object per line; needs `-i`, `-x`, or
+    /// `--tui`.
     #[arg(long)]
     json: bool,
+    /// Save the complete trace as JSON for offline `debug-diff` and `profile`.
+    #[arg(long, value_name = "FILE")]
+    save_trace: Option<PathBuf>,
     /// A debugger command to run before any is read from stdin, such as
     /// `-x 'break Counter.sol:12' -x continue -x vars`; repeatable, and implies `-i`.
     #[arg(short = 'x', long = "command", value_name = "COMMAND")]
@@ -663,6 +682,8 @@ struct RunArgs {
     multi_contract: bool,
     #[arg(long, short = 'i')]
     interactive: bool,
+    /// Answer every debugger command as JSON, one object per line; needs `-i`, `-x`, or
+    /// `--tui`.
     #[arg(long)]
     json: bool,
     #[arg(long)]
@@ -721,10 +742,16 @@ struct SimulateArgs {
         default_value = "http://localhost:8545"
     )]
     rpc_url: String,
+
+    /// Answer every debugger command as JSON, one object per line; needs `-i`, `-x`, or
+    /// `--tui`.
     #[arg(long)]
     json: bool,
     #[arg(long)]
     raw: bool,
+    /// Save the complete trace as JSON for offline `debug-diff` and `profile`.
+    #[arg(long, value_name = "FILE")]
+    save_trace: Option<PathBuf>,
     /// A debugger command to run before any is read from stdin, such as
     /// `-x 'break Counter.sol:12' -x continue -x vars`; repeatable, and implies `-i`.
     #[arg(short = 'x', long = "command", value_name = "COMMAND")]
@@ -1053,6 +1080,8 @@ fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
+    SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+        .check_json(args.interactive)?;
     let traced = match &args.save_replay {
         Some(file) => {
             if matches!(args.backend, TraceBackendArg::DebugRpc) {
@@ -1081,39 +1110,19 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
         )
         .map(|resolved| resolved.trace),
     };
-    let trace = match traced {
-        Ok(trace) => trace,
-        Err(error) if args.json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "error": true,
-                    "type": "TransactionError",
-                    "message": error.to_string(),
-                }))
-                .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?
-            );
-            return Err(soldb_core::SoldbError::AlreadyReported);
-        }
-        Err(error) => return Err(error),
-    };
+    let trace = traced?;
     present_trace(&TraceView::for_trace(args), trace)
 }
 
-/// Shows a traced transaction the way the user asked: interactively, as the web
-/// document, as raw steps, or as the summary. Shared by `trace` and `replay`.
+/// Shows a traced transaction the way the user asked: in a debugging session, as raw
+/// steps, or as the summary. Shared by `trace` and `replay`.
 fn present_trace(view: &TraceView, trace: TransactionTrace) -> SoldbResult<()> {
+    save_trace(view.save_trace.as_deref(), &trace)?;
     if view.session.wanted(view.interactive) {
         let source_indexes = interactive_trace_source_indexes(view, &trace);
         run_debugger_session(trace, source_indexes, view.chain_storage(), &view.session)?;
     } else if view.json {
-        println!(
-            "{}",
-            soldb_serializer::trace_to_web_json_with_contracts(
-                &trace,
-                trace_web_contracts(view, &trace)
-            )?
-        );
+        return Err(json_needs_session());
     } else if view.raw {
         print_raw_trace(&trace, view);
     } else {
@@ -1173,6 +1182,8 @@ fn read_replay_bundle(path: &Path) -> SoldbResult<soldb_rpc::ReplayBundle> {
 }
 
 fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
+    SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+        .check_json(args.interactive)?;
     let auto_deploy = maybe_auto_deploy(args)?;
     let contract_address = auto_deploy.as_ref().map_or_else(
         || args.contract_address.clone(),
@@ -1182,19 +1193,8 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
         .as_ref()
         .map(|deploy| deploy.contract_name.clone());
     let view = SimulationView::for_simulate(args, &contract_address);
-    let calldata = match simulate_calldata(&view) {
-        Ok(calldata) => calldata,
-        Err(error) if args.json => {
-            print_json_command_error("SimulationError", &error.to_string(), None)?;
-            return Err(soldb_core::SoldbError::AlreadyReported);
-        }
-        Err(error) => return Err(error),
-    };
+    let calldata = simulate_calldata(&view)?;
     if let Err(message) = validate_simulate_value(&args.value) {
-        if args.json {
-            print_json_command_error("InvalidValue", &message, Some(&args.value))?;
-            return Err(soldb_core::SoldbError::AlreadyReported);
-        }
         return Err(soldb_core::SoldbError::Message(message));
     }
 
@@ -1229,16 +1229,16 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     present_simulation(&view, trace, contract_name.as_deref(), &calldata)
 }
 
-/// Shows a simulated call the way the user asked: interactively, as the web document, as
-/// raw steps, or as the summary. Shared by `simulate` and `run`.
+/// Shows a simulated call the way the user asked: in a debugging session, as raw steps,
+/// or as the summary. Shared by `simulate` and `run`.
 fn present_simulation(
     view: &SimulationView,
     trace: TransactionTrace,
     contract_name: Option<&str>,
     calldata: &str,
 ) -> SoldbResult<()> {
+    save_trace(view.save_trace.as_deref(), &trace)?;
     let contract_address = view.contract_address.as_str();
-    let json_function_name = simulate_json_function_name(view, calldata);
     let display_function_name = simulate_display_function_name(view, calldata);
 
     if view.session.wanted(view.interactive) {
@@ -1254,14 +1254,7 @@ fn present_simulation(
         let source_indexes = interactive_simulation_source_indexes(view, contract_address);
         run_debugger_session(trace, source_indexes, view.chain_storage(), &view.session)?;
     } else if view.json {
-        println!(
-            "{}",
-            soldb_serializer::simulate_to_web_json_with_contracts(
-                &trace,
-                &json_function_name,
-                simulate_web_contracts(view, &trace, contract_address)
-            )?
-        );
+        return Err(json_needs_session());
     } else if view.raw {
         print_raw_simulation(&trace, view, contract_address);
     } else {
@@ -1284,8 +1277,10 @@ fn present_simulation(
 /// the same synthetic block right after it, so whatever the constructor stored is what
 /// the call sees. `--runtime` installs the bytes as they are instead, and `--deploy`
 /// traces the constructor and stops. Everything after execution is `simulate`'s: the same
-/// ETHDebug mapping, REPL, JSON document, and raw view.
+/// ETHDebug mapping, REPL, and raw view.
 fn run_command(args: &RunArgs) -> SoldbResult<()> {
+    SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+        .check_json(args.interactive)?;
     let bytecode = load_bytecode(&args.bytecode)?;
     let mut chain = soldb_rpc::LocalChain::new()
         .with_chain_id(args.chain_id)
@@ -1370,7 +1365,6 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         })?;
         let trace = chain.deploy(deployment)?;
         let calldata = deployment.input_data.clone();
-        save_run_trace(args, &trace)?;
         return present_simulation(&view, trace, contract_name.as_deref(), &calldata);
     }
 
@@ -1391,22 +1385,32 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
             "the call executed no instructions; there is no code at `{contract_address}`\nnote: pass creation code, or `--runtime` with the deployed code"
         )));
     }
-    save_run_trace(args, &trace)?;
     present_simulation(&view, trace, contract_name.as_deref(), &calldata)
 }
 
-/// Writes the raw trace format used by offline consumers, independently of display mode.
-fn save_run_trace(args: &RunArgs, trace: &TransactionTrace) -> SoldbResult<()> {
-    if let Some(path) = &args.save_trace {
-        let output = soldb_serializer::trace_to_json(trace)?;
-        fs::write(path, output).map_err(|error| {
-            soldb_core::SoldbError::Message(format!(
-                "failed to save trace `{}`: {error}",
-                path.display()
-            ))
-        })?;
-    }
-    Ok(())
+/// Writes the trace as JSON, the format `debug-diff` and `profile` read offline, whatever
+/// the display mode.
+fn save_trace(path: Option<&Path>, trace: &TransactionTrace) -> SoldbResult<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let output = serde_json::to_string_pretty(trace)
+        .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?;
+    fs::write(path, output).map_err(|error| {
+        soldb_core::SoldbError::Message(format!(
+            "failed to save trace `{}`: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// `--json` outside a debugging session: there is no document to print any more.
+fn json_needs_session() -> soldb_core::SoldbError {
+    soldb_core::SoldbError::Message(
+        "`--json` formats the answers of a debugging session; add `-i`, `-x <command>`, or \
+         `--tui`, or `--save-trace <FILE>` to write the trace as JSON"
+            .to_owned(),
+    )
 }
 
 /// Reads bytecode from a file when `source` names one, otherwise treats it as hex.
@@ -1696,6 +1700,15 @@ impl SessionOptions {
     /// only makes sense inside one.
     fn wanted(&self, interactive: bool) -> bool {
         interactive || !self.commands.is_empty() || self.tui
+    }
+
+    /// `--json` prints a debugging session's answers, so it needs one. Checked before any
+    /// tracing so `soldb trace X --json` fails without touching the node.
+    fn check_json(&self, interactive: bool) -> SoldbResult<()> {
+        if self.json && !self.wanted(interactive) {
+            return Err(json_needs_session());
+        }
+        Ok(())
     }
 }
 
@@ -3385,137 +3398,6 @@ fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::p
     .find(|path| path.exists())
 }
 
-fn trace_web_contracts(
-    args: &TraceView,
-    trace: &TransactionTrace,
-) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs = resolve_contract_specs_reporting(
-        &args.ethdebug_dir,
-        args.contracts.as_deref(),
-        &args.source_path,
-    );
-    web_contracts_for_specs(specs, trace, None)
-}
-
-fn simulate_web_contracts(
-    args: &SimulationView,
-    trace: &TransactionTrace,
-    contract_address: &str,
-) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs = resolve_contract_specs_reporting(
-        &args.ethdebug_dir,
-        args.contracts.as_deref(),
-        &args.source_path,
-    );
-    web_contracts_for_specs(specs, trace, Some(contract_address))
-}
-
-fn web_contracts_for_specs(
-    specs: Vec<ResolvedContractSpec>,
-    trace: &TransactionTrace,
-    fallback_address: Option<&str>,
-) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let single_spec = specs.len() == 1;
-    specs
-        .into_iter()
-        .filter_map(|spec| {
-            let address = spec
-                .address
-                .clone()
-                .or_else(|| {
-                    single_spec
-                        .then(|| fallback_address.map(str::to_owned))
-                        .flatten()
-                })
-                .or_else(|| {
-                    single_spec
-                        .then(|| {
-                            trace
-                                .to_addr
-                                .clone()
-                                .or_else(|| trace.contract_address.clone())
-                        })
-                        .flatten()
-                })?;
-            let metadata = web_contract_metadata_for_spec(&spec)?;
-            let metadata = with_final_state(metadata, &spec, trace, &address);
-            Some((normalize_contract_address_key(&address), metadata))
-        })
-        .collect()
-}
-
-/// Adds the contract's storage layout and its state at the end of the transaction.
-///
-/// A client reading the document gets what the REPL shows: each variable's slot, its
-/// value, and whether that value came from the recording, from a chain, or from neither.
-fn with_final_state(
-    metadata: soldb_serializer::WebContractMetadata,
-    spec: &ResolvedContractSpec,
-    trace: &TransactionTrace,
-    address: &str,
-) -> soldb_serializer::WebContractMetadata {
-    let Some(index) = load_source_index(spec) else {
-        return metadata;
-    };
-    let Some(layout) = index.debug.storage_layout.as_ref() else {
-        return metadata;
-    };
-    let Some(last) = trace.steps.len().checked_sub(1) else {
-        return metadata;
-    };
-    let map = soldb_debugger::StepMap::new(trace, vec![index.debug.clone()]);
-    let tape = soldb_debugger::StorageTape::new(trace, &map);
-    // The account this contract's storage belongs to, rather than whichever frame the
-    // last step happened to be in.
-    let context = (0..trace.steps.len()).find(|step| {
-        map.storage_address(*step)
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(address))
-    });
-    let Some(context) = context.and_then(|step| map.storage_context_index(step)) else {
-        return metadata;
-    };
-    let words = tape.at(last, Some(context));
-    let variables = soldb_debugger::state_variables(layout, &words)
-        .into_iter()
-        .map(|variable| soldb_serializer::WebStateVariable {
-            name: variable.name,
-            ty: variable.ty,
-            slot: variable.slot,
-            offset: variable.offset,
-            value: variable.value.display,
-            source: match (variable.value.status, variable.source) {
-                (soldb_debugger::DebugValueStatus::Unavailable, _) => "unknown",
-                (_, soldb_debugger::StateSource::Chain) => "chain",
-                (_, soldb_debugger::StateSource::Trace) => "trace",
-            }
-            .to_owned(),
-        })
-        .collect();
-    metadata.with_state(layout.source.clone(), variables)
-}
-
-fn web_contract_metadata_for_spec(
-    spec: &ResolvedContractSpec,
-) -> Option<soldb_serializer::WebContractMetadata> {
-    let abi = abi_value_for_spec(spec);
-    let Some(index) = load_source_index(spec) else {
-        let metadata = soldb_serializer::WebContractMetadata {
-            abi,
-            ..Default::default()
-        };
-        return (!metadata.is_empty()).then_some(metadata);
-    };
-
-    // The loader already read every source it could find next to the artifacts; the
-    // projection falls back to the path for anything still missing.
-    let metadata = soldb_serializer::WebContractMetadata::from_ethdebug(
-        &index.debug.info,
-        &index.debug.source_contents,
-        abi,
-    );
-    (!metadata.is_empty()).then_some(metadata)
-}
-
 fn normalize_contract_address_key(address: &str) -> String {
     address.to_ascii_lowercase()
 }
@@ -3726,14 +3608,6 @@ fn simulation_source_file(args: &SimulationView, contract_name: &str) -> Option<
     })
 }
 
-fn simulate_json_function_name(args: &SimulationView, calldata: &str) -> String {
-    if let Some(signature) = &args.function_signature {
-        return signature.clone();
-    }
-
-    simulate_display_function_name(args, calldata)
-}
-
 fn simulate_display_function_name(args: &SimulationView, calldata: &str) -> String {
     if let Some(signature) = &args.function_signature {
         if let Some(parsed) = parse_signature(signature) {
@@ -3880,6 +3754,7 @@ mod tests {
     use serde_json::Value;
     use soldb_ethdebug::{EthdebugInfo, Instruction};
     use soldb_repl::{BreakpointTarget, SourceBreakpointTarget, StepOutcome};
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -3939,6 +3814,7 @@ mod tests {
             commands: Vec::new(),
             batch: false,
             tui: false,
+            save_trace: None,
             contract_address: "0x2".to_owned(),
             function_signature: None,
             function_args: Vec::new(),
@@ -4252,14 +4128,6 @@ contract Counter {
             "{outcome:?}"
         );
 
-        let web = web_contract_metadata_for_spec(&spec).expect("web metadata");
-        let expected_mapping = format!("{set_offset}:12:0");
-        assert_eq!(
-            web.pc_to_source_mappings.get(&2).map(String::as_str),
-            Some(expected_mapping.as_str())
-        );
-        assert_eq!(web.sources.get(&0).map(String::as_str), Some(source));
-
         fs::write(
             spec.debug_dir.join("ethdebug.json"),
             json!({
@@ -4291,71 +4159,6 @@ contract Counter {
         let preferred = TraceSourceIndex::load(&spec).expect("prefer ETHDebug");
         assert!(preferred.debug.info.instruction_at_pc(7).is_some());
         assert!(preferred.debug.info.instruction_at_pc(2).is_none());
-    }
-
-    #[test]
-    fn builds_web_contract_metadata_from_ethdebug_artifacts() {
-        let dir = temp_dir("web-contract-metadata");
-        let source = "contract Counter { function set(uint256 amount) public {} }";
-        fs::write(dir.join("Counter.sol"), source).expect("write source");
-        fs::write(
-            dir.join("ethdebug.json"),
-            json!({
-                "compilation": {
-                    "compiler": {"name": "solc", "version": "0.8.31+commit.test"},
-                    "sources": [{"id": 0, "path": "Counter.sol"}]
-                }
-            })
-            .to_string(),
-        )
-        .expect("write metadata");
-        fs::write(
-            dir.join("Counter_ethdebug-runtime.json"),
-            json!({
-                "contract": {"name": "Counter"},
-                "environment": "runtime",
-                "instructions": [
-                    {
-                        "offset": 10,
-                        "operation": {"mnemonic": "JUMPDEST"},
-                        "context": {
-                            "code": {
-                                "source": {"id": 0},
-                                "range": {"offset": 4, "length": 8}
-                            }
-                        }
-                    }
-                ]
-            })
-            .to_string(),
-        )
-        .expect("write runtime");
-        fs::write(
-            dir.join("Counter.abi"),
-            r#"[{"type":"function","name":"set","inputs":[{"name":"amount","type":"uint256"}]}]"#,
-        )
-        .expect("write abi");
-
-        let spec = ResolvedContractSpec {
-            address: None,
-            name: "Counter".to_owned(),
-            debug_dir: dir,
-            source_paths: Vec::new(),
-        };
-        let trace = transaction_trace("0x".to_owned(), Vec::new());
-        let contracts = web_contracts_for_specs(vec![spec], &trace, None);
-        let metadata = contracts.get("0x2").expect("contract metadata");
-        assert_eq!(
-            metadata.pc_to_source_mappings.get(&10).map(String::as_str),
-            Some("4:8:0")
-        );
-        assert_eq!(metadata.sources.get(&0).map(String::as_str), Some(source));
-        assert_eq!(
-            metadata.source_paths.get(&0).map(String::as_str),
-            Some("Counter.sol")
-        );
-        assert!(metadata.debug_available);
-        assert_eq!(metadata.abi.as_ref().expect("abi")[0]["name"], "set");
     }
 
     #[test]
@@ -4528,10 +4331,6 @@ contract Counter {
         let calldata = simulate_calldata(&view_of(&args)).expect("encoded calldata");
         assert!(calldata.starts_with("0x7cf5dab0"));
         assert_eq!(
-            simulate_json_function_name(&view_of(&args), &calldata),
-            "increment(uint256)"
-        );
-        assert_eq!(
             simulate_display_function_name(&view_of(&args), &calldata),
             "increment"
         );
@@ -4632,6 +4431,7 @@ contract Counter {
             json: false,
             raw: false,
             session: SessionOptions::default(),
+            save_trace: None,
         };
         let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
         print_plain_trace_summary(&trace);

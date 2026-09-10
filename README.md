@@ -355,7 +355,6 @@ flowchart TD
 
     cli["soldb trace / simulate / profile"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]
     run["soldb run<br/>compiled bytecode"] --> metadata
-    wasm["soldb-wasm<br/>browser / Node.js host does the RPC"] --> metadata
     artifacts --> metadata
 
     cli --> selector["soldb-rpc<br/>JSON-RPC transport + backend selector"]
@@ -366,12 +365,11 @@ flowchart TD
     debug_rpc --> engine["soldb-evm<br/>trace assembly + REVM engine"]
     replay --> engine
     local --> engine
-    wasm --> engine
     engine --> opcode_trace["opcode trace<br/>a complete recording"]
     metadata --> debugger["soldb-debugger<br/>source steps + variables"]
     opcode_trace --> enriched
     debugger --> enriched["source lines<br/>call frames<br/>decoded values"]
-    enriched --> outputs["CLI / JSON / REPL and DAP, forward and reverse / WASM"]
+    enriched --> outputs["CLI text / REPL and TUI, forward and reverse / DAP / JSON answers"]
     opcode_trace --> profiler["soldb-profiler<br/>gas aggregation"]
     metadata --> profiler
     profiler --> profile_outputs["tables / JSON / flame graph"]
@@ -385,7 +383,10 @@ mapping and ABI data without inventing the missing metadata. The debugger-side
 ETHDebug contract is documented in
 [docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
 
-The `--json` output for `trace` and `simulate` is versioned for web and explorer integrations. See [docs/json.md](docs/json.md) for the current schema, capability flags, replay artifacts, and compatibility rules.
+`--save-trace <FILE>` on `trace`, `simulate`, `run`, and `replay` writes the complete
+trace as JSON, the format `debug-diff` and `profile` read offline; `--json` in a
+debugging session answers every command as JSON (see [Scripting and
+JSON](docs/commands.md#scripting-and-json)).
 
 ### Execution Backends
 
@@ -436,8 +437,7 @@ node, no deployment transaction, and nothing to clean up: the creation code is d
 locally from the first Anvil account, so the contract lands where Anvil would put it, and
 the call runs right after the constructor in the same synthetic block, seeing the state
 it left behind. Everything downstream is `simulate`'s: source mapping through
-`--ethdebug-dir`, the interactive debugger with reverse stepping, the JSON document, and
-the raw view.
+`--ethdebug-dir`, the interactive debugger with reverse stepping, and the raw view.
 
 ```bash
 soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Counter:./out
@@ -474,11 +474,9 @@ step-back button works. Breakpoints are predicates on a step, so `break storage 
 - `crates/soldb-repl`: the debugger's command language, session, and answers; the state
   machine every frontend drives.
 - `crates/soldb-tui`: the full-screen terminal view over a session.
-- `crates/soldb-serializer`: JSON/web-facing trace and simulation serialization, including nested call trees and ETHDebug source metadata.
 - `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.
 - `crates/soldb-bridge`: bridge server for cross-environment Solidity<>Stylus debugging.
 - `crates/soldb-dap`: Debug Adapter Protocol server for editor integrations.
-- `crates/soldb-wasm`: WebAssembly bindings that build traces, run source-level debug sessions, and emit the web JSON document in a browser or Node.js host.
 
 ---
 
@@ -573,22 +571,6 @@ cargo llvm-cov --workspace --all-targets --fail-under-lines 80
 make coverage
 ```
 
-### WebAssembly
-
-The library crates build for `wasm32-unknown-unknown`, and `crates/soldb-wasm` packages
-them for a browser or Node.js host with `wasm-pack`:
-
-```bash
-rustup target add wasm32-unknown-unknown
-cargo install wasm-pack
-make wasm         # crates/soldb-wasm/pkg
-make wasm-test    # bindings smoke tests under Node.js
-```
-
-See [docs/wasm.md](docs/wasm.md) for the API, what runs in WebAssembly and what stays
-native, and how CI checks the build.
-
----
 
 ## License
 

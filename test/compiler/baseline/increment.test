@@ -13,8 +13,8 @@
 # RUN: jq -eRs --arg source Arithmetic.sol --argjson names '["increment"]' -f %S/../checkpoints.jq %S/../Arithmetic.sol > %t/checkpoints.json
 
 # Check each compiler's execution before comparing debug information.
-# RUN: %if compiler-solar %{ %soldb run %t/solar/Arithmetic.bin "increment(uint256)" "41" --save-trace %t/solar.trace.json --json > %t/solar.run.json %}
-# RUN: %if compiler-solc %{ %soldb run %t/solc/Arithmetic.bin "increment(uint256)" "41" --save-trace %t/solc.trace.json --json > %t/solc.run.json %}
+# RUN: %if compiler-solar %{ %soldb run %t/solar/Arithmetic.bin "increment(uint256)" "41" --save-trace %t/solar.trace.json > %t/solar.run.json %}
+# RUN: %if compiler-solc %{ %soldb run %t/solc/Arithmetic.bin "increment(uint256)" "41" --save-trace %t/solc.trace.json > %t/solc.run.json %}
 # RUN: %if compiler-solar %{ jq -c '[.success, .output]' %t/solar.trace.json | FileCheck %s --check-prefix=EXEC %}
 # RUN: %if compiler-solc %{ jq -c '[.success, .output]' %t/solc.trace.json | FileCheck %s --check-prefix=EXEC %}
 # EXEC: [true,"0x000000000000000000000000000000000000000000000000000000000000002a"]

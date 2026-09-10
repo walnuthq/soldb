@@ -7,9 +7,8 @@ Guidance for AI coding agents working in this repository.
 SolDB is an ETHDebug-first, LLDB-style debugger for Solidity and the EVM, written in
 Rust. It maps EVM execution back to Solidity source using compiler-generated debug
 information, and exposes that as a CLI (`trace`, `simulate`, `run`, `replay`,
-`list-events`, `list-contracts`, `bridge`), an interactive REPL, a versioned JSON document for web
-clients, a DAP server for editors, and a WebAssembly module for browser and Node.js
-hosts.
+`list-events`, `list-contracts`, `bridge`), an interactive REPL with a full-screen view,
+and a DAP server for editors.
 
 Two premises drive most design decisions:
 
@@ -40,9 +39,6 @@ cargo clippy --workspace --all-targets -- -D warnings   # Lint (CI gate)
 cargo llvm-cov --workspace --all-targets --fail-under-lines 80   # Coverage gate
 ./test/run-tests.sh                                     # lit/FileCheck end-to-end suite
 make test                                               # cargo test + lit
-make wasm-check                                         # clippy on wasm32-unknown-unknown (CI gate)
-make wasm && make wasm-test                             # both wasm-pack packages + Node.js tests (CI gate)
-make wasm-live-test                                     # replay through the package against a live node (CI gate)
 cargo run --bin soldb -- trace <tx> --rpc http://127.0.0.1:8545  # Run the CLI
 ```
 
@@ -110,14 +106,12 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | `soldb-rpc` | core, evm |
 | `soldb-repl` | core, debugger, `serde` |
 | `soldb-tui` | repl, debugger, `ratatui`, `crossterm` |
-| `soldb-serializer` | core, ethdebug |
 | `soldb-debugger` | core, ethdebug |
 | `soldb-profiler` | core, ethdebug |
 | `soldb-bridge` | core, rpc |
 | `soldb-compiler` | core, ethdebug, rpc |
 | `soldb-dap` | core, ethdebug, rpc, repl, debugger |
-| `soldb-cli` | core, ethdebug, rpc, repl, tui, debugger, profiler, serializer, compiler, bridge, `inferno` |
-| `soldb-wasm` | core, ethdebug, evm (without `replay`), debugger, serializer, `wasm-bindgen` |
+| `soldb-cli` | core, ethdebug, rpc, repl, tui, debugger, profiler, compiler, bridge, `inferno` |
 
 The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
 `cargo install soldb`; the directory keeps the `soldb-cli` name to match its siblings.
@@ -201,8 +195,6 @@ belongs in `soldb-debugger`, not in a second copy.
   current line and breakpoints marked, variables and state, stack, memory, backtrace,
   and opcode panes, a command line that takes every REPL command, and gdb-like keys.
   Opened by `--tui` or the `tui` command; `q` returns to the prompt.
-- **soldb-serializer**: the versioned web/JSON projection of traces and simulations,
-  including the per-contract `contracts` entry built from `EthdebugInfo`.
 - **soldb-compiler**: `solc` invocation, ETHDebug artifact discovery, deploy helpers.
 - **soldb-bridge**: cross-VM bridge protocol and server (Stylus today).
 - **soldb-dap**: Debug Adapter Protocol server for editors.
@@ -211,19 +203,10 @@ belongs in `soldb-debugger`, not in a second copy.
   `Renderer` renders, or the `Output` as JSON under `--json`, and runs `-x` commands
   before reading stdin (`--batch` leaves afterwards). The prompt is printed only when
   stdin is a terminal.
-- **soldb-wasm**: `wasm-bindgen` exports over the library crates for browser and Node.js
-  hosts. One handle, `Trace`, holds the parsed trace in WebAssembly memory; inputs and
-  outputs cross the boundary as JSON strings, but the trace is never re-parsed between
-  calls. With its `replay` feature (on by default) it also exports `Replay`, a host-driven
-  REVM replay that reports the state it needs, runs in rounds, keeps the block prefix
-  once it ran clean, and exports the state it used. The behavior lives in
-  its `pipeline` and `replay` modules and is tested natively. Two packages are built from
-  it: lean (`--no-default-features`, no REVM) and replay-capable. `publish = false`: it
-  ships through `wasm-pack`, not crates.io.
 
 Pipeline: `tx hash -> backend (debug-rpc | replay) -> TransactionTrace -> ETHDebug
-enrichment -> call frames + source steps + decoded values -> CLI text | JSON | REPL | DAP
-| WASM`.
+enrichment -> call frames + source steps + decoded values -> CLI text | REPL and TUI |
+DAP | JSON answers`.
 
 ### Layering Rules
 
@@ -238,24 +221,15 @@ enrichment -> call frames + source steps + decoded values -> CLI text | JSON | R
   re-executing. Do not add reverse commands that replay the transaction.
 - ETHDebug parsing stays in `soldb-ethdebug`. If the CLI is indexing into raw ETHDebug
   JSON, the accessor is missing from the metadata layer.
-- `soldb-core` types are a serialization contract with on-disk artifacts and web clients.
-  Adding a field is additive and needs `#[serde(default)]`; renaming or removing one is a
-  breaking change (see JSON Output Contract).
-- The crates listed in `WASM_CRATES` in the `Makefile` must keep building for
-  `wasm32-unknown-unknown`; the `wasm` CI job lints them on that target, checks
-  `soldb-evm` and `soldb-rpc` without their `replay` feature, and runs the `soldb-wasm`
-  package build and
-  tests. `std::net`, `std::process`, and `std::fs` compile there but fail at runtime, so
-  a WebAssembly host does the I/O and hands results over as strings: nothing reachable
-  from a `soldb-wasm` export may open a socket, spawn a process, or read a file. That is
-  why the bindings depend on `soldb-evm` and not on `soldb-rpc`; do not add the transport
-  back. Check a new dependency in one of those crates with `make wasm-check` before
-  proposing it.
-  `make wasm` builds both packages and fails when either exceeds its budget
-  (`WASM_LEAN_SIZE_BUDGET_BYTES`, `WASM_REPLAY_SIZE_BUDGET_BYTES`); raise a budget
-  deliberately, in the change that explains the growth, never to make CI pass.
-  `soldb-evm` selects `getrandom`'s `js` backend for that target only because REVM's
-  `k256` needs it to link. See `docs/wasm.md`.
+- `soldb-core` types are a serialization contract with on-disk artifacts: the trace
+  files `--save-trace` writes and `debug-diff` and `profile` read, and the replay files
+  of `--save-replay`. Adding a field is additive and needs `#[serde(default)]`; renaming
+  or removing one is a breaking change (see JSON Output Contract).
+- The engine crates (`soldb-core`, `soldb-ethdebug`, `soldb-debugger`, `soldb-repl`,
+  `soldb-evm` without `replay`) do no I/O of their own: no sockets, no processes, no
+  files. Keep it that way; a frontend that runs where those are unavailable — a
+  DAP-over-HTTP server is the next one — depends on it. `soldb-evm` selects `getrandom`'s
+  `js` backend for `wasm32-unknown-unknown` only because REVM's `k256` needs it to link.
 
 ### Big Files
 
@@ -404,13 +378,8 @@ Two layers, with different jobs:
   These must not need a node. If a new behavior can be tested here, test it here —
   it runs in every CI job and counts toward the 80% line-coverage gate.
 - **lit + FileCheck tests** (`test/**/*.test`) cover end-to-end CLI behavior against a
-  real node and real solc output: exact rendered output, exit codes, JSON documents,
+  real node and real solc output: exact rendered output, exit codes, saved traces,
   error messages. Prefer these for anything user-visible.
-- **`test/wasm/replay-live.cjs`** replays a transaction through the replay-capable
-  WebAssembly package against a live node and compares it with the node's
-  `debug_traceTransaction`, then simulates a call on the fork and compares it with
-  `debug_traceCall`. It needs only `anvil` and Node.js, and the `wasm` CI job runs it;
-  `make wasm-live-test` runs it locally.
 
 **Backend parity is itself a test target.** `test/trace/replay-*.test` run the same
 transaction through `--backend debug-rpc` and `--backend replay` and diff the opcode
@@ -497,19 +466,19 @@ already went wrong.
   `paint`/`bold`/`info` helpers in `crates/soldb-cli/src/main.rs` rather than emitting raw
   escapes, or lit tests will match against ANSI noise.
 - Human-readable output goes to stdout (including progress lines such as
-  `Loading transaction`); the final error message from `main` goes to stderr. `--json`
-  and `--json-events` paths print *only* the JSON document, so `soldb trace … --json | jq`
-  stays usable — keep it that way. Never add a progress `println!` that is not gated on
-  the JSON flag.
+  `Loading transaction`); the final error message from `main` goes to stderr. A
+  debugging session under `--json`, and `--json-events`, print *only* JSON, so
+  `soldb run … -x vars --batch --json | jq` stays usable — keep it that way. Never add a
+  progress `println!` that is not gated on the JSON flag.
 - On failure the process exits with code `2`, not `1`. Lit tests that expect failure use
   `not %soldb …`.
 
 Errors flow as `SoldbResult<T>` from `soldb-core`. When you add a failure path, produce a
 message that would let a user fix it without reading our source. Do not branch on error
 *text* — if a caller needs to distinguish a failure, give it a distinguishable error.
-A command that has already rendered its failure (the `--json` paths print a JSON error
-document) returns `SoldbError::AlreadyReported` so `main` exits non-zero without printing
-a second time.
+A command that has already rendered its failure (the `--json-events` path prints a JSON
+error document) returns `SoldbError::AlreadyReported` so `main` exits non-zero without
+printing a second time.
 
 **A failed ETHDebug load is never silent.** The user asked for debug info by naming a
 directory; degrading to a raw opcode view without saying why produces a symptom identical
@@ -522,10 +491,14 @@ empty result. Never reintroduce a bare `TraceSourceIndex::load(spec).ok()` or
 
 ## JSON Output Contract
 
-`soldb trace --json` and `soldb simulate --json` are consumed by web clients and
-explorers. `docs/json.md` is the specification; update it in the same change as the code.
+Two things are JSON on the outside. A debugging session under `--json` answers every
+command with one `soldb_repl::Output` per line, tagged by `kind`; the shapes are the
+serde derivations in `crates/soldb-repl/src/response.rs`, and a frontend that speaks
+HTTP or DAP builds on them. `--save-trace` writes a `soldb_core::TransactionTrace`, which
+`debug-diff`, `profile`, and Foundry's `--dump` read back. The former web document and
+its `soldb-serializer` crate are gone; do not reintroduce a second, view-shaped trace
+format.
 
-- `schemaVersion` increments only on a breaking change. Adding a field is not breaking.
 - New fields must round-trip through `serde` with `#[serde(default)]` so older artifacts
   still deserialize.
 - Capability flags exist so clients can degrade gracefully. When a backend gains or loses
@@ -621,10 +594,8 @@ Beyond the rule:
 - **Do not materialize a trace to answer a question about it.** `DebugTraceResult::steps`
   builds every `TraceStep`; calling it to compute a flag or a count costs a full second
   copy of the trace. Read the raw `struct_logs` instead, and pin the result against the
-  definition it replaces with a test. The same applies to writing one out: the web
-  document's `steps` are streamed by `WebSteps` in `soldb-serializer`, one borrowed step
-  at a time, with a test pinning the bytes against the former `json!` shape. Do not
-  reintroduce a `Vec<serde_json::Value>` of steps.
+  definition it replaces with a test. The same applies to writing one out: serialize the
+  steps as they are; do not build a `Vec<serde_json::Value>` of them.
 - **A `TraceStep` stores its state once and serializes it twice.** The flat `stack`,
   `memory`, and `storage` fields are the wire format older files and clients read; every
   constructor leaves them empty, `Serialize` fills them from `snapshot`, and
