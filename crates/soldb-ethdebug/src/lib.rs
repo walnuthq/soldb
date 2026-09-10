@@ -8,7 +8,8 @@
 //!   variable locations, and the `address:name:dir` contract specs used on the command
 //!   line.
 //! - [`source_map`] reads the legacy `srcmap` format for compiler and tooling
-//!   interoperability when ETHDebug programs are unavailable.
+//!   interoperability when ETHDebug programs are unavailable, naming its instructions
+//!   through [`opcodes`].
 //! - [`abi`] encodes calldata and parses function signatures, including tuples and
 //!   arrays, and carries the keccak-256 implementation used to derive selectors.
 //! - [`events`] decodes logs against event ABIs.
@@ -21,6 +22,7 @@ pub mod abi;
 pub mod artifacts;
 pub mod events;
 pub mod metadata;
+pub mod opcodes;
 pub mod source_map;
 pub mod storage_layout;
 

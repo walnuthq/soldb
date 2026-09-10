@@ -12,11 +12,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use revm_bytecode::OpCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
+use crate::opcodes;
 use crate::storage_layout::StorageLayout;
 use crate::{EthdebugInfo, Instruction};
 
@@ -98,7 +98,7 @@ pub fn build_pc_to_instruction_map(bytecode: &[u8]) -> BTreeMap<usize, usize> {
 
     while pc < bytecode.len() {
         pc_to_index.insert(pc, instruction_index);
-        pc += 1 + push_data_size(bytecode[pc]).unwrap_or(0);
+        pc += 1 + opcodes::immediate_size(bytecode[pc]);
         instruction_index += 1;
     }
 
@@ -418,10 +418,8 @@ fn decode_hex_digit(digit: u8) -> Option<u8> {
 }
 
 fn opcode_operation(opcode: u8) -> Value {
-    let mnemonic = OpCode::new(opcode).map_or_else(
-        || format!("UNKNOWN(0x{opcode:02x})"),
-        |opcode| opcode.as_str().to_owned(),
-    );
+    let mnemonic =
+        opcodes::mnemonic(opcode).map_or_else(|| format!("UNKNOWN(0x{opcode:02x})"), str::to_owned);
     json!({"mnemonic": mnemonic})
 }
 
@@ -575,14 +573,6 @@ pub fn is_legacy_compiler(version: &str) -> bool {
     major == 0 && (minor < 8 || (minor == 8 && patch < 29))
 }
 
-fn push_data_size(opcode: u8) -> Option<usize> {
-    if (0x60..=0x7f).contains(&opcode) {
-        Some(usize::from(opcode - 0x5f))
-    } else {
-        None
-    }
-}
-
 fn parse_inherited_i64(field: Option<&str>, previous: i64, label: &str) -> SoldbResult<i64> {
     let Some(field) = field else {
         return Ok(previous);
@@ -617,8 +607,8 @@ mod tests {
     use crate::Instruction;
 
     use super::{
-        build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, parse_srcmap,
-        SourceMapEnvironment, SourceMapInfo,
+        build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, opcode_operation,
+        parse_srcmap, SourceMapEnvironment, SourceMapInfo,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -629,6 +619,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("soldb-source-map-{label}-{unique}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn names_instructions_and_marks_invalid_bytes() {
+        // The names are what a trace records for the same steps, so a `JUMPDEST` in an
+        // artifact is a `JUMPDEST` in a trace; a byte that is no instruction says so.
+        assert_eq!(opcode_operation(0x5b)["mnemonic"], "JUMPDEST");
+        assert_eq!(opcode_operation(0x60)["mnemonic"], "PUSH1");
+        assert_eq!(opcode_operation(0xf1)["mnemonic"], "CALL");
+        assert_eq!(opcode_operation(0x0c)["mnemonic"], "UNKNOWN(0x0c)");
     }
 
     #[test]
