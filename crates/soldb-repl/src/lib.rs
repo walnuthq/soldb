@@ -112,30 +112,24 @@ impl Breakpoint {
     pub fn label(&self) -> String {
         let target = match &self.kind {
             BreakpointKind::Pc(pc) => format!("PC {pc}"),
-            BreakpointKind::Line(lines) => lines
-                .iter()
-                .map(|line| {
-                    if line.requested_line == line.key.line {
-                        format!("{}:{}", line.path, line.key.line)
-                    } else {
-                        format!(
-                            "{}:{} (the statement containing line {})",
-                            line.path, line.key.line, line.requested_line
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-            BreakpointKind::Function(functions) => functions
-                .iter()
-                .map(|function| {
+            BreakpointKind::Line(lines) => unique(lines.iter().map(|line| {
+                if line.requested_line == line.key.line {
+                    format!("{}:{}", line.path, line.key.line)
+                } else {
                     format!(
-                        "function {}.{} at {}:{}",
-                        function.contract_name, function.name, function.path, function.line
+                        "{}:{} (the statement containing line {})",
+                        line.path, line.key.line, line.requested_line
                     )
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+                }
+            }))
+            .join(", "),
+            BreakpointKind::Function(functions) => unique(functions.iter().map(|function| {
+                format!(
+                    "function {}.{} at {}:{}",
+                    function.contract_name, function.name, function.path, function.line
+                )
+            }))
+            .join(", "),
             BreakpointKind::Storage(slot) => format!("storage slot 0x{slot}"),
             BreakpointKind::StateWrite { path, slot } => {
                 format!("a write to `{path}` (storage slot 0x{slot})")
@@ -150,6 +144,19 @@ impl Breakpoint {
             None => target,
         }
     }
+}
+
+/// The distinct names in order of first appearance. A contract's creation and deployed
+/// programs resolve the same source line or function to one target each, which the user
+/// should read once.
+fn unique(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = Vec::new();
+    for name in names {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    seen
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1230,12 +1237,12 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
-    use soldb_debugger::ContractDebugInfo;
+    use soldb_debugger::{ContractDebugInfo, FunctionId, LineKey, ResolvedFunction, ResolvedLine};
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
     use super::{
-        BreakpointKind, BreakpointTarget, DebuggerCommand, DebuggerInfoCommand, DebuggerState,
-        DisplayMode, SourceBreakpointTarget, StepOutcome,
+        Breakpoint, BreakpointKind, BreakpointTarget, DebuggerCommand, DebuggerInfoCommand,
+        DebuggerState, DisplayMode, SourceBreakpointTarget, StepOutcome,
     };
 
     #[test]
@@ -1992,6 +1999,58 @@ contract C {
         assert_eq!(frames[1].function_name.as_deref(), Some("outer"));
         let listing = state.source_listing(1).expect("listing");
         assert_eq!(listing.current_line, 8);
+    }
+
+    #[test]
+    fn a_breakpoint_names_each_target_once() {
+        // A contract's creation and deployed programs resolve the same line and the same
+        // function to one target each; the user reads the name once.
+        let line = |contract: usize| ResolvedLine {
+            key: LineKey {
+                contract,
+                source_id: 0,
+                line: 4,
+            },
+            path: "C.sol".to_owned(),
+            requested_line: 4,
+        };
+        let lines = Breakpoint {
+            id: 1,
+            kind: BreakpointKind::Line(vec![line(0), line(1)]),
+            condition: None,
+        };
+        assert_eq!(lines.label(), "C.sol:4");
+
+        let function = |contract: usize| ResolvedFunction {
+            id: FunctionId {
+                contract,
+                function: 1,
+            },
+            name: "inner".to_owned(),
+            contract_name: "C".to_owned(),
+            path: "C.sol".to_owned(),
+            line: 7,
+        };
+        let functions = Breakpoint {
+            id: 2,
+            kind: BreakpointKind::Function(vec![function(0), function(1)]),
+            condition: None,
+        };
+        assert_eq!(functions.label(), "function C.inner at C.sol:7");
+
+        // Distinct targets are all named.
+        let mut other = line(1);
+        other.key.line = 1;
+        other.requested_line = 10;
+        let mixed = Breakpoint {
+            id: 3,
+            kind: BreakpointKind::Line(vec![line(0), other]),
+            condition: None,
+        };
+        assert_eq!(
+            mixed.label(),
+            "C.sol:4, C.sol:1 (the statement containing line 10)"
+        );
     }
 
     #[test]
