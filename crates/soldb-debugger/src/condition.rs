@@ -1,11 +1,13 @@
 //! Conditions on a breakpoint: `break TestContract.sol:30 if counter > 4`.
 //!
 //! A condition is a comparison, or several joined by `&&` and `||`, over values the
-//! debugger can actually read at a step: state variables through the storage layout
-//! (including `balances[0xabc]` and `config.limit`), the arguments of the frame being
-//! entered, and a few facts about the step itself (`pc`, `gas`, `depth`, `op`, `step`).
-//! There is no arithmetic and no calls: a debugger that evaluated Solidity would have to
-//! execute it, and this crate never executes anything.
+//! debugger can actually read at a step: the local variables in scope (inferred from the
+//! legacy stack layout, see [`StepMap::locals_at`]), state variables through the storage
+//! layout (including `balances[0xabc]` and `config.limit`), the arguments of the frame
+//! being entered, enum literals such as `Color.Red`, and a few facts about the step
+//! itself (`pc`, `gas`, `depth`, `op`, `step`). There is no arithmetic and no calls: a
+//! debugger that evaluated Solidity would have to execute it, and this crate never
+//! executes anything.
 //!
 //! A condition that cannot be evaluated — a slot the transaction never touched, a name
 //! nothing defines, a comparison between a number and a string — does not stop, and says
@@ -13,11 +15,13 @@
 //! condition would be a false positive, and silently treating it as false would hide the
 //! reason it never fires.
 
+use soldb_core::Word as StackWord;
 use soldb_ethdebug::{parse_word, StorageLayout, Word};
 
+use crate::decode::split_location;
 use crate::state::{state_value, StorageWords};
-use crate::stepping::{Frame, StepMap};
-use crate::DebugValueStatus;
+use crate::stepping::{ContractDebugInfo, Frame, LocalsStatus, StepMap};
+use crate::{memory_bytes, memory_word, word_as_usize, DebugValueStatus};
 
 /// A parsed breakpoint condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +83,8 @@ enum Operand {
     Bool(bool),
     /// A quoted string, which only compares equal to another string.
     Text(String),
-    /// A name to look up: a state variable path, a frame argument, or a step fact.
+    /// A name to look up: a local variable, a state variable path, a frame argument, an
+    /// enum literal, or a step fact.
     Name(String),
 }
 
@@ -309,6 +314,10 @@ pub struct ConditionContext<'a> {
     pc: u64,
     gas: u64,
     depth: u64,
+    /// The stack at the step, which the inferred locals are read off.
+    stack: &'a [StackWord],
+    /// Memory at the step, for a `string memory` local.
+    memory: Option<&'a str>,
     /// The frame being entered or executing, for reading its arguments by name.
     frame: Option<&'a Frame>,
 }
@@ -322,6 +331,7 @@ impl<'a> ConditionContext<'a> {
         trace_step: &'a soldb_core::TraceStep,
         words: Option<StorageWords<'a>>,
     ) -> Self {
+        let snapshot = trace_step.snapshot_ref();
         Self {
             map,
             step,
@@ -330,6 +340,8 @@ impl<'a> ConditionContext<'a> {
             pc: trace_step.pc,
             gas: trace_step.gas,
             depth: trace_step.depth,
+            stack: snapshot.stack,
+            memory: snapshot.memory,
             frame: None,
         }
     }
@@ -350,8 +362,8 @@ impl<'a> ConditionContext<'a> {
         }
     }
 
-    /// The value of a name: a fact about the step, an argument of the frame, or a state
-    /// variable read through the storage layout.
+    /// The value of a name: a fact about the step, a local variable in scope, an argument
+    /// of the frame, a state variable read through the storage layout, or an enum literal.
     fn value(&self, name: &str) -> Result<Value, String> {
         match name {
             "pc" => return Ok(Value::Word(word_of_u64(self.pc), false)),
@@ -363,6 +375,9 @@ impl<'a> ConditionContext<'a> {
             "op" => return Ok(Value::Text(self.op.to_owned())),
             _ => {}
         }
+        if let Some(local) = self.local(name) {
+            return local;
+        }
         if let Some(argument) = self.frame.and_then(|frame| {
             frame
                 .arguments
@@ -373,9 +388,15 @@ impl<'a> ConditionContext<'a> {
                 .map_err(|error| error.to_string())?;
             return Ok(Value::Word(word, argument.ty.starts_with("int")));
         }
+        if let Some(index) = self
+            .contract()
+            .and_then(|contract| contract.types.enum_literal(name))
+        {
+            return Ok(Value::Word(word_of_u64(index), false));
+        }
         let Some(layout) = self.layout() else {
             return Err(format!(
-                "`{name}` is not a step value or an argument here, and no storage layout is loaded to look it up as a state variable"
+                "`{name}` is not a step value, a local, or an argument here, and no storage layout is loaded to look it up as a state variable"
             ));
         };
         let Some(words) = self.words.as_ref() else {
@@ -397,11 +418,80 @@ impl<'a> ConditionContext<'a> {
         Ok(Value::Word(word, variable.ty.starts_with("int")))
     }
 
+    /// A local variable in scope at the step, read off the stack: a value type as its
+    /// word, a `string memory` as its text, a `bytes memory` as its hex. `None` when no
+    /// local of that name is in scope; `Some(Err)` when one is but cannot be compared.
+    fn local(&self, name: &str) -> Option<Result<Value, String>> {
+        let LocalsStatus::Inferred(layout) = self.map.locals_at(self.step) else {
+            return None;
+        };
+        // The last declared wins, as the innermost scope's does in the language.
+        let variable = layout.iter().rev().find(|variable| variable.name == name)?;
+        let Some(word) = variable.slot.and_then(|slot| self.stack.get(slot)) else {
+            return Some(Err(format!(
+                "`{name}` is in scope but its stack slot could not be placed here"
+            )));
+        };
+        let word = match parse_word(&format!("0x{}", word.trim_start_matches("0x"))) {
+            Ok(word) => word,
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        let (base, location) = split_location(&variable.ty);
+        let types = self.contract().map(|contract| &contract.types);
+        let mut base = base;
+        if let Some(types) = types {
+            for _ in 0..4 {
+                match types.underlying(base) {
+                    Some(underlying) => base = underlying,
+                    None => break,
+                }
+            }
+        }
+        Some(match location {
+            None if base == "bool" => Ok(Value::Bool(word != [0_u8; 32])),
+            None if variable.words == 1 => Ok(Value::Word(word, base.starts_with("int"))),
+            Some("memory") if base == "string" || base == "bytes" => {
+                let Some(memory) = self.memory else {
+                    return Some(Err(format!(
+                        "`{name}` lives in memory, which this backend did not capture"
+                    )));
+                };
+                let bytes = word_as_usize(&word).and_then(|pointer| {
+                    let length = word_as_usize(&memory_word(memory, pointer)?)?;
+                    memory_bytes(memory, pointer.checked_add(32)?, length)
+                });
+                let Some(bytes) = bytes else {
+                    return Some(Err(format!(
+                        "`{name}` points beyond the memory this step captured"
+                    )));
+                };
+                if base == "string" {
+                    String::from_utf8(bytes)
+                        .map(Value::Text)
+                        .map_err(|_| format!("`{name}` is not valid UTF-8 text"))
+                } else {
+                    Ok(Value::Text(format!(
+                        "0x{}",
+                        bytes
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    )))
+                }
+            }
+            _ => Err(format!(
+                "`{name}` is a {}, which a condition cannot compare",
+                variable.ty
+            )),
+        })
+    }
+
+    fn contract(&self) -> Option<&ContractDebugInfo> {
+        self.map.contract_at_step(self.step)
+    }
+
     fn layout(&self) -> Option<&StorageLayout> {
-        self.map
-            .contract_at_step(self.step)?
-            .storage_layout
-            .as_ref()
+        self.contract()?.storage_layout.as_ref()
     }
 }
 

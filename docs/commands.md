@@ -250,10 +250,13 @@ soldb> break op SSTORE if depth == 1 && gas > 0
 
 A condition compares values the debugger can read at that step:
 
+- the local variables in scope, by name, wherever [`vars`](#vars) can read them: a value
+  type as its word, a `string memory` as its text, a `bytes memory` as its hex text;
 - state variables through the storage layout, including `balances[0xabc…]`,
   `items[2]`, and `config.limit`;
 - the arguments of the frame being entered, by name, when the trace has proven them
   (see [`backtrace`](#backtrace));
+- enum literals such as `Color.Red`, from the declarations in the loaded sources;
 - `pc`, `gas`, `depth`, and `step` as numbers, and `op` as text.
 
 Operands are those names, decimal or `0x` numbers, `true`, `false`, and quoted strings.
@@ -461,16 +464,46 @@ warning: local variables are inferred from the legacy source map and the stack l
 note: values can be wrong under the optimizer, and a variable whose frame could not be placed shows as unavailable; ETHDebug variable information will replace this once compilers emit it
 ```
 
-A frame is placed by whichever comes first: the parameters on the stack at an internal
-call's entry, the first return parameter's reservation, or the first instruction of the
-body, which runs right above whatever was reserved before it. Modifiers are read the same
-way, and place the function they run for: the first modifier's parameters sit right above
-the function's parameters and return parameters, and the body's locals start above the
-modifiers' slots. A modifier resumed after its `_` keeps the slots it had. A `calldata`
-slice parameter takes two slots, an offset and a length into the frame's calldata, and
-is shown as its bytes (`bytes`), its text (`string`), or its elements (an array of value
-types). The variables of `try ... returns (...)` and `catch (...)` clauses belong to their
-clause blocks like any other local.
+A frame is placed at the entry of its body, where the calling convention leaves the
+parameters as the top words of the stack — whether an internal call jumped there or the
+dispatcher did after decoding them — and the return parameters, the modifiers' slots, and
+the locals follow from that. The legacy optimizer keeps that convention, so the slots hold
+under `--optimize` too; what it does change is *when* a value reaches its slot inside a
+basic block, so a local assigned and consumed within one block can read stale until the
+block ends, which is what the note about the optimizer warns of. A frame whose entry was
+not seen is placed by whichever comes first: the first return parameter's reservation, the
+first local's, or the first instruction of the body. Each modifier's parameters sit right
+above the function's parameters and return parameters and the slots of the modifiers
+before it, and the body's locals start above all of them; a modifier resumed after its
+`_` keeps the slots it had. The variables of `try ... returns (...)` and `catch (...)`
+clauses belong to their clause blocks like any other local.
+
+A variable's word is the value for a value type and a pointer for a reference type, and
+the pointer is followed through the layout the language fixes for its data location:
+
+```text
+soldb> vars
+Item memory item = { id: 5, name: "widget", color: Color.Blue, tags: [7, 8] } [stack+9]
+Price price = 15 [stack+10]
+bytes memory blob = 0xc0ffee [stack+11]
+Item storage stored = { id: 5, name: "widget", color: 2, tags: <1 element(s); index it with [i]> } [stack+13]
+```
+
+- `memory`: a `string` or `bytes` is its length and its bytes, an array its length (for a
+  dynamic one) and one word per element, a struct one word per member, in declaration
+  order as the sources declare it; an element or member that is itself a reference is a
+  pointer, followed the same way, a few levels deep;
+- `storage`: the word is a slot, decoded through the storage layout the way a state
+  variable is, so a `Item storage` local shows its members and a `uint256[] storage` its
+  length; a slot the transaction has not touched is unknown, as for state variables;
+- `calldata`: a slice of a dynamic type takes two slots, an offset and a length into the
+  frame's calldata, and is shown as its bytes (`bytes`), its text (`string`), or its
+  elements (an array of value types); a fixed-size array or a struct of value types is
+  read from its offset.
+
+Enums show as `Color.Blue`, user-defined value types as the value they wrap, and contract
+types as addresses, from the `enum`, `type ... is`, and `struct` declarations found in
+the loaded sources (the storage layout carries a struct's members itself).
 
 Code from the via-IR pipeline, and from any IR-based compiler, lays the stack out as its
 optimizer sees fit, so nothing is inferred for it: a program loaded from ETHDebug is taken

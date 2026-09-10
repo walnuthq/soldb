@@ -1022,10 +1022,17 @@ impl DebuggerState {
             });
         }
         match map.locals_at(self.current_step) {
-            LocalsStatus::Inferred(_) => Ok(StepVariables {
-                variables: map.inferred_variables(trace, self.current_step),
-                origin: VariablesOrigin::Inferred,
-            }),
+            LocalsStatus::Inferred(_) => {
+                // Storage pointers among the locals read the words the trace recorded.
+                let words = self
+                    .storage_tape
+                    .as_ref()
+                    .map(|tape| tape.at_step(map, self.current_step));
+                Ok(StepVariables {
+                    variables: map.inferred_variables(trace, self.current_step, words.as_ref()),
+                    origin: VariablesOrigin::Inferred,
+                })
+            }
             LocalsStatus::Unavailable(reason) => Err(reason.to_owned()),
         }
     }
@@ -2241,6 +2248,77 @@ contract C {
             state.clear_breakpoint_target(&BreakpointTarget::Function("C.inner".to_owned())),
             StepOutcome::BreakpointMissing(label) if label == "function C.inner at C.sol:7"
         ));
+    }
+
+    #[test]
+    fn a_breakpoint_condition_reads_an_inferred_local() {
+        let source = "contract C {\n    enum Mode { Off, On }\n    function f(uint256 a, Mode m) public {\n        uint256 b = a;\n        b = 0;\n    }\n}\n";
+        let offset = |needle: &str| source.find(needle).expect(needle) as u64;
+        let instruction = |pc: u64, needle: &str| -> Instruction {
+            serde_json::from_value(json!({
+                "offset": pc,
+                "operation": {"mnemonic": "JUMPDEST"},
+                "context": {"code": {"source": {"id": 0}, "range": {"offset": offset(needle), "length": needle.len()}}}
+            }))
+            .expect("instruction")
+        };
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "call".to_owned(),
+            instructions: vec![
+                instruction(0, "contract C"),
+                instruction(1, "function f"),
+                instruction(2, "uint256 b"),
+                instruction(3, "b = 0"),
+            ],
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let contract =
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]))
+                .with_code_generator(Some(CodeGenerator::Legacy));
+        let mut trace = sample_trace();
+        trace.steps = vec![
+            step(0, "PUSH1", 0, &[]),
+            step(1, "JUMPDEST", 0, &["0x9", "0x5", "0x1"]),
+            step(2, "PUSH0", 0, &["0x9", "0x5", "0x1"]),
+            step(3, "POP", 0, &["0x9", "0x5", "0x1", "0x5"]),
+        ];
+        let mut state = DebuggerState::new();
+        state.load_trace(trace);
+        state.attach_debug_info(vec![contract]);
+
+        // The local is read off its slot, the enum parameter by name and against an enum
+        // literal; a condition that does not hold there does not stop.
+        let hit = |condition: &str| -> (Option<usize>, Option<String>) {
+            let mut state = state.clone();
+            let DebuggerCommand::Break(target, condition) =
+                DebuggerCommand::parse(&format!("break C.sol:5 if {condition}"))
+            else {
+                panic!("break command");
+            };
+            state.set_conditional_breakpoint_target(&target, condition.as_deref());
+            let step = match state.continue_execution() {
+                StepOutcome::BreakpointHit { .. } => Some(state.current_step),
+                _ => None,
+            };
+            (step, state.take_note())
+        };
+        assert_eq!(hit("b == 5"), (Some(3), None));
+        assert_eq!(hit("b == a"), (Some(3), None));
+        assert_eq!(hit("m == Mode.On"), (Some(3), None));
+        assert_eq!(hit("m == Mode.Off").0, None);
+        assert_eq!(hit("b > 5").0, None);
+        // An unknown name says what was looked for.
+        let (step, note) = hit("c == 5");
+        assert_eq!(step, None);
+        let note = note.expect("note");
+        assert!(note.contains("`c == 5` could not be evaluated"), "{note}");
+        assert!(
+            note.contains("`c` is not a step value, a local, or an argument here"),
+            "{note}"
+        );
     }
 
     fn sample_trace() -> TransactionTrace {

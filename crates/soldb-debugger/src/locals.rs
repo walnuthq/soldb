@@ -583,7 +583,7 @@ pub(crate) fn skip_trivia(source: &str, mut index: usize) -> usize {
 }
 
 /// Skips a string literal opening at `index`, escapes included.
-fn skip_string(source: &str, index: usize) -> usize {
+pub(crate) fn skip_string(source: &str, index: usize) -> usize {
     let bytes = source.as_bytes();
     let quote = bytes[index];
     let mut cursor = index + 1;

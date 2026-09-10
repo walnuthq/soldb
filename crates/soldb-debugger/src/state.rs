@@ -293,7 +293,7 @@ impl<'a> StorageWords<'a> {
 
     /// The word at `slot` from the chain, for a slot the trace did not record.
     #[must_use]
-    fn chain_word(&self, slot: &Word) -> Option<Word> {
+    pub(crate) fn chain_word(&self, slot: &Word) -> Option<Word> {
         self.chain?.word(self.address?, slot)
     }
 
@@ -332,7 +332,7 @@ impl<'a> StorageWords<'a> {
     }
 
     /// Why a word is missing, for the user.
-    fn unavailable(&self, slot: &Word) -> String {
+    pub(crate) fn unavailable(&self, slot: &Word) -> String {
         let unread = if self.chain.is_some() {
             format!(
                 "<unknown: slot {} was not touched by this transaction and the chain could not be read>",

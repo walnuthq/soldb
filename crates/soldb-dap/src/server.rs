@@ -821,8 +821,21 @@ impl DapServer {
                     .cloned()
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
-            expression => self.evaluate_state(expression),
+            expression => self
+                .evaluate_local(expression)
+                .unwrap_or_else(|| self.evaluate_state(expression)),
         }
+    }
+
+    /// A local variable in scope at the current step, by name.
+    fn evaluate_local(&self, name: &str) -> Option<String> {
+        let variables = self.debugger.variables().ok()?;
+        variables
+            .variables
+            .iter()
+            .rev()
+            .find(|variable| variable.name == name)
+            .map(|variable| variable.value.display.clone())
     }
 
     /// A storage path such as `counter` or `balances[0xabc]`, read through the storage

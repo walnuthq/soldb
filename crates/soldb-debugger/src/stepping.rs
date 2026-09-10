@@ -37,10 +37,13 @@ use soldb_ethdebug::{
     StorageLayout,
 };
 
+use crate::decode::ValueReader;
+use crate::state::StorageWords;
+use crate::types::SourceTypes;
 use crate::{
-    decode_arguments, decode_debug_value, is_value_type, parse_source_functions,
-    readable_parameter, ArgumentLayout, ArgumentOrder, ByteRange, DebugLocation, DebugValue,
-    DebugValueStatus, DebugVariable, FrameArgument, FrameState, SourceFunction, SourceParam,
+    decode_arguments, is_value_type, parse_source_functions, readable_parameter, ArgumentLayout,
+    ArgumentOrder, ByteRange, DebugLocation, DebugValue, DebugValueStatus, DebugVariable,
+    FrameArgument, FrameState, SourceFunction, SourceParam,
 };
 
 /// The warning a frontend shows once when it presents inferred local variables.
@@ -66,6 +69,9 @@ pub struct ContractDebugInfo {
     pub info: EthdebugInfo,
     pub source_contents: BTreeMap<u64, String>,
     pub functions: Vec<SourceFunction>,
+    /// The struct, enum, and user-defined value type declarations of the sources, which
+    /// say how a variable of such a type is shown.
+    pub types: SourceTypes,
     /// Where the contract's state variables live, when it was compiled with
     /// `--storage-layout`.
     pub storage_layout: Option<StorageLayout>,
@@ -115,6 +121,10 @@ impl ContractDebugInfo {
             .iter()
             .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
             .collect::<Vec<SourceFunction>>();
+        let mut types = SourceTypes::default();
+        for source in source_contents.values() {
+            types.add_source(source);
+        }
         let line_starts = source_contents
             .iter()
             .map(|(source_id, source)| (*source_id, line_starts(source)))
@@ -149,6 +159,7 @@ impl ContractDebugInfo {
             info,
             source_contents,
             functions,
+            types,
             storage_layout: None,
             code_generator: None,
             line_starts,
@@ -692,9 +703,14 @@ struct FrameEntry {
 /// above them at entry, and each local takes the next free slot when its declaration
 /// executes and gives it back at the end of its block. So once the frame's base is known,
 /// a live local's slot is the locals base plus the number of locals declared before it
-/// that are still in scope, which the source alone decides. The base is established
-/// once, from whichever comes first: the parameters at an internal call's entry, the
-/// first return parameter's reservation, or the first local's.
+/// that are still in scope, which the source alone decides.
+///
+/// The base is the calling convention's: the parameters are the top words at the entry
+/// of the function's body, whether an internal call or the dispatcher jumped there, and
+/// the optimizer keeps that whatever it does inside a block. When the entry was not seen
+/// the frame is placed by whichever comes first: the first return parameter's
+/// reservation, or the first local's, or the first instruction of the body; those read
+/// single instructions, which the optimizer may reorder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FrameVariables {
     /// The slot of the first parameter, once established.
@@ -708,16 +724,42 @@ struct FrameVariables {
     /// The layout last computed for the frame, which steps without a location of their
     /// own in the function inherit.
     layout: Option<u32>,
+    /// The stack slots the function's modifiers hold below its body's locals: their
+    /// parameters, and the locals each has declared by its `_`. `None` when a modifier's
+    /// declaration was not found, so the body's first instruction places the locals.
+    modifier_slots: Option<usize>,
 }
 
 impl FrameVariables {
-    fn new(function: &SourceFunction, params_base: Option<usize>) -> Self {
+    fn new(
+        function: &SourceFunction,
+        params_base: Option<usize>,
+        modifier_slots: Option<usize>,
+    ) -> Self {
         Self {
             params_base,
             returns: vec![None; function.returns.len()],
             locals_base: None,
             body_seen: false,
             layout: None,
+            modifier_slots,
+        }
+    }
+
+    /// Places the return parameters and the locals from known parameters: the returns
+    /// sit right above the parameters, the locals above those and the modifiers' slots.
+    fn place_from_parameters(&mut self, function: &SourceFunction) {
+        let Some(base) = self.params_base else {
+            return;
+        };
+        let returns_base = base + parameter_slots(&function.params);
+        for (index, slot) in self.returns.iter_mut().enumerate() {
+            slot.get_or_insert(returns_base + index);
+        }
+        if self.locals_base.is_none() {
+            if let Some(modifier_slots) = self.modifier_slots {
+                self.locals_base = Some(returns_base + function.returns.len() + modifier_slots);
+            }
         }
     }
 
@@ -732,6 +774,8 @@ impl FrameVariables {
     ) -> u32 {
         let length = span.end - span.start;
         let param_slots = parameter_slots(&function.params);
+        // Known parameters place everything else before any instruction is read.
+        self.place_from_parameters(function);
         // The body's first instruction runs right above whatever was reserved before it:
         // the first local goes there, and without modifiers in between that is right
         // above the parameters and the return parameters. A modifier resumed after its
@@ -774,17 +818,8 @@ impl FrameVariables {
                 self.locals_base = height.checked_sub(live_index(function, index, span.start));
             }
         }
-        // Known parameters place the return parameters, and the locals unless a modifier
-        // reserves slots of its own in between.
-        if let Some(base) = self.params_base {
-            let returns_base = base + param_slots;
-            for (index, slot) in self.returns.iter_mut().enumerate() {
-                slot.get_or_insert(returns_base + index);
-            }
-            if self.locals_base.is_none() && !function.has_modifiers {
-                self.locals_base = Some(returns_base + function.returns.len());
-            }
-        }
+        // Parameters a reservation just placed place the rest.
+        self.place_from_parameters(function);
 
         let mut layout = Vec::new();
         if let Some(base) = self.params_base {
@@ -872,69 +907,6 @@ fn calldata_for_step(trace: &TransactionTrace, step: usize) -> &str {
         .map_or("", |call| call.input.as_str())
 }
 
-/// The value of a `calldata` slice: the bytes of `bytes` and `string`, the elements of an
-/// array of value types, or the element count of any other array. `offset` is where the
-/// slice's data starts in `calldata`, the way the legacy decoder leaves it on the stack.
-fn decode_calldata_slice(
-    calldata: &str,
-    ty: &str,
-    offset: &str,
-    length: &str,
-) -> Option<DebugValue> {
-    let word = |value: &str| usize::from_str_radix(value.trim_start_matches("0x"), 16).ok();
-    let (offset, length) = (word(offset)?, word(length)?);
-    let data = calldata.trim_start_matches("0x");
-    let ty = ty.trim_end_matches(" calldata");
-    if ty == "bytes" || ty == "string" {
-        let end = offset.checked_add(length)?;
-        let hex = data.get(offset * 2..end * 2)?;
-        let raw = format!("0x{hex}");
-        let display = if ty == "string" {
-            let bytes = (0..length)
-                .map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16))
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?;
-            match String::from_utf8(bytes) {
-                Ok(text) if text.chars().all(|character| !character.is_control()) => {
-                    format!("\"{text}\"")
-                }
-                _ => raw.clone(),
-            }
-        } else {
-            raw.clone()
-        };
-        return Some(DebugValue {
-            display,
-            raw: Some(raw),
-            status: DebugValueStatus::Decoded,
-        });
-    }
-    let element = ty.strip_suffix("[]")?;
-    let shown = length.min(8);
-    let mut elements = Vec::with_capacity(shown);
-    for index in 0..shown {
-        let start = offset.checked_add(index * 32)?;
-        let hex = data.get(start * 2..(start + 32) * 2)?;
-        let value = decode_debug_value(&format!("0x{hex}"), element);
-        if value.status != DebugValueStatus::Decoded {
-            return Some(DebugValue {
-                display: format!("[{length} items at calldata offset {offset:#x}]"),
-                raw: None,
-                status: DebugValueStatus::Raw,
-            });
-        }
-        elements.push(value.display);
-    }
-    if length > shown {
-        elements.push(format!("... {} more", length - shown));
-    }
-    Some(DebugValue {
-        display: format!("[{}]", elements.join(", ")),
-        raw: None,
-        status: DebugValueStatus::Decoded,
-    })
-}
-
 /// How many stack words a parameter takes: a `calldata` slice of a dynamic type is an
 /// offset and a length, an external function is an address and a selector, and
 /// everything else is one word.
@@ -952,6 +924,41 @@ fn parameter_stack_slots(parameter: &SourceParam) -> usize {
 
 fn parameter_slots(parameters: &[SourceParam]) -> usize {
     parameters.iter().map(parameter_stack_slots).sum()
+}
+
+/// The stack slots the first `count` modifiers of `function` hold while the code they
+/// wrap runs: each modifier's parameters, and the locals it has declared by its `_`.
+/// `None` when a modifier's declaration is not among the parsed functions (a base
+/// contract's source that was not loaded, or a base constructor call in the header).
+fn modifier_slots(
+    contract: &ContractDebugInfo,
+    function: &SourceFunction,
+    count: usize,
+) -> Option<usize> {
+    let mut slots = 0;
+    for name in function.modifiers.iter().take(count) {
+        let modifier = contract.functions.iter().find(|candidate| {
+            candidate.placeholder.is_some()
+                && candidate.name == *name
+                && candidate.source_id == function.source_id
+        });
+        let modifier = modifier.or_else(|| {
+            contract
+                .functions
+                .iter()
+                .find(|candidate| candidate.placeholder.is_some() && candidate.name == *name)
+        })?;
+        let placeholder = modifier.placeholder?;
+        let live = modifier
+            .locals
+            .iter()
+            .filter(|local| {
+                local.declaration.start < placeholder && local.scope.contains(placeholder)
+            })
+            .count();
+        slots += parameter_slots(&modifier.params) + live;
+    }
+    Some(slots)
 }
 
 /// Whether a contract's variables can be inferred from the stack, or why not.
@@ -1022,6 +1029,97 @@ impl InternalFrame {
             .last()
             .is_some_and(|entry| entry.return_pc == Some(pc))
     }
+}
+
+/// Places the parameters of `function` when the step at `index` is its body's entry
+/// tag, jumped to by the dispatcher: the parameters it decoded are the top words of the
+/// stack there, under the calling convention the optimizer keeps. The frame's calldata,
+/// when it names this function, must agree with those words, or nothing is placed.
+fn place_at_body_tag(
+    frame: &mut InternalFrame,
+    contract: &ContractDebugInfo,
+    function: usize,
+    trace: &TransactionTrace,
+    index: usize,
+    own: LocationRef,
+    height: usize,
+) {
+    let Some(declared) = contract.functions.get(function) else {
+        return;
+    };
+    let from_dispatcher = index > 0
+        && framed_declaration(trace, contract, index - 1, declared)
+        && contract.is_jumpdest(trace.steps[index].pc)
+        && own.offset == declared.declaration_start;
+    if !from_dispatcher {
+        return;
+    }
+    let entry = frame
+        .functions
+        .iter_mut()
+        .rev()
+        .find(|entry| entry.function == Some(function));
+    let Some(variables) = entry.and_then(|entry| entry.variables.as_mut()) else {
+        return;
+    };
+    if variables.params_base.is_some() {
+        return;
+    }
+    let stack = trace.steps[index].snapshot_ref().stack;
+    let calldata = calldata_for_step(trace, index);
+    if argument_evidence(declared, calldata, stack) == Evidence::Contradicted {
+        return;
+    }
+    variables.params_base = height.checked_sub(parameter_slots(&declared.params));
+}
+
+/// Whether the step at `index` is a `JUMP` attributed to the declaration of `function`
+/// as a whole: the dispatcher's jump into its body.
+fn framed_declaration(
+    trace: &TransactionTrace,
+    contract: &ContractDebugInfo,
+    index: usize,
+    function: &SourceFunction,
+) -> bool {
+    if &*trace.steps[index].op != "JUMP" {
+        return false;
+    }
+    contract
+        .location_at_pc(trace.steps[index].pc)
+        .is_some_and(|location| {
+            location.source_id == function.source_id
+                && location.offset == function.declaration_start
+        })
+}
+
+/// The slot of the first parameter of the modifier `function`, from the placed function
+/// it runs for: above that function's parameters and return parameters, and the slots of
+/// the modifiers invoked before it.
+fn modifier_base(
+    frame: &InternalFrame,
+    contract: &ContractDebugInfo,
+    function: usize,
+) -> Option<usize> {
+    let modifier = contract.functions.get(function)?;
+    modifier.placeholder?;
+    let parent = frame
+        .functions
+        .iter()
+        .rev()
+        .find(|entry| entry.function.is_some())?;
+    let parent_function = contract.functions.get(parent.function?)?;
+    let position = parent_function
+        .modifiers
+        .iter()
+        .position(|name| *name == modifier.name)?;
+    let parent_base = parent.variables.as_ref()?.params_base?;
+    let before = modifier_slots(contract, parent_function, position)?;
+    Some(
+        parent_base
+            + parameter_slots(&parent_function.params)
+            + parent_function.returns.len()
+            + before,
+    )
 }
 
 impl StepMap {
@@ -1214,7 +1312,8 @@ impl StepMap {
             let frame_variables = |function: usize| -> Option<FrameVariables> {
                 let contract_index = step.contract?;
                 locals_support[contract_index].ok()?;
-                let function = contracts[contract_index].functions.get(function)?;
+                let contract = &contracts[contract_index];
+                let function = contract.functions.get(function)?;
                 let landed_from_function = index > 0
                     && framed[index - 1].evm_depth == step.evm_depth
                     && &*trace.steps[index - 1].op == "JUMP"
@@ -1224,8 +1323,13 @@ impl StepMap {
                 let params_base = landed_from_function
                     .then(|| height.checked_sub(parameter_slots(&function.params)))
                     .flatten();
-                Some(FrameVariables::new(function, params_base))
+                Some(FrameVariables::new(
+                    function,
+                    params_base,
+                    modifier_slots(contract, function, function.modifiers.len()),
+                ))
             };
+            let contract_info = step.contract.map(|index| &contracts[index]);
             let evm_depth = step.evm_depth as usize;
             let mut frame_entry = false;
             internal.truncate(evm_depth + 1);
@@ -1305,8 +1409,15 @@ impl StepMap {
                             frame_entry = true;
                         } else if pending_call {
                             // A marked call into the active function away from its entry
-                            // point is a generated helper whose span is the calling line:
-                            // recursion always enters at the entry point.
+                            // point: recursion always enters at the entry point, so this
+                            // is the dispatcher jumping to the body of the function whose
+                            // parameters it decoded, which places them, or a generated
+                            // helper whose span is the calling line.
+                            if let Some(contract) = contract_info {
+                                place_at_body_tag(
+                                    frame, contract, function, trace, index, own, height,
+                                );
+                            }
                             frame.push_placeholder();
                         } else if !frame.is_active(function) {
                             match frame
@@ -1326,10 +1437,22 @@ impl StepMap {
                                     }
                                 }
                                 None => {
-                                    let variables = frame
+                                    let mut variables = frame
                                         .remembered
                                         .remove(&function)
                                         .or_else(|| frame_variables(function));
+                                    // A modifier's parameters sit right above the
+                                    // parameters and return parameters of the function
+                                    // it runs for, and the slots of the modifiers before
+                                    // it; a placed function places its modifiers.
+                                    if let (Some(variables), Some(contract)) =
+                                        (variables.as_mut(), contract_info)
+                                    {
+                                        if variables.params_base.is_none() {
+                                            variables.params_base =
+                                                modifier_base(frame, contract, function);
+                                        }
+                                    }
                                     frame.push_function(function, None, variables);
                                     frame_entry = true;
                                 }
@@ -1384,9 +1507,10 @@ impl StepMap {
                         let layout = entry.variables.as_mut().map(|variables| {
                             variables.track(function, span, height, &mut variable_layouts)
                         });
-                        // The first modifier's parameters sit right above the function's
-                        // parameters and return parameters, so placing the modifier
-                        // places the function it runs for.
+                        // A modifier's parameters sit right above the function's
+                        // parameters and return parameters and the slots of the modifiers
+                        // before it, so placing the modifier places the function it runs
+                        // for when nothing else has.
                         let modifier_base = entry
                             .variables
                             .as_ref()
@@ -1398,14 +1522,23 @@ impl StepMap {
                         if let (Some(modifier_base), Some(parent)) = (modifier_base, parent) {
                             let parent_function =
                                 &contract.functions[parent.function.unwrap_or_default()];
-                            if parent_function.modifiers.first() == Some(&function.name) {
-                                if let Some(variables) = parent.variables.as_mut() {
-                                    if variables.params_base.is_none() {
-                                        variables.params_base = modifier_base.checked_sub(
-                                            parameter_slots(&parent_function.params)
-                                                + parent_function.returns.len(),
-                                        );
-                                    }
+                            let position = parent_function
+                                .modifiers
+                                .iter()
+                                .position(|name| *name == function.name);
+                            if let (Some(position), Some(variables)) =
+                                (position, parent.variables.as_mut())
+                            {
+                                if variables.params_base.is_none() {
+                                    variables.params_base =
+                                        modifier_slots(contract, parent_function, position)
+                                            .and_then(|before| {
+                                                modifier_base.checked_sub(
+                                                    parameter_slots(&parent_function.params)
+                                                        + parent_function.returns.len()
+                                                        + before,
+                                                )
+                                            });
                                 }
                             }
                         }
@@ -1647,19 +1780,38 @@ impl StepMap {
         }
     }
 
-    /// The inferred variables at `step`, read off its stack and decoded by type.
+    /// The inferred variables at `step`, read off its stack and decoded by type: a value
+    /// type from its word, a reference type through the memory, storage, or calldata its
+    /// word points into. `words` are the storage words known at the step, for storage
+    /// pointers; without them a storage pointer is shown as its slot.
     ///
     /// A variable whose slot is not known, or lies above the stack, is reported as
     /// unavailable rather than as a wrong word.
     #[must_use]
-    pub fn inferred_variables(&self, trace: &TransactionTrace, step: usize) -> Vec<DebugVariable> {
+    pub fn inferred_variables(
+        &self,
+        trace: &TransactionTrace,
+        step: usize,
+        words: Option<&StorageWords<'_>>,
+    ) -> Vec<DebugVariable> {
         let LocalsStatus::Inferred(layout) = self.locals_at(step) else {
             return Vec::new();
         };
-        let stack = trace
+        let Some(contract) = self.contract_at_step(step) else {
+            return Vec::new();
+        };
+        let snapshot = trace
             .steps
             .get(step)
-            .map_or(&[][..], |trace_step| trace_step.snapshot_ref().stack);
+            .map(soldb_core::TraceStep::snapshot_ref);
+        let stack = snapshot.map_or(&[][..], |snapshot| snapshot.stack);
+        let reader = ValueReader {
+            memory: snapshot.and_then(|snapshot| snapshot.memory),
+            calldata: calldata_for_step(trace, step),
+            storage: words,
+            layout: contract.storage_layout.as_ref(),
+            types: &contract.types,
+        };
         let unavailable = || DebugValue {
             display: "<unavailable>".to_owned(),
             raw: None,
@@ -1668,24 +1820,13 @@ impl StepMap {
         layout
             .iter()
             .map(|variable| {
-                let word = variable.slot.and_then(|slot| stack.get(slot));
-                let value = match (variable.words, word) {
-                    (1, Some(word)) => decode_debug_value(word, &variable.ty),
-                    // A `calldata` slice: its offset and length words select the bytes
-                    // of the frame's calldata.
-                    (2, Some(offset)) => variable
-                        .slot
-                        .and_then(|slot| stack.get(slot + 1))
-                        .and_then(|length| {
-                            decode_calldata_slice(
-                                calldata_for_step(trace, step),
-                                &variable.ty,
-                                offset,
-                                length,
-                            )
-                        })
-                        .unwrap_or_else(unavailable),
-                    _ => unavailable(),
+                let words = variable
+                    .slot
+                    .and_then(|slot| stack.get(slot..slot + variable.words))
+                    .map(|words| words.iter().map(|word| &**word).collect::<Vec<_>>());
+                let value = match words {
+                    Some(words) => reader.variable(&variable.ty, &words),
+                    None => unavailable(),
                 };
                 DebugVariable {
                     name: variable.name.clone(),
@@ -1730,7 +1871,7 @@ impl StepMap {
         let Some(layout) = self.argument_layout(location.key.contract) else {
             return Vec::new();
         };
-        decode_arguments(&function.params, state, layout)
+        decode_arguments(&function.params, state, layout, &contract.types)
     }
 
     #[must_use]
@@ -2279,7 +2420,7 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{ContractCreation, ExecutionCall, StepSnapshot, TraceStep, TransactionTrace};
-    use soldb_ethdebug::{CodeGenerator, EthdebugInfo, Instruction};
+    use soldb_ethdebug::{function_selector, CodeGenerator, EthdebugInfo, Instruction};
 
     use soldb_core::Word as StackWord;
 
@@ -3124,22 +3265,41 @@ contract P {
             (22, "r = y"),
             (23, "function helper"),
             (24, "uint256 r"),
-            // guarded and its modifier.
+            // guarded and its modifier: entry, the modifier's local, the body's, the
+            // body's statement, the modifier's statement after `_`, and the dispatcher's
+            // jump to the body tag with the body tag itself.
             (30, "function guarded"),
             (31, "uint256 before"),
             (32, "uint256 kept"),
             (33, "total = kept"),
             (34, "total = before + tag"),
-            // set: entry and its only statement.
+            (35, "function guarded"),
+            (36, "function guarded"),
+            // set: entry, its only statement, and the dispatcher's jump to the body tag
+            // with the body tag itself.
             (40, "function set"),
             (41, "total = v"),
+            (42, "function set"),
+            (43, "function set"),
             // take: entry and its only statement.
             (50, "function take"),
             (51, "total = n"),
         ];
         let instructions = spans
             .iter()
-            .map(|(pc, needle)| instruction(*pc, legacy_offset(needle), needle.len() as u64))
+            .map(|(pc, needle)| {
+                // The dispatcher's jump into a body is marked as a call.
+                if matches!(pc, 35 | 42) {
+                    instruction_with(
+                        *pc,
+                        legacy_offset(needle),
+                        needle.len() as u64,
+                        json!({"invoke": {}}),
+                    )
+                } else {
+                    instruction(*pc, legacy_offset(needle), needle.len() as u64)
+                }
+            })
             .collect();
         let info = EthdebugInfo {
             compilation: serde_json::Value::Null,
@@ -3248,7 +3408,7 @@ contract P {
                 ("twice", VariableKind::Local, Some(3))
             ]
         );
-        let values = map.inferred_variables(&trace, 5);
+        let values = map.inferred_variables(&trace, 5, None);
         assert_eq!(values[0].value.display, "5");
         assert_eq!(values[2].value.display, "10");
         assert_eq!(values[2].location.offset, 3);
@@ -3260,12 +3420,18 @@ contract P {
             named(in_block).last(),
             Some(&("inner", VariableKind::Local, Some(4)))
         );
-        assert_eq!(map.inferred_variables(&trace, 7)[3].value.display, "8");
+        assert_eq!(
+            map.inferred_variables(&trace, 7, None)[3].value.display,
+            "8"
+        );
         let LocalsStatus::Inferred(after_block) = map.locals_at(8) else {
             panic!("{:?}", map.locals_at(8));
         };
         assert_eq!(after_block.len(), 3);
-        assert_eq!(map.inferred_variables(&trace, 8)[1].value.display, "8");
+        assert_eq!(
+            map.inferred_variables(&trace, 8, None)[1].value.display,
+            "8"
+        );
 
         // `helper` is entered by a jump from `outer`, which places its parameter at
         // once and its return parameter above; a slot above the stack reads as
@@ -3281,12 +3447,12 @@ contract P {
                 ("r", VariableKind::Return, Some(6))
             ]
         );
-        let at_entry = map.inferred_variables(&trace, 10);
+        let at_entry = map.inferred_variables(&trace, 10, None);
         assert_eq!(
             at_entry[1].value.status,
             crate::DebugValueStatus::Unavailable
         );
-        let helper_values = map.inferred_variables(&trace, 13);
+        let helper_values = map.inferred_variables(&trace, 13, None);
         assert_eq!(
             helper_values
                 .iter()
@@ -3299,7 +3465,10 @@ contract P {
             panic!("{:?}", map.locals_at(15));
         };
         assert_eq!(named(back).len(), 3);
-        assert_eq!(map.inferred_variables(&trace, 15)[2].value.display, "10");
+        assert_eq!(
+            map.inferred_variables(&trace, 15, None)[2].value.display,
+            "10"
+        );
     }
 
     #[test]
@@ -3339,7 +3508,10 @@ contract P {
                 ("kept", VariableKind::Local, Some(4))
             ]
         );
-        assert_eq!(map.inferred_variables(&trace, 3)[1].value.display, "7");
+        assert_eq!(
+            map.inferred_variables(&trace, 3, None)[1].value.display,
+            "7"
+        );
         let LocalsStatus::Inferred(resumed) = map.locals_at(4) else {
             panic!("{:?}", map.locals_at(4));
         };
@@ -3350,7 +3522,10 @@ contract P {
                 ("before", VariableKind::Local, Some(3))
             ]
         );
-        assert_eq!(map.inferred_variables(&trace, 4)[1].value.display, "3");
+        assert_eq!(
+            map.inferred_variables(&trace, 4, None)[1].value.display,
+            "3"
+        );
     }
 
     #[test]
@@ -3389,7 +3564,7 @@ contract P {
                 ("n", Some(5), 1)
             ]
         );
-        let values = map.inferred_variables(&trace, 1);
+        let values = map.inferred_variables(&trace, 1, None);
         assert_eq!(
             values
                 .iter()
@@ -3419,7 +3594,121 @@ contract P {
             panic!("{:?}", map.locals_at(2));
         };
         assert_eq!(named(in_body), [("v", VariableKind::Parameter, Some(1))]);
-        assert_eq!(map.inferred_variables(&trace, 2)[0].value.display, "7");
+        assert_eq!(
+            map.inferred_variables(&trace, 2, None)[0].value.display,
+            "7"
+        );
+    }
+
+    #[test]
+    fn the_dispatchers_jump_to_the_body_places_a_public_function() {
+        // The dispatcher enters the function's declaration before decoding, then jumps to
+        // its body with the decoded parameter on top of the return tag. The optimizer
+        // has hoisted a temporary above it before the first statement, which would
+        // misplace a frame read off that statement's height.
+        let selector = "0x9c";
+        let mut trace = trace(vec![
+            step(0, 1, "PUSH1", &[]),
+            step(40, 1, "JUMPDEST", &[selector]),
+            step(42, 1, "JUMP", &[selector, "0x9", "0x7", "0x2b"]),
+            step(43, 1, "JUMPDEST", &[selector, "0x9", "0x7"]),
+            step(41, 1, "SSTORE", &[selector, "0x9", "0x7", "0x0"]),
+        ]);
+        let map = StepMap::new(&trace, vec![legacy_contract(Some(CodeGenerator::Legacy))]);
+        let LocalsStatus::Inferred(at_entry) = map.locals_at(1) else {
+            panic!("{:?}", map.locals_at(1));
+        };
+        assert!(at_entry.is_empty());
+        let LocalsStatus::Inferred(in_body) = map.locals_at(4) else {
+            panic!("{:?}", map.locals_at(4));
+        };
+        assert_eq!(named(in_body), [("v", VariableKind::Parameter, Some(2))]);
+        assert_eq!(
+            map.inferred_variables(&trace, 4, None)[0].value.display,
+            "7"
+        );
+
+        // Calldata that selects the function but disagrees with the words at the body
+        // tag says this is not where the parameters are: the placement is left to the
+        // body's first statement, as before.
+        let selector = super::hex_bytes(&function_selector("set(uint256)").expect("selector"));
+        trace.input_data = format!("0x{selector}{:064x}", 8);
+        let map = StepMap::new(&trace, vec![legacy_contract(Some(CodeGenerator::Legacy))]);
+        let LocalsStatus::Inferred(in_body) = map.locals_at(4) else {
+            panic!("{:?}", map.locals_at(4));
+        };
+        assert_eq!(named(in_body), [("v", VariableKind::Parameter, Some(3))]);
+        // Calldata that agrees confirms it.
+        trace.input_data = format!("0x{selector}{:064x}", 7);
+        let map = StepMap::new(&trace, vec![legacy_contract(Some(CodeGenerator::Legacy))]);
+        let LocalsStatus::Inferred(in_body) = map.locals_at(4) else {
+            panic!("{:?}", map.locals_at(4));
+        };
+        assert_eq!(named(in_body), [("v", VariableKind::Parameter, Some(2))]);
+    }
+
+    #[test]
+    fn a_placed_function_places_its_modifiers() {
+        // The optimizer merged the modifier's argument with its local's reservation, so
+        // the first instruction attributed to the modifier runs with both already on
+        // the stack; read off that height the modifier would land one slot too high.
+        // The function was placed at its body tag, and the modifier's parameter sits
+        // right above the function's, whatever the modifier's own instructions say.
+        let selector = "0x9c";
+        let ret = "0x9";
+        let trace = trace(vec![
+            step(0, 1, "PUSH1", &[]),
+            step(30, 1, "JUMPDEST", &[selector]),
+            step(35, 1, "JUMP", &[selector, ret, "0x5", "0x24"]),
+            step(36, 1, "JUMPDEST", &[selector, ret, "0x5"]),
+            step(31, 1, "DUP1", &[selector, ret, "0x5", "0x9", "0x9"]),
+            step(32, 1, "PUSH0", &[selector, ret, "0x5", "0x9", "0x9"]),
+            step(
+                33,
+                1,
+                "SSTORE",
+                &[selector, ret, "0x5", "0x9", "0x9", "0x5"],
+            ),
+            step(34, 1, "SSTORE", &[selector, ret, "0x5", "0x9", "0x9"]),
+        ]);
+        let map = StepMap::new(&trace, vec![legacy_contract(Some(CodeGenerator::Legacy))]);
+        let LocalsStatus::Inferred(modifier) = map.locals_at(4) else {
+            panic!("{:?}", map.locals_at(4));
+        };
+        assert_eq!(
+            named(modifier),
+            [
+                ("tag", VariableKind::Parameter, Some(3)),
+                ("before", VariableKind::Local, Some(4))
+            ]
+        );
+        let LocalsStatus::Inferred(body) = map.locals_at(6) else {
+            panic!("{:?}", map.locals_at(6));
+        };
+        assert_eq!(
+            named(body),
+            [
+                ("v", VariableKind::Parameter, Some(2)),
+                ("kept", VariableKind::Local, Some(5))
+            ]
+        );
+        assert_eq!(
+            map.inferred_variables(&trace, 6, None)[1].value.display,
+            "5"
+        );
+        let LocalsStatus::Inferred(resumed) = map.locals_at(7) else {
+            panic!("{:?}", map.locals_at(7));
+        };
+        assert_eq!(
+            named(resumed),
+            [
+                ("tag", VariableKind::Parameter, Some(3)),
+                ("before", VariableKind::Local, Some(4))
+            ]
+        );
+        let values = map.inferred_variables(&trace, 7, None);
+        assert_eq!(values[0].value.display, "9");
+        assert_eq!(values[1].value.display, "9");
     }
 
     #[test]
@@ -3432,7 +3721,9 @@ contract P {
             via_ir.locals_at(5),
             LocalsStatus::Unavailable(reason) if reason.contains("via-IR pipeline")
         ));
-        assert!(via_ir.inferred_variables(&outer_trace(), 5).is_empty());
+        assert!(via_ir
+            .inferred_variables(&outer_trace(), 5, None)
+            .is_empty());
         let unknown = StepMap::new(&outer_trace(), vec![legacy_contract(None)]);
         assert!(matches!(
             unknown.locals_at(5),
