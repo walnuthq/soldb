@@ -1,8 +1,8 @@
 [package]
-name = "soldb-repl"
+name = "soldb-tui"
 version.workspace = true
 edition.workspace = true
-description = "Interactive debugger state machine (breakpoints, stepping, display modes) for SolDB"
+description = "Full-screen terminal view for the SolDB debugger"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -14,13 +14,10 @@ categories.workspace = true
 doctest = false
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-soldb-core.workspace = true
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 soldb-debugger.workspace = true
-
-[dev-dependencies]
-soldb-ethdebug.workspace = true
+soldb-repl.workspace = true
 
 [lints]
 workspace = true

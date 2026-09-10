@@ -21,7 +21,6 @@
 # CHECK: Breakpoint #1 set at Locals.sol:10
 # CHECK: Breakpoint #1 hit at step {{[0-9]+}}, Locals.sol:10
 # CHECK: warning: local variables are inferred from the legacy source map
-# CHECK: note: values can be wrong under the optimizer
 # CHECK: uint256 a = 3 [stack+2]
 # CHECK-NEXT: uint256 b = 4 [stack+3]
 # CHECK-NEXT: uint256 sum = 0 [stack+4]

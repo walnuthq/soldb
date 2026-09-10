@@ -108,14 +108,15 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 | `soldb-ethdebug` | core, `revm-bytecode` |
 | `soldb-evm` | core, `ruint`, `revm` (behind the default-on `replay` feature) |
 | `soldb-rpc` | core, evm |
-| `soldb-repl` | core, debugger |
+| `soldb-repl` | core, debugger, `serde` |
+| `soldb-tui` | repl, debugger, `ratatui`, `crossterm` |
 | `soldb-serializer` | core, ethdebug |
 | `soldb-debugger` | core, ethdebug |
 | `soldb-profiler` | core, ethdebug |
 | `soldb-bridge` | core, rpc |
 | `soldb-compiler` | core, ethdebug, rpc |
 | `soldb-dap` | core, ethdebug, rpc, repl, debugger |
-| `soldb-cli` | core, ethdebug, rpc, repl, debugger, profiler, serializer, compiler, bridge, `inferno` |
+| `soldb-cli` | core, ethdebug, rpc, repl, tui, debugger, profiler, serializer, compiler, bridge, `inferno` |
 | `soldb-wasm` | core, ethdebug, evm (without `replay`), debugger, serializer, `wasm-bindgen` |
 
 The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
@@ -185,18 +186,31 @@ belongs in `soldb-debugger`, not in a second copy.
   part of the recording. All of it is a search over the recording; nothing re-executes.
 - **soldb-profiler**: gas attribution over borrowed trace steps and indexed ETHDebug
   programs. Frontend-agnostic; returns tables and folded stacks without printing or I/O.
-- **soldb-repl**: the interactive debugger *state machine* — breakpoints, stepping,
-  display mode, and the inspection queries (`frames`, `source_listing`, `calldata`). It
-  owns no I/O; the CLI drives it and prints. Keep it that way, because it is what makes
-  REPL behavior unit-testable without a terminal. Breakpoints are predicates on a step
+- **soldb-repl**: the interactive debugger — its command language, its state machine,
+  and its answers. `command.rs` holds one table (`COMMANDS`) that both the parser and
+  `help` are built from; `session.rs` runs a command against the `DebuggerState` and
+  answers with `Output` values (`response.rs`), never text; `render.rs` turns `Output`
+  into terminal lines, and serde turns it into JSON. It owns no I/O: the CLI, the TUI,
+  the DAP server, and Foundry's adapter all drive a `Session` and print or draw what it
+  answers, which is what keeps them from disagreeing and makes REPL behavior
+  unit-testable without a terminal. Keep new commands in the table and new answers as
+  `Output` variants; never print from this crate. Breakpoints are predicates on a step
   (`BreakpointKind`: PC, line entry, function entry, `SSTORE` to a slot, revert, call,
   opcode), checked on every step a movement passes through, forward or backward.
+- **soldb-tui**: the full-screen `ratatui` view over a `Session`: source with the
+  current line and breakpoints marked, variables and state, stack, memory, backtrace,
+  and opcode panes, a command line that takes every REPL command, and gdb-like keys.
+  Opened by `--tui` or the `tui` command; `q` returns to the prompt.
 - **soldb-serializer**: the versioned web/JSON projection of traces and simulations,
   including the per-contract `contracts` entry built from `EthdebugInfo`.
 - **soldb-compiler**: `solc` invocation, ETHDebug artifact discovery, deploy helpers.
 - **soldb-bridge**: cross-VM bridge protocol and server (Stylus today).
 - **soldb-dap**: Debug Adapter Protocol server for editors.
-- **soldb-cli**: argument parsing, command dispatch, and *all* human-readable formatting.
+- **soldb-cli**: argument parsing, command dispatch, and the human-readable formatting of
+  everything outside a debugging session; inside one it prints what `soldb-repl`'s
+  `Renderer` renders, or the `Output` as JSON under `--json`, and runs `-x` commands
+  before reading stdin (`--batch` leaves afterwards). The prompt is printed only when
+  stdin is a terminal.
 - **soldb-wasm**: `wasm-bindgen` exports over the library crates for browser and Node.js
   hosts. One handle, `Trace`, holds the parsed trace in WebAssembly memory; inputs and
   outputs cross the boundary as JSON strings, but the trace is never re-parsed between

@@ -122,11 +122,42 @@ Interactive mode:
 soldb trace <tx_hash> --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545 --interactive
 ```
 
-Inside REPL:
+Inside the REPL:
 ```
 soldb> break TestContract.sol:42
-soldb> next
+Breakpoint #1 set at TestContract.sol:42
+soldb> continue
+Breakpoint #1 hit at step 299, TestContract.sol:42
+TestContract.sol:42 in increment  (step 299/1071, pc 1899, PUSH2, gas 955476)
+   42 |         balance += amount;
 soldb> print balance
+uint256 balance = 10 [slot 0x0]
+```
+
+The same session as a script, and as JSON for a tool or an agent to read:
+```bash
+soldb trace <tx_hash> --ethdebug-dir … --rpc … -x 'break TestContract.sol:42' -x continue -x vars --batch
+soldb trace <tx_hash> --ethdebug-dir … --rpc … -x 'break TestContract.sol:42' -x continue -x vars --batch --json
+```
+
+And as a full-screen view (`--tui`, or the `tui` command from the prompt):
+
+```
+┌ Source ──────────────────────────────────┬ Variables ─────────────────────────┐
+│    40 |     function increment(uint256 a)│ uint256 amount = 4 [stack+2]       │
+│ *  41 |         require(amount > 0);     │ uint256 twice = 8 [stack+4]        │
+│ => 42 |         balance += amount;       │ State:                             │
+│    43 |         emit Incremented(amount);│ uint256 balance = 10 [slot 0x0]    │
+├ Opcodes ─────────────────────────────────┼ Stack ─────────────────────────────┤
+│ =>  1899 PUSH2 0x0771                    │ [ 4] 0x8                           │
+│     1902 JUMP                            │ [ 3] 0x0                           │
+├ Backtrace ───────────────┬ Console ───────┴────────────────────────────────────┤
+│ #0  increment at :42     │ soldb> continue                                     │
+│ #1  TestContract at :4   │ Breakpoint #1 hit at step 299, TestContract.sol:42  │
+├──────────────────────────┴─────────────────────────────────────────────────────┤
+│ step 299/1071  pc 1899  PUSH2  gas 955476  TestContract.sol:42 in increment    │
+│ n/s/c/f/i step  N/S/C/F/I back  b break  m mode  : command  Tab focus  ? help  │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -163,7 +194,7 @@ You can also debug simulations interactively using the `--interactive` flag:
 soldb simulate <contract_address> "increment(uint256)" 5     --from <sender_address>     --ethdebug-dir <contract_address>:<contract_name>:./out     --rpc http://localhost:8545     --interactive
 ```
 
-Inside REPL:
+Inside the REPL:
 ```
 soldb> break TestContract.sol:38
 soldb> step
@@ -199,8 +230,23 @@ reports and flamegraphs.
 
 ---
 
+## Agent Friendly
+
+SolDB is a terminal program end to end, which makes it as usable by an agent as by a
+person. The REPL answers each command with plain text and nothing else: no prompt or
+banner when the input is a pipe, one line per stop with the step, program counter,
+opcode, and gas in a fixed place, no colors unless the output is a terminal. Commands
+can be given on the command line (`-x`, repeatable, `--batch` to leave afterwards), so a
+whole session is one shell command, and `--json` turns every answer into one JSON
+object per line with the raw words next to the decoded values. Editors and tools that
+speak the Debug Adapter Protocol get the same engine through `soldb-dap`. See
+[`docs/commands.md`](docs/commands.md#scripting-and-json).
+
 ## Features
 
+- Three frontends over one engine: a gdb-style REPL (the default), a full-screen
+  terminal view (`--tui`, or `tui` at the prompt) with source, variables, stack, memory,
+  backtrace, and opcode panes, and a DAP server for editors
 - ETHDebug-first source debugging with legacy `srcmap`/`srcmap-runtime` fallback
 - Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
   server: locals decoded from ETHDebug variable locations, or, for solc's legacy pipeline,
@@ -360,7 +406,9 @@ step-back button works. Breakpoints are predicates on a step, so `break storage 
 - `crates/soldb-ethdebug`: ETHDebug metadata loading, ABI helpers, source mapping, event decoding, and call-frame enrichment.
 - `crates/soldb-debugger`: reusable source-step, function, and variable decoding model shared by frontends.
 - `crates/soldb-profiler`: reusable gas attribution and folded-stack model over traces and ETHDebug programs.
-- `crates/soldb-repl`: interactive debugger state and REPL commands.
+- `crates/soldb-repl`: the debugger's command language, session, and answers; the state
+  machine every frontend drives.
+- `crates/soldb-tui`: the full-screen terminal view over a session.
 - `crates/soldb-serializer`: JSON/web-facing trace and simulation serialization, including nested call trees and ETHDebug source metadata.
 - `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.
 - `crates/soldb-bridge`: bridge server for cross-environment Solidity<>Stylus debugging.

@@ -1,14 +1,15 @@
-//! The interactive debugger's command parser and state machine.
+//! The interactive debugger: its command language, its state machine, and its answers.
 //!
-//! [`DebuggerCommand::parse`] turns a typed line into a command, and
-//! [`DebuggerState::apply_command`] applies the ones that move the debugger or change its
-//! breakpoints, returning a [`StepOutcome`] describing what happened.
+//! [`DebuggerCommand::parse`] turns a typed line into a command; a [`Session`] runs it
+//! and answers with [`Output`] values, which [`Renderer`] turns into text and serde into
+//! JSON. Underneath, [`DebuggerState`] holds the trace, the breakpoints, and the
+//! position, and [`DebuggerState::apply_command`] applies the commands that move or
+//! change breakpoints, returning a [`StepOutcome`].
 //!
 //! This crate performs no I/O: it neither reads stdin nor prints. The frontend owns the
-//! terminal and renders outcomes, which is what makes stepping, breakpoints, and command
-//! parsing testable without a terminal or a node. Commands that only display something
-//! (`vars`, `backtrace`, `list`, `info`) return `None` from `apply_command`; the frontend
-//! reads the data it needs through the state's accessors and formats it.
+//! terminal — a line-oriented REPL, a full-screen view, an editor over DAP, a script —
+//! and renders what the session answers, which is what makes stepping, breakpoints,
+//! command parsing, and the answers themselves testable without a terminal or a node.
 //!
 //! The trace is a complete recording, so every movement is a search over it, forward or
 //! backward, and a breakpoint is a predicate on a step: a program counter, the start of
@@ -19,6 +20,22 @@
 use std::cell::RefCell;
 
 use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
+
+mod command;
+mod render;
+mod response;
+mod session;
+
+pub use command::{
+    command_spec, CommandGroup, CommandSpec, DebuggerCommand, DebuggerInfoCommand, COMMANDS,
+};
+pub use render::{shorten_hex, Renderer};
+pub use response::{
+    ArgumentInfo, BreakpointEvent, BreakpointInfo, FrameInfo, Level, ListedLine, LoadedContract,
+    MemoryInfo, MemoryWord, Output, ResourceInfo, SlotInfo, StateInfo, Stop, StopLocation,
+    StopReason, ValueStatus, VariableInfo,
+};
+pub use session::{breakpoint_lines, Session, FRAME_ARGUMENTS_WARNING, LISTING_RADIUS};
 use soldb_debugger::{
     call_target, normalize_address, variables_for_step, ChainStorage, Condition, ConditionContext,
     ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState, LocalsStatus,
@@ -175,134 +192,6 @@ fn unique(names: impl Iterator<Item = String>) -> Vec<String> {
         }
     }
     seen
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DebuggerCommand {
-    Next,
-    NextInstruction,
-    Step,
-    Continue,
-    /// Run until the current frame returns to its caller.
-    Finish,
-    /// Step back to the previous source step.
-    ReverseNext,
-    /// Step back one EVM instruction.
-    ReverseNextInstruction,
-    /// Step back into the previous instruction, the mirror of `step`.
-    ReverseStep,
-    /// Run backward until a breakpoint or the first step.
-    ReverseContinue,
-    /// Run backward to the step that entered the current frame.
-    ReverseFinish,
-    Goto(usize),
-    /// List every source variable ETHDebug reports as live at the current program counter.
-    Vars,
-    /// Print one source variable by name at the current program counter.
-    ///
-    /// An empty name means the user typed `print` with no argument; the frontend reports
-    /// the usage rather than treating it as an unknown command.
-    Print(String),
-    Info(DebuggerInfoCommand),
-    /// The call structure at the current step.
-    Backtrace,
-    /// The source around the current step.
-    List,
-    /// Memory at the current step, optionally one range of it.
-    Memory {
-        offset: Option<u64>,
-        length: Option<u64>,
-    },
-    /// The calldata of the current call frame.
-    Calldata,
-    /// The stack at the current step.
-    Stack,
-    Mode(Option<DisplayMode>),
-    /// Set a breakpoint, optionally one that stops only when a condition holds.
-    Break(BreakpointTarget, Option<String>),
-    Clear(BreakpointTarget),
-    /// Remove a breakpoint by number.
-    Delete(u32),
-    Help(Option<String>),
-    Quit,
-    Empty,
-    Unknown(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DebuggerInfoCommand {
-    Resources { json: bool },
-    Breakpoints,
-    Storage,
-}
-
-impl DebuggerCommand {
-    pub fn parse(line: &str) -> Self {
-        let line = line.trim();
-        if line.is_empty() {
-            return Self::Empty;
-        }
-
-        let mut parts = line.split_whitespace();
-        let command = parts.next().unwrap_or_default().to_ascii_lowercase();
-        let rest = parts.collect::<Vec<_>>().join(" ");
-        match command.as_str() {
-            "next" | "n" => Self::Next,
-            "nexti" | "ni" | "stepi" | "si" => Self::NextInstruction,
-            "step" | "s" => Self::Step,
-            "continue" | "c" => Self::Continue,
-            "finish" | "fin" => Self::Finish,
-            "reverse-next" | "rnext" | "rn" => Self::ReverseNext,
-            "reverse-nexti" | "rnexti" | "rni" | "reverse-stepi" | "rsi" | "back" => {
-                Self::ReverseNextInstruction
-            }
-            "reverse-step" | "rstep" | "rs" => Self::ReverseStep,
-            "reverse-continue" | "rcontinue" | "rc" => Self::ReverseContinue,
-            "reverse-finish" | "rfinish" | "rfin" => Self::ReverseFinish,
-            "vars" | "locals" => Self::Vars,
-            "print" | "p" => Self::Print(rest),
-            "backtrace" | "bt" | "where" => Self::Backtrace,
-            "list" | "l" => Self::List,
-            "memory" | "mem" => {
-                parse_memory_command(&rest).unwrap_or_else(|| Self::Unknown(line.to_owned()))
-            }
-            "calldata" => Self::Calldata,
-            "stack" => Self::Stack,
-            "storage" => Self::Info(DebuggerInfoCommand::Storage),
-            "goto" => rest
-                .parse::<usize>()
-                .map(Self::Goto)
-                .unwrap_or_else(|_| Self::Unknown(line.to_owned())),
-            "info" | "i" => parse_info_command(&rest)
-                .map(Self::Info)
-                .unwrap_or_else(|| Self::Unknown(line.to_owned())),
-            "mode" => Self::Mode(
-                (!rest.is_empty())
-                    .then(|| DisplayMode::parse(&rest))
-                    .flatten(),
-            ),
-            "break" | "b" => {
-                // `break <target> if <condition>`: the condition is everything after the
-                // first ` if `, so a target containing `if` in a name still parses.
-                let (target, condition) = split_condition(&rest);
-                parse_breakpoint_target(target)
-                    .map(|target| Self::Break(target, condition))
-                    .unwrap_or_else(|| Self::Unknown(line.to_owned()))
-            }
-            "clear" => parse_breakpoint_target(&rest)
-                .map(Self::Clear)
-                .unwrap_or_else(|| Self::Unknown(line.to_owned())),
-            "delete" | "d" => rest
-                .trim()
-                .trim_start_matches('#')
-                .parse::<u32>()
-                .map(Self::Delete)
-                .unwrap_or_else(|_| Self::Unknown(line.to_owned())),
-            "help" => Self::Help((!rest.is_empty()).then_some(rest)),
-            "exit" | "quit" | "q" => Self::Quit,
-            _ => Self::Unknown(line.to_owned()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1112,9 +1001,10 @@ impl DebuggerState {
             | DebuggerCommand::List
             | DebuggerCommand::Memory { .. }
             | DebuggerCommand::Calldata
-            | DebuggerCommand::Stack
+            | DebuggerCommand::Stack { .. }
             | DebuggerCommand::Mode(None)
             | DebuggerCommand::Print(_)
+            | DebuggerCommand::Tui
             | DebuggerCommand::Quit
             | DebuggerCommand::Unknown(_)
             | DebuggerCommand::Vars => None,
@@ -1172,134 +1062,6 @@ fn normalize_slot(input: &str) -> Option<String> {
     } else {
         trimmed.to_owned()
     })
-}
-
-fn parse_info_command(input: &str) -> Option<DebuggerInfoCommand> {
-    match input.trim() {
-        "resources" => Some(DebuggerInfoCommand::Resources { json: false }),
-        "resources --json" | "resources json" => {
-            Some(DebuggerInfoCommand::Resources { json: true })
-        }
-        "breakpoints" | "break" | "b" => Some(DebuggerInfoCommand::Breakpoints),
-        "storage" => Some(DebuggerInfoCommand::Storage),
-        _ => None,
-    }
-}
-
-fn parse_memory_command(input: &str) -> Option<DebuggerCommand> {
-    let mut parts = input.split_whitespace();
-    let offset = match parts.next() {
-        Some(text) => Some(parse_u64_arg(text)?),
-        None => None,
-    };
-    let length = match parts.next() {
-        Some(text) => Some(parse_u64_arg(text)?),
-        None => None,
-    };
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(DebuggerCommand::Memory { offset, length })
-}
-
-fn parse_u64_arg(input: &str) -> Option<u64> {
-    let input = input.trim();
-    if let Some(hex) = input.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        input.parse::<u64>().ok()
-    }
-}
-
-fn parse_breakpoint_target(input: &str) -> Option<BreakpointTarget> {
-    let input = input.trim();
-    if input.is_empty() {
-        return None;
-    }
-    let mut parts = input.splitn(2, char::is_whitespace);
-    let head = parts.next().unwrap_or_default();
-    let rest = parts.next().map(str::trim).unwrap_or_default();
-    match head.to_ascii_lowercase().as_str() {
-        "storage" | "slot" => {
-            (!rest.is_empty()).then(|| BreakpointTarget::Storage(rest.to_owned()))
-        }
-        "revert" if rest.is_empty() => Some(BreakpointTarget::Revert),
-        "call" => Some(BreakpointTarget::Call(
-            (!rest.is_empty()).then(|| rest.to_owned()),
-        )),
-        "op" | "opcode" => (!rest.is_empty() && !rest.contains(char::is_whitespace))
-            .then(|| BreakpointTarget::Opcode(rest.to_owned())),
-        _ => {
-            if let Some(target) = parse_source_breakpoint_target(input) {
-                return Some(BreakpointTarget::SourceLine(target));
-            }
-            if let Some(pc) = parse_u64_arg(input) {
-                return Some(BreakpointTarget::Pc(pc));
-            }
-            if is_function_name(input) {
-                return Some(BreakpointTarget::Function(input.to_owned()));
-            }
-            // `balances[0xabc…]` and the like: a place in storage, named the way `print`
-            // names it.
-            is_state_path(input).then(|| BreakpointTarget::State(input.to_owned()))
-        }
-    }
-}
-
-/// Splits `<target> if <condition>` at the first ` if `, which cannot appear inside a
-/// target: a file name, a function name, a slot, and an opcode all lack spaces.
-fn split_condition(input: &str) -> (&str, Option<String>) {
-    let input = input.trim();
-    match input.find(" if ") {
-        Some(index) => {
-            let condition = input[index + 4..].trim();
-            (
-                input[..index].trim(),
-                (!condition.is_empty()).then(|| condition.to_owned()),
-            )
-        }
-        None => (input, None),
-    }
-}
-
-/// Whether the text looks like a state variable path: a name followed by any number of
-/// `[key]` and `.member` steps.
-fn is_state_path(input: &str) -> bool {
-    let head = input.split(['[', '.']).next().unwrap_or_default();
-    !head.is_empty() && is_function_name(head) && input.len() > head.len()
-}
-
-fn is_function_name(input: &str) -> bool {
-    let mut segments = input.split('.');
-    segments.all(|segment| {
-        let mut bytes = segment.bytes();
-        bytes
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    })
-}
-
-fn parse_source_breakpoint_target(input: &str) -> Option<SourceBreakpointTarget> {
-    let input = input.trim();
-    if let Some(line) = input.strip_prefix("line ") {
-        return parse_source_line_number(line)
-            .map(|line| SourceBreakpointTarget { file: None, line });
-    }
-
-    let (file, line) = input.rsplit_once(':')?;
-    let file = file.trim();
-    if file.is_empty() {
-        return None;
-    }
-    parse_source_line_number(line).map(|line| SourceBreakpointTarget {
-        file: Some(file.to_owned()),
-        line,
-    })
-}
-
-fn parse_source_line_number(input: &str) -> Option<u64> {
-    input.trim().parse::<u64>().ok().filter(|line| *line > 0)
 }
 
 #[cfg(test)]
@@ -1470,7 +1232,10 @@ mod tests {
             DebuggerCommand::parse("calldata"),
             DebuggerCommand::Calldata
         );
-        assert_eq!(DebuggerCommand::parse("stack"), DebuggerCommand::Stack);
+        assert_eq!(
+            DebuggerCommand::parse("stack"),
+            DebuggerCommand::Stack { limit: None }
+        );
         assert_eq!(
             DebuggerCommand::parse("help mode"),
             DebuggerCommand::Help(Some("mode".to_owned()))

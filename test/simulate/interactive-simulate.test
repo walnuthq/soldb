@@ -14,5 +14,5 @@
 # CHECK: Parameters:
 # CHECK: amount: 4
 
-# Check for the specific step format
-# CHECK: [ Step 0 | Gas: {{[0-9]+}} | PC: 0 | PUSH1 ]
+# Check for the initial stop: one line with the step, program counter, opcode, and gas.
+# CHECK: step 0/{{[0-9]+}}, pc 0, PUSH1, gas {{[0-9]+}}

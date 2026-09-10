@@ -63,7 +63,7 @@
 # Without debug info the line commands fall back to instructions and say what is missing.
 # RUN: printf 'next\nbreak TestContract.sol:30\nbreak increment\nlist\nquit\n' | %soldb trace %{test_tx} --rpc %{rpc_url} -i 2>&1 | FileCheck --check-prefix=NOMETA %s
 
-# NOMETA: Step 1/
+# NOMETA: step 1/
 # NOMETA: Could not set breakpoint: source breakpoints require compiler debug metadata
 # NOMETA: Could not set breakpoint: function breakpoints require compiler debug metadata
 # NOMETA: Cannot list source: no ETHDebug metadata is loaded

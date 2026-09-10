@@ -22,20 +22,52 @@ the map and the source text either way. Only *local* variables need ETHDebug, be
 their locations exist nowhere else; state variables are read from the storage layout
 `solc --storage-layout` writes, which pre-ETHDebug compilers emit as well.
 
-The prompt is:
+The prompt is `soldb> `, printed only when stdin is a terminal: a session fed from a
+pipe or a script prints the answers alone.
 
-```text
-soldb>
+## Scripting and JSON
+
+Every command can be given on the command line with `-x`, repeatable and run in order
+before anything is read from stdin; `--batch` leaves afterwards instead of waiting for
+more:
+
+```console
+soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir 0x5fbd…:Counter:out \
+    -x 'break Counter.sol:12' -x continue -x vars --batch
 ```
+
+With `--json`, every answer is one JSON object per line, tagged by `kind` (`stop`,
+`variables`, `variable`, `backtrace`, `stack`, `memory`, `storage`, `breakpoint`,
+`message`, …), with the same fields the text shows and the raw words alongside the
+decoded values, so a tool or an agent reads the session instead of scraping it:
+
+```console
+soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir … -x 'break Counter.sol:12' -x continue -x vars --batch --json
+{"kind":"stop","reason":"initial","step":0,"last_step":982,"pc":0,"op":"PUSH1","gas":29978656,"location":{"path":"Counter.sol","line":4,"generated":false,"text":"contract Counter {"},"address":"0x5fbd…","has_source":true}
+{"kind":"breakpoint","event":"set","id":1,"label":"Counter.sol:12"}
+{"kind":"stop","reason":"breakpoint","id":1,"label":"Counter.sol:12","step":767,…}
+{"kind":"variables","warning":"local variables are inferred …","pc":717,"locals":[{"name":"amount","ty":"uint256","value":"4","raw":"0x…04","status":"decoded","place":"stack+2"}],"state":{"status":"variables","variables":[…]}}
+```
+
+Colors are used only on a terminal (`NO_COLOR` turns them off, `CLICOLOR_FORCE` on).
+
+## The Full-Screen View
+
+`--tui` starts, and the `tui` command opens, a full-screen view over the same session:
+the source with the current line and the breakpoints marked, the variables and the state,
+the stack, memory, the backtrace, and the opcodes around the program counter, with a
+command line that takes every command on this page. `n`, `s`, `c`, `f`, and `i` step
+without typing, their capitals step backward, `b` breaks on the current line, `m`
+switches source and assembly, `:` types a command, `Tab` moves between panes, `?` lists
+the keys, `q` returns to the prompt, and `Q` leaves the debugger.
 
 ## What a Stop Shows
 
-Every stop prints the step, its program counter, opcode, and remaining gas. In source mode
-(the default) it also prints where the step is in the source and the line's text:
+Every stop is one line: where the step is in the source, then the step, its program
+counter, opcode, and remaining gas in parentheses, followed by the line's text:
 
 ```text
-Step 156/1071 | PC 1872 | PUSH2 | gas 978188
-TestContract.sol:28 in increment
+TestContract.sol:28 in increment  (step 156/1071, pc 1872, PUSH2, gas 978188)
    28 |         counter += amount;
 ```
 
@@ -44,10 +76,13 @@ updates) to the contract as a whole rather than to a line. The debugger attribut
 step to the statement that was executing and marks it:
 
 ```text
-TestContract.sol:28 in increment  (compiler-generated code for this line)
+TestContract.sol:28 in increment  (compiler-generated code for this line)  (step 160/1071, pc 1890, JUMP, gas 978170)
 ```
 
-In assembly mode (`mode asm`) the stop prints the EVM stack instead of the source.
+Without a source for the step the line says so, with the address executing; without any
+debug information loaded it is the step alone: `step 156/1071, pc 1872, PUSH2, gas
+978188`. In assembly mode (`mode asm`) the stop prints the top of the EVM stack instead of
+the source line, each word with its index from the bottom of the stack.
 
 ## Stepping
 
@@ -389,9 +424,11 @@ TestContract.sol:32
       33 |     }
 ```
 
-### `stack`
+### `stack [<n>]`
 
-Print the EVM stack at the current step.
+Print the EVM stack at the current step, top first, all of it or the top `n` words. Each
+word carries its index from the bottom of the stack, which is the index `vars` reports a
+variable's slot as, so `[stack+5]` in `vars` is the line `[5]` here.
 
 ### `memory [offset [length]]`
 
@@ -459,11 +496,10 @@ uint256 total = 0 [slot 0x0]
 ```
 
 This is a reading of the stack, not compiler-reported variable locations, and the first
-`vars` or `print` of a session says so:
+`vars` or `print` of a session says so in one line; `help vars` explains what that means:
 
 ```text
 warning: local variables are inferred from the legacy source map and the stack layout of solc's legacy code generator, not from compiler-reported variable locations
-note: values can be wrong under the optimizer, and a variable whose frame could not be placed shows as unavailable; ETHDebug variable information will replace this once compilers emit it
 ```
 
 A frame is placed at the entry of its body, where the calling convention leaves the
@@ -654,22 +690,17 @@ Show the EVM stack at each stop instead of the source.
 
 ## Help
 
-### `help`
+### `help [<command>]`
 
-Print the REPL command summary.
+Aliases: `h`, `?`
 
-```text
-soldb> help
-Stepping: next (n), step (s), nexti (ni), finish (fin), continue (c), goto <step>
-Reverse:  reverse-next (rn), reverse-step (rs), reverse-nexti (back), reverse-finish (rfin), reverse-continue (rc)
-Break:    break <pc>|<file>:<line>|line <line>|<function>|storage <slot>|revert|call [<address>]|op <OPCODE>
-          clear <target>, delete <n>, info breakpoints
-Inspect:  backtrace (bt), list (l), vars, print <variable>|<state>[<key>], stack, memory [offset [length]], storage, calldata
-Other:    info resources [--json], mode source|asm, help <command>, quit
-```
+Print every command with its usage and a line saying what it does, grouped as this page
+is; `help <command>` prints one command's usage, aliases, and details, such as the
+breakpoint targets under `help break` or where local values come from under `help vars`.
 
-`help <command>` prints the details for a command group: `help next`, `help break`,
-`help backtrace`, `help vars`, `help info`, `help mode`.
+### `tui`
+
+Open the full-screen view over this session; `q` there returns to the prompt.
 
 ## Exit
 
@@ -685,25 +716,20 @@ Exit the interactive debugger.
 soldb> break TestContract.sol:30
 Breakpoint #1 set at TestContract.sol:30
 soldb> continue
-Breakpoint #1 hit at step 299, TestContract.sol:30, PC 1899
-Step 299/1071 | PC 1899 | PUSH2 | gas 955476
-TestContract.sol:30 in increment
+Breakpoint #1 hit at step 299, TestContract.sol:30
+TestContract.sol:30 in increment  (step 299/1071, pc 1899, PUSH2, gas 955476)
    30 |         increment2(amount);
 soldb> step
-Step 301/1071 | PC 1678 | JUMPDEST | gas 955465
-TestContract.sol:39 in increment2
+TestContract.sol:39 in increment2  (step 301/1071, pc 1678, JUMPDEST, gas 955465)
    39 |     function increment2(uint256 amount) public {
 soldb> finish
-Step 962/1071 | PC 1903 | JUMPDEST | gas 950160
-TestContract.sol:30 in increment
+TestContract.sol:30 in increment  (step 962/1071, pc 1903, JUMPDEST, gas 950160)
    30 |         increment2(amount);
 soldb> next
-Step 963/1071 | PC 1904 | PUSH2 | gas 950159
-TestContract.sol:32 in increment
+TestContract.sol:32 in increment  (step 963/1071, pc 1904, PUSH2, gas 950159)
    32 |         emit CounterIncremented(counter);
 soldb> reverse-next
-Step 962/1071 | PC 1903 | JUMPDEST | gas 950160
-TestContract.sol:30 in increment
+TestContract.sol:30 in increment  (step 962/1071, pc 1903, JUMPDEST, gas 950160)
    30 |         increment2(amount);
 soldb> q
 Exiting debugger.

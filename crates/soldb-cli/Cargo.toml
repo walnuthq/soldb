@@ -31,6 +31,7 @@ soldb-profiler.workspace = true
 soldb-repl.workspace = true
 soldb-rpc.workspace = true
 soldb-serializer.workspace = true
+soldb-tui.workspace = true
 
 [lints]
 workspace = true
