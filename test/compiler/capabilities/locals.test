@@ -1,0 +1,41 @@
+# Local variables without compiler variable locations. solc's legacy code generator
+# keeps every parameter, return parameter, and local at a fixed stack slot, which soldb
+# infers from the declaration spans in the source map and says so once. An IR-based
+# compiler lays its stack out as its optimizer sees fit, so this needs ETHDebug variable
+# locations from Solar and is expected to fail there until it emits them.
+# REQUIRES: soldb
+# XFAIL: compiler-solar
+# RUN: rm -rf %t
+# RUN: mkdir -p %t/solar %t/solc
+# RUN: %if compiler-solar %{ cd %S/.. && %solar Locals.sol --emit=abi,bin,bin-runtime,srcmap,srcmap-runtime --out-dir %t/solar > %t/solar/compile.stdout 2> %t/solar/compile.stderr %}
+# RUN: %if compiler-solc %{ cd %S/.. && %solc Locals.sol --bin --abi --combined-json abi,bin,bin-runtime,srcmap,srcmap-runtime,storage-layout -o %t/solc > %t/solc/compile.stdout 2> %t/solc/compile.stderr %}
+# RUN: %if compiler-solar %{ cp %S/../Locals.sol %t/solar/Locals.sol %}
+# RUN: %if compiler-solc %{ cp %S/../Locals.sol %t/solc/Locals.sol %}
+# RUN: %if compiler-solar %{ jq -er '.contracts["Locals.sol:Locals"].bin | strings | select(length > 0)' %t/solar/combined.json > %t/solar/Locals.bin %}
+
+# Stop where `sum` is assigned: the parameters, the return parameter, and both locals
+# are live, and the warning about where their values come from is printed once.
+# RUN: %if compiler-solc %{ printf 'break Locals.sol:10\ncontinue\nvars\nnext\nprint sum\nprint big\nprint nothing\nvars\nquit\n' | %soldb run %t/solc/Locals.bin "accumulate(uint256,uint256)" 3 4 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Locals:%t/solc -i 2>&1 | FileCheck %s %}
+# RUN: %if compiler-solar %{ printf 'break Locals.sol:10\ncontinue\nvars\nnext\nprint sum\nprint big\nprint nothing\nvars\nquit\n' | %soldb run %t/solar/Locals.bin "accumulate(uint256,uint256)" 3 4 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Locals:%t/solar -i 2>&1 | FileCheck %s %}
+
+# CHECK: Breakpoint #1 set at Locals.sol:10
+# CHECK: Breakpoint #1 hit at step {{[0-9]+}}, Locals.sol:10
+# CHECK: warning: local variables are inferred from the legacy source map
+# CHECK: note: values can be wrong under the optimizer
+# CHECK: uint256 a = 3 [stack+2]
+# CHECK-NEXT: uint256 b = 4 [stack+3]
+# CHECK-NEXT: uint256 sum = 0 [stack+4]
+# CHECK-NEXT: uint256 twice = 6 [stack+5]
+# CHECK-NEXT: bool big = true [stack+6]
+# CHECK-NEXT: State:
+# CHECK-NEXT: uint256 total = {{.*}} [slot 0x0
+# After the assignment the return parameter holds the sum.
+# CHECK: uint256 sum = 10 [stack+4]
+# CHECK: bool big = true [stack+6]
+# A name that is neither a local nor a state variable says so, without blaming the
+# debug info, since locals are available here.
+# CHECK: No such variable: `nothing` is not in scope at PC {{[0-9]+}}; no state variable named `nothing` in the storage layout
+# CHECK-NOT: note: locals are unavailable
+# The warning is printed once a session.
+# CHECK-NOT: warning: local variables are inferred
+# CHECK: uint256 twice = 6 [stack+5]

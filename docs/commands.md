@@ -250,10 +250,15 @@ soldb> break op SSTORE if depth == 1 && gas > 0
 
 A condition compares values the debugger can read at that step:
 
+- the local variables in scope, by name, wherever [`vars`](#vars) can read them, and
+  paths through them — `item.color`, `item.tags[1]`, `stored.owners[0xabc]`,
+  `blob.length` — with a value type as its word, a `string` as its text, a `bytes` as
+  its hex text;
 - state variables through the storage layout, including `balances[0xabc…]`,
   `items[2]`, and `config.limit`;
 - the arguments of the frame being entered, by name, when the trace has proven them
   (see [`backtrace`](#backtrace));
+- enum literals such as `Color.Red`, from the declarations in the loaded sources;
 - `pc`, `gas`, `depth`, and `step` as numbers, and `op` as text.
 
 Operands are those names, decimal or `0x` numbers, `true`, `false`, and quoted strings.
@@ -429,19 +434,117 @@ Both commands need the session to be started with
 `--ethdebug-dir <address>:<contract>:<dir>`, and they read two things from it.
 
 *Local* variables come from the ETHDebug variable information for the current program
-counter, shared with the DAP server's variables view. A compiler only reports them if it
-emits `context.variables` in its ETHDebug output, and no compiler release does yet. When
-the loaded artifact carries no variable locations at all, `vars` and `print` say that,
-rather than reporting an empty scope:
+counter, shared with the DAP server's variables view, when the artifact carries any. A
+compiler only reports them if it emits `context.variables` in its ETHDebug output, and no
+compiler release does yet.
+
+Without them, soldb reads locals off the stack for code from solc's legacy pipeline. That
+code generator keeps every parameter, return parameter, and local at a fixed stack slot:
+the parameters sit below the height the function was entered at, and each declaration
+reserves the next slot when it executes and frees it at the end of its block. The legacy
+source map attributes that reservation to the declaration's `type name` span, which is
+enough to follow each variable through the trace: `vars` lists the parameters, the return
+parameters, and the locals in scope, with the slot each was read from, and `print` reads
+one by name.
 
 ```text
 soldb> vars
-Variables: this artifact carries no ETHDebug variable locations, so locals cannot be shown; the compiler that produced it does not emit them yet
+uint256 a = 3 [stack+2]
+uint256 b = 4 [stack+3]
+uint256 sum = 0 [stack+4]
+uint256 twice = 6 [stack+5]
+bool big = true [stack+6]
+State:
+uint256 total = 0 [slot 0x0]
+```
+
+This is a reading of the stack, not compiler-reported variable locations, and the first
+`vars` or `print` of a session says so:
+
+```text
+warning: local variables are inferred from the legacy source map and the stack layout of solc's legacy code generator, not from compiler-reported variable locations
+note: values can be wrong under the optimizer, and a variable whose frame could not be placed shows as unavailable; ETHDebug variable information will replace this once compilers emit it
+```
+
+A frame is placed at the entry of its body, where the calling convention leaves the
+parameters as the top words of the stack — whether an internal call jumped there or the
+dispatcher did after decoding them — and the return parameters, the modifiers' slots, and
+the locals follow from that. The legacy optimizer keeps that convention, so the slots hold
+under `--optimize` too; what it does change is *when* a value reaches its slot inside a
+basic block, so a local assigned and consumed within one block can read stale until the
+block ends, which is what the note about the optimizer warns of. A frame whose entry was
+not seen is placed by whichever comes first: the first return parameter's reservation, the
+first local's, or the first instruction of the body. Each modifier's parameters sit right
+above the function's parameters and return parameters and the slots of the modifiers
+before it, and the body's locals start above all of them; a modifier resumed after its
+`_` keeps the slots it had. The variables of `try ... returns (...)` and `catch (...)`
+clauses belong to their clause blocks like any other local.
+
+A variable's word is the value for a value type and a pointer for a reference type, and
+the pointer is followed through the layout the language fixes for its data location:
+
+```text
+soldb> vars
+Item memory item = { id: 5, name: "widget", color: Color.Blue, tags: [7, 8] } [stack+9]
+Price price = 15 [stack+10]
+bytes memory blob = 0xc0ffee [stack+11]
+Item storage stored = { id: 5, name: "widget", color: 2, tags: <1 element(s); index it with [i]> } [stack+13]
+```
+
+- `memory`: a `string` or `bytes` is its length and its bytes, an array its length (for a
+  dynamic one) and one word per element, a struct one word per member, in declaration
+  order as the sources declare it; an element or member that is itself a reference is a
+  pointer, followed the same way, a few levels deep;
+- `storage`: the word is a slot, decoded through the storage layout the way a state
+  variable is, so a `Item storage` local shows its members and a `uint256[] storage` its
+  length; a slot the transaction has not touched is unknown, as for state variables;
+- `calldata`: a slice of a dynamic type takes two slots, an offset and a length into the
+  frame's calldata, and is shown as its bytes (`bytes`), its text (`string`), or its
+  elements (an array of value types); a fixed-size array or a struct of value types is
+  read from its offset.
+
+Enums show as `Color.Blue`, user-defined value types as the value they wrap, and contract
+types as addresses, from the `enum`, `type ... is`, and `struct` declarations found in
+the loaded sources (the storage layout carries a struct's members itself, and is handed
+the enum declarations so an enum in storage shows by name too). A bare type name resolves
+the way the language resolves it: in the contract whose code is executing, then in the
+contracts it inherits from, then at file level.
+
+`print` reaches into a local the way it reaches into a state variable: a struct member,
+an array element, a mapping entry of a storage pointer, or `length`, in any chain.
+
+```text
+soldb> print item.color
+Color item.color = Color.Blue [stack+9]
+soldb> print item.tags[1]
+uint256 item.tags[1] = 8 [stack+9]
+soldb> print stored.owners[0xabc]
+uint256 storage stored.owners[0xabc] = 3 [stack+13]
+soldb> print blob.length
+uint256 blob.length = 3 [stack+11]
+soldb> print item.tags[5]
+Cannot read variable: index 5 is out of range; `item.tags` has 2 elements
+```
+
+A function the optimizer inlined — a small internal function whose body runs inside the
+caller's without a call — still appears as a frame, so a breakpoint in it stops there
+with the caller behind it, but its variables have no stack slots of their own and `vars`
+says so rather than reading the caller's words as them.
+
+Code from the via-IR pipeline, and from any IR-based compiler, lays the stack out as its
+optimizer sees fit, so nothing is inferred for it: a program loaded from ETHDebug is taken
+to come from via-IR, and a trace whose calling convention shows the via-IR order overrides
+whatever the artifact says. `vars` and `print` then say why, rather than reporting an
+empty scope:
+
+```text
+soldb> vars
+Variables: locals are unavailable here: this contract was compiled through the via-IR pipeline, whose stack layout cannot be recovered without compiler-reported variable locations
 ```
 
 That is a limitation of the debug info, not of the lookup, and it is worth telling apart
-from `no variables in scope at PC …`, which means the compiler did describe variables and
-none of them is live here.
+from `no variables in scope at PC …`, which means variables are known here and none is
+live.
 
 *State* variables come from the storage layout, the `<Contract>_storage.json` (or the
 `storage-layout` entry of a legacy `combined.json`) that `solc --storage-layout` writes.

@@ -20,10 +20,15 @@ use serde::{Deserialize, Serialize};
 use soldb_core::{StepSnapshot, TraceStep, TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
+use crate::decode::ValueReader;
+
 pub mod condition;
 pub mod debug_diff;
+mod decode;
+mod locals;
 pub mod state;
 pub mod stepping;
+mod types;
 
 pub use condition::{Condition, ConditionContext, Evaluation};
 pub use debug_diff::{
@@ -31,16 +36,18 @@ pub use debug_diff::{
     DebugDifference, DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent,
     DebugTraceSummary,
 };
-pub use soldb_ethdebug::StorageLayout;
+pub use soldb_ethdebug::{CodeGenerator, StorageLayout};
 pub use state::{
     short_hex, state_value, state_variables, CachedChain, ChainRead, ChainStorage, StateSource,
     StateVariable, StorageTape, StorageWords,
 };
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
-    Frame, FunctionId, JumpMarker, LineKey, ResolvedFunction, ResolvedLine, SourceListing,
-    StepLocation, StepMap,
+    Frame, FunctionId, InferredVariable, JumpMarker, LineKey, LocalsStatus, ResolvedFunction,
+    ResolvedLine, SourceListing, StepLocation, StepMap, VariableKind, INFERRED_LOCALS_NOTE,
+    INFERRED_LOCALS_WARNING,
 };
+pub use types::{SourceTypes, StructMember};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugSession {
@@ -198,7 +205,84 @@ pub struct SourceFunction {
     /// The one-based line the declaration begins on.
     #[serde(default)]
     pub declaration_line: u64,
+    /// The offset of the body's opening brace.
+    #[serde(default)]
+    pub body_start: u64,
     pub body_end: u64,
+    /// The return parameters, named or not, in declaration order.
+    #[serde(default)]
+    pub returns: Vec<SourceLocal>,
+    /// The local variables declared in the body, in declaration order.
+    #[serde(default)]
+    pub locals: Vec<SourceLocal>,
+    /// Whether the header invokes modifiers, which run inlined around the body and reserve
+    /// stack slots of their own.
+    #[serde(default)]
+    pub has_modifiers: bool,
+    /// The modifiers the header invokes, in the order they run.
+    #[serde(default)]
+    pub modifiers: Vec<String>,
+    /// For a modifier, the offset of its `_;` placeholder, where the function body runs.
+    #[serde(default)]
+    pub placeholder: Option<u64>,
+}
+
+/// A half-open byte range in a source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl ByteRange {
+    #[must_use]
+    pub const fn contains(self, offset: u64) -> bool {
+        self.start <= offset && offset < self.end
+    }
+
+    /// Whether a span of `length` bytes at `offset` lies inside this range.
+    #[must_use]
+    pub const fn covers(self, offset: u64, length: u64) -> bool {
+        self.start <= offset && offset.saturating_add(length) <= self.end
+    }
+
+    /// Whether this range contains the whole of `other`.
+    #[must_use]
+    pub const fn encloses(self, other: Self) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+}
+
+/// A variable a function declares in its source: a return parameter or a local.
+///
+/// The spans are what ties the variable to the trace. solc's legacy code generator reserves
+/// the variable's stack slot under `declaration`, the `type [location] name` text, as the
+/// first instructions of `statement`; the slot lives until execution leaves `scope`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceLocal {
+    pub name: String,
+    /// The type without its data location, such as `uint256` or `string`.
+    pub ty: String,
+    /// The data location as declared, when the type has one.
+    #[serde(default)]
+    pub location: Option<String>,
+    pub declaration: ByteRange,
+    /// The declaration statement, from its first token to before its `;`.
+    pub statement: ByteRange,
+    /// The variable's index among those its statement declares: each takes the next slot.
+    pub position: usize,
+    pub scope: ByteRange,
+}
+
+impl SourceLocal {
+    /// The type as declared, with its data location.
+    #[must_use]
+    pub fn declared_type(&self) -> String {
+        match &self.location {
+            Some(location) => format!("{} {location}", self.ty),
+            None => self.ty.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,7 +395,7 @@ fn raw_value_for_location(
     }
 }
 
-fn decode_debug_value(raw: &str, ty: &str) -> DebugValue {
+pub(crate) fn decode_debug_value(raw: &str, ty: &str) -> DebugValue {
     let ty = ty.trim();
     let normalized = normalize_hex(raw);
     let word = normalized.trim_start_matches("0x");
@@ -330,12 +414,15 @@ fn decode_debug_value(raw: &str, ty: &str) -> DebugValue {
     }
 }
 
-fn decode_static_word(word: &str, ty: &str) -> Option<String> {
+pub(crate) fn decode_static_word(word: &str, ty: &str) -> Option<String> {
     if !word.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     if ty.starts_with("uint") {
         return Some(format_uint_word(word));
+    }
+    if ty.starts_with("int") {
+        return Some(format_int_word(word));
     }
     if ty == "address" {
         let padded = left_pad_word(word);
@@ -419,6 +506,8 @@ pub fn decode_arguments(
     params: &[SourceParam],
     state: FrameState<'_>,
     layout: ArgumentLayout,
+    types: &SourceTypes,
+    scope: Option<&str>,
 ) -> Vec<FrameArgument> {
     let stack = state.stack;
     if params.is_empty() || stack.len() < params.len() {
@@ -441,13 +530,19 @@ pub fn decode_arguments(
             FrameArgument {
                 name: param.name.clone(),
                 ty: param.ty.clone(),
-                value: argument_value(param, word, state.memory),
+                value: argument_value(param, word, state.memory, types, scope),
             }
         })
         .collect()
 }
 
-fn argument_value(param: &SourceParam, word: &str, memory: Option<&str>) -> DebugValue {
+fn argument_value(
+    param: &SourceParam,
+    word: &str,
+    memory: Option<&str>,
+    types: &SourceTypes,
+    scope: Option<&str>,
+) -> DebugValue {
     let Ok(parsed) = parse_word(&format!("0x{}", word.trim_start_matches("0x"))) else {
         return DebugValue {
             display: "<unreadable stack word>".to_owned(),
@@ -455,38 +550,17 @@ fn argument_value(param: &SourceParam, word: &str, memory: Option<&str>) -> Debu
             status: DebugValueStatus::Unavailable,
         };
     };
+    let reader = ValueReader {
+        memory,
+        calldata: "",
+        storage: None,
+        layout: None,
+        types,
+        scope,
+    };
     let raw = Some(short_hex(&parsed));
     match param.location.as_deref() {
-        Some("memory") => {
-            let pointer = word_as_usize(&parsed);
-            let display = match (pointer, memory) {
-                (Some(pointer), Some(memory)) => read_memory_value(memory, pointer, &param.ty)
-                    .unwrap_or_else(|| {
-                        format!(
-                            "<{} in memory at {}, beyond what this step captured>",
-                            param.ty,
-                            short_hex(&parsed)
-                        )
-                    }),
-                (_, None) => format!(
-                    "<{} in memory at {}; this backend captured no memory>",
-                    param.ty,
-                    short_hex(&parsed)
-                ),
-                (None, _) => format!("<{} at {}>", param.ty, short_hex(&parsed)),
-            };
-            let decoded =
-                display.starts_with('"') || display.starts_with('[') || display.starts_with("0x");
-            DebugValue {
-                display,
-                raw,
-                status: if decoded {
-                    DebugValueStatus::Decoded
-                } else {
-                    DebugValueStatus::Raw
-                },
-            }
-        }
+        Some("memory") => reader.variable(&format!("{} memory", param.ty), &[word]),
         Some(location) => DebugValue {
             display: format!("<{} in {location} at {}>", param.ty, short_hex(&parsed)),
             raw,
@@ -515,51 +589,9 @@ fn is_dynamic_type(ty: &str) -> bool {
     ty == "string" || ty == "bytes" || ty.ends_with("[]")
 }
 
-/// A value living in memory, read through Solidity's memory layout: a `string` or `bytes`
-/// is a length followed by its bytes, a dynamic array is a length followed by one word
-/// per element, and a fixed-size array is those words with no length.
-///
-/// The layout is the language's, not a guess — the same standing as the storage layout —
-/// but only value-type elements are decoded; anything else is a pointer this does not
-/// follow, and it says so rather than printing an offset as a number.
-fn read_memory_value(memory: &str, pointer: usize, ty: &str) -> Option<String> {
-    if ty == "string" || ty == "bytes" {
-        let length = word_as_usize(&memory_word(memory, pointer)?)?;
-        let bytes = memory_bytes(memory, pointer.checked_add(32)?, length)?;
-        if ty == "string" {
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                return Some(format!("{text:?}"));
-            }
-        }
-        return Some(format!("0x{}", hex_of(&bytes)));
-    }
-    let (element, count) = array_shape(ty)?;
-    if !is_value_type(element) {
-        return None;
-    }
-    let (first, count) = match count {
-        // Dynamic: the length is the first word, the elements follow it.
-        None => (
-            pointer.checked_add(32)?,
-            word_as_usize(&memory_word(memory, pointer)?)?,
-        ),
-        Some(count) => (pointer, count),
-    };
-    let shown = count.min(8);
-    let mut parts = Vec::with_capacity(shown);
-    for index in 0..shown {
-        let word = memory_word(memory, first.checked_add(index.checked_mul(32)?)?)?;
-        parts.push(decode_value(value_bytes(&word, element), element));
-    }
-    if count > shown {
-        parts.push(format!("... {} more", count - shown));
-    }
-    Some(format!("[{}]", parts.join(", ")))
-}
-
 /// An array type as its element type and its length: `None` for a dynamic array, which
 /// carries its length in memory.
-fn array_shape(ty: &str) -> Option<(&str, Option<usize>)> {
+pub(crate) fn array_shape(ty: &str) -> Option<(&str, Option<usize>)> {
     let inner = ty.strip_suffix(']')?;
     let open = inner.rfind('[')?;
     let element = inner[..open].trim();
@@ -571,7 +603,7 @@ fn array_shape(ty: &str) -> Option<(&str, Option<usize>)> {
 }
 
 /// The 32 bytes at `offset` of a memory image, when it reaches that far.
-fn memory_word(memory: &str, offset: usize) -> Option<Word> {
+pub(crate) fn memory_word(memory: &str, offset: usize) -> Option<Word> {
     let bytes = memory_bytes(memory, offset, 32)?;
     let mut word = [0_u8; 32];
     word.copy_from_slice(&bytes);
@@ -579,7 +611,7 @@ fn memory_word(memory: &str, offset: usize) -> Option<Word> {
 }
 
 /// `length` bytes at `offset` of a memory image, which is two hex digits per byte.
-fn memory_bytes(memory: &str, offset: usize, length: usize) -> Option<Vec<u8>> {
+pub(crate) fn memory_bytes(memory: &str, offset: usize, length: usize) -> Option<Vec<u8>> {
     let start = offset.checked_mul(2)?;
     let end = start.checked_add(length.checked_mul(2)?)?;
     let digits = memory.get(start..end)?;
@@ -598,21 +630,21 @@ fn memory_bytes(memory: &str, offset: usize, length: usize) -> Option<Vec<u8>> {
 }
 
 /// A word as an offset or a length, when it fits one.
-fn word_as_usize(word: &Word) -> Option<usize> {
+pub(crate) fn word_as_usize(word: &Word) -> Option<usize> {
     if word[..24].iter().any(|byte| *byte != 0) {
         return None;
     }
     usize::try_from(u64::from_be_bytes(word[24..].try_into().expect("8 bytes"))).ok()
 }
 
-fn hex_of(bytes: &[u8]) -> String {
+pub(crate) fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The bytes of a stack word a value of type `ty` occupies: a signed integer is its own
 /// width from the low end so the sign bit is the right one, fixed bytes are left-aligned,
 /// and everything else reads as a whole word.
-fn value_bytes<'a>(word: &'a Word, ty: &str) -> &'a [u8] {
+pub(crate) fn value_bytes<'a>(word: &'a Word, ty: &str) -> &'a [u8] {
     if let Some(bits) = integer_bits(ty, "int") {
         return &word[32 - bits / 8..];
     }
@@ -658,6 +690,40 @@ fn format_uint_word(word: &str) -> String {
             .unwrap_or_else(|_| format!("0x{}", trimmed.to_ascii_lowercase()));
     }
     format!("0x{}", trimmed.to_ascii_lowercase())
+}
+
+/// A two's-complement word as a signed decimal, or as hex when it does not fit `i128`.
+fn format_int_word(word: &str) -> String {
+    let padded = left_pad_word(word);
+    let Ok(bytes) = (0..32)
+        .map(|index| u8::from_str_radix(&padded[index * 2..index * 2 + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return format!("0x{}", word.to_ascii_lowercase());
+    };
+    if bytes[0] & 0x80 == 0 {
+        return format_uint_word(word);
+    }
+    // Negate: invert every byte and add one, from the least significant end.
+    let mut magnitude = bytes.iter().map(|byte| !byte).collect::<Vec<_>>();
+    for byte in magnitude.iter_mut().rev() {
+        let (sum, carry) = byte.overflowing_add(1);
+        *byte = sum;
+        if !carry {
+            break;
+        }
+    }
+    let hex = magnitude
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let trimmed = hex.trim_start_matches('0');
+    if trimmed.len() <= 32 {
+        if let Ok(value) = u128::from_str_radix(trimmed, 16) {
+            return format!("-{value}");
+        }
+    }
+    format!("-0x{trimmed}")
 }
 
 fn storage_value(storage: &BTreeMap<String, String>, slot: u64) -> Option<String> {
@@ -775,6 +841,27 @@ fn collect_declarations(
             cursor = body_start + 1;
             continue;
         };
+        let (returns, modifiers) = parse_header(source, params_end + 1, body_start);
+        let modifiers = if keyword == "modifier" {
+            Vec::new()
+        } else {
+            modifiers
+        };
+        let returns = returns
+            .into_iter()
+            .map(|variable| SourceLocal {
+                name: variable.name,
+                ty: variable.ty,
+                location: variable.location,
+                declaration: variable.span,
+                statement: variable.span,
+                position: 0,
+                scope: ByteRange {
+                    start: body_start as u64,
+                    end: body_end as u64,
+                },
+            })
+            .collect();
 
         functions.push(SourceFunction {
             source_id,
@@ -786,10 +873,92 @@ fn collect_declarations(
                 .filter(|byte| *byte == b'\n')
                 .count() as u64
                 + 1,
+            body_start: body_start as u64,
             body_end: body_end as u64,
+            returns,
+            locals: locals::scan_locals(source, body_start, body_end),
+            has_modifiers: !modifiers.is_empty(),
+            modifiers,
+            placeholder: (keyword == "modifier")
+                .then(|| locals::find_placeholder(source, body_start, body_end))
+                .flatten(),
         });
         cursor = body_end + 1;
     }
+}
+
+/// The words a function header may carry between its parameter list and its body
+/// without invoking a modifier.
+const HEADER_KEYWORDS: [&str; 11] = [
+    "public", "private", "internal", "external", "pure", "view", "payable", "virtual", "override",
+    "returns", "constant",
+];
+
+/// The return parameters declared in a function header, and the modifiers it invokes.
+///
+/// The header is the text between the parameter list and the body. A `returns (...)`
+/// clause holds the return parameters, each with the span the compiler reserves its slot
+/// under; any other identifier that is not a visibility or mutability keyword is a
+/// modifier invocation, and they run in the order written.
+fn parse_header(source: &str, start: usize, end: usize) -> (Vec<locals::Declared>, Vec<String>) {
+    let bytes = source.as_bytes();
+    let mut returns = Vec::new();
+    let mut modifiers = Vec::new();
+    let mut index = start;
+    while index < end {
+        index = locals::skip_trivia(source, index);
+        if index >= end {
+            break;
+        }
+        let Some((word, word_end)) = parse_identifier(source, index) else {
+            index += 1;
+            continue;
+        };
+        let after = locals::skip_trivia(source, word_end);
+        let arguments = (bytes.get(after) == Some(&b'('))
+            .then(|| find_matching_delimiter(source, after, b'(', b')'))
+            .flatten()
+            .filter(|close| *close < end);
+        if word == "returns" {
+            if let Some(close) = arguments {
+                returns = parse_return_list(source, after, close);
+            }
+        } else if !HEADER_KEYWORDS.contains(&word) {
+            modifiers.push(word.to_owned());
+        }
+        index = arguments.map_or(word_end, |close| close + 1);
+    }
+    (returns, modifiers)
+}
+
+/// The return parameters between the parentheses at `open` and `close`.
+fn parse_return_list(source: &str, open: usize, close: usize) -> Vec<locals::Declared> {
+    let mut returns = Vec::new();
+    let mut start = open + 1;
+    let mut depth = 0_i32;
+    for index in open + 1..=close {
+        match source.as_bytes()[index] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' if depth > 0 => depth -= 1,
+            b',' | b')' => {
+                let component = source[start..index].trim();
+                if !component.is_empty() {
+                    let component_start = start
+                        + (source[start..index].len() - source[start..index].trim_start().len());
+                    let component_start = locals::skip_trivia(source, component_start);
+                    let component_end = component_start + component.len();
+                    if let Some(declared) =
+                        locals::parse_return(source, component_start, component_end, returns.len())
+                    {
+                        returns.push(declared);
+                    }
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    returns
 }
 
 /// The words that may follow a parameter's type without naming it.
@@ -912,7 +1081,7 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
     parts
 }
 
-fn find_solidity_keyword(source: &str, keyword: &str, start: usize) -> Option<usize> {
+pub(crate) fn find_solidity_keyword(source: &str, keyword: &str, start: usize) -> Option<usize> {
     let mut cursor = start;
     while let Some(relative) = source[cursor..].find(keyword) {
         let absolute = cursor + relative;
@@ -931,7 +1100,7 @@ fn find_solidity_keyword(source: &str, keyword: &str, start: usize) -> Option<us
     None
 }
 
-fn parse_identifier(source: &str, start: usize) -> Option<(&str, usize)> {
+pub(crate) fn parse_identifier(source: &str, start: usize) -> Option<(&str, usize)> {
     let bytes = source.as_bytes();
     let first = *bytes.get(start)?;
     if !is_identifier_start_byte(first) {
@@ -944,7 +1113,7 @@ fn parse_identifier(source: &str, start: usize) -> Option<(&str, usize)> {
     Some((&source[start..end], end))
 }
 
-fn is_identifier(input: &str) -> bool {
+pub(crate) fn is_identifier(input: &str) -> bool {
     let mut bytes = input.bytes();
     let Some(first) = bytes.next() else {
         return false;
@@ -956,11 +1125,11 @@ fn is_identifier_start_byte(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphabetic()
 }
 
-fn is_identifier_byte(byte: u8) -> bool {
+pub(crate) fn is_identifier_byte(byte: u8) -> bool {
     is_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 
-fn skip_ascii_whitespace(source: &str, mut index: usize) -> usize {
+pub(crate) fn skip_ascii_whitespace(source: &str, mut index: usize) -> usize {
     while source
         .as_bytes()
         .get(index)
@@ -980,7 +1149,12 @@ fn find_next_byte(source: &str, start: usize, needle: u8) -> Option<usize> {
         .find_map(|(index, byte)| (*byte == needle).then_some(index))
 }
 
-fn find_matching_delimiter(source: &str, open_index: usize, open: u8, close: u8) -> Option<usize> {
+pub(crate) fn find_matching_delimiter(
+    source: &str,
+    open_index: usize,
+    open: u8,
+    close: u8,
+) -> Option<usize> {
     let mut depth = 0_i32;
     for (index, byte) in source.bytes().enumerate().skip(open_index) {
         if byte == open {
@@ -1350,25 +1524,29 @@ mod tests {
             "8",
             "9",
         ]);
-        let string_at = |offset: usize| super::read_memory_value(&memory, offset, "string");
-        assert_eq!(string_at(0).as_deref(), Some("\"hello\""));
-        assert_eq!(
-            super::read_memory_value(&memory, 0, "bytes").as_deref(),
-            Some("0x68656c6c6f")
-        );
-        assert_eq!(
-            super::read_memory_value(&memory, 64, "uint256[]").as_deref(),
-            Some("[7, 8, 9]")
-        );
+        let types = super::SourceTypes::default();
+        let reader = super::ValueReader {
+            memory: Some(&memory),
+            calldata: "",
+            storage: None,
+            layout: None,
+            types: &types,
+            scope: None,
+        };
+        let read = |offset: usize, ty: &str| reader.read_memory(offset, ty, 0);
+        assert_eq!(read(0, "string").as_deref(), Some("\"hello\""));
+        assert_eq!(read(0, "bytes").as_deref(), Some("0x68656c6c6f"));
+        assert_eq!(read(64, "uint256[]").as_deref(), Some("[7, 8, 9]"));
         // A fixed-size array has no length word: it starts at the pointer.
+        assert_eq!(read(96, "uint256[2]").as_deref(), Some("[7, 8]"));
+        // Beyond what the step captured: no guess, and the caller says where the pointer
+        // pointed instead. An array of strings follows each element's pointer, and says
+        // where one pointed when it cannot.
+        assert_eq!(read(4096, "string"), None);
         assert_eq!(
-            super::read_memory_value(&memory, 96, "uint256[2]").as_deref(),
-            Some("[7, 8]")
+            read(64, "string[]").as_deref(),
+            Some("[<string at 0x7>, <string at 0x8>, <string at 0x9>]")
         );
-        // Beyond what the step captured, and a type whose elements are not values: no
-        // guess, and the caller says where the pointer pointed instead.
-        assert_eq!(super::read_memory_value(&memory, 4096, "string"), None);
-        assert_eq!(super::read_memory_value(&memory, 64, "string[]"), None);
     }
 
     #[test]

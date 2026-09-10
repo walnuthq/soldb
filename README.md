@@ -203,10 +203,17 @@ reports and flamegraphs.
 
 - ETHDebug-first source debugging with legacy `srcmap`/`srcmap-runtime` fallback
 - Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
-  server: locals decoded from ETHDebug variable locations, and state variables — including
-  `balances[0xabc…]`, `items[2]`, and `config.owner` — read through the storage layout
-  `solc --storage-layout` emits, for legacy compilers as well. A slot the transaction never
-  touched is read from the node at the block it started from, and says so
+  server: locals decoded from ETHDebug variable locations, or, for solc's legacy pipeline,
+  read off the stack through the fixed layout its code generator keeps (said so once, as it
+  is an inference until compilers emit variable locations) — memory structs, arrays, and
+  strings, storage pointers, calldata slices, enums by name, and user-defined value types
+  included, placed from the calling convention so the slots hold under the optimizer — and
+  state variables — including `balances[0xabc…]`, `items[2]`, and `config.owner` — read
+  through the storage layout `solc --storage-layout` emits, for legacy compilers as well.
+  A slot the transaction never touched is read from the node at the block it started from,
+  and says so. `print` follows paths into locals (`item.tags[1]`, `stored.owners[0xabc]`,
+  `blob.length`), and breakpoint conditions read the same locals and paths: `break
+  Shop.sol:40 if price > 10 && item.color == Color.Blue`
 - Call frames carry the arguments they were entered with, once the trace itself has proven
   where the compiler leaves them; a frame that cannot be proven stays bare rather than
   naming stack words that may not be the parameters

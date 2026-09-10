@@ -1,11 +1,13 @@
 //! Conditions on a breakpoint: `break TestContract.sol:30 if counter > 4`.
 //!
 //! A condition is a comparison, or several joined by `&&` and `||`, over values the
-//! debugger can actually read at a step: state variables through the storage layout
-//! (including `balances[0xabc]` and `config.limit`), the arguments of the frame being
-//! entered, and a few facts about the step itself (`pc`, `gas`, `depth`, `op`, `step`).
-//! There is no arithmetic and no calls: a debugger that evaluated Solidity would have to
-//! execute it, and this crate never executes anything.
+//! debugger can actually read at a step: the local variables in scope (inferred from the
+//! legacy stack layout, see [`StepMap::locals_at`]), state variables through the storage
+//! layout (including `balances[0xabc]` and `config.limit`), the arguments of the frame
+//! being entered, enum literals such as `Color.Red`, and a few facts about the step
+//! itself (`pc`, `gas`, `depth`, `op`, `step`). There is no arithmetic and no calls: a
+//! debugger that evaluated Solidity would have to execute it, and this crate never
+//! executes anything.
 //!
 //! A condition that cannot be evaluated — a slot the transaction never touched, a name
 //! nothing defines, a comparison between a number and a string — does not stop, and says
@@ -13,10 +15,11 @@
 //! condition would be a false positive, and silently treating it as false would hide the
 //! reason it never fires.
 
+use soldb_core::TransactionTrace;
 use soldb_ethdebug::{parse_word, StorageLayout, Word};
 
 use crate::state::{state_value, StorageWords};
-use crate::stepping::{Frame, StepMap};
+use crate::stepping::{ContractDebugInfo, Frame, StepMap};
 use crate::DebugValueStatus;
 
 /// A parsed breakpoint condition.
@@ -79,7 +82,8 @@ enum Operand {
     Bool(bool),
     /// A quoted string, which only compares equal to another string.
     Text(String),
-    /// A name to look up: a state variable path, a frame argument, or a step fact.
+    /// A name to look up: a local variable, a state variable path, a frame argument, an
+    /// enum literal, or a step fact.
     Name(String),
 }
 
@@ -309,6 +313,8 @@ pub struct ConditionContext<'a> {
     pc: u64,
     gas: u64,
     depth: u64,
+    /// The whole trace, for reading the locals in scope at the step.
+    trace: Option<&'a TransactionTrace>,
     /// The frame being entered or executing, for reading its arguments by name.
     frame: Option<&'a Frame>,
 }
@@ -330,8 +336,17 @@ impl<'a> ConditionContext<'a> {
             pc: trace_step.pc,
             gas: trace_step.gas,
             depth: trace_step.depth,
+            trace: None,
             frame: None,
         }
+    }
+
+    /// Reads the local variables in scope at the step, and paths through them, from
+    /// the trace; see [`StepMap::local_condition_value`].
+    #[must_use]
+    pub fn with_trace(mut self, trace: &'a TransactionTrace) -> Self {
+        self.trace = Some(trace);
+        self
     }
 
     /// Reads the arguments of this frame by name, when the trace proved them.
@@ -350,8 +365,8 @@ impl<'a> ConditionContext<'a> {
         }
     }
 
-    /// The value of a name: a fact about the step, an argument of the frame, or a state
-    /// variable read through the storage layout.
+    /// The value of a name: a fact about the step, a local variable in scope, an argument
+    /// of the frame, a state variable read through the storage layout, or an enum literal.
     fn value(&self, name: &str) -> Result<Value, String> {
         match name {
             "pc" => return Ok(Value::Word(word_of_u64(self.pc), false)),
@@ -363,6 +378,9 @@ impl<'a> ConditionContext<'a> {
             "op" => return Ok(Value::Text(self.op.to_owned())),
             _ => {}
         }
+        if let Some(local) = self.local(name) {
+            return local;
+        }
         if let Some(argument) = self.frame.and_then(|frame| {
             frame
                 .arguments
@@ -373,9 +391,16 @@ impl<'a> ConditionContext<'a> {
                 .map_err(|error| error.to_string())?;
             return Ok(Value::Word(word, argument.ty.starts_with("int")));
         }
+        if let Some(index) = self.contract().and_then(|contract| {
+            contract
+                .types
+                .enum_literal(self.map.scope_at_step(self.step), name)
+        }) {
+            return Ok(Value::Word(word_of_u64(index), false));
+        }
         let Some(layout) = self.layout() else {
             return Err(format!(
-                "`{name}` is not a step value or an argument here, and no storage layout is loaded to look it up as a state variable"
+                "`{name}` is not a step value, a local, or an argument here, and no storage layout is loaded to look it up as a state variable"
             ));
         };
         let Some(words) = self.words.as_ref() else {
@@ -397,11 +422,23 @@ impl<'a> ConditionContext<'a> {
         Ok(Value::Word(word, variable.ty.starts_with("int")))
     }
 
-    fn layout(&self) -> Option<&StorageLayout> {
+    /// A local variable in scope at the step, or a path through one such as
+    /// `item.tags[1]`, read off the stack and through memory, storage, or calldata as its
+    /// type says: a value type as its word, a `string` as its text, a `bytes` as its hex
+    /// text. `None` when no local of that name is in scope; `Some(Err)` when one is but
+    /// cannot be compared.
+    fn local(&self, name: &str) -> Option<Result<Value, String>> {
+        let trace = self.trace?;
         self.map
-            .contract_at_step(self.step)?
-            .storage_layout
-            .as_ref()
+            .local_condition_value(trace, self.step, self.words.as_ref(), name)
+    }
+
+    fn contract(&self) -> Option<&ContractDebugInfo> {
+        self.map.contract_at_step(self.step)
+    }
+
+    fn layout(&self) -> Option<&StorageLayout> {
+        self.contract()?.storage_layout.as_ref()
     }
 }
 

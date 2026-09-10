@@ -1,0 +1,72 @@
+# Reference-type locals, enums, and user-defined value types, read through the legacy
+# stack layout: a memory struct is shown as its members (a nested string, enum, and
+# array included), `bytes memory` as its bytes, a storage pointer through the storage
+# layout, an enum as its variant's name, and a user-defined value type as the value it
+# wraps. Breakpoint conditions read the same locals, and enum literals such as
+# `Color.Blue`. All of it follows solc's legacy code generator and is expected to fail
+# for Solar until it emits ETHDebug variable locations.
+# REQUIRES: soldb
+# XFAIL: compiler-solar
+# RUN: rm -rf %t
+# RUN: mkdir -p %t/solar %t/solc
+# RUN: %if compiler-solar %{ cd %S/.. && %solar References.sol --emit=abi,bin,bin-runtime,srcmap,srcmap-runtime --out-dir %t/solar > %t/solar/compile.stdout 2> %t/solar/compile.stderr %}
+# RUN: %if compiler-solc %{ cd %S/.. && %solc References.sol --bin --abi --combined-json abi,bin,bin-runtime,srcmap,srcmap-runtime,storage-layout -o %t/solc > %t/solc/compile.stdout 2> %t/solc/compile.stderr %}
+# RUN: %if compiler-solar %{ cp %S/../References.sol %t/solar/References.sol %}
+# RUN: %if compiler-solc %{ cp %S/../References.sol %t/solc/References.sol %}
+# RUN: %if compiler-solar %{ jq -er '.contracts["References.sol:References"].bin | strings | select(length > 0)' %t/solar/combined.json > %t/solar/References.bin %}
+
+# Inside `store`: the memory struct parameter with its nested values, the wrapped price,
+# the bytes, the unnamed return, and the storage pointer decoded through the layout. The
+# condition reads the user-defined value type through the type it wraps. Then in `build`,
+# after the calls that materialise every local: the enum parameter by name, and the
+# condition compares it with an enum literal.
+# RUN: %if compiler-solc %{ printf 'break References.sol:34 if price == 15\ncontinue\nvars\nprint stored\nbreak References.sol:43 if color == Color.Blue\ncontinue\nvars\nprint item\nquit\n' | %soldb run %t/solc/References.bin "build(uint256,uint8)" 5 2 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:References:%t/solc -i 2>&1 | FileCheck %s %}
+# RUN: %if compiler-solar %{ printf 'break References.sol:34 if price == 15\ncontinue\nvars\nprint stored\nbreak References.sol:43 if color == Color.Blue\ncontinue\nvars\nprint item\nquit\n' | %soldb run %t/solar/References.bin "build(uint256,uint8)" 5 2 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:References:%t/solar -i 2>&1 | FileCheck %s %}
+
+# CHECK: Breakpoint #1 hit at step {{[0-9]+}}, References.sol:34 if price == 15
+# CHECK: warning: local variables are inferred from the legacy source map
+# CHECK: Item memory item = { id: 5, name: "widget", color: Color.Blue, tags: [7, 8] } [stack+9]
+# CHECK-NEXT: Price price = 15 [stack+10]
+# CHECK-NEXT: bytes memory blob = 0xc0ffee [stack+11]
+# CHECK-NEXT: uint256 ret0 = 0 [stack+12]
+# CHECK-NEXT: Item storage stored = { id: 5, name: "widget", color: Color.Blue, tags: <1 element(s); index it with [i]> } [stack+13]
+# CHECK-NEXT: State:
+# CHECK: Item storage stored = { id: 5, name: "widget", color: Color.Blue, tags: <1 element(s); index it with [i]> } [stack+13]
+# CHECK: Breakpoint #2 hit at step {{[0-9]+}}, References.sol:43 if color == Color.Blue
+# CHECK: uint256 id = 5 [stack+2]
+# CHECK-NEXT: Color color = Color.Blue [stack+3]
+# CHECK-NEXT: uint256 count = 1 [stack+4]
+# CHECK-NEXT: Item memory item = { id: 5, name: "widget", color: Color.Blue, tags: [7, 8] } [stack+5]
+# CHECK-NEXT: Price price = 15 [stack+6]
+# CHECK-NEXT: bytes memory blob = 0xc0ffee [stack+7]
+# CHECK: Item memory item = { id: 5, name: "widget", color: Color.Blue, tags: [7, 8] } [stack+5]
+
+# A path reaches into a local the way it does into a state variable: a memory struct's
+# members and array elements, a storage pointer's members and elements through the
+# layout, a `bytes` length and byte. What a path cannot reach is said, and a condition
+# reads the same paths.
+# RUN: %if compiler-solc %{ printf 'break References.sol:34 if item.tags[0] == 7 && stored.id == 5\ncontinue\nprint item.color\nprint item.tags[1]\nprint item.tags.length\nprint stored.name\nprint stored.color\nprint stored.tags[0]\nprint blob.length\nprint blob[1]\nprint item.tags[5]\nprint item.zip\nbreak References.sol:43 if item.name == "widget"\ncontinue\nprint item.tags\nquit\n' | %soldb run %t/solc/References.bin "build(uint256,uint8)" 5 2 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:References:%t/solc -i 2>&1 | FileCheck %s --check-prefix=PATH %}
+# RUN: %if compiler-solar %{ printf 'break References.sol:34 if item.tags[0] == 7 && stored.id == 5\ncontinue\nprint item.color\nprint item.tags[1]\nprint item.tags.length\nprint stored.name\nprint stored.color\nprint stored.tags[0]\nprint blob.length\nprint blob[1]\nprint item.tags[5]\nprint item.zip\nbreak References.sol:43 if item.name == "widget"\ncontinue\nprint item.tags\nquit\n' | %soldb run %t/solar/References.bin "build(uint256,uint8)" 5 2 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:References:%t/solar -i 2>&1 | FileCheck %s --check-prefix=PATH %}
+# PATH: Breakpoint #1 hit at step {{[0-9]+}}, References.sol:34 if item.tags[0] == 7 && stored.id == 5
+# PATH: Color item.color = Color.Blue [stack+9]
+# PATH: uint256 item.tags[1] = 8 [stack+9]
+# PATH: uint256 item.tags.length = 2 [stack+9]
+# PATH: string storage stored.name = "widget" [stack+13]
+# PATH: enum References.Color storage stored.color = Color.Blue [stack+13]
+# PATH: uint256 storage stored.tags[0] = 15 [stack+13]
+# PATH: uint256 blob.length = 3 [stack+11]
+# PATH: bytes1 blob[1] = 0xff [stack+11]
+# PATH: Cannot read variable: index 5 is out of range; `item.tags` has 2 elements
+# PATH: Cannot read variable: `Item` has no member `zip`; it has id, name, color, tags
+# PATH: Breakpoint #2 hit at step {{[0-9]+}}, References.sol:43 if item.name == "widget"
+# PATH: uint256[] memory item.tags = [7, 8] [stack+5]
+
+# A condition that never holds does not stop, whether it reads a local, an enum literal,
+# or a `bytes memory` (compared as its hex text).
+# RUN: %if compiler-solc %{ printf 'break References.sol:34 if price == 16\ncontinue\nbreak References.sol:43 if color == Color.Red\ncontinue\nquit\n' | %soldb run %t/solc/References.bin "build(uint256,uint8)" 5 2 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:References:%t/solc -i 2>&1 | FileCheck %s --check-prefix=NEVER %}
+# RUN: %if compiler-solar %{ printf 'break References.sol:34 if price == 16\ncontinue\nbreak References.sol:43 if color == Color.Red\ncontinue\nquit\n' | %soldb run %t/solar/References.bin "build(uint256,uint8)" 5 2 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:References:%t/solar -i 2>&1 | FileCheck %s --check-prefix=NEVER %}
+# NEVER: Breakpoint #1 set at References.sol:34 if price == 16
+# NEVER-NEXT: End of trace at step {{[0-9]+}}
+# NEVER: Breakpoint #2 set at References.sol:43 if color == Color.Red
+# NEVER-NEXT: End of trace at step {{[0-9]+}}
+# NEVER-NOT: Breakpoint #{{[0-9]+}} hit

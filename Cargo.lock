@@ -2719,7 +2719,6 @@ dependencies = [
 name = "soldb-ethdebug"
 version = "0.3.0"
 dependencies = [
- "revm-bytecode",
  "serde",
  "serde_json",
  "soldb-core",

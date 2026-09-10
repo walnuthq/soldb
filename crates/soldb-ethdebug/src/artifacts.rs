@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use soldb_core::{SoldbError, SoldbResult};
@@ -20,6 +21,19 @@ use soldb_core::{SoldbError, SoldbResult};
 use crate::metadata::{read_compilation_source, EthdebugInfo};
 use crate::source_map::{load_source_map_program_with_sources, SourceMapEnvironment};
 use crate::storage_layout::StorageLayout;
+
+/// Which of solc's code generators produced a program.
+///
+/// The two keep variables in different places: the legacy generator reserves a stack slot
+/// per declaration and frees it at the end of its block, which a debugger can follow
+/// without variable information from the compiler; the via-IR pipeline lays the stack out
+/// as its optimizer sees fit, and only compiler-emitted locations can describe it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodeGenerator {
+    Legacy,
+    ViaIr,
+}
 
 /// One contract's debug information as loaded from its artifacts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +50,20 @@ pub struct DebugProgram {
     /// Sources the artifact names that could not be read, so a frontend can say why its
     /// lines are missing instead of degrading to an opcode view without a word.
     pub missing_sources: Vec<String>,
+}
+
+impl DebugProgram {
+    /// The code generator the program came from. A legacy `srcmap` is taken to come from
+    /// the legacy pipeline, which is the only one that emits nothing else; ETHDebug comes
+    /// from solc's via-IR pipeline or from a compiler built on IR.
+    #[must_use]
+    pub const fn code_generator(&self) -> CodeGenerator {
+        if self.legacy {
+            CodeGenerator::Legacy
+        } else {
+            CodeGenerator::ViaIr
+        }
+    }
 }
 
 /// The global ETHDebug resource file in `root`, under either of its names.

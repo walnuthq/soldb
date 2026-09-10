@@ -20,10 +20,28 @@ use std::cell::RefCell;
 
 use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
 use soldb_debugger::{
-    call_target, normalize_address, ChainStorage, Condition, ConditionContext, ContractDebugInfo,
-    Evaluation, Frame, FrameState, ResolvedFunction, ResolvedLine, SourceListing, StepLocation,
-    StepMap, StorageLayout, StorageTape, StorageWords,
+    call_target, normalize_address, variables_for_step, ChainStorage, Condition, ConditionContext,
+    ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState, LocalsStatus,
+    ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap, StorageLayout,
+    StorageTape, StorageWords,
 };
+
+/// Where a step's variables came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariablesOrigin {
+    /// Variable locations the compiler emitted in the ETHDebug artifact.
+    Ethdebug,
+    /// A reading of the stack following solc's legacy layout; the frontend should say so
+    /// once, with [`soldb_debugger::INFERRED_LOCALS_WARNING`].
+    Inferred,
+}
+
+/// The variables of the function executing at a step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepVariables {
+    pub variables: Vec<DebugVariable>,
+    pub origin: VariablesOrigin,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -112,30 +130,24 @@ impl Breakpoint {
     pub fn label(&self) -> String {
         let target = match &self.kind {
             BreakpointKind::Pc(pc) => format!("PC {pc}"),
-            BreakpointKind::Line(lines) => lines
-                .iter()
-                .map(|line| {
-                    if line.requested_line == line.key.line {
-                        format!("{}:{}", line.path, line.key.line)
-                    } else {
-                        format!(
-                            "{}:{} (the statement containing line {})",
-                            line.path, line.key.line, line.requested_line
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-            BreakpointKind::Function(functions) => functions
-                .iter()
-                .map(|function| {
+            BreakpointKind::Line(lines) => unique(lines.iter().map(|line| {
+                if line.requested_line == line.key.line {
+                    format!("{}:{}", line.path, line.key.line)
+                } else {
                     format!(
-                        "function {}.{} at {}:{}",
-                        function.contract_name, function.name, function.path, function.line
+                        "{}:{} (the statement containing line {})",
+                        line.path, line.key.line, line.requested_line
                     )
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+                }
+            }))
+            .join(", "),
+            BreakpointKind::Function(functions) => unique(functions.iter().map(|function| {
+                format!(
+                    "function {}.{} at {}:{}",
+                    function.contract_name, function.name, function.path, function.line
+                )
+            }))
+            .join(", "),
             BreakpointKind::Storage(slot) => format!("storage slot 0x{slot}"),
             BreakpointKind::StateWrite { path, slot } => {
                 format!("a write to `{path}` (storage slot 0x{slot})")
@@ -150,6 +162,19 @@ impl Breakpoint {
             None => target,
         }
     }
+}
+
+/// The distinct names in order of first appearance. A contract's creation and deployed
+/// programs resolve the same source line or function to one target each, which the user
+/// should read once.
+fn unique(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = Vec::new();
+    for name in names {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    seen
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -914,7 +939,9 @@ impl DebuggerState {
             .map(|tape| tape.at_step(map, step));
         let frames = self.frames_at(step);
         let frame = frames.iter().find(|frame| !frame.arguments.is_empty());
-        let context = ConditionContext::new(map, step, trace_step, words).with_frame(frame);
+        let context = ConditionContext::new(map, step, trace_step, words)
+            .with_frame(frame)
+            .with_trace(trace);
         let outcome = condition.evaluate(&context);
         if let Evaluation::Unavailable(reason) = &outcome {
             self.push_note(format!(
@@ -975,6 +1002,57 @@ impl DebuggerState {
         self.step_map
             .as_ref()?
             .source_listing(self.current_step, radius)
+    }
+
+    /// The variables of the function executing at the current step, or why there are
+    /// none: the artifact's ETHDebug variable locations when it carries any, otherwise
+    /// the legacy stack layout when the contract's code generator keeps one.
+    pub fn variables(&self) -> Result<StepVariables, String> {
+        let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
+            return Err("no trace is loaded".to_owned());
+        };
+        let Some(step) = trace.steps.get(self.current_step) else {
+            return Err(format!("step {} is outside the trace", self.current_step));
+        };
+        let Some(contract) = map.contract_at_step(self.current_step) else {
+            return Err("no sources matched the contract executing at this step".to_owned());
+        };
+        if contract.info.has_variable_locations() {
+            return Ok(StepVariables {
+                variables: variables_for_step(trace, &contract.info, step),
+                origin: VariablesOrigin::Ethdebug,
+            });
+        }
+        match map.locals_at(self.current_step) {
+            LocalsStatus::Inferred(_) => {
+                // Storage pointers among the locals read the words the trace recorded.
+                let words = self
+                    .storage_tape
+                    .as_ref()
+                    .map(|tape| tape.at_step(map, self.current_step));
+                Ok(StepVariables {
+                    variables: map.inferred_variables(trace, self.current_step, words.as_ref()),
+                    origin: VariablesOrigin::Inferred,
+                })
+            }
+            LocalsStatus::Unavailable(reason) => Err(reason.to_owned()),
+        }
+    }
+
+    /// The value of `path` at the current step when its first name is a local variable
+    /// in scope: the variable itself, or a member, element, mapping entry, or `length`
+    /// reached from it, such as `item.tags[1]` or `stored.owners[0xabc]`. `None` when no
+    /// local has that name, so the caller can look the path up as a state variable.
+    #[must_use]
+    pub fn local_path(&self, path: &str) -> Option<Result<DebugVariable, String>> {
+        let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
+            return None;
+        };
+        let words = self
+            .storage_tape
+            .as_ref()
+            .map(|tape| tape.at_step(map, self.current_step));
+        map.local_path(trace, self.current_step, words.as_ref(), path)
     }
 
     /// The innermost recorded call that contains the current step, when the backend
@@ -1230,12 +1308,14 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
-    use soldb_debugger::ContractDebugInfo;
+    use soldb_debugger::{
+        CodeGenerator, ContractDebugInfo, FunctionId, LineKey, ResolvedFunction, ResolvedLine,
+    };
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
     use super::{
-        BreakpointKind, BreakpointTarget, DebuggerCommand, DebuggerInfoCommand, DebuggerState,
-        DisplayMode, SourceBreakpointTarget, StepOutcome,
+        Breakpoint, BreakpointKind, BreakpointTarget, DebuggerCommand, DebuggerInfoCommand,
+        DebuggerState, DisplayMode, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
     };
 
     #[test]
@@ -1995,6 +2075,122 @@ contract C {
     }
 
     #[test]
+    fn a_breakpoint_names_each_target_once() {
+        // A contract's creation and deployed programs resolve the same line and the same
+        // function to one target each; the user reads the name once.
+        let line = |contract: usize| ResolvedLine {
+            key: LineKey {
+                contract,
+                source_id: 0,
+                line: 4,
+            },
+            path: "C.sol".to_owned(),
+            requested_line: 4,
+        };
+        let lines = Breakpoint {
+            id: 1,
+            kind: BreakpointKind::Line(vec![line(0), line(1)]),
+            condition: None,
+        };
+        assert_eq!(lines.label(), "C.sol:4");
+
+        let function = |contract: usize| ResolvedFunction {
+            id: FunctionId {
+                contract,
+                function: 1,
+            },
+            name: "inner".to_owned(),
+            contract_name: "C".to_owned(),
+            path: "C.sol".to_owned(),
+            line: 7,
+        };
+        let functions = Breakpoint {
+            id: 2,
+            kind: BreakpointKind::Function(vec![function(0), function(1)]),
+            condition: None,
+        };
+        assert_eq!(functions.label(), "function C.inner at C.sol:7");
+
+        // Distinct targets are all named.
+        let mut other = line(1);
+        other.key.line = 1;
+        other.requested_line = 10;
+        let mixed = Breakpoint {
+            id: 3,
+            kind: BreakpointKind::Line(vec![line(0), other]),
+            condition: None,
+        };
+        assert_eq!(
+            mixed.label(),
+            "C.sol:4, C.sol:1 (the statement containing line 10)"
+        );
+    }
+
+    #[test]
+    fn variables_are_inferred_from_the_stack_when_the_artifact_has_no_locations() {
+        let source = "contract C {\n    function f(uint256 a) public {\n        uint256 b = a;\n        b = 0;\n    }\n}\n";
+        let offset = |needle: &str| source.find(needle).expect(needle) as u64;
+        let instruction = |pc: u64, needle: &str| -> Instruction {
+            serde_json::from_value(json!({
+                "offset": pc,
+                "operation": {"mnemonic": "JUMPDEST"},
+                "context": {"code": {"source": {"id": 0}, "range": {"offset": offset(needle), "length": needle.len()}}}
+            }))
+            .expect("instruction")
+        };
+        let contract = |code_generator: Option<CodeGenerator>| {
+            let info = EthdebugInfo {
+                compilation: serde_json::Value::Null,
+                contract_name: "C".to_owned(),
+                environment: "call".to_owned(),
+                instructions: vec![
+                    instruction(0, "contract C"),
+                    instruction(1, "function f"),
+                    instruction(2, "uint256 b"),
+                    instruction(3, "b = 0"),
+                ],
+                sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+                variable_locations: BTreeMap::new(),
+            };
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]))
+                .with_code_generator(code_generator)
+        };
+        let mut trace = sample_trace();
+        trace.steps = vec![
+            step(0, "PUSH1", 0, &[]),
+            step(1, "JUMPDEST", 0, &["0x9", "0x5"]),
+            step(2, "PUSH0", 0, &["0x9", "0x5"]),
+            step(3, "POP", 0, &["0x9", "0x5", "0x5"]),
+        ];
+
+        let mut state = DebuggerState::new();
+        state.load_trace(trace.clone());
+        state.attach_debug_info(vec![contract(Some(CodeGenerator::Legacy))]);
+        assert_eq!(
+            state.variables().unwrap_err(),
+            "no function is executing at this step"
+        );
+        state.goto_step(3);
+        let variables = state.variables().expect("inferred");
+        assert_eq!(variables.origin, VariablesOrigin::Inferred);
+        assert_eq!(
+            variables
+                .variables
+                .iter()
+                .map(|variable| (variable.name.as_str(), variable.value.display.as_str()))
+                .collect::<Vec<_>>(),
+            [("a", "5"), ("b", "5")]
+        );
+
+        // The via-IR pipeline keeps no layout to read.
+        let mut state = DebuggerState::new();
+        state.load_trace(trace);
+        state.attach_debug_info(vec![contract(Some(CodeGenerator::ViaIr))]);
+        state.goto_step(3);
+        assert!(state.variables().unwrap_err().contains("via-IR pipeline"));
+    }
+
+    #[test]
     fn line_and_function_breakpoints_stop_on_entry() {
         let mut state = source_state();
         let set =
@@ -2070,6 +2266,77 @@ contract C {
             state.clear_breakpoint_target(&BreakpointTarget::Function("C.inner".to_owned())),
             StepOutcome::BreakpointMissing(label) if label == "function C.inner at C.sol:7"
         ));
+    }
+
+    #[test]
+    fn a_breakpoint_condition_reads_an_inferred_local() {
+        let source = "contract C {\n    enum Mode { Off, On }\n    function f(uint256 a, Mode m) public {\n        uint256 b = a;\n        b = 0;\n    }\n}\n";
+        let offset = |needle: &str| source.find(needle).expect(needle) as u64;
+        let instruction = |pc: u64, needle: &str| -> Instruction {
+            serde_json::from_value(json!({
+                "offset": pc,
+                "operation": {"mnemonic": "JUMPDEST"},
+                "context": {"code": {"source": {"id": 0}, "range": {"offset": offset(needle), "length": needle.len()}}}
+            }))
+            .expect("instruction")
+        };
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "call".to_owned(),
+            instructions: vec![
+                instruction(0, "contract C"),
+                instruction(1, "function f"),
+                instruction(2, "uint256 b"),
+                instruction(3, "b = 0"),
+            ],
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let contract =
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]))
+                .with_code_generator(Some(CodeGenerator::Legacy));
+        let mut trace = sample_trace();
+        trace.steps = vec![
+            step(0, "PUSH1", 0, &[]),
+            step(1, "JUMPDEST", 0, &["0x9", "0x5", "0x1"]),
+            step(2, "PUSH0", 0, &["0x9", "0x5", "0x1"]),
+            step(3, "POP", 0, &["0x9", "0x5", "0x1", "0x5"]),
+        ];
+        let mut state = DebuggerState::new();
+        state.load_trace(trace);
+        state.attach_debug_info(vec![contract]);
+
+        // The local is read off its slot, the enum parameter by name and against an enum
+        // literal; a condition that does not hold there does not stop.
+        let hit = |condition: &str| -> (Option<usize>, Option<String>) {
+            let mut state = state.clone();
+            let DebuggerCommand::Break(target, condition) =
+                DebuggerCommand::parse(&format!("break C.sol:5 if {condition}"))
+            else {
+                panic!("break command");
+            };
+            state.set_conditional_breakpoint_target(&target, condition.as_deref());
+            let step = match state.continue_execution() {
+                StepOutcome::BreakpointHit { .. } => Some(state.current_step),
+                _ => None,
+            };
+            (step, state.take_note())
+        };
+        assert_eq!(hit("b == 5"), (Some(3), None));
+        assert_eq!(hit("b == a"), (Some(3), None));
+        assert_eq!(hit("m == Mode.On"), (Some(3), None));
+        assert_eq!(hit("m == Mode.Off").0, None);
+        assert_eq!(hit("b > 5").0, None);
+        // An unknown name says what was looked for.
+        let (step, note) = hit("c == 5");
+        assert_eq!(step, None);
+        let note = note.expect("note");
+        assert!(note.contains("`c == 5` could not be evaluated"), "{note}");
+        assert!(
+            note.contains("`c` is not a step value, a local, or an argument here"),
+            "{note}"
+        );
     }
 
     fn sample_trace() -> TransactionTrace {

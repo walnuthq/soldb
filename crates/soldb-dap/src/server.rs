@@ -19,7 +19,9 @@ use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
 use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo};
 use soldb_ethdebug::{load_debug_program, SourceMapEnvironment};
-use soldb_repl::{BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome};
+use soldb_repl::{
+    BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
+};
 use soldb_rpc::trace_transaction;
 
 use crate::{
@@ -51,6 +53,8 @@ pub struct DapServer {
     function_breakpoint_ids: Vec<u32>,
     /// Whether the console note about inferred frame arguments has been sent.
     reported_frame_arguments: bool,
+    /// Whether the console note about inferred local variables has been sent.
+    reported_inferred_locals: bool,
     /// The chain to read state variables the transaction never touched from, when the
     /// session was launched against a node.
     chain: Option<ChainReader>,
@@ -111,6 +115,7 @@ impl Default for DapServer {
             line_breakpoint_ids: BTreeMap::new(),
             function_breakpoint_ids: Vec::new(),
             reported_frame_arguments: false,
+            reported_inferred_locals: false,
             chain: None,
             terminated: false,
         }
@@ -147,7 +152,7 @@ impl DapServer {
             )],
             "stackTrace" => self.stack_trace(message),
             "scopes" => vec![self.scopes(message)],
-            "variables" => vec![self.variables(message)],
+            "variables" => self.variables(message),
             "evaluate" => vec![self.evaluate(message)],
             "continue" => self.continue_execution(message),
             "next" => self.step_over(message),
@@ -475,15 +480,34 @@ impl DapServer {
         )
     }
 
-    fn variables(&mut self, request: &DapMessage) -> DapMessage {
+    fn variables(&mut self, request: &DapMessage) -> Vec<DapMessage> {
         let reference = request
             .arguments
             .as_ref()
             .and_then(|args| args.get("variablesReference"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let mut note = None;
         let variables = match reference {
-            LOCALS_REF => self.local_variables(),
+            LOCALS_REF => {
+                let (variables, inferred) = self.local_variables();
+                // Inferred locals are a reading of the stack, said once per session.
+                if inferred && !self.reported_inferred_locals {
+                    self.reported_inferred_locals = true;
+                    note = Some(self.event(
+                        "output",
+                        Some(json!({
+                            "category": "console",
+                            "output": format!(
+                                "soldb: {}; {}\n",
+                                soldb_debugger::INFERRED_LOCALS_WARNING,
+                                soldb_debugger::INFERRED_LOCALS_NOTE
+                            )
+                        })),
+                    ));
+                }
+                variables
+            }
             STACK_REF => self.stack_variables(),
             MEMORY_REF => self.memory_variables(),
             STORAGE_REF => self.storage_variables(),
@@ -491,7 +515,11 @@ impl DapServer {
             STEP_REF => self.step_variables(),
             _ => Vec::new(),
         };
-        self.response(request, true, Some(json!({"variables": variables})), None)
+        let response = self.response(request, true, Some(json!({"variables": variables})), None);
+        match note {
+            Some(note) => vec![response, note],
+            None => vec![response],
+        }
     }
 
     fn evaluate(&mut self, request: &DapMessage) -> DapMessage {
@@ -635,18 +663,15 @@ impl DapServer {
         }
     }
 
-    fn local_variables(&self) -> Vec<Value> {
-        let Some(step) = self.debugger.current_step_data() else {
-            return Vec::new();
+    /// The locals at the current step, and whether they were inferred from the stack
+    /// rather than read from compiler variable locations.
+    fn local_variables(&self) -> (Vec<Value>, bool) {
+        let Ok(step_variables) = self.debugger.variables() else {
+            return (Vec::new(), false);
         };
-        let Some(source) = &self.source else {
-            return Vec::new();
-        };
-        let Some(trace) = self.debugger.trace() else {
-            return Vec::new();
-        };
-
-        soldb_debugger::variables_for_step(trace, &source.contract.info, step)
+        let inferred = step_variables.origin == VariablesOrigin::Inferred;
+        let variables = step_variables
+            .variables
             .into_iter()
             .map(|variable| {
                 json!({
@@ -656,7 +681,8 @@ impl DapServer {
                     "variablesReference": 0
                 })
             })
-            .collect()
+            .collect();
+        (variables, inferred)
     }
 
     /// Every state variable of the contract executing at the current step, read through
@@ -795,7 +821,18 @@ impl DapServer {
                     .cloned()
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
-            expression => self.evaluate_state(expression),
+            expression => self
+                .evaluate_local(expression)
+                .unwrap_or_else(|| self.evaluate_state(expression)),
+        }
+    }
+
+    /// A local variable in scope at the current step, by name, or a path through one
+    /// such as `item.tags[1]`.
+    fn evaluate_local(&self, name: &str) -> Option<String> {
+        match self.debugger.local_path(name)? {
+            Ok(variable) => Some(variable.value.display),
+            Err(reason) => Some(format!("<{reason}>")),
         }
     }
 
@@ -948,9 +985,11 @@ impl LoadedSource {
                 ))
             })?;
         let name = program.info.contract_name.clone();
+        let code_generator = program.code_generator();
         Ok(Self {
             root: root.to_path_buf(),
             contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents)
+                .with_code_generator(Some(code_generator))
                 .with_storage_layout(program.storage_layout),
         })
     }

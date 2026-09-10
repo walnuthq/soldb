@@ -8,7 +8,8 @@
 //!   variable locations, and the `address:name:dir` contract specs used on the command
 //!   line.
 //! - [`source_map`] reads the legacy `srcmap` format for compiler and tooling
-//!   interoperability when ETHDebug programs are unavailable.
+//!   interoperability when ETHDebug programs are unavailable, naming its instructions
+//!   through [`opcodes`].
 //! - [`abi`] encodes calldata and parses function signatures, including tuples and
 //!   arrays, and carries the keccak-256 implementation used to derive selectors.
 //! - [`events`] decodes logs against event ABIs.
@@ -21,6 +22,7 @@ pub mod abi;
 pub mod artifacts;
 pub mod events;
 pub mod metadata;
+pub mod opcodes;
 pub mod source_map;
 pub mod storage_layout;
 
@@ -33,7 +35,7 @@ pub use artifacts::{
     contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
     find_program_ethdebug, load_debug_program, load_debug_program_with_sources,
     load_storage_layout, read_debug_source, read_debug_source_from, read_json_file,
-    source_candidates, DebugProgram,
+    source_candidates, CodeGenerator, DebugProgram,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,
@@ -50,7 +52,7 @@ pub use source_map::{
     SourceMapInfo, SourceMapProgram,
 };
 pub use storage_layout::{
-    add_word, decode_value, element_place, mapping_slot, parse_word, word_hex, word_to_decimal,
-    DecodedStorage, StorageEncoding, StorageLayout, StorageMember, StorageRef, StorageType,
-    StorageVariable, Word,
+    add_word, decode_value, element_place, mapping_slot, parse_path, parse_word, word_hex,
+    word_to_decimal, DecodedStorage, PathSegment, StorageEncoding, StorageLayout, StorageMember,
+    StorageRef, StorageType, StorageVariable, Word,
 };

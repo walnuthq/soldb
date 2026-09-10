@@ -36,6 +36,7 @@ use soldb_ethdebug::{
 };
 use soldb_repl::{
     BreakpointKind, DebuggerCommand, DebuggerInfoCommand, DebuggerState, DisplayMode, StepOutcome,
+    StepVariables, VariablesOrigin,
 };
 use soldb_rpc::{RpcLog, TraceBackend};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2197,10 +2198,10 @@ fn print_debugger_variables(
         );
         return;
     };
-    let Some(trace) = state.trace() else {
+    if state.trace().is_none() {
         println!("{} no trace is loaded", warning("Cannot read variables:"));
         return;
-    };
+    }
     let Some(step) = state.current_step_data() else {
         println!(
             "{} step {} is outside the loaded trace",
@@ -2210,7 +2211,24 @@ fn print_debugger_variables(
         return;
     };
 
-    let variables = soldb_debugger::variables_for_step(trace, &index.debug.info, step);
+    // Locals come from the state: the artifact's ETHDebug variable locations when it has
+    // any, otherwise a reading of the legacy stack layout, which is said once.
+    let variables = state.variables();
+    if let Ok(StepVariables {
+        origin: VariablesOrigin::Inferred,
+        ..
+    }) = &variables
+    {
+        report_once(
+            "inferred-locals".to_owned(),
+            soldb_debugger::INFERRED_LOCALS_WARNING,
+            soldb_debugger::INFERRED_LOCALS_NOTE,
+        );
+    }
+    let (variables, unavailable) = match variables {
+        Ok(step_variables) => (step_variables.variables, None),
+        Err(reason) => (Vec::new(), Some(reason)),
+    };
     let words = state.storage_words_with_chain(chain.map(|chain| chain as &dyn ChainStorage));
     let layout = state
         .storage_layout()
@@ -2224,12 +2242,12 @@ fn print_debugger_variables(
         println!("{} {} = {} {}", info(ty), bold(name), shown, dim(place));
     };
     let print_variable = |variable: &soldb_debugger::DebugVariable| {
-        print_value(
-            &variable.ty,
-            &variable.name,
-            &variable.value,
-            format!("[{}+{}]", variable.location.kind, variable.location.offset),
-        );
+        let place = if variable.value.status == soldb_debugger::DebugValueStatus::Unavailable {
+            String::new()
+        } else {
+            format!("[{}+{}]", variable.location.kind, variable.location.offset)
+        };
+        print_value(&variable.ty, &variable.name, &variable.value, place);
     };
     let chain_label = words.as_ref().and_then(StorageWords::chain_label);
     let print_state = |variable: &soldb_debugger::StateVariable| {
@@ -2252,6 +2270,18 @@ fn print_debugger_variables(
             print_variable(variable);
             return;
         }
+        // A path through a local: `item.tags[1]`, `stored.owners[0xabc]`, `blob.length`.
+        match state.local_path(name) {
+            Some(Ok(variable)) => {
+                print_variable(&variable);
+                return;
+            }
+            Some(Err(reason)) => {
+                println!("{} {reason}", warning("Cannot read variable:"));
+                return;
+            }
+            None => {}
+        }
         let (Some(layout), Some(words)) = (layout, words) else {
             println!(
                 "{} `{name}` is not in scope at PC {}; state variables need a storage layout, compile with `--storage-layout`",
@@ -2268,9 +2298,9 @@ fn print_debugger_variables(
                     warning("No such variable:"),
                     number_color(step.pc)
                 );
-                if !index.debug.info.has_variable_locations() {
+                if let Some(reason) = &unavailable {
                     println!(
-                        "{} this artifact carries no ETHDebug variable locations, so a local of that name cannot be looked up; the compiler that produced it does not emit them yet",
+                        "{} locals are unavailable here: {reason}, so a local of that name cannot be looked up",
                         dim("note:")
                     );
                 }
@@ -2280,19 +2310,18 @@ fn print_debugger_variables(
     }
 
     if variables.is_empty() {
-        if index.debug.info.has_variable_locations() {
-            println!(
+        // The difference matters: locals that cannot be read here at all is not the
+        // same as none being live at this program counter.
+        match &unavailable {
+            Some(reason) => println!(
+                "{} locals are unavailable here: {reason}",
+                dim("Variables:")
+            ),
+            None => println!(
                 "{} no variables in scope at PC {}",
                 dim("Variables:"),
                 number_color(step.pc)
-            );
-        } else {
-            // The difference matters: the compiler described no variables at all, which is
-            // not the same as none being live here.
-            println!(
-                "{} this artifact carries no ETHDebug variable locations, so locals cannot be shown; the compiler that produced it does not emit them yet",
-                dim("Variables:")
-            );
+            ),
         }
     }
     for variable in &variables {
@@ -2764,12 +2793,14 @@ impl TraceSourceIndex {
                 "source lines and functions are unavailable for them; the paths are relative to the directory the contract was compiled in, so run soldb from there or keep the sources next to the artifacts",
             );
         }
+        let code_generator = program.code_generator();
         let debug = ContractDebugInfo::new(
             spec.address.as_deref(),
             &spec.name,
             program.info,
             program.source_contents,
         )
+        .with_code_generator(Some(code_generator))
         .with_storage_layout(program.storage_layout);
         Ok(Some(Self {
             spec: spec.clone(),
