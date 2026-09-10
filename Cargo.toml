@@ -12,6 +12,7 @@ members = [
     "crates/soldb-repl",
     "crates/soldb-rpc",
     "crates/soldb-tui",
+    "crates/soldb-wasm",
 ]
 resolver = "2"
 

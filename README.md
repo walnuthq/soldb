@@ -342,6 +342,7 @@ speak the Debug Adapter Protocol get the same engine through `soldb-dap`. See
 - Debug Adapter Protocol server for editors: line and function breakpoints, step in/over/out, step-back
 - HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and a REVM replay backend for nodes that cannot trace
 - Scriptable and machine-readable: `-x <command>` runs a session non-interactively, `--json` answers every command as one JSON object per line, and `--save-trace` writes the full trace for offline `debug-diff` and `profile`
+- WebAssembly bindings (`soldb-wasm`) that build a trace and run a host-driven REVM replay in a browser or Node.js, for nodes that cannot trace
 - Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
 
 ## Architecture
@@ -355,6 +356,7 @@ flowchart TD
 
     cli["soldb trace / simulate / profile"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]
     run["soldb run<br/>compiled bytecode"] --> metadata
+    wasm["soldb-wasm<br/>browser / Node.js host does the RPC"] --> metadata
     artifacts --> metadata
 
     cli --> selector["soldb-rpc<br/>JSON-RPC transport + backend selector"]
@@ -365,11 +367,12 @@ flowchart TD
     debug_rpc --> engine["soldb-evm<br/>trace assembly + REVM engine"]
     replay --> engine
     local --> engine
+    wasm --> engine
     engine --> opcode_trace["opcode trace<br/>a complete recording"]
     metadata --> debugger["soldb-debugger<br/>source steps + variables"]
     opcode_trace --> enriched
     debugger --> enriched["source lines<br/>call frames<br/>decoded values"]
-    enriched --> outputs["CLI text / REPL and TUI, forward and reverse / DAP / JSON answers"]
+    enriched --> outputs["CLI text / REPL and TUI, forward and reverse / DAP / JSON answers / WASM"]
     opcode_trace --> profiler["soldb-profiler<br/>gas aggregation"]
     metadata --> profiler
     profiler --> profile_outputs["tables / JSON / flame graph"]
@@ -474,6 +477,7 @@ step-back button works. Breakpoints are predicates on a step, so `break storage 
 - `crates/soldb-repl`: the debugger's command language, session, and answers; the state
   machine every frontend drives.
 - `crates/soldb-tui`: the full-screen terminal view over a session.
+- `crates/soldb-wasm`: WebAssembly bindings that build a trace and run a host-driven REVM replay in a browser or Node.js; the host does the RPC and hands the responses in as strings.
 - `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.
 - `crates/soldb-bridge`: bridge server for cross-environment Solidity<>Stylus debugging.
 - `crates/soldb-dap`: Debug Adapter Protocol server for editor integrations.
@@ -571,6 +575,26 @@ cargo llvm-cov --workspace --all-targets --fail-under-lines 80
 make coverage
 ```
 
+
+### WebAssembly
+
+The library crates build for `wasm32-unknown-unknown`, and `crates/soldb-wasm` packages
+them for a browser or Node.js host with `wasm-pack`. The host has no network or
+filesystem, so it fetches the JSON-RPC responses and ETHDebug artifacts itself and hands
+them in as strings; the trace stays in WebAssembly memory between calls. The
+replay-capable package also runs a host-driven REVM replay for nodes that cannot trace.
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+make wasm         # crates/soldb-wasm/pkg (lean) and pkg-replay (with REVM)
+make wasm-test    # bindings smoke tests under Node.js
+```
+
+See [docs/wasm.md](docs/wasm.md) for the API, what runs in WebAssembly and what stays
+native, and how CI checks the build.
+
+---
 
 ## License
 

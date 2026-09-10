@@ -7,6 +7,9 @@ name: Release
 # crates. Renaming the file breaks publishing until every trusted-publisher
 # config is updated to match.
 #
+# `soldb-wasm` sets `publish = false` and ships through `wasm-pack` instead, so
+# `cargo publish --workspace` skips it.
+#
 # A crate added to the workspace does not publish from here on its first release.
 # A trusted-publishing token cannot create a crate, so the upload fails with
 # `403 Trusted Publishing tokens do not support creating new crates`, and every
