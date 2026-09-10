@@ -429,19 +429,60 @@ Both commands need the session to be started with
 `--ethdebug-dir <address>:<contract>:<dir>`, and they read two things from it.
 
 *Local* variables come from the ETHDebug variable information for the current program
-counter, shared with the DAP server's variables view. A compiler only reports them if it
-emits `context.variables` in its ETHDebug output, and no compiler release does yet. When
-the loaded artifact carries no variable locations at all, `vars` and `print` say that,
-rather than reporting an empty scope:
+counter, shared with the DAP server's variables view, when the artifact carries any. A
+compiler only reports them if it emits `context.variables` in its ETHDebug output, and no
+compiler release does yet.
+
+Without them, soldb reads locals off the stack for code from solc's legacy pipeline. That
+code generator keeps every parameter, return parameter, and local at a fixed stack slot:
+the parameters sit below the height the function was entered at, and each declaration
+reserves the next slot when it executes and frees it at the end of its block. The legacy
+source map attributes that reservation to the declaration's `type name` span, which is
+enough to follow each variable through the trace: `vars` lists the parameters, the return
+parameters, and the locals in scope, with the slot each was read from, and `print` reads
+one by name.
 
 ```text
 soldb> vars
-Variables: this artifact carries no ETHDebug variable locations, so locals cannot be shown; the compiler that produced it does not emit them yet
+uint256 a = 3 [stack+2]
+uint256 b = 4 [stack+3]
+uint256 sum = 0 [stack+4]
+uint256 twice = 6 [stack+5]
+bool big = true [stack+6]
+State:
+uint256 total = 0 [slot 0x0]
+```
+
+This is a reading of the stack, not compiler-reported variable locations, and the first
+`vars` or `print` of a session says so:
+
+```text
+warning: local variables are inferred from the legacy source map and the stack layout of solc's legacy code generator, not from compiler-reported variable locations
+note: values can be wrong under the optimizer, and a variable whose frame could not be placed shows as unavailable; ETHDebug variable information will replace this once compilers emit it
+```
+
+A frame is placed by whichever comes first: the parameters on the stack at an internal
+call's entry, the first return parameter's reservation, or the first instruction of the
+body, which runs right above the parameters and return parameters. A public function with
+modifiers and no return parameters cannot be placed that way, because the modifiers'
+slots sit in between; its parameters are then listed as `<unavailable>`, while its locals
+are placed by their first reservation. A `calldata` slice parameter takes two slots and
+is listed unavailable too. Modifiers' own parameters and locals are read the same way.
+
+Code from the via-IR pipeline, and from any IR-based compiler, lays the stack out as its
+optimizer sees fit, so nothing is inferred for it: a program loaded from ETHDebug is taken
+to come from via-IR, and a trace whose calling convention shows the via-IR order overrides
+whatever the artifact says. `vars` and `print` then say why, rather than reporting an
+empty scope:
+
+```text
+soldb> vars
+Variables: locals are unavailable here: this contract was compiled through the via-IR pipeline, whose stack layout cannot be recovered without compiler-reported variable locations
 ```
 
 That is a limitation of the debug info, not of the lookup, and it is worth telling apart
-from `no variables in scope at PC …`, which means the compiler did describe variables and
-none of them is live here.
+from `no variables in scope at PC …`, which means variables are known here and none is
+live.
 
 *State* variables come from the storage layout, the `<Contract>_storage.json` (or the
 `storage-layout` entry of a legacy `combined.json`) that `solc --storage-layout` writes.

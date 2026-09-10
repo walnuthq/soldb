@@ -20,10 +20,28 @@ use std::cell::RefCell;
 
 use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
 use soldb_debugger::{
-    call_target, normalize_address, ChainStorage, Condition, ConditionContext, ContractDebugInfo,
-    Evaluation, Frame, FrameState, ResolvedFunction, ResolvedLine, SourceListing, StepLocation,
-    StepMap, StorageLayout, StorageTape, StorageWords,
+    call_target, normalize_address, variables_for_step, ChainStorage, Condition, ConditionContext,
+    ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState, LocalsStatus,
+    ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap, StorageLayout,
+    StorageTape, StorageWords,
 };
+
+/// Where a step's variables came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariablesOrigin {
+    /// Variable locations the compiler emitted in the ETHDebug artifact.
+    Ethdebug,
+    /// A reading of the stack following solc's legacy layout; the frontend should say so
+    /// once, with [`soldb_debugger::INFERRED_LOCALS_WARNING`].
+    Inferred,
+}
+
+/// The variables of the function executing at a step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepVariables {
+    pub variables: Vec<DebugVariable>,
+    pub origin: VariablesOrigin,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -984,6 +1002,34 @@ impl DebuggerState {
             .source_listing(self.current_step, radius)
     }
 
+    /// The variables of the function executing at the current step, or why there are
+    /// none: the artifact's ETHDebug variable locations when it carries any, otherwise
+    /// the legacy stack layout when the contract's code generator keeps one.
+    pub fn variables(&self) -> Result<StepVariables, String> {
+        let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
+            return Err("no trace is loaded".to_owned());
+        };
+        let Some(step) = trace.steps.get(self.current_step) else {
+            return Err(format!("step {} is outside the trace", self.current_step));
+        };
+        let Some(contract) = map.contract_at_step(self.current_step) else {
+            return Err("no sources matched the contract executing at this step".to_owned());
+        };
+        if contract.info.has_variable_locations() {
+            return Ok(StepVariables {
+                variables: variables_for_step(trace, &contract.info, step),
+                origin: VariablesOrigin::Ethdebug,
+            });
+        }
+        match map.locals_at(self.current_step) {
+            LocalsStatus::Inferred(_) => Ok(StepVariables {
+                variables: map.inferred_variables(trace, self.current_step),
+                origin: VariablesOrigin::Inferred,
+            }),
+            LocalsStatus::Unavailable(reason) => Err(reason.to_owned()),
+        }
+    }
+
     /// The innermost recorded call that contains the current step, when the backend
     /// recorded calls.
     #[must_use]
@@ -1237,12 +1283,14 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
-    use soldb_debugger::{ContractDebugInfo, FunctionId, LineKey, ResolvedFunction, ResolvedLine};
+    use soldb_debugger::{
+        CodeGenerator, ContractDebugInfo, FunctionId, LineKey, ResolvedFunction, ResolvedLine,
+    };
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
     use super::{
         Breakpoint, BreakpointKind, BreakpointTarget, DebuggerCommand, DebuggerInfoCommand,
-        DebuggerState, DisplayMode, SourceBreakpointTarget, StepOutcome,
+        DebuggerState, DisplayMode, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
     };
 
     #[test]
@@ -2051,6 +2099,70 @@ contract C {
             mixed.label(),
             "C.sol:4, C.sol:1 (the statement containing line 10)"
         );
+    }
+
+    #[test]
+    fn variables_are_inferred_from_the_stack_when_the_artifact_has_no_locations() {
+        let source = "contract C {\n    function f(uint256 a) public {\n        uint256 b = a;\n        b = 0;\n    }\n}\n";
+        let offset = |needle: &str| source.find(needle).expect(needle) as u64;
+        let instruction = |pc: u64, needle: &str| -> Instruction {
+            serde_json::from_value(json!({
+                "offset": pc,
+                "operation": {"mnemonic": "JUMPDEST"},
+                "context": {"code": {"source": {"id": 0}, "range": {"offset": offset(needle), "length": needle.len()}}}
+            }))
+            .expect("instruction")
+        };
+        let contract = |code_generator: Option<CodeGenerator>| {
+            let info = EthdebugInfo {
+                compilation: serde_json::Value::Null,
+                contract_name: "C".to_owned(),
+                environment: "call".to_owned(),
+                instructions: vec![
+                    instruction(0, "contract C"),
+                    instruction(1, "function f"),
+                    instruction(2, "uint256 b"),
+                    instruction(3, "b = 0"),
+                ],
+                sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+                variable_locations: BTreeMap::new(),
+            };
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]))
+                .with_code_generator(code_generator)
+        };
+        let mut trace = sample_trace();
+        trace.steps = vec![
+            step(0, "PUSH1", 0, &[]),
+            step(1, "JUMPDEST", 0, &["0x9", "0x5"]),
+            step(2, "PUSH0", 0, &["0x9", "0x5"]),
+            step(3, "POP", 0, &["0x9", "0x5", "0x5"]),
+        ];
+
+        let mut state = DebuggerState::new();
+        state.load_trace(trace.clone());
+        state.attach_debug_info(vec![contract(Some(CodeGenerator::Legacy))]);
+        assert_eq!(
+            state.variables().unwrap_err(),
+            "no function is executing at this step"
+        );
+        state.goto_step(3);
+        let variables = state.variables().expect("inferred");
+        assert_eq!(variables.origin, VariablesOrigin::Inferred);
+        assert_eq!(
+            variables
+                .variables
+                .iter()
+                .map(|variable| (variable.name.as_str(), variable.value.display.as_str()))
+                .collect::<Vec<_>>(),
+            [("a", "5"), ("b", "5")]
+        );
+
+        // The via-IR pipeline keeps no layout to read.
+        let mut state = DebuggerState::new();
+        state.load_trace(trace);
+        state.attach_debug_info(vec![contract(Some(CodeGenerator::ViaIr))]);
+        state.goto_step(3);
+        assert!(state.variables().unwrap_err().contains("via-IR pipeline"));
     }
 
     #[test]

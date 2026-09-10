@@ -22,6 +22,7 @@ use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, W
 
 pub mod condition;
 pub mod debug_diff;
+mod locals;
 pub mod state;
 pub mod stepping;
 
@@ -31,15 +32,16 @@ pub use debug_diff::{
     DebugDifference, DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent,
     DebugTraceSummary,
 };
-pub use soldb_ethdebug::StorageLayout;
+pub use soldb_ethdebug::{CodeGenerator, StorageLayout};
 pub use state::{
     short_hex, state_value, state_variables, CachedChain, ChainRead, ChainStorage, StateSource,
     StateVariable, StorageTape, StorageWords,
 };
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
-    Frame, FunctionId, JumpMarker, LineKey, ResolvedFunction, ResolvedLine, SourceListing,
-    StepLocation, StepMap,
+    Frame, FunctionId, InferredVariable, JumpMarker, LineKey, LocalsStatus, ResolvedFunction,
+    ResolvedLine, SourceListing, StepLocation, StepMap, VariableKind, INFERRED_LOCALS_NOTE,
+    INFERRED_LOCALS_WARNING,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,7 +200,78 @@ pub struct SourceFunction {
     /// The one-based line the declaration begins on.
     #[serde(default)]
     pub declaration_line: u64,
+    /// The offset of the body's opening brace.
+    #[serde(default)]
+    pub body_start: u64,
     pub body_end: u64,
+    /// The return parameters, named or not, in declaration order.
+    #[serde(default)]
+    pub returns: Vec<SourceLocal>,
+    /// The local variables declared in the body, in declaration order.
+    #[serde(default)]
+    pub locals: Vec<SourceLocal>,
+    /// Whether the header invokes modifiers, which run inlined around the body and reserve
+    /// stack slots of their own.
+    #[serde(default)]
+    pub has_modifiers: bool,
+}
+
+/// A half-open byte range in a source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl ByteRange {
+    #[must_use]
+    pub const fn contains(self, offset: u64) -> bool {
+        self.start <= offset && offset < self.end
+    }
+
+    /// Whether a span of `length` bytes at `offset` lies inside this range.
+    #[must_use]
+    pub const fn covers(self, offset: u64, length: u64) -> bool {
+        self.start <= offset && offset.saturating_add(length) <= self.end
+    }
+
+    /// Whether this range contains the whole of `other`.
+    #[must_use]
+    pub const fn encloses(self, other: Self) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+}
+
+/// A variable a function declares in its source: a return parameter or a local.
+///
+/// The spans are what ties the variable to the trace. solc's legacy code generator reserves
+/// the variable's stack slot under `declaration`, the `type [location] name` text, as the
+/// first instructions of `statement`; the slot lives until execution leaves `scope`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceLocal {
+    pub name: String,
+    /// The type without its data location, such as `uint256` or `string`.
+    pub ty: String,
+    /// The data location as declared, when the type has one.
+    #[serde(default)]
+    pub location: Option<String>,
+    pub declaration: ByteRange,
+    /// The declaration statement, from its first token to before its `;`.
+    pub statement: ByteRange,
+    /// The variable's index among those its statement declares: each takes the next slot.
+    pub position: usize,
+    pub scope: ByteRange,
+}
+
+impl SourceLocal {
+    /// The type as declared, with its data location.
+    #[must_use]
+    pub fn declared_type(&self) -> String {
+        match &self.location {
+            Some(location) => format!("{} {location}", self.ty),
+            None => self.ty.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,7 +384,7 @@ fn raw_value_for_location(
     }
 }
 
-fn decode_debug_value(raw: &str, ty: &str) -> DebugValue {
+pub(crate) fn decode_debug_value(raw: &str, ty: &str) -> DebugValue {
     let ty = ty.trim();
     let normalized = normalize_hex(raw);
     let word = normalized.trim_start_matches("0x");
@@ -336,6 +409,9 @@ fn decode_static_word(word: &str, ty: &str) -> Option<String> {
     }
     if ty.starts_with("uint") {
         return Some(format_uint_word(word));
+    }
+    if ty.starts_with("int") {
+        return Some(format_int_word(word));
     }
     if ty == "address" {
         let padded = left_pad_word(word);
@@ -660,6 +736,40 @@ fn format_uint_word(word: &str) -> String {
     format!("0x{}", trimmed.to_ascii_lowercase())
 }
 
+/// A two's-complement word as a signed decimal, or as hex when it does not fit `i128`.
+fn format_int_word(word: &str) -> String {
+    let padded = left_pad_word(word);
+    let Ok(bytes) = (0..32)
+        .map(|index| u8::from_str_radix(&padded[index * 2..index * 2 + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return format!("0x{}", word.to_ascii_lowercase());
+    };
+    if bytes[0] & 0x80 == 0 {
+        return format_uint_word(word);
+    }
+    // Negate: invert every byte and add one, from the least significant end.
+    let mut magnitude = bytes.iter().map(|byte| !byte).collect::<Vec<_>>();
+    for byte in magnitude.iter_mut().rev() {
+        let (sum, carry) = byte.overflowing_add(1);
+        *byte = sum;
+        if !carry {
+            break;
+        }
+    }
+    let hex = magnitude
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let trimmed = hex.trim_start_matches('0');
+    if trimmed.len() <= 32 {
+        if let Ok(value) = u128::from_str_radix(trimmed, 16) {
+            return format!("-{value}");
+        }
+    }
+    format!("-0x{trimmed}")
+}
+
 fn storage_value(storage: &BTreeMap<String, String>, slot: u64) -> Option<String> {
     storage
         .get(&format!("0x{slot:x}"))
@@ -775,6 +885,22 @@ fn collect_declarations(
             cursor = body_start + 1;
             continue;
         };
+        let (returns, has_modifiers) = parse_header(source, params_end + 1, body_start);
+        let returns = returns
+            .into_iter()
+            .map(|variable| SourceLocal {
+                name: variable.name,
+                ty: variable.ty,
+                location: variable.location,
+                declaration: variable.span,
+                statement: variable.span,
+                position: 0,
+                scope: ByteRange {
+                    start: body_start as u64,
+                    end: body_end as u64,
+                },
+            })
+            .collect();
 
         functions.push(SourceFunction {
             source_id,
@@ -786,10 +912,88 @@ fn collect_declarations(
                 .filter(|byte| *byte == b'\n')
                 .count() as u64
                 + 1,
+            body_start: body_start as u64,
             body_end: body_end as u64,
+            returns,
+            locals: locals::scan_locals(source, body_start, body_end),
+            has_modifiers: has_modifiers && keyword != "modifier",
         });
         cursor = body_end + 1;
     }
+}
+
+/// The words a function header may carry between its parameter list and its body
+/// without invoking a modifier.
+const HEADER_KEYWORDS: [&str; 11] = [
+    "public", "private", "internal", "external", "pure", "view", "payable", "virtual", "override",
+    "returns", "constant",
+];
+
+/// The return parameters declared in a function header, and whether it invokes modifiers.
+///
+/// The header is the text between the parameter list and the body. A `returns (...)`
+/// clause holds the return parameters, each with the span the compiler reserves its slot
+/// under; any other identifier that is not a visibility or mutability keyword is a
+/// modifier invocation.
+fn parse_header(source: &str, start: usize, end: usize) -> (Vec<locals::Declared>, bool) {
+    let bytes = source.as_bytes();
+    let mut returns = Vec::new();
+    let mut has_modifiers = false;
+    let mut index = start;
+    while index < end {
+        index = locals::skip_trivia(source, index);
+        if index >= end {
+            break;
+        }
+        let Some((word, word_end)) = parse_identifier(source, index) else {
+            index += 1;
+            continue;
+        };
+        let after = locals::skip_trivia(source, word_end);
+        let arguments = (bytes.get(after) == Some(&b'('))
+            .then(|| find_matching_delimiter(source, after, b'(', b')'))
+            .flatten()
+            .filter(|close| *close < end);
+        if word == "returns" {
+            if let Some(close) = arguments {
+                returns = parse_return_list(source, after, close);
+            }
+        } else if !HEADER_KEYWORDS.contains(&word) {
+            has_modifiers = true;
+        }
+        index = arguments.map_or(word_end, |close| close + 1);
+    }
+    (returns, has_modifiers)
+}
+
+/// The return parameters between the parentheses at `open` and `close`.
+fn parse_return_list(source: &str, open: usize, close: usize) -> Vec<locals::Declared> {
+    let mut returns = Vec::new();
+    let mut start = open + 1;
+    let mut depth = 0_i32;
+    for index in open + 1..=close {
+        match source.as_bytes()[index] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' if depth > 0 => depth -= 1,
+            b',' | b')' => {
+                let component = source[start..index].trim();
+                if !component.is_empty() {
+                    let component_start = start
+                        + (source[start..index].len() - source[start..index].trim_start().len());
+                    let component_start = locals::skip_trivia(source, component_start);
+                    let component_end = component_start + component.len();
+                    if let Some(declared) =
+                        locals::parse_return(source, component_start, component_end, returns.len())
+                    {
+                        returns.push(declared);
+                    }
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    returns
 }
 
 /// The words that may follow a parameter's type without naming it.
@@ -931,7 +1135,7 @@ fn find_solidity_keyword(source: &str, keyword: &str, start: usize) -> Option<us
     None
 }
 
-fn parse_identifier(source: &str, start: usize) -> Option<(&str, usize)> {
+pub(crate) fn parse_identifier(source: &str, start: usize) -> Option<(&str, usize)> {
     let bytes = source.as_bytes();
     let first = *bytes.get(start)?;
     if !is_identifier_start_byte(first) {
@@ -944,7 +1148,7 @@ fn parse_identifier(source: &str, start: usize) -> Option<(&str, usize)> {
     Some((&source[start..end], end))
 }
 
-fn is_identifier(input: &str) -> bool {
+pub(crate) fn is_identifier(input: &str) -> bool {
     let mut bytes = input.bytes();
     let Some(first) = bytes.next() else {
         return false;
@@ -960,7 +1164,7 @@ fn is_identifier_byte(byte: u8) -> bool {
     is_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 
-fn skip_ascii_whitespace(source: &str, mut index: usize) -> usize {
+pub(crate) fn skip_ascii_whitespace(source: &str, mut index: usize) -> usize {
     while source
         .as_bytes()
         .get(index)
@@ -980,7 +1184,12 @@ fn find_next_byte(source: &str, start: usize, needle: u8) -> Option<usize> {
         .find_map(|(index, byte)| (*byte == needle).then_some(index))
 }
 
-fn find_matching_delimiter(source: &str, open_index: usize, open: u8, close: u8) -> Option<usize> {
+pub(crate) fn find_matching_delimiter(
+    source: &str,
+    open_index: usize,
+    open: u8,
+    close: u8,
+) -> Option<usize> {
     let mut depth = 0_i32;
     for (index, byte) in source.bytes().enumerate().skip(open_index) {
         if byte == open {

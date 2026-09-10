@@ -35,7 +35,7 @@ pub use artifacts::{
     contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
     find_program_ethdebug, load_debug_program, load_debug_program_with_sources,
     load_storage_layout, read_debug_source, read_debug_source_from, read_json_file,
-    source_candidates, DebugProgram,
+    source_candidates, CodeGenerator, DebugProgram,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,

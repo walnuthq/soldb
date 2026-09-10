@@ -14,9 +14,10 @@
 # RUN: printf 'print definitely_not_a_variable\nprint\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s --check-prefix=LOOKUP
 
 # LOOKUP: No such variable: `definitely_not_a_variable` is not in scope at PC {{[0-9]+}}
-# The reason matters: this compiler emits no ETHDebug variable locations at all, which is
-# not the same as the name not being live here.
-# LOOKUP: note: this artifact carries no ETHDebug variable locations
+# The reason matters: this compiler emits no ETHDebug variable locations, and the
+# via-IR pipeline it uses keeps no stack layout the debugger could read locals from
+# instead, which is not the same as the name not being live here.
+# LOOKUP: note: locals are unavailable here: this contract was compiled through the via-IR pipeline
 # LOOKUP: Usage: print <variable>
 
 # `vars` says the same thing rather than reporting an empty scope, and a backtrace that
@@ -24,7 +25,7 @@
 # convention this trace proved, not the compiler's own variable information.
 # RUN: printf 'vars\nbreak TestContract.sol:30\ncontinue\nbt\nbt\nquit\n' | %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} -i 2>&1 | FileCheck %s --check-prefix=SOURCES
 
-# SOURCES: Variables: this artifact carries no ETHDebug variable locations, so locals cannot be shown; the compiler that produced it does not emit them yet
+# SOURCES: Variables: locals are unavailable here: this contract was compiled through the via-IR pipeline, whose stack layout cannot be recovered without compiler-reported variable locations
 # SOURCES: warning: frame arguments are read off the stack, not from compiler-reported variable locations
 # SOURCES: note: the calling convention was proved from this trace's calldata
 # The note is printed once a session, not on every backtrace.
