@@ -463,11 +463,14 @@ note: values can be wrong under the optimizer, and a variable whose frame could 
 
 A frame is placed by whichever comes first: the parameters on the stack at an internal
 call's entry, the first return parameter's reservation, or the first instruction of the
-body, which runs right above the parameters and return parameters. A public function with
-modifiers and no return parameters cannot be placed that way, because the modifiers'
-slots sit in between; its parameters are then listed as `<unavailable>`, while its locals
-are placed by their first reservation. A `calldata` slice parameter takes two slots and
-is listed unavailable too. Modifiers' own parameters and locals are read the same way.
+body, which runs right above whatever was reserved before it. Modifiers are read the same
+way, and place the function they run for: the first modifier's parameters sit right above
+the function's parameters and return parameters, and the body's locals start above the
+modifiers' slots. A modifier resumed after its `_` keeps the slots it had. A `calldata`
+slice parameter takes two slots, an offset and a length into the frame's calldata, and
+is shown as its bytes (`bytes`), its text (`string`), or its elements (an array of value
+types). The variables of `try ... returns (...)` and `catch (...)` clauses belong to their
+clause blocks like any other local.
 
 Code from the via-IR pipeline, and from any IR-based compiler, lays the stack out as its
 optimizer sees fit, so nothing is inferred for it: a program loaded from ETHDebug is taken

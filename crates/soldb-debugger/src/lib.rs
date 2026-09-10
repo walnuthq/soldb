@@ -214,6 +214,12 @@ pub struct SourceFunction {
     /// stack slots of their own.
     #[serde(default)]
     pub has_modifiers: bool,
+    /// The modifiers the header invokes, in the order they run.
+    #[serde(default)]
+    pub modifiers: Vec<String>,
+    /// For a modifier, the offset of its `_;` placeholder, where the function body runs.
+    #[serde(default)]
+    pub placeholder: Option<u64>,
 }
 
 /// A half-open byte range in a source.
@@ -885,7 +891,12 @@ fn collect_declarations(
             cursor = body_start + 1;
             continue;
         };
-        let (returns, has_modifiers) = parse_header(source, params_end + 1, body_start);
+        let (returns, modifiers) = parse_header(source, params_end + 1, body_start);
+        let modifiers = if keyword == "modifier" {
+            Vec::new()
+        } else {
+            modifiers
+        };
         let returns = returns
             .into_iter()
             .map(|variable| SourceLocal {
@@ -916,7 +927,11 @@ fn collect_declarations(
             body_end: body_end as u64,
             returns,
             locals: locals::scan_locals(source, body_start, body_end),
-            has_modifiers: has_modifiers && keyword != "modifier",
+            has_modifiers: !modifiers.is_empty(),
+            modifiers,
+            placeholder: (keyword == "modifier")
+                .then(|| locals::find_placeholder(source, body_start, body_end))
+                .flatten(),
         });
         cursor = body_end + 1;
     }
@@ -929,16 +944,16 @@ const HEADER_KEYWORDS: [&str; 11] = [
     "returns", "constant",
 ];
 
-/// The return parameters declared in a function header, and whether it invokes modifiers.
+/// The return parameters declared in a function header, and the modifiers it invokes.
 ///
 /// The header is the text between the parameter list and the body. A `returns (...)`
 /// clause holds the return parameters, each with the span the compiler reserves its slot
 /// under; any other identifier that is not a visibility or mutability keyword is a
-/// modifier invocation.
-fn parse_header(source: &str, start: usize, end: usize) -> (Vec<locals::Declared>, bool) {
+/// modifier invocation, and they run in the order written.
+fn parse_header(source: &str, start: usize, end: usize) -> (Vec<locals::Declared>, Vec<String>) {
     let bytes = source.as_bytes();
     let mut returns = Vec::new();
-    let mut has_modifiers = false;
+    let mut modifiers = Vec::new();
     let mut index = start;
     while index < end {
         index = locals::skip_trivia(source, index);
@@ -959,11 +974,11 @@ fn parse_header(source: &str, start: usize, end: usize) -> (Vec<locals::Declared
                 returns = parse_return_list(source, after, close);
             }
         } else if !HEADER_KEYWORDS.contains(&word) {
-            has_modifiers = true;
+            modifiers.push(word.to_owned());
         }
         index = arguments.map_or(word_end, |close| close + 1);
     }
-    (returns, has_modifiers)
+    (returns, modifiers)
 }
 
 /// The return parameters between the parentheses at `open` and `close`.
@@ -1116,7 +1131,7 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
     parts
 }
 
-fn find_solidity_keyword(source: &str, keyword: &str, start: usize) -> Option<usize> {
+pub(crate) fn find_solidity_keyword(source: &str, keyword: &str, start: usize) -> Option<usize> {
     let mut cursor = start;
     while let Some(relative) = source[cursor..].find(keyword) {
         let absolute = cursor + relative;
@@ -1160,7 +1175,7 @@ fn is_identifier_start_byte(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphabetic()
 }
 
-fn is_identifier_byte(byte: u8) -> bool {
+pub(crate) fn is_identifier_byte(byte: u8) -> bool {
     is_identifier_start_byte(byte) || byte.is_ascii_digit()
 }
 

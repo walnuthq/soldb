@@ -1,0 +1,56 @@
+# Variables the stack layout places beyond a plain body: a modifier's parameter and local,
+# before and after its `_`, and the function they wrap; the variables of `try ... returns`
+# and `catch` clauses; and `calldata` slice parameters, read from the frame's calldata. All
+# of it follows solc's legacy code generator and is expected to fail for Solar until it
+# emits ETHDebug variable locations. The legacy optimizer reuses and reorders stack slots,
+# so these richer placements (a modifier wrapping a function, clause variables, calldata
+# slices) hold only for unoptimized output; the `vars` warning says values can be wrong
+# under the optimizer, and this test pins the exact slots without it.
+# REQUIRES: soldb, optimization-none
+# XFAIL: compiler-solar
+# RUN: rm -rf %t
+# RUN: mkdir -p %t/solar %t/solc
+# RUN: %if compiler-solar %{ cd %S/.. && %solar Clauses.sol --emit=abi,bin,bin-runtime,srcmap,srcmap-runtime --out-dir %t/solar > %t/solar/compile.stdout 2> %t/solar/compile.stderr %}
+# RUN: %if compiler-solc %{ cd %S/.. && %solc Clauses.sol --bin --abi --combined-json abi,bin,bin-runtime,srcmap,srcmap-runtime,storage-layout -o %t/solc > %t/solc/compile.stdout 2> %t/solc/compile.stderr %}
+# RUN: %if compiler-solar %{ cp %S/../Clauses.sol %t/solar/Clauses.sol %}
+# RUN: %if compiler-solc %{ cp %S/../Clauses.sol %t/solc/Clauses.sol %}
+# RUN: %if compiler-solar %{ jq -er '.contracts["Clauses.sol:Clauses"].bin | strings | select(length > 0)' %t/solar/combined.json > %t/solar/Clauses.bin %}
+
+# The modifier runs first with its argument; the body's local sits above the modifier's
+# slots and the function's parameter below them; after `_` the modifier still has both.
+# RUN: %if compiler-solc %{ printf 'break Clauses.sol:15\ncontinue\nvars\nbreak Clauses.sol:10\ncontinue\nvars\nquit\n' | %soldb run %t/solc/Clauses.bin "guarded(uint256)" 5 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Clauses:%t/solc -i 2>&1 | FileCheck %s --check-prefix=MODIFIER %}
+# RUN: %if compiler-solar %{ printf 'break Clauses.sol:15\ncontinue\nvars\nbreak Clauses.sol:10\ncontinue\nvars\nquit\n' | %soldb run %t/solar/Clauses.bin "guarded(uint256)" 5 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Clauses:%t/solar -i 2>&1 | FileCheck %s --check-prefix=MODIFIER %}
+# MODIFIER: Breakpoint #1 hit at step {{[0-9]+}}, Clauses.sol:15
+# MODIFIER: uint256 v = 5 [stack+2]
+# MODIFIER-NEXT: uint256 kept = 6 [stack+5]
+# MODIFIER: Breakpoint #2 hit at step {{[0-9]+}}, Clauses.sol:10
+# MODIFIER: uint256 tag = 9 [stack+3]
+# MODIFIER-NEXT: uint256 seen = 9 [stack+4]
+# MODIFIER-NEXT: State:
+# MODIFIER-NEXT: uint256 total = 6 [slot 0x0]
+
+# The calldata slices of the nested call, read from that call's input.
+# RUN: %if compiler-solc %{ printf 'break Clauses.sol:21\ncontinue\nvars\nquit\n' | %soldb run %t/solc/Clauses.bin "probe(address,bool)" 0x5fbdb2315678afecb367f032d93f642f64180aa3 false --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Clauses:%t/solc -i 2>&1 | FileCheck %s --check-prefix=CALLDATA %}
+# RUN: %if compiler-solar %{ printf 'break Clauses.sol:21\ncontinue\nvars\nquit\n' | %soldb run %t/solar/Clauses.bin "probe(address,bool)" 0x5fbdb2315678afecb367f032d93f642f64180aa3 false --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Clauses:%t/solar -i 2>&1 | FileCheck %s --check-prefix=CALLDATA %}
+# CALLDATA: Breakpoint #1 hit at step {{[0-9]+}}, Clauses.sol:21
+# CALLDATA: uint256[] calldata xs = [3, 4] [stack+2]
+# CALLDATA-NEXT: bytes calldata tag = 0x6162 [stack+4]
+# CALLDATA-NEXT: uint256 s = 0 [stack+6]
+# CALLDATA-NEXT: uint256 i = 0 [stack+7]
+
+# The success clause's return value, in scope in its block above the caller's locals.
+# RUN: %if compiler-solc %{ printf 'break Clauses.sol:31\ncontinue\nvars\nquit\n' | %soldb run %t/solc/Clauses.bin "probe(address,bool)" 0x5fbdb2315678afecb367f032d93f642f64180aa3 false --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Clauses:%t/solc -i 2>&1 | FileCheck %s --check-prefix=SUCCESS %}
+# RUN: %if compiler-solar %{ printf 'break Clauses.sol:31\ncontinue\nvars\nquit\n' | %soldb run %t/solar/Clauses.bin "probe(address,bool)" 0x5fbdb2315678afecb367f032d93f642f64180aa3 false --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Clauses:%t/solar -i 2>&1 | FileCheck %s --check-prefix=SUCCESS %}
+# SUCCESS: Breakpoint #1 hit at step {{[0-9]+}}, Clauses.sol:31
+# SUCCESS: address target = 0x5fbdb2315678afecb367f032d93f642f64180aa3 [stack+2]
+# SUCCESS-NEXT: bool fail = false [stack+3]
+# SUCCESS-NEXT: uint256 got = 0 [stack+4]
+# SUCCESS-NEXT: uint256[] memory xs = 128 [stack+5]
+# SUCCESS-NEXT: uint256 value = 9 [stack+6]
+
+# The `catch Error` clause's parameter, a memory pointer to the decoded reason.
+# RUN: %if compiler-solc %{ printf 'break Clauses.sol:33\ncontinue\nvars\nquit\n' | %soldb run %t/solc/Clauses.bin "probe(address,bool)" 0x5fbdb2315678afecb367f032d93f642f64180aa3 true --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Clauses:%t/solc -i 2>&1 | FileCheck %s --check-prefix=CATCH %}
+# RUN: %if compiler-solar %{ printf 'break Clauses.sol:33\ncontinue\nvars\nquit\n' | %soldb run %t/solar/Clauses.bin "probe(address,bool)" 0x5fbdb2315678afecb367f032d93f642f64180aa3 true --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Clauses:%t/solar -i 2>&1 | FileCheck %s --check-prefix=CATCH %}
+# CATCH: Breakpoint #1 hit at step {{[0-9]+}}, Clauses.sol:33
+# CATCH: bool fail = true [stack+3]
+# CATCH: string memory reason = 0x{{[0-9a-f]+}} [stack+6]

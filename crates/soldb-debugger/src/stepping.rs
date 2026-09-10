@@ -535,9 +535,12 @@ pub struct InferredVariable {
     /// The declared type, with its data location.
     pub ty: String,
     pub kind: VariableKind,
-    /// The slot, counted from the bottom of the stack; `None` when the variable is in
-    /// scope but its reservation was not seen, which the optimizer can fold away.
+    /// The slot, counted from the bottom of the stack, of the variable's first word;
+    /// `None` when the variable is in scope but its frame could not be placed.
     pub slot: Option<usize>,
+    /// How many stack words the variable takes: two for a `calldata` slice, whose words
+    /// are its offset and its length, one for everything else.
+    pub words: usize,
 }
 
 /// Whether local variables are known at a step.
@@ -729,10 +732,22 @@ impl FrameVariables {
     ) -> u32 {
         let length = span.end - span.start;
         let param_slots = parameter_slots(&function.params);
-        // The body's first instruction runs with nothing above the parameters and the
-        // return parameters, unless a modifier ran first and left slots of its own.
-        if !self.body_seen && span.start >= function.body_start && span.start < function.body_end {
+        // The body's first instruction runs right above whatever was reserved before it:
+        // the first local goes there, and without modifiers in between that is right
+        // above the parameters and the return parameters. A modifier resumed after its
+        // `_` is not at its beginning.
+        let at_beginning = function
+            .placeholder
+            .is_none_or(|placeholder| span.start < placeholder);
+        if !self.body_seen
+            && at_beginning
+            && span.start >= function.body_start
+            && span.start < function.body_end
+        {
             self.body_seen = true;
+            if self.locals_base.is_none() {
+                self.locals_base = Some(height);
+            }
             if self.params_base.is_none() && !function.has_modifiers {
                 self.params_base = height.checked_sub(param_slots + function.returns.len());
             }
@@ -783,7 +798,8 @@ impl FrameVariables {
                         None => parameter.ty.clone(),
                     },
                     kind: VariableKind::Parameter,
-                    slot: (size == 1).then_some(slot),
+                    slot: Some(slot),
+                    words: size,
                 });
                 slot += size;
             }
@@ -794,6 +810,7 @@ impl FrameVariables {
                 ty: parameter.declared_type(),
                 kind: VariableKind::Return,
                 slot: self.returns[index],
+                words: 1,
             });
         }
         for (index, local) in function.locals.iter().enumerate() {
@@ -805,6 +822,7 @@ impl FrameVariables {
                     slot: self
                         .locals_base
                         .map(|base| base + live_index(function, index, span.start)),
+                    words: 1,
                 });
             }
         }
@@ -829,6 +847,92 @@ fn live_index(function: &SourceFunction, index: usize, offset: u64) -> usize {
         .iter()
         .filter(|other| other.scope.contains(offset) && other.declaration.start < declaration)
         .count()
+}
+
+/// The calldata of the frame executing `step`: the transaction's input at the root, the
+/// recorded call's input in a nested frame.
+fn calldata_for_step(trace: &TransactionTrace, step: usize) -> &str {
+    let root_depth = trace.steps.first().map_or(0, |first| first.depth);
+    let depth = trace
+        .steps
+        .get(step)
+        .map_or(root_depth, |current| current.depth);
+    if depth == root_depth {
+        return &trace.input_data;
+    }
+    trace
+        .artifacts
+        .calls
+        .iter()
+        .filter(|call| {
+            call.entry_step.is_some_and(|entry| entry <= step)
+                && call.exit_step.is_none_or(|exit| step < exit)
+        })
+        .max_by_key(|call| call.depth)
+        .map_or("", |call| call.input.as_str())
+}
+
+/// The value of a `calldata` slice: the bytes of `bytes` and `string`, the elements of an
+/// array of value types, or the element count of any other array. `offset` is where the
+/// slice's data starts in `calldata`, the way the legacy decoder leaves it on the stack.
+fn decode_calldata_slice(
+    calldata: &str,
+    ty: &str,
+    offset: &str,
+    length: &str,
+) -> Option<DebugValue> {
+    let word = |value: &str| usize::from_str_radix(value.trim_start_matches("0x"), 16).ok();
+    let (offset, length) = (word(offset)?, word(length)?);
+    let data = calldata.trim_start_matches("0x");
+    let ty = ty.trim_end_matches(" calldata");
+    if ty == "bytes" || ty == "string" {
+        let end = offset.checked_add(length)?;
+        let hex = data.get(offset * 2..end * 2)?;
+        let raw = format!("0x{hex}");
+        let display = if ty == "string" {
+            let bytes = (0..length)
+                .map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            match String::from_utf8(bytes) {
+                Ok(text) if text.chars().all(|character| !character.is_control()) => {
+                    format!("\"{text}\"")
+                }
+                _ => raw.clone(),
+            }
+        } else {
+            raw.clone()
+        };
+        return Some(DebugValue {
+            display,
+            raw: Some(raw),
+            status: DebugValueStatus::Decoded,
+        });
+    }
+    let element = ty.strip_suffix("[]")?;
+    let shown = length.min(8);
+    let mut elements = Vec::with_capacity(shown);
+    for index in 0..shown {
+        let start = offset.checked_add(index * 32)?;
+        let hex = data.get(start * 2..(start + 32) * 2)?;
+        let value = decode_debug_value(&format!("0x{hex}"), element);
+        if value.status != DebugValueStatus::Decoded {
+            return Some(DebugValue {
+                display: format!("[{length} items at calldata offset {offset:#x}]"),
+                raw: None,
+                status: DebugValueStatus::Raw,
+            });
+        }
+        elements.push(value.display);
+    }
+    if length > shown {
+        elements.push(format!("... {} more", length - shown));
+    }
+    Some(DebugValue {
+        display: format!("[{}]", elements.join(", ")),
+        raw: None,
+        status: DebugValueStatus::Decoded,
+    })
 }
 
 /// How many stack words a parameter takes: a `calldata` slice of a dynamic type is an
@@ -876,6 +980,9 @@ struct InternalFrame {
     functions: Vec<FrameEntry>,
     /// The last real statement executed in this frame, which generated code belongs to.
     statement: Option<LocationRef>,
+    /// The variables of frames that were left without returning, by function: a modifier
+    /// hands over to the body it wraps and resumes after it with its slots still there.
+    remembered: HashMap<usize, FrameVariables>,
 }
 
 impl InternalFrame {
@@ -907,14 +1014,6 @@ impl InternalFrame {
             return_pc: None,
             variables: None,
         });
-    }
-
-    /// The innermost function frame, looking past helper placeholders.
-    fn active_entry(&mut self) -> Option<&mut FrameEntry> {
-        self.functions
-            .iter_mut()
-            .rev()
-            .find(|entry| entry.function.is_some())
     }
 
     /// Whether a jump landing on `pc` returns from the innermost frame.
@@ -1215,9 +1314,23 @@ impl StepMap {
                                 .iter()
                                 .rposition(|entry| entry.function == Some(function))
                             {
-                                Some(position) => frame.functions.truncate(position + 1),
+                                Some(position) => {
+                                    // A modifier handing over to the body keeps its slots;
+                                    // remember them for when it resumes.
+                                    for left in frame.functions.drain(position + 1..) {
+                                        if let (Some(function), Some(variables)) =
+                                            (left.function, left.variables)
+                                        {
+                                            frame.remembered.insert(function, variables);
+                                        }
+                                    }
+                                }
                                 None => {
-                                    frame.push_function(function, None, frame_variables(function));
+                                    let variables = frame
+                                        .remembered
+                                        .remove(&function)
+                                        .or_else(|| frame_variables(function));
+                                    frame.push_function(function, None, variables);
                                     frame_entry = true;
                                 }
                             }
@@ -1251,20 +1364,57 @@ impl StepMap {
             let layout = {
                 let frame = internal.last_mut().expect("the root frame is never popped");
                 let contract = step.contract.map(|index| &contracts[index]);
-                match (frame.active_entry(), step.location, contract) {
-                    (Some(entry), Some(own), Some(contract))
-                        if own.function.is_some() && own.function == entry.function =>
+                let active = frame
+                    .functions
+                    .iter()
+                    .rposition(|entry| entry.function.is_some());
+                match (active, step.location, contract) {
+                    (Some(position), Some(own), Some(contract))
+                        if own.function.is_some()
+                            && own.function == frame.functions[position].function =>
                     {
-                        let function = &contract.functions[own.function.unwrap_or_default()];
+                        let function_index = own.function.unwrap_or_default();
+                        let function = &contract.functions[function_index];
                         let span = ByteRange {
                             start: own.offset,
                             end: own.offset + own.length,
                         };
-                        entry.variables.as_mut().map(|variables| {
+                        let (below, rest) = frame.functions.split_at_mut(position);
+                        let entry = &mut rest[0];
+                        let layout = entry.variables.as_mut().map(|variables| {
                             variables.track(function, span, height, &mut variable_layouts)
-                        })
+                        });
+                        // The first modifier's parameters sit right above the function's
+                        // parameters and return parameters, so placing the modifier
+                        // places the function it runs for.
+                        let modifier_base = entry
+                            .variables
+                            .as_ref()
+                            .and_then(|variables| variables.params_base);
+                        let parent = below
+                            .iter_mut()
+                            .rev()
+                            .find(|entry| entry.function.is_some());
+                        if let (Some(modifier_base), Some(parent)) = (modifier_base, parent) {
+                            let parent_function =
+                                &contract.functions[parent.function.unwrap_or_default()];
+                            if parent_function.modifiers.first() == Some(&function.name) {
+                                if let Some(variables) = parent.variables.as_mut() {
+                                    if variables.params_base.is_none() {
+                                        variables.params_base = modifier_base.checked_sub(
+                                            parameter_slots(&parent_function.params)
+                                                + parent_function.returns.len(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        layout
                     }
-                    (Some(entry), _, _) => entry.variables.as_ref().and_then(|v| v.layout),
+                    (Some(position), _, _) => frame.functions[position]
+                        .variables
+                        .as_ref()
+                        .and_then(|variables| variables.layout),
                     _ => None,
                 }
             };
@@ -1510,18 +1660,33 @@ impl StepMap {
             .steps
             .get(step)
             .map_or(&[][..], |trace_step| trace_step.snapshot_ref().stack);
+        let unavailable = || DebugValue {
+            display: "<unavailable>".to_owned(),
+            raw: None,
+            status: DebugValueStatus::Unavailable,
+        };
         layout
             .iter()
             .map(|variable| {
                 let word = variable.slot.and_then(|slot| stack.get(slot));
-                let value = word.map_or_else(
-                    || DebugValue {
-                        display: "<unavailable>".to_owned(),
-                        raw: None,
-                        status: DebugValueStatus::Unavailable,
-                    },
-                    |word| decode_debug_value(word, &variable.ty),
-                );
+                let value = match (variable.words, word) {
+                    (1, Some(word)) => decode_debug_value(word, &variable.ty),
+                    // A `calldata` slice: its offset and length words select the bytes
+                    // of the frame's calldata.
+                    (2, Some(offset)) => variable
+                        .slot
+                        .and_then(|slot| stack.get(slot + 1))
+                        .and_then(|length| {
+                            decode_calldata_slice(
+                                calldata_for_step(trace, step),
+                                &variable.ty,
+                                offset,
+                                length,
+                            )
+                        })
+                        .unwrap_or_else(unavailable),
+                    _ => unavailable(),
+                };
                 DebugVariable {
                     name: variable.name.clone(),
                     ty: variable.ty.clone(),
@@ -2901,10 +3066,10 @@ contract P {
     /// modifier, laid out the way solc's legacy code generator attributes them.
     const LEGACY_SOURCE: &str = "contract L {
     uint256 total;
-    modifier tracked() {
+    modifier tracked(uint256 tag) {
         uint256 before = total;
         _;
-        total = before;
+        total = before + tag;
     }
     function outer(uint256 a) public returns (uint256 sum) {
         uint256 twice = a * 2;
@@ -2918,12 +3083,15 @@ contract P {
         uint256 y = x + 1;
         r = y;
     }
-    function guarded(uint256 v) public tracked {
+    function guarded(uint256 v) public tracked(9) {
         uint256 kept = v;
         total = kept;
     }
     function set(uint256 v) public {
         total = v;
+    }
+    function take(bytes calldata data, uint256[] calldata items, uint256 n) public {
+        total = n;
     }
 }
 ";
@@ -2961,10 +3129,13 @@ contract P {
             (31, "uint256 before"),
             (32, "uint256 kept"),
             (33, "total = kept"),
-            (34, "total = before"),
+            (34, "total = before + tag"),
             // set: entry and its only statement.
             (40, "function set"),
             (41, "total = v"),
+            // take: entry and its only statement.
+            (50, "function take"),
+            (51, "total = n"),
         ];
         let instructions = spans
             .iter()
@@ -3132,29 +3303,101 @@ contract P {
     }
 
     #[test]
-    fn a_modifier_places_its_own_locals_and_the_functions_parameters() {
+    fn a_modifier_places_itself_and_the_function_it_runs_for() {
         let ret = "0x9";
         let trace = trace(vec![
             step(30, 1, "JUMPDEST", &[ret, "0x7"]),
-            // The modifier runs first: its local is reserved above the parameter.
-            step(31, 1, "PUSH0", &[ret, "0x7"]),
+            // The modifier runs first, its argument pushed above the parameter; its own
+            // local is reserved above that.
+            step(31, 1, "PUSH0", &[ret, "0x7", "0x9"]),
             // Then the body, whose local sits above the modifier's.
-            step(32, 1, "PUSH0", &[ret, "0x7", "0x3"]),
-            step(33, 1, "SSTORE", &[ret, "0x7", "0x3", "0x7"]),
-            step(34, 1, "SSTORE", &[ret, "0x7", "0x3"]),
+            step(32, 1, "PUSH0", &[ret, "0x7", "0x9", "0x3"]),
+            step(33, 1, "SSTORE", &[ret, "0x7", "0x9", "0x3", "0x7"]),
+            // The modifier resumes after the body with its slots still in place.
+            step(34, 1, "SSTORE", &[ret, "0x7", "0x9", "0x3"]),
         ]);
         let map = StepMap::new(&trace, vec![legacy_contract(Some(CodeGenerator::Legacy))]);
         let LocalsStatus::Inferred(modifier) = map.locals_at(1) else {
             panic!("{:?}", map.locals_at(1));
         };
-        assert_eq!(named(modifier), [("before", VariableKind::Local, Some(2))]);
-        // A function with a modifier and no return parameters cannot place its parameters
-        // from its first local: modifier slots sit in between.
+        assert_eq!(
+            named(modifier),
+            [
+                ("tag", VariableKind::Parameter, Some(2)),
+                ("before", VariableKind::Local, Some(3))
+            ]
+        );
+        // The function's parameter sits right below the modifier's, and its body's local
+        // right above the modifier's slots.
         let LocalsStatus::Inferred(body) = map.locals_at(3) else {
             panic!("{:?}", map.locals_at(3));
         };
-        assert_eq!(named(body), [("kept", VariableKind::Local, Some(3))]);
-        assert_eq!(map.inferred_variables(&trace, 3)[0].value.display, "7");
+        assert_eq!(
+            named(body),
+            [
+                ("v", VariableKind::Parameter, Some(1)),
+                ("kept", VariableKind::Local, Some(4))
+            ]
+        );
+        assert_eq!(map.inferred_variables(&trace, 3)[1].value.display, "7");
+        let LocalsStatus::Inferred(resumed) = map.locals_at(4) else {
+            panic!("{:?}", map.locals_at(4));
+        };
+        assert_eq!(
+            named(resumed),
+            [
+                ("tag", VariableKind::Parameter, Some(2)),
+                ("before", VariableKind::Local, Some(3))
+            ]
+        );
+        assert_eq!(map.inferred_variables(&trace, 4)[1].value.display, "3");
+    }
+
+    #[test]
+    fn calldata_slices_read_the_frames_calldata() {
+        // `take("ab", [3, 4], 5)` as the legacy decoder leaves it: each slice is an offset
+        // into the calldata and a length, the offset pointing at the data itself. The
+        // elements of `items` follow the selector at offset 0x4, and the bytes "ab" follow
+        // them at 0x44.
+        let ret = "0x9";
+        let mut trace = trace(vec![
+            step(
+                50,
+                1,
+                "JUMPDEST",
+                &[ret, "0x44", "0x2", "0x4", "0x2", "0x5"],
+            ),
+            step(51, 1, "PUSH0", &[ret, "0x44", "0x2", "0x4", "0x2", "0x5"]),
+        ]);
+        trace.input_data = format!(
+            "0xaabbccdd{}{}6162",
+            "0000000000000000000000000000000000000000000000000000000000000003",
+            "0000000000000000000000000000000000000000000000000000000000000004"
+        );
+        let map = StepMap::new(&trace, vec![legacy_contract(Some(CodeGenerator::Legacy))]);
+        let LocalsStatus::Inferred(layout) = map.locals_at(1) else {
+            panic!("{:?}", map.locals_at(1));
+        };
+        assert_eq!(
+            layout
+                .iter()
+                .map(|variable| (variable.name.as_str(), variable.slot, variable.words))
+                .collect::<Vec<_>>(),
+            [
+                ("data", Some(1), 2),
+                ("items", Some(3), 2),
+                ("n", Some(5), 1)
+            ]
+        );
+        let values = map.inferred_variables(&trace, 1);
+        assert_eq!(
+            values
+                .iter()
+                .map(|variable| (variable.name.as_str(), variable.value.display.as_str()))
+                .collect::<Vec<_>>(),
+            [("data", "0x6162"), ("items", "[3, 4]"), ("n", "5")]
+        );
+        assert_eq!(values[0].value.raw.as_deref(), Some("0x6162"));
     }
 
     #[test]

@@ -14,8 +14,8 @@
 //! failure for a debugger.
 
 use crate::{
-    find_matching_delimiter, is_identifier, parse_identifier, skip_ascii_whitespace, ByteRange,
-    SourceLocal,
+    find_matching_delimiter, find_solidity_keyword, is_identifier, parse_identifier,
+    skip_ascii_whitespace, ByteRange, SourceLocal,
 };
 
 /// Words that neither begin a local declaration's type nor name a variable.
@@ -151,8 +151,16 @@ fn scan_block(source: &str, open: usize, close: usize, out: &mut Vec<SourceLocal
                         }
                     }
                 }
+                // A `try` clause's return parameters and a `catch` clause's parameters are
+                // variables of the clause block that follows.
+                "try" | "catch" => {
+                    if let Some(block) = scan_clause(source, word, end, close, out) {
+                        index = block;
+                        continue;
+                    }
+                }
                 // What follows these is a statement of its own.
-                "else" | "unchecked" | "do" | "try" => {
+                "else" | "unchecked" | "do" => {
                     index = end;
                     statement_start = true;
                     continue;
@@ -238,6 +246,131 @@ fn scan_for(
     }
     // The body block is scanned by the caller like any other block.
     Some(paren_end + 1)
+}
+
+/// A `try` or `catch` clause whose keyword ends at `after`: `try <call> [returns (params)]
+/// { ... }` or `catch [Error|Panic] [(params)] { ... }`. The parameters are variables of
+/// the clause block. Returns the position of the block's opening brace.
+fn scan_clause(
+    source: &str,
+    keyword: &str,
+    after: usize,
+    close: usize,
+    out: &mut Vec<SourceLocal>,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let block = find_block_open(source, after, close)?;
+    let open = if keyword == "try" {
+        let returns = find_solidity_keyword(source, "returns", after).filter(|at| *at < block)?;
+        skip_trivia(source, returns + "returns".len())
+    } else {
+        let mut cursor = skip_trivia(source, after);
+        if let Some((_, end)) = parse_identifier(source, cursor) {
+            cursor = skip_trivia(source, end);
+        }
+        cursor
+    };
+    if bytes.get(open) != Some(&b'(') {
+        return Some(block);
+    }
+    let close_paren = find_matching_delimiter(source, open, b'(', b')').filter(|at| *at < block)?;
+    let block_end = find_matching_delimiter(source, block, b'{', b'}').unwrap_or(close);
+    let mut start = open + 1;
+    let mut depth = 0_i32;
+    let mut position = 0;
+    for (index, byte) in bytes
+        .iter()
+        .enumerate()
+        .take(close_paren + 1)
+        .skip(open + 1)
+    {
+        match *byte {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' if depth > 0 => depth -= 1,
+            b',' | b')' => {
+                if let Some((component_start, component_end)) = trimmed_range(source, start, index)
+                {
+                    if let Some(variable) = parse_typed_name(source, component_start, component_end)
+                    {
+                        out.push(SourceLocal {
+                            name: variable.name,
+                            ty: variable.ty,
+                            location: variable.location,
+                            declaration: variable.span,
+                            statement: variable.span,
+                            position,
+                            scope: ByteRange {
+                                start: variable.span.start,
+                                end: block_end as u64,
+                            },
+                        });
+                        position += 1;
+                    }
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    Some(block)
+}
+
+/// The `_;` placeholder of a modifier body, where the function it modifies runs.
+pub(crate) fn find_placeholder(source: &str, body_start: usize, body_end: usize) -> Option<u64> {
+    let bytes = source.as_bytes();
+    let mut index = body_start + 1;
+    while index < body_end {
+        index = skip_trivia(source, index);
+        match bytes.get(index) {
+            Some(b'"' | b'\'') => {
+                index = skip_string(source, index);
+                continue;
+            }
+            Some(b'_') => {
+                let before = bytes.get(index.wrapping_sub(1)).copied();
+                let after = skip_trivia(source, index + 1);
+                if before.is_none_or(|byte| !crate::is_identifier_byte(byte))
+                    && bytes.get(after) == Some(&b';')
+                {
+                    return Some(index as u64);
+                }
+                index += 1;
+            }
+            Some(_) => {
+                index = match parse_identifier(source, index) {
+                    Some((_, end)) => end,
+                    None => index + 1,
+                };
+            }
+            None => break,
+        }
+    }
+    None
+}
+
+/// The first `{` at or after `from` and before `limit` that is not inside parentheses,
+/// strings, or comments: the opening brace of a clause block.
+fn find_block_open(source: &str, from: usize, limit: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = from;
+    let mut depth = 0_i32;
+    while index < limit {
+        index = skip_trivia(source, index);
+        match bytes.get(index) {
+            Some(b'"' | b'\'') => {
+                index = skip_string(source, index);
+                continue;
+            }
+            Some(b'(' | b'[') => depth += 1,
+            Some(b')' | b']') => depth -= 1,
+            Some(b'{') if depth <= 0 => return Some(index),
+            Some(b';') if depth <= 0 => return None,
+            Some(_) => {}
+            None => break,
+        }
+        index += 1;
+    }
+    None
 }
 
 /// The variables a declaration statement starting at `index` introduces, and where its
@@ -549,6 +682,51 @@ mod tests {
         assert_eq!(locals[6].ty, "address payable");
         assert_eq!(locals[7].ty, "Counter[]");
         assert_eq!(locals[7].statement, range("Counter[] memory counters"));
+    }
+
+    #[test]
+    fn clause_parameters_belong_to_their_blocks() {
+        let body = r#"function probe(address target) public returns (uint256 got) {
+        uint256[] memory xs = new uint256[](2);
+        try Clauses(target).sum(xs, S({a: 1})) returns (uint256 value, bool ok) {
+            got = value + 1;
+        } catch Error(string memory reason) {
+            got = bytes(reason).length;
+        } catch (bytes memory data) {
+            got = data.length;
+        }
+        uint256 after = got;
+    }"#;
+        let offset = |needle: &str| body.find(needle).expect(needle) as u64;
+        let locals = scan_locals(body, body.find('{').unwrap(), body.rfind('}').unwrap());
+        let names = locals
+            .iter()
+            .map(|local| local.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["xs", "value", "ok", "reason", "data", "after"]);
+        let value = &locals[1];
+        assert_eq!(value.declaration.start, offset("uint256 value"));
+        assert_eq!(value.scope.end, offset("} catch Error"));
+        assert_eq!(locals[2].position, 1);
+        let reason = &locals[3];
+        assert_eq!(
+            (reason.ty.as_str(), reason.location.as_deref()),
+            ("string", Some("memory"))
+        );
+        assert!(reason.scope.contains(offset("got = bytes(reason)")));
+        assert!(!reason.scope.contains(offset("got = data.length")));
+        let data = &locals[4];
+        assert!(data.scope.contains(offset("got = data.length")));
+        assert_eq!(locals[5].declaration.start, offset("uint256 after"));
+    }
+
+    #[test]
+    fn a_modifier_placeholder_is_found() {
+        let body = "modifier tracked(uint256 tag) {\n    uint256 before = total_; // _;\n    _;\n    total = before;\n}";
+        let placeholder =
+            super::find_placeholder(body, body.find('{').unwrap(), body.rfind('}').unwrap());
+        assert_eq!(placeholder, Some(body.find("\n    _;").unwrap() as u64 + 5));
+        assert_eq!(super::find_placeholder("{ total = 1; }", 0, 13), None);
     }
 
     #[test]
