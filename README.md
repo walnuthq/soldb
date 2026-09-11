@@ -10,8 +10,73 @@
 
 SolDB is an open-source, ETHDebug-first, LLDB-style debugger for Solidity and the EVM.
 
-![soldb demo 11 sept 2025](https://github.com/user-attachments/assets/7376da04-96b0-4aae-8c9b-154680ffe6b4)
+![SolDB full-screen view](docs/assets/soldb-tui.png)
 
+---
+
+## Try It in Two Minutes
+
+No node, no project: `soldb run` deploys a contract on a chain that exists only for the
+run and calls it. [`examples/Shop.sol`](examples/Shop.sol) has one of everything the
+debugger can show. Compile it with solc's legacy pipeline, whose fixed stack layout is
+what lets the debugger read local variables (see [Variables](docs/commands.md#variables)):
+
+```bash
+cargo install soldb
+cd examples
+solc --evm-version cancun Shop.sol --bin --abi --combined-json abi,bin,bin-runtime,srcmap,srcmap-runtime,storage-layout -o out_shop --overwrite
+soldb run out_shop/Shop.bin "place(string,uint128,uint256)" widget 5 3 --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Shop:out_shop -i
+```
+
+Then, at the prompt:
+
+```text
+soldb> break Shop.sol:40
+Breakpoint #1 set at Shop.sol:40
+soldb> continue
+Breakpoint #1 hit at step 1444, Shop.sol:40
+Shop.sol:40 in place  (step 1444/2142, pc 699, PUSH2, gas 29795966)
+   40 |         revenue += total(order);
+soldb> vars
+string memory item = "widget" [stack+2]
+uint128 unitPrice = 5 [stack+3]
+uint256 count = 3 [stack+4]
+uint256 id = 1 [stack+5]
+Order memory order = { id: 1, item: "widget", price: 5, status: Status.Open, quantities: [1, 2, 3] } [stack+6]
+State:
+mapping(uint256 => struct Shop.Order) orders = <mapping; index it with [key]> [slot 0x0]
+uint256 nextId = 1 [slot 0x1]
+...
+soldb> print order.quantities[2]
+uint256 order.quantities[2] = 3 [stack+6]
+soldb> print orders[1].status
+enum Shop.Status orders[1].status = Status.Paid [slot 0xada5…e7f + 16]
+soldb> step
+Shop.sol:69 in total  (step 1448/2142, pc 1376, JUMPDEST, gas 29795949)
+   69 |     function total(Order memory order) internal pure returns (uint256 sum) {
+soldb> break Shop.sol:72 if sum > 10
+soldb> continue
+Breakpoint #2 hit at step 1826, Shop.sol:72 if sum > 10
+Shop.sol:72 in total  (step 1826/2142, pc 1404, DUP4, gas 29794734)
+   72 |             sum += unit * order.quantities[i];
+soldb> bt
+#0  total at Shop.sol:72  step 1826, PC 1404
+#1  place at Shop.sol:40  step 1447, PC 706
+#2  Shop at Shop.sol:8  step 33, PC 62
+soldb> reverse-next
+soldb> tui
+```
+
+The same session as one command, and as JSON:
+
+```bash
+soldb run out_shop/Shop.bin "place(string,uint128,uint256)" widget 5 3 --ethdebug-dir 0x5fbd…:Shop:out_shop \
+    -x 'break Shop.sol:72 if sum > 10' -x continue -x vars -x bt --batch
+soldb run out_shop/Shop.bin "place(string,uint128,uint256)" widget 5 3 --ethdebug-dir 0x5fbd…:Shop:out_shop \
+    -x 'break Shop.sol:72 if sum > 10' -x continue -x 'print sum' --batch --json
+```
+
+`--tui` starts in the full-screen view instead.
 
 ---
 
@@ -122,11 +187,42 @@ Interactive mode:
 soldb trace <tx_hash> --ethdebug-dir <contract_address>:<contract_name>:./out --rpc http://localhost:8545 --interactive
 ```
 
-Inside REPL:
+Inside the REPL:
 ```
 soldb> break TestContract.sol:42
-soldb> next
+Breakpoint #1 set at TestContract.sol:42
+soldb> continue
+Breakpoint #1 hit at step 299, TestContract.sol:42
+TestContract.sol:42 in increment  (step 299/1071, pc 1899, PUSH2, gas 955476)
+   42 |         balance += amount;
 soldb> print balance
+uint256 balance = 10 [slot 0x0]
+```
+
+The same session as a script, and as JSON for a tool or an agent to read:
+```bash
+soldb trace <tx_hash> --ethdebug-dir … --rpc … -x 'break TestContract.sol:42' -x continue -x vars --batch
+soldb trace <tx_hash> --ethdebug-dir … --rpc … -x 'break TestContract.sol:42' -x continue -x vars --batch --json
+```
+
+And as a full-screen view (`--tui`, or the `tui` command from the prompt):
+
+```
+┌ Source ──────────────────────────────────┬ Variables ─────────────────────────┐
+│    40 |     function increment(uint256 a)│ uint256 amount = 4 [stack+2]       │
+│ *  41 |         require(amount > 0);     │ uint256 twice = 8 [stack+4]        │
+│ => 42 |         balance += amount;       │ State:                             │
+│    43 |         emit Incremented(amount);│ uint256 balance = 10 [slot 0x0]    │
+├ Opcodes ─────────────────────────────────┼ Stack ─────────────────────────────┤
+│ =>  1899 PUSH2 0x0771                    │ [ 4] 0x8                           │
+│     1902 JUMP                            │ [ 3] 0x0                           │
+├ Backtrace ───────────────┬ Console ───────┴────────────────────────────────────┤
+│ #0  increment at :42     │ soldb> continue                                     │
+│ #1  TestContract at :4   │ Breakpoint #1 hit at step 299, TestContract.sol:42  │
+├──────────────────────────┴─────────────────────────────────────────────────────┤
+│ step 299/1071  pc 1899  PUSH2  gas 955476  TestContract.sol:42 in increment    │
+│ n/s/c/f/i step  N/S/C/F/I back  b break  m mode  : command  Tab focus  ? help  │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -163,7 +259,7 @@ You can also debug simulations interactively using the `--interactive` flag:
 soldb simulate <contract_address> "increment(uint256)" 5     --from <sender_address>     --ethdebug-dir <contract_address>:<contract_name>:./out     --rpc http://localhost:8545     --interactive
 ```
 
-Inside REPL:
+Inside the REPL:
 ```
 soldb> break TestContract.sol:38
 soldb> step
@@ -199,8 +295,23 @@ reports and flamegraphs.
 
 ---
 
+## Agent Friendly
+
+SolDB is a terminal program end to end, which makes it as usable by an agent as by a
+person. The REPL answers each command with plain text and nothing else: no prompt or
+banner when the input is a pipe, one line per stop with the step, program counter,
+opcode, and gas in a fixed place, no colors unless the output is a terminal. Commands
+can be given on the command line (`-x`, repeatable, `--batch` to leave afterwards), so a
+whole session is one shell command, and `--json` turns every answer into one JSON
+object per line with the raw words next to the decoded values. Editors and tools that
+speak the Debug Adapter Protocol get the same engine through `soldb-dap`. See
+[`docs/commands.md`](docs/commands.md#scripting-and-json).
+
 ## Features
 
+- Three frontends over one engine: a gdb-style REPL (the default), a full-screen
+  terminal view (`--tui`, or `tui` at the prompt) with source, variables, stack, memory,
+  backtrace, and opcode panes, and a DAP server for editors
 - ETHDebug-first source debugging with legacy `srcmap`/`srcmap-runtime` fallback
 - Source-level variable inspection (`vars`, `print <name>`) in both the REPL and the DAP
   server: locals decoded from ETHDebug variable locations, or, for solc's legacy pipeline,
@@ -230,7 +341,8 @@ reports and flamegraphs.
   recorded trace; `backtrace`, `list`, `stack`, `memory`, `storage`, and `calldata` at any step
 - Debug Adapter Protocol server for editors: line and function breakpoints, step in/over/out, step-back
 - HTTP/HTTPS JSON-RPC transport with debug-RPC tracing and a REVM replay backend for nodes that cannot trace
-- WebAssembly package for browser and Node.js hosts, with host-driven replay
+- Scriptable and machine-readable: `-x <command>` runs a session non-interactively, `--json` answers every command as one JSON object per line, and `--save-trace` writes the full trace for offline `debug-diff` and `profile`
+- WebAssembly bindings (`soldb-wasm`) that build a trace and run a host-driven REVM replay in a browser or Node.js, for nodes that cannot trace
 - Interop-ready tracing for Ethereum environments that combine EVM contracts with other VMs
 
 ## Architecture
@@ -260,7 +372,7 @@ flowchart TD
     metadata --> debugger["soldb-debugger<br/>source steps + variables"]
     opcode_trace --> enriched
     debugger --> enriched["source lines<br/>call frames<br/>decoded values"]
-    enriched --> outputs["CLI / JSON / REPL and DAP, forward and reverse / WASM"]
+    enriched --> outputs["CLI text / REPL and TUI, forward and reverse / DAP / JSON answers / WASM"]
     opcode_trace --> profiler["soldb-profiler<br/>gas aggregation"]
     metadata --> profiler
     profiler --> profile_outputs["tables / JSON / flame graph"]
@@ -274,7 +386,10 @@ mapping and ABI data without inventing the missing metadata. The debugger-side
 ETHDebug contract is documented in
 [docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
 
-The `--json` output for `trace` and `simulate` is versioned for web and explorer integrations. See [docs/json.md](docs/json.md) for the current schema, capability flags, replay artifacts, and compatibility rules.
+`--save-trace <FILE>` on `trace`, `simulate`, `run`, and `replay` writes the complete
+trace as JSON, the format `debug-diff` and `profile` read offline; `--json` in a
+debugging session answers every command as JSON (see [Scripting and
+JSON](docs/commands.md#scripting-and-json)).
 
 ### Execution Backends
 
@@ -325,8 +440,7 @@ node, no deployment transaction, and nothing to clean up: the creation code is d
 locally from the first Anvil account, so the contract lands where Anvil would put it, and
 the call runs right after the constructor in the same synthetic block, seeing the state
 it left behind. Everything downstream is `simulate`'s: source mapping through
-`--ethdebug-dir`, the interactive debugger with reverse stepping, the JSON document, and
-the raw view.
+`--ethdebug-dir`, the interactive debugger with reverse stepping, and the raw view.
 
 ```bash
 soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Counter:./out
@@ -360,12 +474,13 @@ step-back button works. Breakpoints are predicates on a step, so `break storage 
 - `crates/soldb-ethdebug`: ETHDebug metadata loading, ABI helpers, source mapping, event decoding, and call-frame enrichment.
 - `crates/soldb-debugger`: reusable source-step, function, and variable decoding model shared by frontends.
 - `crates/soldb-profiler`: reusable gas attribution and folded-stack model over traces and ETHDebug programs.
-- `crates/soldb-repl`: interactive debugger state and REPL commands.
-- `crates/soldb-serializer`: JSON/web-facing trace and simulation serialization, including nested call trees and ETHDebug source metadata.
+- `crates/soldb-repl`: the debugger's command language, session, and answers; the state
+  machine every frontend drives.
+- `crates/soldb-tui`: the full-screen terminal view over a session.
+- `crates/soldb-wasm`: WebAssembly bindings that build a trace and run a host-driven REVM replay in a browser or Node.js; the host does the RPC and hands the responses in as strings.
 - `crates/soldb-compiler`: `solc` ETHDebug compilation, deployment helpers, and auto-deploy support for local workflows.
 - `crates/soldb-bridge`: bridge server for cross-environment Solidity<>Stylus debugging.
 - `crates/soldb-dap`: Debug Adapter Protocol server for editor integrations.
-- `crates/soldb-wasm`: WebAssembly bindings that build traces, run source-level debug sessions, and emit the web JSON document in a browser or Node.js host.
 
 ---
 
@@ -460,15 +575,19 @@ cargo llvm-cov --workspace --all-targets --fail-under-lines 80
 make coverage
 ```
 
+
 ### WebAssembly
 
 The library crates build for `wasm32-unknown-unknown`, and `crates/soldb-wasm` packages
-them for a browser or Node.js host with `wasm-pack`:
+them for a browser or Node.js host with `wasm-pack`. The host has no network or
+filesystem, so it fetches the JSON-RPC responses and ETHDebug artifacts itself and hands
+them in as strings; the trace stays in WebAssembly memory between calls. The
+replay-capable package also runs a host-driven REVM replay for nodes that cannot trace.
 
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
-make wasm         # crates/soldb-wasm/pkg
+make wasm         # crates/soldb-wasm/pkg (lean) and pkg-replay (with REVM)
 make wasm-test    # bindings smoke tests under Node.js
 ```
 

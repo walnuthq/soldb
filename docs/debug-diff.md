@@ -86,7 +86,7 @@ executed bytecode: PUSH immediates are not part of a trace step.
 ## Offline and CI Use
 
 For a hermetic test, pass serialized `TransactionTrace` values instead of
-transaction hashes. `soldb run ... --save-trace trace.json` creates this format
+transaction hashes. `--save-trace trace.json` on `trace`, `simulate`, `run`, or `replay` creates this format
 through local REVM execution. The normal `run --json` output remains the
 web-facing document:
 

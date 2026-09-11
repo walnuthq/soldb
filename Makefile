@@ -4,7 +4,7 @@
 # (spawns `solc`), and `soldb-bridge` (a TCP server) are host-only by design. CI runs the
 # same targets, so this list is the single place to extend. See docs/wasm.md.
 WASM_TARGET = wasm32-unknown-unknown
-WASM_CRATES = soldb-core soldb-ethdebug soldb-debugger soldb-profiler soldb-repl soldb-serializer soldb-evm soldb-wasm
+WASM_CRATES = soldb-core soldb-ethdebug soldb-debugger soldb-profiler soldb-repl soldb-evm soldb-wasm
 
 # Size-oriented cargo settings for the published module. They apply to this invocation
 # only, so native release builds keep their profile. `panic = "abort"` is free on

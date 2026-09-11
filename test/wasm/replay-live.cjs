@@ -143,8 +143,8 @@ async function main() {
   const sstore = replayedSteps[8];
   assert(sstore.snapshot.storage["0x0"] === "0x1", `slot 0 after the call: ${JSON.stringify(sstore.snapshot.storage)}`);
   assert(sstore.snapshot.storage_diff["0x0"].after === "0x1", "storage diff missing");
-  const document = JSON.parse(replayed.toWebJson());
-  assert(document.backend === "replay" && document.steps.length === EXPECTED_OPS.length, "web document mismatch");
+  const saved = JSON.parse(replayed.toJson());
+  assert(saved.backend === "replay" && saved.steps.length === EXPECTED_OPS.length, "saved trace mismatch");
 
   // Backend parity: the node's debug_traceTransaction, through the same module, must
   // agree on program counters and opcodes.

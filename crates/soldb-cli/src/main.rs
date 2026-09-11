@@ -12,8 +12,8 @@
 //!   stderr for warnings, decided separately so a redirected log never collects escape
 //!   codes and a warning on a terminal keeps its color when the result is piped away.
 //!   Emitting escapes directly breaks the lit tests.
-//! - `--json` and `--json-events` print only their JSON document, so the output stays
-//!   pipeable into `jq`. Progress lines must stay gated on those flags.
+//! - A debugging session under `--json`, and `--json-events`, print only JSON, so the
+//!   output stays pipeable into `jq`. Progress lines must stay gated on those flags.
 //! - A command that has already rendered a failure returns
 //!   [`soldb_core::SoldbError::AlreadyReported`] so the exit path does not print it
 //!   twice. Failures exit with code 2.
@@ -27,19 +27,15 @@ use serde_json::json;
 use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace, Word as StackWord};
 use soldb_debugger::{
     CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam,
-    StorageWords,
 };
 use soldb_ethdebug::{
     encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
     function_selector, load_debug_program_with_sources, parse_ethdebug_spec, parse_event_abis,
     parse_signature, DecodedEvent, EventRegistry, SourceMapEnvironment,
 };
-use soldb_repl::{
-    BreakpointKind, DebuggerCommand, DebuggerInfoCommand, DebuggerState, DisplayMode, StepOutcome,
-    StepVariables, VariablesOrigin,
-};
+use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
 use soldb_rpc::{RpcLog, TraceBackend};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Display;
 use std::fs;
@@ -374,8 +370,23 @@ struct TraceArgs {
     interactive: bool,
     #[arg(long)]
     raw: bool,
+    /// Answer every debugger command as JSON, one object per line; needs `-i`, `-x`, or
+    /// `--tui`.
     #[arg(long)]
     json: bool,
+    /// Save the complete trace as JSON for offline `debug-diff` and `profile`.
+    #[arg(long, value_name = "FILE")]
+    save_trace: Option<PathBuf>,
+    /// A debugger command to run before any is read from stdin, such as
+    /// `-x 'break Counter.sol:12' -x continue -x vars`; repeatable, and implies `-i`.
+    #[arg(short = 'x', long = "command", value_name = "COMMAND")]
+    commands: Vec<String>,
+    /// Leave the debugger after the `-x` commands instead of reading more from stdin.
+    #[arg(long, requires = "commands")]
+    batch: bool,
+    /// Start the debugger in the full-screen view (the `tui` command opens it later).
+    #[arg(long)]
+    tui: bool,
     #[arg(long)]
     cross_env_bridge: Option<String>,
     #[arg(long)]
@@ -398,6 +409,12 @@ struct TraceView {
     source_path: Vec<String>,
     contracts: Option<String>,
     max_steps: i64,
+    interactive: bool,
+    json: bool,
+    raw: bool,
+    session: SessionOptions,
+    /// Where to save the trace as JSON, for offline `debug-diff` and `profile`.
+    save_trace: Option<PathBuf>,
 }
 
 impl TraceView {
@@ -409,6 +426,11 @@ impl TraceView {
             source_path: args.source_path.clone(),
             contracts: args.contracts.clone(),
             max_steps: args.max_steps,
+            interactive: args.interactive,
+            json: args.json,
+            raw: args.raw,
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 
@@ -420,6 +442,11 @@ impl TraceView {
             source_path: args.source_path.clone(),
             contracts: args.contracts.clone(),
             max_steps: args.max_steps,
+            interactive: args.interactive,
+            json: args.json,
+            raw: args.raw,
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 
@@ -460,6 +487,9 @@ struct SimulationView {
     json: bool,
     raw: bool,
     max_steps: i64,
+    session: SessionOptions,
+    /// Where to save the trace as JSON, for offline `debug-diff` and `profile`.
+    save_trace: Option<PathBuf>,
     /// The block the call ran on top of, when it ran on a node and the block is fixed:
     /// its end state is exactly what the call started from. `None` when the call ran at a
     /// position inside a block, where neither that block nor its parent is that state.
@@ -488,6 +518,8 @@ impl SimulationView {
             json: args.json,
             raw: args.raw,
             max_steps: args.max_steps,
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 
@@ -512,6 +544,8 @@ impl SimulationView {
             json: args.json,
             raw: args.raw,
             max_steps: args.max_steps,
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 
@@ -537,6 +571,8 @@ impl SimulationView {
             json: args.json,
             raw: args.raw,
             max_steps: args.max_steps,
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            save_trace: args.save_trace.clone(),
         }
     }
 }
@@ -562,8 +598,23 @@ struct ReplayArgs {
     interactive: bool,
     #[arg(long)]
     raw: bool,
+    /// Answer every debugger command as JSON, one object per line; needs `-i`, `-x`, or
+    /// `--tui`.
     #[arg(long)]
     json: bool,
+    /// Save the complete trace as JSON for offline `debug-diff` and `profile`.
+    #[arg(long, value_name = "FILE")]
+    save_trace: Option<PathBuf>,
+    /// A debugger command to run before any is read from stdin, such as
+    /// `-x 'break Counter.sol:12' -x continue -x vars`; repeatable, and implies `-i`.
+    #[arg(short = 'x', long = "command", value_name = "COMMAND")]
+    commands: Vec<String>,
+    /// Leave the debugger after the `-x` commands instead of reading more from stdin.
+    #[arg(long, requires = "commands")]
+    batch: bool,
+    /// Start the debugger in the full-screen view (the `tui` command opens it later).
+    #[arg(long)]
+    tui: bool,
 }
 
 #[derive(Debug, Args)]
@@ -631,10 +682,22 @@ struct RunArgs {
     multi_contract: bool,
     #[arg(long, short = 'i')]
     interactive: bool,
+    /// Answer every debugger command as JSON, one object per line; needs `-i`, `-x`, or
+    /// `--tui`.
     #[arg(long)]
     json: bool,
     #[arg(long)]
     raw: bool,
+    /// A debugger command to run before any is read from stdin, such as
+    /// `-x 'break Counter.sol:12' -x continue -x vars`; repeatable, and implies `-i`.
+    #[arg(short = 'x', long = "command", value_name = "COMMAND")]
+    commands: Vec<String>,
+    /// Leave the debugger after the `-x` commands instead of reading more from stdin.
+    #[arg(long, requires = "commands")]
+    batch: bool,
+    /// Start the debugger in the full-screen view (the `tui` command opens it later).
+    #[arg(long)]
+    tui: bool,
     #[arg(long, short = 'm', default_value_t = 50)]
     max_steps: i64,
 }
@@ -679,10 +742,26 @@ struct SimulateArgs {
         default_value = "http://localhost:8545"
     )]
     rpc_url: String,
+
+    /// Answer every debugger command as JSON, one object per line; needs `-i`, `-x`, or
+    /// `--tui`.
     #[arg(long)]
     json: bool,
     #[arg(long)]
     raw: bool,
+    /// Save the complete trace as JSON for offline `debug-diff` and `profile`.
+    #[arg(long, value_name = "FILE")]
+    save_trace: Option<PathBuf>,
+    /// A debugger command to run before any is read from stdin, such as
+    /// `-x 'break Counter.sol:12' -x continue -x vars`; repeatable, and implies `-i`.
+    #[arg(short = 'x', long = "command", value_name = "COMMAND")]
+    commands: Vec<String>,
+    /// Leave the debugger after the `-x` commands instead of reading more from stdin.
+    #[arg(long, requires = "commands")]
+    batch: bool,
+    /// Start the debugger in the full-screen view (the `tui` command opens it later).
+    #[arg(long)]
+    tui: bool,
     #[arg(long, short = 'm', default_value_t = 50)]
     max_steps: i64,
     #[arg(long)]
@@ -1001,6 +1080,8 @@ fn bridge_command(args: &BridgeArgs) -> SoldbResult<()> {
 }
 
 fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
+    SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+        .check_json(args.interactive)?;
     let traced = match &args.save_replay {
         Some(file) => {
             if matches!(args.backend, TraceBackendArg::DebugRpc) {
@@ -1029,57 +1110,20 @@ fn trace_command(args: &TraceArgs) -> SoldbResult<()> {
         )
         .map(|resolved| resolved.trace),
     };
-    let trace = match traced {
-        Ok(trace) => trace,
-        Err(error) if args.json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "error": true,
-                    "type": "TransactionError",
-                    "message": error.to_string(),
-                }))
-                .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?
-            );
-            return Err(soldb_core::SoldbError::AlreadyReported);
-        }
-        Err(error) => return Err(error),
-    };
-    present_trace(
-        &TraceView::for_trace(args),
-        trace,
-        args.interactive,
-        args.json,
-        args.raw,
-    )
+    let trace = traced?;
+    present_trace(&TraceView::for_trace(args), trace)
 }
 
-/// Shows a traced transaction the way the user asked: interactively, as the web
-/// document, as raw steps, or as the summary. Shared by `trace` and `replay`.
-fn present_trace(
-    view: &TraceView,
-    trace: TransactionTrace,
-    interactive: bool,
-    json: bool,
-    raw: bool,
-) -> SoldbResult<()> {
-    if interactive {
+/// Shows a traced transaction the way the user asked: in a debugging session, as raw
+/// steps, or as the summary. Shared by `trace` and `replay`.
+fn present_trace(view: &TraceView, trace: TransactionTrace) -> SoldbResult<()> {
+    save_trace(view.save_trace.as_deref(), &trace)?;
+    if view.session.wanted(view.interactive) {
         let source_indexes = interactive_trace_source_indexes(view, &trace);
-        run_interactive_debugger(
-            trace,
-            "Transaction trace debugger",
-            source_indexes,
-            view.chain_storage(),
-        )?;
-    } else if json {
-        println!(
-            "{}",
-            soldb_serializer::trace_to_web_json_with_contracts(
-                &trace,
-                trace_web_contracts(view, &trace)
-            )?
-        );
-    } else if raw {
+        run_debugger_session(trace, source_indexes, view.chain_storage(), &view.session)?;
+    } else if view.json {
+        return Err(json_needs_session());
+    } else if view.raw {
         print_raw_trace(&trace, view);
     } else {
         print_trace_summary(&trace, view);
@@ -1101,13 +1145,9 @@ fn replay_command(args: &ReplayArgs) -> SoldbResult<()> {
     }
     let trace = bundle.replay()?;
     match &bundle.target {
-        soldb_rpc::ReplayBundleTarget::Transaction { transaction, .. } => present_trace(
-            &TraceView::for_replay(args, &transaction.hash),
-            trace,
-            args.interactive,
-            args.json,
-            args.raw,
-        ),
+        soldb_rpc::ReplayBundleTarget::Transaction { transaction, .. } => {
+            present_trace(&TraceView::for_replay(args, &transaction.hash), trace)
+        }
         soldb_rpc::ReplayBundleTarget::Call { request, .. } => {
             let view = SimulationView::for_replay(args, request, &args.file);
             present_simulation(&view, trace, None, &request.calldata)
@@ -1142,6 +1182,8 @@ fn read_replay_bundle(path: &Path) -> SoldbResult<soldb_rpc::ReplayBundle> {
 }
 
 fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
+    SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+        .check_json(args.interactive)?;
     let auto_deploy = maybe_auto_deploy(args)?;
     let contract_address = auto_deploy.as_ref().map_or_else(
         || args.contract_address.clone(),
@@ -1151,19 +1193,8 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
         .as_ref()
         .map(|deploy| deploy.contract_name.clone());
     let view = SimulationView::for_simulate(args, &contract_address);
-    let calldata = match simulate_calldata(&view) {
-        Ok(calldata) => calldata,
-        Err(error) if args.json => {
-            print_json_command_error("SimulationError", &error.to_string(), None)?;
-            return Err(soldb_core::SoldbError::AlreadyReported);
-        }
-        Err(error) => return Err(error),
-    };
+    let calldata = simulate_calldata(&view)?;
     if let Err(message) = validate_simulate_value(&args.value) {
-        if args.json {
-            print_json_command_error("InvalidValue", &message, Some(&args.value))?;
-            return Err(soldb_core::SoldbError::AlreadyReported);
-        }
         return Err(soldb_core::SoldbError::Message(message));
     }
 
@@ -1198,42 +1229,32 @@ fn simulate_command(args: &SimulateArgs) -> SoldbResult<()> {
     present_simulation(&view, trace, contract_name.as_deref(), &calldata)
 }
 
-/// Shows a simulated call the way the user asked: interactively, as the web document, as
-/// raw steps, or as the summary. Shared by `simulate` and `run`.
+/// Shows a simulated call the way the user asked: in a debugging session, as raw steps,
+/// or as the summary. Shared by `simulate` and `run`.
 fn present_simulation(
     view: &SimulationView,
     trace: TransactionTrace,
     contract_name: Option<&str>,
     calldata: &str,
 ) -> SoldbResult<()> {
+    save_trace(view.save_trace.as_deref(), &trace)?;
     let contract_address = view.contract_address.as_str();
-    let json_function_name = simulate_json_function_name(view, calldata);
     let display_function_name = simulate_display_function_name(view, calldata);
 
-    if view.interactive {
-        print_simulation_interactive_prelude(
-            view,
-            contract_address,
-            contract_name,
-            calldata,
-            &display_function_name,
-        );
+    if view.session.wanted(view.interactive) {
+        if !view.session.json {
+            print_simulation_interactive_prelude(
+                view,
+                contract_address,
+                contract_name,
+                calldata,
+                &display_function_name,
+            );
+        }
         let source_indexes = interactive_simulation_source_indexes(view, contract_address);
-        run_interactive_debugger(
-            trace,
-            "Simulation debugger",
-            source_indexes,
-            view.chain_storage(),
-        )?;
+        run_debugger_session(trace, source_indexes, view.chain_storage(), &view.session)?;
     } else if view.json {
-        println!(
-            "{}",
-            soldb_serializer::simulate_to_web_json_with_contracts(
-                &trace,
-                &json_function_name,
-                simulate_web_contracts(view, &trace, contract_address)
-            )?
-        );
+        return Err(json_needs_session());
     } else if view.raw {
         print_raw_simulation(&trace, view, contract_address);
     } else {
@@ -1256,8 +1277,10 @@ fn present_simulation(
 /// the same synthetic block right after it, so whatever the constructor stored is what
 /// the call sees. `--runtime` installs the bytes as they are instead, and `--deploy`
 /// traces the constructor and stops. Everything after execution is `simulate`'s: the same
-/// ETHDebug mapping, REPL, JSON document, and raw view.
+/// ETHDebug mapping, REPL, and raw view.
 fn run_command(args: &RunArgs) -> SoldbResult<()> {
+    SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+        .check_json(args.interactive)?;
     let bytecode = load_bytecode(&args.bytecode)?;
     let mut chain = soldb_rpc::LocalChain::new()
         .with_chain_id(args.chain_id)
@@ -1342,7 +1365,6 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         })?;
         let trace = chain.deploy(deployment)?;
         let calldata = deployment.input_data.clone();
-        save_run_trace(args, &trace)?;
         return present_simulation(&view, trace, contract_name.as_deref(), &calldata);
     }
 
@@ -1363,22 +1385,32 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
             "the call executed no instructions; there is no code at `{contract_address}`\nnote: pass creation code, or `--runtime` with the deployed code"
         )));
     }
-    save_run_trace(args, &trace)?;
     present_simulation(&view, trace, contract_name.as_deref(), &calldata)
 }
 
-/// Writes the raw trace format used by offline consumers, independently of display mode.
-fn save_run_trace(args: &RunArgs, trace: &TransactionTrace) -> SoldbResult<()> {
-    if let Some(path) = &args.save_trace {
-        let output = soldb_serializer::trace_to_json(trace)?;
-        fs::write(path, output).map_err(|error| {
-            soldb_core::SoldbError::Message(format!(
-                "failed to save trace `{}`: {error}",
-                path.display()
-            ))
-        })?;
-    }
-    Ok(())
+/// Writes the trace as JSON, the format `debug-diff` and `profile` read offline, whatever
+/// the display mode.
+fn save_trace(path: Option<&Path>, trace: &TransactionTrace) -> SoldbResult<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let output = serde_json::to_string_pretty(trace)
+        .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?;
+    fs::write(path, output).map_err(|error| {
+        soldb_core::SoldbError::Message(format!(
+            "failed to save trace `{}`: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// `--json` outside a debugging session: there is no document to print any more.
+fn json_needs_session() -> soldb_core::SoldbError {
+    soldb_core::SoldbError::Message(
+        "`--json` formats the answers of a debugging session; add `-i`, `-x <command>`, or \
+         `--tui`, or `--save-trace <FILE>` to write the trace as JSON"
+            .to_owned(),
+    )
 }
 
 /// Reads bytecode from a file when `source` names one, otherwise treats it as hex.
@@ -1640,13 +1672,64 @@ impl NodeStorage {
 /// What a session reads untouched slots through.
 type ChainReader = CachedChain<ChainRead>;
 
-fn run_interactive_debugger(
+/// How a debugging session is driven, from the flags of `trace`, `replay`, `simulate`,
+/// and `run`.
+#[derive(Debug, Clone, Default)]
+struct SessionOptions {
+    /// Commands to run before any are read from stdin (`-x`).
+    commands: Vec<String>,
+    /// Leave after the `-x` commands instead of reading stdin.
+    batch: bool,
+    /// Answer every command as JSON, one object per item, instead of text.
+    json: bool,
+    /// Start in the full-screen view.
+    tui: bool,
+}
+
+impl SessionOptions {
+    fn new(commands: &[String], batch: bool, json: bool, tui: bool) -> Self {
+        Self {
+            commands: commands.to_vec(),
+            batch,
+            json,
+            tui,
+        }
+    }
+
+    /// Whether the flags ask for a debugging session at all: `-i`, or anything that
+    /// only makes sense inside one.
+    fn wanted(&self, interactive: bool) -> bool {
+        interactive || !self.commands.is_empty() || self.tui
+    }
+
+    /// `--json` prints a debugging session's answers, so it needs one. Checked before any
+    /// tracing so `soldb trace X --json` fails without touching the node.
+    fn check_json(&self, interactive: bool) -> SoldbResult<()> {
+        if self.json && !self.wanted(interactive) {
+            return Err(json_needs_session());
+        }
+        Ok(())
+    }
+}
+
+/// What a command's answers asked the frontend to do next.
+enum Flow {
+    Continue,
+    Tui,
+    Quit,
+}
+
+/// Drives a debugging session over `trace`: the `-x` commands first, then the
+/// full-screen view if asked for, then stdin line by line until `quit` or its end.
+///
+/// The prompt is printed only when stdin is a terminal, so a piped session's output is
+/// the answers alone; with `--json` every answer is one JSON object per line.
+fn run_debugger_session(
     trace: TransactionTrace,
-    title: &str,
     source_indexes: Vec<TraceSourceIndex>,
     chain: Option<ChainReader>,
+    options: &SessionOptions,
 ) -> SoldbResult<()> {
-    let contract_address = trace.to_addr.clone().or(trace.contract_address.clone());
     let mut state = DebuggerState::new();
     state.load_trace(trace);
     state.attach_debug_info(
@@ -1655,113 +1738,119 @@ fn run_interactive_debugger(
             .map(|index| index.debug.clone())
             .collect(),
     );
+    let mut session =
+        Session::new(state).with_chain(chain.map(|chain| Box::new(chain) as Box<dyn ChainStorage>));
+    let renderer = Renderer::new(colors_enabled());
+    let json = options.json;
+    let terminal = io::stdin().is_terminal();
 
-    println!("{}", bold(info("Starting interactive debugger...")));
-    if let Some(address) = contract_address {
-        println!("{} {}", info("Contract found:"), address_color(address));
+    let emit = |outputs: Vec<Output>| -> SoldbResult<Flow> {
+        let mut flow = Flow::Continue;
+        for output in outputs {
+            match &output {
+                Output::Quit => flow = Flow::Quit,
+                Output::Tui => flow = Flow::Tui,
+                _ => {}
+            }
+            if json {
+                println!("{}", serde_json::to_string(&output).map_err(json_error)?);
+            } else {
+                print!("{}", renderer.render(&output));
+            }
+        }
+        io::stdout().flush().map_err(io_error)?;
+        Ok(flow)
+    };
+    let open_tui = |session: &mut Session| -> SoldbResult<Flow> {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"kind": "message", "level": "warning", "text": "the full-screen view is not available with --json"})
+            );
+            return Ok(Flow::Continue);
+        }
+        match soldb_tui::run(session) {
+            Ok(soldb_tui::Exit::Repl) => Ok(Flow::Continue),
+            Ok(soldb_tui::Exit::Quit) => Ok(Flow::Quit),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                println!("{} {error}", warning("Cannot open the full-screen view:"));
+                Ok(Flow::Continue)
+            }
+            Err(error) => Err(io_error(error)),
+        }
+    };
+
+    emit(vec![session.loaded()])?;
+    if !json && terminal {
+        println!(
+            "{}",
+            dim("Type `help` for the command list, `tui` for the full-screen view.")
+        );
     }
-    println!(
-        "Transaction loaded. {} steps.",
-        number_color(state.step_count())
-    );
-    println!(
-        "Loaded trace with {} steps",
-        number_color(state.step_count())
-    );
-    println!("{}", bold(info(title)));
-    print_current_debugger_step(&state);
+    emit(session.initial_stop())?;
+    if options.tui && matches!(open_tui(&mut session)?, Flow::Quit) {
+        return Ok(());
+    }
+    for command in &options.commands {
+        let flow = emit(session.execute(DebuggerCommand::parse(command)))?;
+        match flow {
+            Flow::Quit => return Ok(()),
+            Flow::Tui => {
+                if matches!(open_tui(&mut session)?, Flow::Quit) {
+                    return Ok(());
+                }
+            }
+            Flow::Continue => {}
+        }
+    }
+    if options.batch {
+        return Ok(());
+    }
 
     let stdin = io::stdin();
     let mut line = String::new();
     loop {
-        print!("soldb> ");
-        io::stdout()
-            .flush()
-            .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?;
-
+        if terminal && !json {
+            print!("soldb> ");
+            io::stdout().flush().map_err(io_error)?;
+        }
         line.clear();
-        let bytes_read = stdin
-            .read_line(&mut line)
-            .map_err(|error| soldb_core::SoldbError::Message(error.to_string()))?;
-        if bytes_read == 0 {
-            println!();
+        if stdin.read_line(&mut line).map_err(io_error)? == 0 {
+            if terminal && !json {
+                println!();
+            }
             break;
         }
-
         let command = DebuggerCommand::parse(&line);
-        let report_note = |state: &DebuggerState| {
-            if let Some(note) = state.take_note() {
-                println!("{} {note}", warning("Note:"));
-            }
-        };
-        match command {
-            DebuggerCommand::Empty => {}
-            DebuggerCommand::Quit => {
-                println!("{}", info("Exiting debugger."));
-                break;
-            }
-            DebuggerCommand::Help(topic) => print_debugger_help(topic.as_deref()),
-            DebuggerCommand::Mode(None) => {
-                println!("{} {}", info("Mode:"), bold(state.display_mode.as_str()));
-            }
-            DebuggerCommand::Info(DebuggerInfoCommand::Resources { json }) => {
-                if let Err(error) = print_debugger_resources(source_indexes.first(), json) {
-                    println!("{} {}", warning("Could not print resources:"), error);
-                }
-            }
-            DebuggerCommand::Info(DebuggerInfoCommand::Breakpoints) => {
-                print_debugger_breakpoints(&state);
-            }
-            DebuggerCommand::Info(DebuggerInfoCommand::Storage) => print_debugger_storage(&state),
-            DebuggerCommand::Vars => {
-                print_debugger_variables(&state, &source_indexes, chain.as_ref(), None);
-            }
-            DebuggerCommand::Print(name) => {
-                let name = name.trim();
-                if name.is_empty() {
-                    println!("{} print <variable>", warning("Usage:"));
-                } else {
-                    print_debugger_variables(&state, &source_indexes, chain.as_ref(), Some(name));
-                }
-            }
-            DebuggerCommand::Backtrace => print_debugger_backtrace(&state),
-            DebuggerCommand::List => print_debugger_listing(&state),
-            DebuggerCommand::Memory { offset, length } => {
-                print_debugger_memory(&state, offset, length);
-            }
-            DebuggerCommand::Calldata => print_debugger_calldata(&state),
-            DebuggerCommand::Stack => print_debugger_stack(&state),
-            DebuggerCommand::Unknown(command) => {
-                println!("{} {}", warning("Unknown command:"), command);
-            }
-            command => {
-                if let Some(outcome) = state.apply_command(command) {
-                    print_step_outcome(&state, &outcome);
-                }
-                report_note(&state);
+        // The CLI loaded the artifacts, so it can say more about them than the session.
+        if let DebuggerCommand::Info(DebuggerInfoCommand::Resources { json: as_json }) = &command {
+            if let Some(index) = source_indexes.first() {
+                print_debugger_resources(index, *as_json || json)?;
+                continue;
             }
         }
+        match emit(session.execute(command))? {
+            Flow::Quit => break,
+            Flow::Tui => {
+                if matches!(open_tui(&mut session)?, Flow::Quit) {
+                    break;
+                }
+            }
+            Flow::Continue => {}
+        }
     }
-
     Ok(())
 }
 
-fn print_debugger_resources(
-    source_index: Option<&TraceSourceIndex>,
-    json_output: bool,
-) -> SoldbResult<()> {
-    let Some(source_index) = source_index else {
-        println!("{}", warning("ETHDebug resources are not loaded."));
-        return Ok(());
-    };
-
+/// The debug resources of the first loaded artifact, as `info resources` prints them
+/// outside a session.
+fn print_debugger_resources(source_index: &TraceSourceIndex, json_output: bool) -> SoldbResult<()> {
     let contract = InfoResourcesContractJson {
         address: source_index.spec.address.clone(),
         name: source_index.spec.name.clone(),
         debug_dir: source_index.spec.debug_dir.display().to_string(),
         resources: source_index.resources.clone(),
     };
-
     if json_output {
         print_json(&InfoResourcesJson {
             contracts: vec![contract],
@@ -1772,642 +1861,12 @@ fn print_debugger_resources(
     }
 }
 
-fn print_current_debugger_step(state: &DebuggerState) {
-    let Some(step) = state.current_step_data() else {
-        println!("{}", warning("No trace loaded."));
-        return;
-    };
-    let max_step = state.step_count().saturating_sub(1);
-    println!(
-        "Step {}/{} | PC {} | {} | gas {}",
-        number_color(state.current_step),
-        number_color(max_step),
-        number_color(step.pc),
-        opcode_color(&step.op),
-        success(step.gas)
-    );
-    println!(
-        "Step {}/{}",
-        number_color(state.current_step),
-        number_color(max_step)
-    );
-    println!(
-        "PC: {} | {} | Gas: {} |",
-        number_color(step.pc),
-        opcode_color(&step.op),
-        success(step.gas)
-    );
-    println!(
-        "[ Step {} | Gas: {} | PC: {} | {} ]",
-        number_color(state.current_step),
-        success(step.gas),
-        number_color(step.pc),
-        opcode_color(&step.op)
-    );
-    match state.display_mode {
-        DisplayMode::Source => print_debugger_location(state),
-        DisplayMode::Assembly => {
-            let stack = step.snapshot_ref().stack;
-            if !stack.is_empty() {
-                println!("{} {}", info("Stack:"), format_stack(stack));
-            }
-        }
-    }
+fn io_error(error: io::Error) -> soldb_core::SoldbError {
+    soldb_core::SoldbError::Message(error.to_string())
 }
 
-/// Where the current step is in the source: file, line, function, and the line's text.
-/// Says so when a mapped trace has no source for this step, and stays quiet when no
-/// source is loaded at all.
-fn print_debugger_location(state: &DebuggerState) {
-    let Some(location) = state.location() else {
-        if state.has_source() {
-            let address = state
-                .step_map()
-                .and_then(|map| map.executing_address(state.current_step))
-                .map(|address| format!(" in {}", address_color(address)))
-                .unwrap_or_default();
-            println!("{}", dim(format!("no source for this step{address}")));
-        }
-        return;
-    };
-    let function = location
-        .function_name
-        .as_deref()
-        .map(|name| format!(" in {}", function_color(name)))
-        .unwrap_or_default();
-    let generated = if location.generated {
-        dim("  (compiler-generated code for this line)")
-    } else {
-        String::new()
-    };
-    println!(
-        "{}:{}{}{}",
-        info(&location.path),
-        number_color(location.line),
-        function,
-        generated
-    );
-    let text = state
-        .step_map()
-        .and_then(|map| map.contracts().get(location.key.contract))
-        .and_then(|contract| contract.line_text(location.key.source_id, location.line));
-    if let Some(text) = text {
-        println!("{} {}", dim(format!("{:>5} |", location.line)), text);
-    }
-}
-
-fn print_step_outcome(state: &DebuggerState, outcome: &StepOutcome) {
-    match outcome {
-        StepOutcome::NoTrace => println!("{}", warning("No trace loaded.")),
-        StepOutcome::Moved { .. } => print_current_debugger_step(state),
-        StepOutcome::BreakpointHit {
-            step,
-            pc,
-            breakpoint,
-        } => {
-            let detail = if matches!(breakpoint.kind, BreakpointKind::Pc(_)) {
-                format!("PC {}", number_color(pc))
-            } else {
-                format!("{}, PC {}", breakpoint.label(), number_color(pc))
-            };
-            println!(
-                "{} step {}, {detail}",
-                success(format!("Breakpoint #{} hit at", breakpoint.id)),
-                number_color(step)
-            );
-            print_current_debugger_step(state);
-        }
-        StepOutcome::AtEnd { step } => {
-            println!("{} {}", info("End of trace at step"), number_color(step));
-            print_current_debugger_step(state);
-        }
-        StepOutcome::AtStart { step } => {
-            println!("{} {}", info("Start of trace at step"), number_color(step));
-            print_current_debugger_step(state);
-        }
-        StepOutcome::InvalidStep {
-            requested,
-            max_step,
-        } => match max_step {
-            Some(max_step) => println!(
-                "{} {}; max step is {}",
-                warning("Invalid step"),
-                number_color(requested),
-                number_color(max_step)
-            ),
-            None => println!(
-                "{} {}; trace is empty",
-                warning("Invalid step"),
-                number_color(requested)
-            ),
-        },
-        StepOutcome::ModeChanged(mode) => println!("{} {}", info("Mode:"), bold(mode.as_str())),
-        StepOutcome::BreakpointSet(breakpoint) => {
-            println!(
-                "{} {}",
-                success(format!("Breakpoint #{} set at", breakpoint.id)),
-                breakpoint.label()
-            );
-        }
-        StepOutcome::BreakpointCleared(breakpoint) => {
-            println!(
-                "{} {}",
-                info(format!("Breakpoint #{} cleared at", breakpoint.id)),
-                breakpoint.label()
-            );
-        }
-        StepOutcome::BreakpointMissing(label) => {
-            println!("{} {}", warning("No breakpoint set at"), label);
-        }
-        StepOutcome::BreakpointError(message) => {
-            println!("{} {}", warning("Could not set breakpoint:"), message);
-        }
-    }
-}
-
-fn print_debugger_breakpoints(state: &DebuggerState) {
-    let breakpoints = state.breakpoints();
-    if breakpoints.is_empty() {
-        println!("{}", dim("No breakpoints set."));
-        return;
-    }
-    for breakpoint in breakpoints {
-        println!("#{} {}", number_color(breakpoint.id), breakpoint.label());
-    }
-}
-
-/// The call structure at the current step, innermost frame first: the function or, for a
-/// frame without source, the contract or address executing, where it is, and the step
-/// and program counter it sits at.
-fn print_debugger_backtrace(state: &DebuggerState) {
-    let frames = state.frames();
-    if frames.is_empty() {
-        println!("{}", warning("No trace loaded."));
-        return;
-    }
-    if frames.iter().any(|frame| !frame.arguments.is_empty()) {
-        // These values are read off the stack, not reported by the compiler. The order was
-        // proved from this trace, but say so: it is an inference about the whole contract
-        // drawn from the frames the trace happened to contain.
-        report_once(
-            "frame-arguments".to_owned(),
-            "frame arguments are read off the stack, not from compiler-reported variable locations",
-            "the calling convention was proved from this trace's calldata; ETHDebug variable locations will replace this once the compiler emits them",
-        );
-    }
-    for (index, frame) in frames.iter().enumerate() {
-        let name = frame
-            .function_name
-            .clone()
-            .or_else(|| frame.contract_name.clone())
-            .or_else(|| frame.address.clone())
-            .unwrap_or_else(|| "<unknown>".to_owned());
-        let mut line = format!("#{index:<2} {}", function_color(&name));
-        if !frame.arguments.is_empty() {
-            let arguments = frame
-                .arguments
-                .iter()
-                .map(|argument| format!("{} = {}", argument.name, argument.value.display))
-                .collect::<Vec<_>>()
-                .join(", ");
-            line.push_str(&format!("({arguments})"));
-        }
-        if let Some(location) = &frame.location {
-            line.push_str(&format!(" at {}:{}", location.path, location.line));
-        }
-        if frame.external && frame.function_name.is_some() {
-            if let Some(address) = &frame.address {
-                line.push_str(&format!(" ({})", address_color(address)));
-            }
-        }
-        line.push_str(&dim(format!("  step {}, PC {}", frame.step, frame.pc)));
-        println!("{line}");
-    }
-}
-
-/// Five lines of source on each side of the current step's line, the current one marked.
-fn print_debugger_listing(state: &DebuggerState) {
-    let Some(listing) = state.source_listing(5) else {
-        if state.has_source() {
-            println!("{}", warning("No source for this step."));
-        } else {
-            println!(
-                "{} no ETHDebug metadata is loaded; start the session with `--ethdebug-dir <address>:<contract>:<dir>`",
-                warning("Cannot list source:")
-            );
-        }
-        return;
-    };
-    println!(
-        "{}:{}",
-        info(&listing.path),
-        number_color(listing.current_line)
-    );
-    for (line, text) in &listing.lines {
-        if *line == listing.current_line {
-            println!("{} {}", bold(format!("=> {line:>5} |")), bold(text));
-        } else {
-            println!("{} {}", dim(format!("   {line:>5} |")), text);
-        }
-    }
-}
-
-/// Memory at the current step in 32-byte words, the whole of it or one range.
-fn print_debugger_memory(state: &DebuggerState, offset: Option<u64>, length: Option<u64>) {
-    let Some(step) = state.current_step_data() else {
-        println!("{}", warning("No trace loaded."));
-        return;
-    };
-    let Some(memory) = step.snapshot_ref().memory else {
-        let captured = state.trace().is_some_and(|trace| trace.capabilities.memory);
-        if captured {
-            println!("{}", dim("Memory is empty at this step."));
-        } else {
-            println!("{}", warning("Memory was not captured by this backend."));
-        }
-        return;
-    };
-    let hex = memory.trim_start_matches("0x");
-    if hex.is_empty() {
-        println!("{}", dim("Memory is empty at this step."));
-        return;
-    }
-    if !hex.is_ascii() {
-        // Not hex at all; show it as the backend sent it rather than slicing into it.
-        println!("{} {}", info("Memory:"), hex);
-        return;
-    }
-    let total = hex.len() / 2;
-    let start = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
-    if start >= total {
-        println!(
-            "{} memory is {} bytes; offset {} is past the end",
-            warning("Nothing to show:"),
-            number_color(total),
-            number_color(start)
-        );
-        return;
-    }
-    let end = length
-        .and_then(|length| usize::try_from(length).ok())
-        .and_then(|length| start.checked_add(length))
-        .map_or(total, |end| end.min(total));
-    let range = if start > 0 || end < total {
-        format!(", showing bytes {start}..{end}")
-    } else {
-        String::new()
-    };
-    println!("{} {} bytes{}", info("Memory:"), number_color(total), range);
-    let bytes = hex.as_bytes();
-    let mut word_start = start;
-    while word_start < end {
-        let word_end = word_start.saturating_add(32).min(end);
-        let word = std::str::from_utf8(&bytes[word_start * 2..word_end * 2]).unwrap_or("");
-        println!("{} {word}", dim(format!("0x{word_start:04x}:")));
-        word_start = word_end;
-    }
-}
-
-/// Every slot whose value is known at the current step: what the transaction has read or
-/// written so far in this frame's storage, not only what the current opcode touched.
-fn print_debugger_storage(state: &DebuggerState) {
-    if state.current_step_data().is_none() {
-        println!("{}", warning("No trace loaded."));
-        return;
-    }
-    let captured = state
-        .trace()
-        .is_some_and(|trace| trace.capabilities.storage);
-    if !captured {
-        println!(
-            "{}",
-            warning("Storage was not captured by this backend; the debug-rpc node returned no per-step storage.")
-        );
-        return;
-    }
-    let known = state
-        .storage_words()
-        .map(|words| words.known())
-        .unwrap_or_default();
-    if known.is_empty() {
-        println!("{}", dim("Storage: no slots read or written yet."));
-        return;
-    }
-    match state.storage_address() {
-        Some(address) => println!("{} {}", info("Storage:"), dim(format!("of {address}"))),
-        None => println!("{}", info("Storage:")),
-    }
-    // The slots this step itself changed, so a stop at an `SSTORE` shows what moved.
-    let changed = state
-        .current_step_data()
-        .map(|step| step.snapshot_ref().storage_diff.clone())
-        .unwrap_or_default();
-    for (slot, value) in known {
-        let slot = soldb_debugger::short_hex(&slot);
-        let change = changed
-            .iter()
-            .find(|(candidate, _)| normalize_storage_slot(candidate) == slot)
-            .map(|(_, change)| {
-                dim(format!(
-                    "  (was {})",
-                    change.before.as_deref().unwrap_or("0x0")
-                ))
-            })
-            .unwrap_or_default();
-        println!(
-            "  {} = {}{}",
-            slot,
-            soldb_debugger::short_hex(&value),
-            change
-        );
-    }
-}
-
-/// A recorded slot as `print_debugger_storage` prints it: `0x`-prefixed, no leading
-/// zeros.
-fn normalize_storage_slot(slot: &str) -> String {
-    let digits = slot.trim_start_matches("0x").trim_start_matches('0');
-    if digits.is_empty() {
-        "0x0".to_owned()
-    } else {
-        format!("0x{}", digits.to_ascii_lowercase())
-    }
-}
-
-fn print_debugger_calldata(state: &DebuggerState) {
-    if state.trace().is_none() {
-        println!("{}", warning("No trace loaded."));
-        return;
-    }
-    match state.calldata() {
-        Some(calldata) => {
-            let bytes = calldata.trim_start_matches("0x").len() / 2;
-            println!("{} {} bytes", info("Calldata:"), number_color(bytes));
-            println!("{calldata}");
-        }
-        None => println!(
-            "{}",
-            warning("Calldata for this frame was not recorded by the backend; only the root frame's is known.")
-        ),
-    }
-}
-
-fn print_debugger_stack(state: &DebuggerState) {
-    let Some(step) = state.current_step_data() else {
-        println!("{}", warning("No trace loaded."));
-        return;
-    };
-    let stack = step.snapshot_ref().stack;
-    if stack.is_empty() {
-        println!("{}", dim("Stack: empty"));
-    } else {
-        println!("{} {}", info("Stack:"), format_stack(stack));
-    }
-}
-
-/// Prints the source variables ETHDebug reports as live at the current program counter.
-///
-/// With `filter` set, only the variable of that name is printed. This is the terminal
-/// counterpart of the DAP `variables` request; both go through
-/// `soldb_debugger::variables_for_step` so the two frontends decode identically. The
-/// variables come from the contract whose code the step executes, when that is known.
-fn print_debugger_variables(
-    state: &DebuggerState,
-    source_indexes: &[TraceSourceIndex],
-    chain: Option<&ChainReader>,
-    filter: Option<&str>,
-) {
-    let executing = state
-        .step_map()
-        .and_then(|map| map.executing_address(state.current_step));
-    let index = executing
-        .and_then(|address| {
-            source_indexes.iter().find(|index| {
-                index
-                    .spec
-                    .address
-                    .as_deref()
-                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(address))
-            })
-        })
-        .or_else(|| source_indexes.first());
-    let Some(index) = index else {
-        println!(
-            "{} no ETHDebug metadata is loaded; start the session with `--ethdebug-dir <address>:<contract>:<dir>`",
-            warning("Cannot read variables:")
-        );
-        return;
-    };
-    if state.trace().is_none() {
-        println!("{} no trace is loaded", warning("Cannot read variables:"));
-        return;
-    }
-    let Some(step) = state.current_step_data() else {
-        println!(
-            "{} step {} is outside the loaded trace",
-            warning("Cannot read variables:"),
-            state.current_step
-        );
-        return;
-    };
-
-    // Locals come from the state: the artifact's ETHDebug variable locations when it has
-    // any, otherwise a reading of the legacy stack layout, which is said once.
-    let variables = state.variables();
-    if let Ok(StepVariables {
-        origin: VariablesOrigin::Inferred,
-        ..
-    }) = &variables
-    {
-        report_once(
-            "inferred-locals".to_owned(),
-            soldb_debugger::INFERRED_LOCALS_WARNING,
-            soldb_debugger::INFERRED_LOCALS_NOTE,
-        );
-    }
-    let (variables, unavailable) = match variables {
-        Ok(step_variables) => (step_variables.variables, None),
-        Err(reason) => (Vec::new(), Some(reason)),
-    };
-    let words = state.storage_words_with_chain(chain.map(|chain| chain as &dyn ChainStorage));
-    let layout = state
-        .storage_layout()
-        .or(index.debug.storage_layout.as_ref());
-
-    let print_value = |ty: &str, name: &str, value: &soldb_debugger::DebugValue, place: String| {
-        let shown = match value.status {
-            soldb_debugger::DebugValueStatus::Unavailable => warning(&value.display),
-            _ => success(&value.display),
-        };
-        println!("{} {} = {} {}", info(ty), bold(name), shown, dim(place));
-    };
-    let print_variable = |variable: &soldb_debugger::DebugVariable| {
-        let place = if variable.value.status == soldb_debugger::DebugValueStatus::Unavailable {
-            String::new()
-        } else {
-            format!("[{}+{}]", variable.location.kind, variable.location.offset)
-        };
-        print_value(&variable.ty, &variable.name, &variable.value, place);
-    };
-    let chain_label = words.as_ref().and_then(StorageWords::chain_label);
-    let print_state = |variable: &soldb_debugger::StateVariable| {
-        let mut place = if variable.offset == 0 {
-            format!("[slot {}", variable.slot)
-        } else {
-            format!("[slot {} + {}", variable.slot, variable.offset)
-        };
-        // A value the transaction never touched came from the chain; say so, because it
-        // is the state before the transaction, not a step of it.
-        if variable.source == soldb_debugger::StateSource::Chain {
-            place.push_str(&format!(", from {}", chain_label.unwrap_or("the chain")));
-        }
-        place.push(']');
-        print_value(&variable.ty, &variable.name, &variable.value, place);
-    };
-
-    if let Some(name) = filter {
-        if let Some(variable) = variables.iter().find(|variable| variable.name == name) {
-            print_variable(variable);
-            return;
-        }
-        // A path through a local: `item.tags[1]`, `stored.owners[0xabc]`, `blob.length`.
-        match state.local_path(name) {
-            Some(Ok(variable)) => {
-                print_variable(&variable);
-                return;
-            }
-            Some(Err(reason)) => {
-                println!("{} {reason}", warning("Cannot read variable:"));
-                return;
-            }
-            None => {}
-        }
-        let (Some(layout), Some(words)) = (layout, words) else {
-            println!(
-                "{} `{name}` is not in scope at PC {}; state variables need a storage layout, compile with `--storage-layout`",
-                warning("No such variable:"),
-                number_color(step.pc)
-            );
-            return;
-        };
-        match soldb_debugger::state_value(layout, &words, name) {
-            Ok(variable) => print_state(&variable),
-            Err(error) => {
-                println!(
-                    "{} `{name}` is not in scope at PC {}; {error}",
-                    warning("No such variable:"),
-                    number_color(step.pc)
-                );
-                if let Some(reason) = &unavailable {
-                    println!(
-                        "{} locals are unavailable here: {reason}, so a local of that name cannot be looked up",
-                        dim("note:")
-                    );
-                }
-            }
-        }
-        return;
-    }
-
-    if variables.is_empty() {
-        // The difference matters: locals that cannot be read here at all is not the
-        // same as none being live at this program counter.
-        match &unavailable {
-            Some(reason) => println!(
-                "{} locals are unavailable here: {reason}",
-                dim("Variables:")
-            ),
-            None => println!(
-                "{} no variables in scope at PC {}",
-                dim("Variables:"),
-                number_color(step.pc)
-            ),
-        }
-    }
-    for variable in &variables {
-        print_variable(variable);
-    }
-    match (layout, words) {
-        // A contract can have a layout and no state variables at all, which is worth
-        // saying: an empty `State:` heading reads like something failed.
-        (Some(layout), _) if layout.variables.is_empty() => println!(
-            "{}",
-            dim("State: this contract declares no state variables")
-        ),
-        (Some(layout), Some(words)) => {
-            println!("{}", dim("State:"));
-            for variable in soldb_debugger::state_variables(layout, &words) {
-                print_state(&variable);
-            }
-        }
-        _ => println!(
-            "{}",
-            dim("State: no storage layout loaded; compile with `--storage-layout` to read state variables")
-        ),
-    }
-}
-
-fn print_debugger_help(topic: Option<&str>) {
-    match topic {
-        Some("mode") => println!("mode source|asm - switch display mode"),
-        Some("info") => {
-            println!("info resources [--json] - print loaded ETHDebug resources");
-            println!("info breakpoints - list breakpoints with their numbers");
-            println!("info storage - print the contract's storage at the current step");
-        }
-        Some("vars" | "locals" | "print") => {
-            println!("vars - print the variables live at the current PC, the frame's arguments at entry, and every state variable");
-            println!("print <variable> - print one variable by name");
-            println!("print <state>[<key>] | <state>[<i>] | <state>.<member> - read a mapping entry, an array element, or a struct member from storage");
-        }
-        Some("break" | "b" | "clear" | "delete") => {
-            println!("break <pc> - stop at a program counter");
-            println!(
-                "break <file>:<line> | break line <line> - stop when a source line is entered"
-            );
-            println!(
-                "break <function> | break <Contract>.<function> - stop when a function is entered"
-            );
-            println!("break storage <slot> - stop at an SSTORE to a slot");
-            println!("break revert - stop at a REVERT or a failing step");
-            println!("break call [<address>] - stop at a call, to one address or to any");
-            println!("break op <OPCODE> - stop at every execution of an opcode");
-            println!("break <target> if <condition> - stop there only when the condition holds,");
-            println!("    over state variables, the frame's arguments, and pc/gas/depth/op/step,");
-            println!("    compared with == != < <= > >= and joined with && or ||");
-            println!("clear <target> - remove the breakpoint set with that target");
-            println!("delete <n> - remove breakpoint number n");
-        }
-        Some("next" | "step" | "finish" | "continue" | "reverse") => {
-            println!("next (n) - run to the next source line, stepping over calls");
-            println!("step (s) - run to the next source line, entering calls");
-            println!("nexti (ni) - execute one EVM instruction");
-            println!("finish (fin) - run until the current frame returns");
-            println!("continue (c) - run to the next breakpoint or the end");
-            println!("Each has a reverse form: reverse-next (rn), reverse-step (rs), reverse-nexti (back),");
-            println!("reverse-finish (rfin), reverse-continue (rc). Without debug info next and step move one instruction.");
-        }
-        Some("backtrace" | "bt" | "list" | "memory" | "stack" | "storage" | "calldata") => {
-            println!("backtrace (bt) - the call frames at the current step, innermost first");
-            println!("list (l) - the source around the current step");
-            println!("stack - the EVM stack at the current step");
-            println!("memory [offset [length]] - memory at the current step, in 32-byte words");
-            println!("storage - the contract's storage at the current step");
-            println!("calldata - the calldata of the current frame");
-        }
-        Some(topic) => println!("No help for {topic}"),
-        None => {
-            println!(
-                "Stepping: next (n), step (s), nexti (ni), finish (fin), continue (c), goto <step>"
-            );
-            println!("Reverse:  reverse-next (rn), reverse-step (rs), reverse-nexti (back), reverse-finish (rfin), reverse-continue (rc)");
-            println!("Break:    break <pc>|<file>:<line>|line <line>|<function>|storage <slot>|revert|call [<address>]|op <OPCODE>");
-            println!("          break <target> if <condition>, e.g. break line 30 if counter > 4");
-            println!("          clear <target>, delete <n>, info breakpoints");
-            println!("Inspect:  backtrace (bt), list (l), vars, print <variable>|<state>[<key>], stack, memory [offset [length]], storage, calldata");
-            println!("Other:    info resources [--json], mode source|asm, help <command>, quit");
-        }
-    }
+fn json_error(error: serde_json::Error) -> soldb_core::SoldbError {
+    soldb_core::SoldbError::Message(error.to_string())
 }
 
 fn list_events_command(args: &ListEventsArgs) -> SoldbResult<()> {
@@ -3223,6 +2682,9 @@ fn decode_calldata_word(calldata: &str, index: usize, ty: &str) -> Option<Decode
     let data = calldata.trim_start_matches("0x");
     let start = 8 + index * 64;
     let word = data.get(start..start + 64)?;
+    if let Some(dynamic) = decode_dynamic_argument(data, word, ty) {
+        return Some(dynamic);
+    }
     decode_static_word(word, ty).map_or_else(
         || {
             Some(DecodedWord {
@@ -3232,6 +2694,62 @@ fn decode_calldata_word(calldata: &str, index: usize, ty: &str) -> Option<Decode
         },
         |value| Some(DecodedWord { value, raw: false }),
     )
+}
+
+/// A `string`, `bytes`, or dynamic array argument, whose head word is the offset of its
+/// data: the text, the bytes, or the element count.
+fn decode_dynamic_argument(data: &str, head: &str, ty: &str) -> Option<DecodedWord> {
+    let ty = ty.trim();
+    if ty != "string" && ty != "bytes" && !ty.ends_with("[]") {
+        return None;
+    }
+    let offset = usize::from_str_radix(head.trim_start_matches('0'), 16)
+        .ok()
+        .or_else(|| head.bytes().all(|byte| byte == b'0').then_some(0))?;
+    let length_start = 8 + offset * 2;
+    let length = usize::from_str_radix(
+        data.get(length_start..length_start + 64)?
+            .trim_start_matches('0'),
+        16,
+    )
+    .ok()
+    .or_else(|| {
+        data.get(length_start..length_start + 64)?
+            .bytes()
+            .all(|byte| byte == b'0')
+            .then_some(0)
+    })?;
+    if ty.ends_with("[]") {
+        return Some(DecodedWord {
+            value: format!("[{length} element(s)]"),
+            raw: false,
+        });
+    }
+    let hex = data.get(length_start + 64..length_start + 64 + length * 2)?;
+    let bytes = (0..length)
+        .map(|index| u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if ty == "string" {
+        if let Ok(text) = String::from_utf8(bytes.clone()) {
+            if text.chars().all(|character| !character.is_control()) {
+                return Some(DecodedWord {
+                    value: text,
+                    raw: false,
+                });
+            }
+        }
+    }
+    Some(DecodedWord {
+        value: format!(
+            "0x{}",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+        raw: false,
+    })
 }
 
 fn decode_static_word(word: &str, ty: &str) -> Option<String> {
@@ -3880,137 +3398,6 @@ fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::p
     .find(|path| path.exists())
 }
 
-fn trace_web_contracts(
-    args: &TraceView,
-    trace: &TransactionTrace,
-) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs = resolve_contract_specs_reporting(
-        &args.ethdebug_dir,
-        args.contracts.as_deref(),
-        &args.source_path,
-    );
-    web_contracts_for_specs(specs, trace, None)
-}
-
-fn simulate_web_contracts(
-    args: &SimulationView,
-    trace: &TransactionTrace,
-    contract_address: &str,
-) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let specs = resolve_contract_specs_reporting(
-        &args.ethdebug_dir,
-        args.contracts.as_deref(),
-        &args.source_path,
-    );
-    web_contracts_for_specs(specs, trace, Some(contract_address))
-}
-
-fn web_contracts_for_specs(
-    specs: Vec<ResolvedContractSpec>,
-    trace: &TransactionTrace,
-    fallback_address: Option<&str>,
-) -> BTreeMap<String, soldb_serializer::WebContractMetadata> {
-    let single_spec = specs.len() == 1;
-    specs
-        .into_iter()
-        .filter_map(|spec| {
-            let address = spec
-                .address
-                .clone()
-                .or_else(|| {
-                    single_spec
-                        .then(|| fallback_address.map(str::to_owned))
-                        .flatten()
-                })
-                .or_else(|| {
-                    single_spec
-                        .then(|| {
-                            trace
-                                .to_addr
-                                .clone()
-                                .or_else(|| trace.contract_address.clone())
-                        })
-                        .flatten()
-                })?;
-            let metadata = web_contract_metadata_for_spec(&spec)?;
-            let metadata = with_final_state(metadata, &spec, trace, &address);
-            Some((normalize_contract_address_key(&address), metadata))
-        })
-        .collect()
-}
-
-/// Adds the contract's storage layout and its state at the end of the transaction.
-///
-/// A client reading the document gets what the REPL shows: each variable's slot, its
-/// value, and whether that value came from the recording, from a chain, or from neither.
-fn with_final_state(
-    metadata: soldb_serializer::WebContractMetadata,
-    spec: &ResolvedContractSpec,
-    trace: &TransactionTrace,
-    address: &str,
-) -> soldb_serializer::WebContractMetadata {
-    let Some(index) = load_source_index(spec) else {
-        return metadata;
-    };
-    let Some(layout) = index.debug.storage_layout.as_ref() else {
-        return metadata;
-    };
-    let Some(last) = trace.steps.len().checked_sub(1) else {
-        return metadata;
-    };
-    let map = soldb_debugger::StepMap::new(trace, vec![index.debug.clone()]);
-    let tape = soldb_debugger::StorageTape::new(trace, &map);
-    // The account this contract's storage belongs to, rather than whichever frame the
-    // last step happened to be in.
-    let context = (0..trace.steps.len()).find(|step| {
-        map.storage_address(*step)
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(address))
-    });
-    let Some(context) = context.and_then(|step| map.storage_context_index(step)) else {
-        return metadata;
-    };
-    let words = tape.at(last, Some(context));
-    let variables = soldb_debugger::state_variables(layout, &words)
-        .into_iter()
-        .map(|variable| soldb_serializer::WebStateVariable {
-            name: variable.name,
-            ty: variable.ty,
-            slot: variable.slot,
-            offset: variable.offset,
-            value: variable.value.display,
-            source: match (variable.value.status, variable.source) {
-                (soldb_debugger::DebugValueStatus::Unavailable, _) => "unknown",
-                (_, soldb_debugger::StateSource::Chain) => "chain",
-                (_, soldb_debugger::StateSource::Trace) => "trace",
-            }
-            .to_owned(),
-        })
-        .collect();
-    metadata.with_state(layout.source.clone(), variables)
-}
-
-fn web_contract_metadata_for_spec(
-    spec: &ResolvedContractSpec,
-) -> Option<soldb_serializer::WebContractMetadata> {
-    let abi = abi_value_for_spec(spec);
-    let Some(index) = load_source_index(spec) else {
-        let metadata = soldb_serializer::WebContractMetadata {
-            abi,
-            ..Default::default()
-        };
-        return (!metadata.is_empty()).then_some(metadata);
-    };
-
-    // The loader already read every source it could find next to the artifacts; the
-    // projection falls back to the path for anything still missing.
-    let metadata = soldb_serializer::WebContractMetadata::from_ethdebug(
-        &index.debug.info,
-        &index.debug.source_contents,
-        abi,
-    );
-    (!metadata.is_empty()).then_some(metadata)
-}
-
 fn normalize_contract_address_key(address: &str) -> String {
     address.to_ascii_lowercase()
 }
@@ -4221,14 +3608,6 @@ fn simulation_source_file(args: &SimulationView, contract_name: &str) -> Option<
     })
 }
 
-fn simulate_json_function_name(args: &SimulationView, calldata: &str) -> String {
-    if let Some(signature) = &args.function_signature {
-        return signature.clone();
-    }
-
-    simulate_display_function_name(args, calldata)
-}
-
 fn simulate_display_function_name(args: &SimulationView, calldata: &str) -> String {
     if let Some(signature) = &args.function_signature {
         if let Some(parsed) = parse_signature(signature) {
@@ -4374,7 +3753,8 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use soldb_ethdebug::{EthdebugInfo, Instruction};
-    use soldb_repl::{BreakpointTarget, SourceBreakpointTarget};
+    use soldb_repl::{BreakpointTarget, SourceBreakpointTarget, StepOutcome};
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -4431,6 +3811,10 @@ mod tests {
             save_replay: None,
             from_addr: "0x1".to_owned(),
             interactive: false,
+            commands: Vec::new(),
+            batch: false,
+            tui: false,
+            save_trace: None,
             contract_address: "0x2".to_owned(),
             function_signature: None,
             function_args: Vec::new(),
@@ -4744,14 +4128,6 @@ contract Counter {
             "{outcome:?}"
         );
 
-        let web = web_contract_metadata_for_spec(&spec).expect("web metadata");
-        let expected_mapping = format!("{set_offset}:12:0");
-        assert_eq!(
-            web.pc_to_source_mappings.get(&2).map(String::as_str),
-            Some(expected_mapping.as_str())
-        );
-        assert_eq!(web.sources.get(&0).map(String::as_str), Some(source));
-
         fs::write(
             spec.debug_dir.join("ethdebug.json"),
             json!({
@@ -4783,71 +4159,6 @@ contract Counter {
         let preferred = TraceSourceIndex::load(&spec).expect("prefer ETHDebug");
         assert!(preferred.debug.info.instruction_at_pc(7).is_some());
         assert!(preferred.debug.info.instruction_at_pc(2).is_none());
-    }
-
-    #[test]
-    fn builds_web_contract_metadata_from_ethdebug_artifacts() {
-        let dir = temp_dir("web-contract-metadata");
-        let source = "contract Counter { function set(uint256 amount) public {} }";
-        fs::write(dir.join("Counter.sol"), source).expect("write source");
-        fs::write(
-            dir.join("ethdebug.json"),
-            json!({
-                "compilation": {
-                    "compiler": {"name": "solc", "version": "0.8.31+commit.test"},
-                    "sources": [{"id": 0, "path": "Counter.sol"}]
-                }
-            })
-            .to_string(),
-        )
-        .expect("write metadata");
-        fs::write(
-            dir.join("Counter_ethdebug-runtime.json"),
-            json!({
-                "contract": {"name": "Counter"},
-                "environment": "runtime",
-                "instructions": [
-                    {
-                        "offset": 10,
-                        "operation": {"mnemonic": "JUMPDEST"},
-                        "context": {
-                            "code": {
-                                "source": {"id": 0},
-                                "range": {"offset": 4, "length": 8}
-                            }
-                        }
-                    }
-                ]
-            })
-            .to_string(),
-        )
-        .expect("write runtime");
-        fs::write(
-            dir.join("Counter.abi"),
-            r#"[{"type":"function","name":"set","inputs":[{"name":"amount","type":"uint256"}]}]"#,
-        )
-        .expect("write abi");
-
-        let spec = ResolvedContractSpec {
-            address: None,
-            name: "Counter".to_owned(),
-            debug_dir: dir,
-            source_paths: Vec::new(),
-        };
-        let trace = transaction_trace("0x".to_owned(), Vec::new());
-        let contracts = web_contracts_for_specs(vec![spec], &trace, None);
-        let metadata = contracts.get("0x2").expect("contract metadata");
-        assert_eq!(
-            metadata.pc_to_source_mappings.get(&10).map(String::as_str),
-            Some("4:8:0")
-        );
-        assert_eq!(metadata.sources.get(&0).map(String::as_str), Some(source));
-        assert_eq!(
-            metadata.source_paths.get(&0).map(String::as_str),
-            Some("Counter.sol")
-        );
-        assert!(metadata.debug_available);
-        assert_eq!(metadata.abi.as_ref().expect("abi")[0]["name"], "set");
     }
 
     #[test]
@@ -4910,11 +4221,9 @@ contract Counter {
         let descriptor = abi_descriptor_for_calldata(&legacy, &raw).expect("combined descriptor");
         assert_eq!(descriptor.name, "set");
         assert_eq!(descriptor.params[0].name, "value");
-        assert!(descriptor.params[0].raw);
-        assert_eq!(
-            descriptor.params[0].value,
-            "0x0000000000000000000000000000000000000000000000000000000000000020"
-        );
+        // A dynamic argument is read from where its head word points, not shown as it.
+        assert!(!descriptor.params[0].raw);
+        assert_eq!(descriptor.params[0].value, "hi");
     }
 
     #[test]
@@ -5022,10 +4331,6 @@ contract Counter {
         let calldata = simulate_calldata(&view_of(&args)).expect("encoded calldata");
         assert!(calldata.starts_with("0x7cf5dab0"));
         assert_eq!(
-            simulate_json_function_name(&view_of(&args), &calldata),
-            "increment(uint256)"
-        );
-        assert_eq!(
             simulate_display_function_name(&view_of(&args), &calldata),
             "increment"
         );
@@ -5122,6 +4427,11 @@ contract Counter {
             source_path: Vec::new(),
             contracts: None,
             max_steps: 1,
+            interactive: false,
+            json: false,
+            raw: false,
+            session: SessionOptions::default(),
+            save_trace: None,
         };
         let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
         print_plain_trace_summary(&trace);

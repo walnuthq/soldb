@@ -12,6 +12,8 @@
 # REPLAY: Replayed from {{.*}}; no node involved
 # REPLAY: Status: SUCCESS
 
-# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --backend replay --rpc %{rpc_url} --json | jq -S '.steps' > %t.live.json
-# RUN: %soldb replay %t.json --json | jq -S '.steps' > %t.offline.json
-# RUN: diff %t.live.json %t.offline.json
+# RUN: %soldb simulate %{contract_address} "increment(uint256)" 4 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --backend replay --rpc %{rpc_url} --save-trace %t.live.trace > /dev/null
+# RUN: %soldb replay %t.json --save-trace %t.offline.trace > /dev/null
+# RUN: jq -S '.steps' %t.live.trace > %t.live.steps
+# RUN: jq -S '.steps' %t.offline.trace > %t.offline.steps
+# RUN: diff %t.live.steps %t.offline.steps

@@ -12,8 +12,8 @@
 //! The `replay` module, behind the cargo feature of the same name (on by default), is the
 //! REVM engine: it re-executes a transaction or a call over state supplied through a
 //! [`ReplayStateProvider`], and runs bytecode on a [`LocalChain`] with no node at all. It
-//! is the only part of the crate that links REVM, so a build without it, such as the lean
-//! WebAssembly package, keeps only the data shapes and the trace assembly.
+//! is the only part of the crate that links REVM, so a build without it keeps only the
+//! data shapes and the trace assembly, for a host that does its own execution.
 //!
 //! `soldb-rpc` builds on this crate with the JSON-RPC transport, the networked `debug-rpc`
 //! backend, and the state provider that reads a node lazily.
@@ -51,8 +51,8 @@ pub use ruint::aliases::U256;
 /// Whether the REVM replay engine was compiled into this build.
 ///
 /// The engine sits behind the `replay` cargo feature (on by default) because it is the
-/// only part of the crate that links REVM. A build without it, such as the lean
-/// WebAssembly package, keeps the node data shapes and the trace assembly.
+/// only part of the crate that links REVM. A build without it keeps the node data shapes
+/// and the trace assembly.
 #[must_use]
 pub fn replay_available() -> bool {
     cfg!(feature = "replay")
@@ -522,8 +522,8 @@ pub fn build_transaction_trace(
 /// `eth_getTransactionByHash`, `eth_getTransactionReceipt`, and `debug_traceTransaction`.
 ///
 /// This is the whole of the `debug-rpc` backend once the three requests have been
-/// answered, so a host that fetches them itself, such as a WebAssembly client, produces
-/// the identical trace to `soldb-rpc`'s `trace_transaction_with_client`.
+/// answered, so a host that fetches them itself produces the identical trace to
+/// `soldb-rpc`'s `trace_transaction_with_client`.
 pub fn debug_rpc_transaction_trace(
     tx: RpcTransaction,
     receipt: RpcReceipt,

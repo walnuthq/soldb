@@ -21,7 +21,7 @@ runner infrastructure.
 - `soldb-ethdebug`: ETHDebug and legacy source-map parsing.
 - `soldb-evm`: node data shapes, trace assembly, and the REVM replay engine.
 - `soldb-rpc`: Ethereum JSON-RPC tracing and simulation.
-- `soldb-serializer`: JSON/web trace serialization.
+- `soldb-serializer`: JSON/web trace serialization (since removed with the web client).
 - `soldb-repl`: debugger state machine and interactive command loop.
 - `soldb-bridge`: Stylus bridge protocol, client, and server.
 - `soldb-dap`: Debug Adapter Protocol server.

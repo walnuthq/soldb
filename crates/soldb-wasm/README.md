@@ -3,9 +3,9 @@
 WebAssembly bindings for [SolDB](https://github.com/walnuthq/soldb), the ETHDebug-first
 Solidity debugger. The module builds transaction traces from a node's JSON-RPC responses,
 holds them in memory, steps through them at source level with the contract's ETHDebug
-artifacts, and renders the same versioned web JSON document as `soldb trace --json`,
-including its per-contract source metadata. The replay-capable build also re-executes a
-transaction in REVM from state the host fetches, for nodes without
+artifacts, and reads them incrementally: a header with `summary()`, one step at a time
+with `step(i)`, or the whole trace as JSON with `toJson()`. The replay-capable build also
+re-executes a transaction in REVM from state the host fetches, for nodes without
 `debug_traceTransaction`.
 
 The host does the I/O: fetch the JSON-RPC responses yourself, read the ETHDebug
@@ -19,8 +19,10 @@ await init();
 const trace = Trace.fromTransaction(debugTraceResult, transaction, receipt);
 const counter = { name: "Counter", metadata: resources, program: runtimeProgram, sources, abi };
 trace.attachEthdebug(JSON.stringify(counter));
-const step = JSON.parse(trace.step(0));
-const document = JSON.parse(trace.toWebJson(JSON.stringify({ [address]: counter })));
+const header = JSON.parse(trace.summary());
+for (let i = 0; i < trace.stepCount(); i += 1) {
+  const step = JSON.parse(trace.step(i)); // pc, op, gas, source span, variables
+}
 trace.free();
 ```
 

@@ -16,8 +16,8 @@ doctest = false
 [features]
 default = ["replay"]
 # The REVM replay engine. It is the only part of the crate that links REVM, so a build
-# without it, such as the lean WebAssembly package, keeps the node data shapes and the
-# trace assembly at a fraction of the size.
+# without it keeps the node data shapes and the trace assembly at a fraction of the size,
+# which is what an embedded host that does its own execution links.
 replay = ["dep:revm", "dep:getrandom"]
 
 [dependencies]

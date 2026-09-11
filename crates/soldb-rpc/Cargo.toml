@@ -16,9 +16,8 @@ doctest = false
 [features]
 default = ["replay"]
 # The REVM replay backend: the engine in `soldb-evm` plus the node side here that fetches
-# a transaction's inputs and reads parent-block state over RPC. Off, a build such as the
-# WebAssembly package keeps the JSON-RPC transport and the `debug-rpc` backend without
-# linking REVM.
+# a transaction's inputs and reads parent-block state over RPC. Off, a build keeps the
+# JSON-RPC transport and the `debug-rpc` backend without linking REVM.
 replay = ["soldb-evm/replay"]
 
 [dependencies]

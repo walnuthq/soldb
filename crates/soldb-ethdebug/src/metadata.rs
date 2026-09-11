@@ -193,8 +193,8 @@ impl EthdebugInfo {
     /// `ethdebug_resources.json` from modern ones) and `program` is the contract's
     /// program artifact (`<Contract>_ethdebug.json` for creation code,
     /// `<Contract>_ethdebug-runtime.json` for runtime code). Nothing is read from disk
-    /// here, so the CLI, the DAP server, and a WebAssembly host that receives the
-    /// artifacts as strings all build the same value through this one path.
+    /// here, so the CLI, the DAP server, and any host that receives the artifacts as
+    /// strings all build the same value through this one path.
     ///
     /// A program without an `instructions` array yields no instructions rather than an
     /// error; callers that need to know report it as a debug-info gap.

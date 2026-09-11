@@ -5,7 +5,8 @@
 # RUN: %soldb run 0x6000405060005460010160005500 --runtime --storage 0x0=0x29 --raw --max-steps 12 2>&1 | FileCheck %s
 # Without a function signature or data the call carries empty calldata, and the raw
 # view lists every instruction of the tiny program.
-# RUN: %soldb run 0x6000405060005460010160005500 --runtime --json | jq -e '.status == "success" and (.steps | length) == 10 and (.steps[8].snapshot.storage["0x0"] == "0x1")'
+# RUN: %soldb run 0x6000405060005460010160005500 --runtime --save-trace %t.trace > /dev/null
+# RUN: jq -e '.success == true and (.steps | length) == 10 and (.steps[8].snapshot.storage["0x0"] == "0x1")' %t.trace
 
 # CHECK: Installed runtime code at 0x5fbdb2315678afecb367f032d93f642f64180aa3
 # CHECK: SLOAD

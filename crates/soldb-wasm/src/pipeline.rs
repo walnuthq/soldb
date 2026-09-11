@@ -1,10 +1,9 @@
 //! The in-memory trace handle behind the WebAssembly exports.
 //!
 //! Every export takes the node's or the compiler's output as a string and returns a
-//! string, but the trace itself is parsed once and then read in place: stepping,
-//! summaries, and the web document borrow it, so a large trace is never serialized and
-//! parsed again on the way to a result. Serialization happens exactly once per output
-//! the host asks for. That matters because a mainnet transaction is easily hundreds of
+//! string, but the trace itself is parsed once and then read in place: stepping and
+//! summaries borrow it, so a large trace is never serialized and parsed again on the way
+//! to a result. Serialization happens exactly once per output the host asks for. That matters because a mainnet transaction is easily hundreds of
 //! thousands of steps, each carrying a stack and all of memory.
 //!
 //! Nothing here depends on a `wasm-bindgen` type, so the same code runs natively under
@@ -13,8 +12,8 @@
 //!
 //! A WebAssembly host has neither network nor filesystem, and the node is the execution
 //! oracle, so the host fetches the JSON-RPC responses and the ETHDebug artifacts itself
-//! and hands them over. What comes out is the same [`TransactionTrace`] and the same
-//! web document the CLI produces from the same inputs.
+//! and hands them over. What comes out is the same [`TransactionTrace`] the CLI produces
+//! from the same inputs.
 
 use std::collections::BTreeMap;
 
@@ -25,13 +24,11 @@ use soldb_core::{SoldbError, SoldbResult, TraceCapabilities, TransactionTrace};
 use soldb_debugger::DebugSession;
 use soldb_ethdebug::{read_compilation_source, EthdebugInfo};
 use soldb_evm::{DebugTraceResult, RpcReceipt, RpcTransaction, SimulateCallRequest};
-use soldb_serializer::WebContractMetadata;
 
 /// One contract's compiler output, as the host supplies it.
 ///
-/// This is the JSON shape behind every export that takes debug info: one object attaches
-/// to a [`Trace`], and a map from contract address to one of these fills the `contracts`
-/// section of the web document.
+/// This is the JSON shape behind every export that takes debug info, attached to a
+/// [`Trace`] so its steps carry source spans and variables.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ContractArtifacts {
     /// The contract name, as in `<name>_ethdebug-runtime.json`.
@@ -91,7 +88,6 @@ pub struct DebugInfoSummary {
 struct LoadedArtifacts {
     info: EthdebugInfo,
     sources: BTreeMap<u64, String>,
-    abi: Option<Value>,
 }
 
 /// A trace held in memory, with debug info attached on request.
@@ -120,7 +116,7 @@ fn load_artifacts(artifacts: ContractArtifacts) -> SoldbResult<LoadedArtifacts> 
         metadata,
         program,
         mut sources,
-        abi,
+        abi: _,
     } = artifacts;
     let info = EthdebugInfo::from_artifacts(&name, "runtime", &metadata, &program)?;
     for source_id in info.sources.keys() {
@@ -131,34 +127,7 @@ fn load_artifacts(artifacts: ContractArtifacts) -> SoldbResult<LoadedArtifacts> 
             sources.insert(*source_id, contents);
         }
     }
-    Ok(LoadedArtifacts { info, sources, abi })
-}
-
-/// Builds the `contracts` section from a map of contract address to
-/// [`ContractArtifacts`].
-///
-/// Addresses are lowercased so a lookup does not depend on checksum casing, and an entry
-/// with nothing to report is left out, both as the CLI does for `--ethdebug-dir`.
-fn web_contracts(
-    contracts_json: Option<&str>,
-) -> SoldbResult<BTreeMap<String, WebContractMetadata>> {
-    let Some(contracts_json) = contracts_json.filter(|json| !json.trim().is_empty()) else {
-        return Ok(BTreeMap::new());
-    };
-    let contracts = parse_json::<BTreeMap<String, ContractArtifacts>>("contracts", contracts_json)?;
-
-    let mut web_contracts = BTreeMap::new();
-    for (address, artifacts) in contracts {
-        let loaded = load_artifacts(artifacts)
-            .map_err(|error| SoldbError::Message(format!("contract `{address}`: {error}")))?;
-        let metadata =
-            WebContractMetadata::from_ethdebug(&loaded.info, &loaded.sources, loaded.abi);
-        if metadata.is_empty() {
-            continue;
-        }
-        web_contracts.insert(address.to_ascii_lowercase(), metadata);
-    }
-    Ok(web_contracts)
+    Ok(LoadedArtifacts { info, sources })
 }
 
 impl Trace {
@@ -281,31 +250,6 @@ impl Trace {
     /// native CLI reads and writes as a trace file.
     pub fn to_json(&self) -> SoldbResult<String> {
         to_json(&self.session.trace)
-    }
-
-    /// Renders the versioned web document specified in `docs/json.md`.
-    ///
-    /// `contracts_json` maps contract address to [`ContractArtifacts`] and fills the
-    /// document's `contracts` section the way `--ethdebug-dir` does for the CLI; `None`
-    /// or an empty string leaves it empty.
-    pub fn to_web_json(&self, contracts_json: Option<&str>) -> SoldbResult<String> {
-        let contracts = web_contracts(contracts_json)?;
-        soldb_serializer::trace_to_web_json_with_contracts(&self.session.trace, contracts)
-    }
-
-    /// Renders the simulation form of the web document, as `soldb simulate --json` does.
-    /// `contracts_json` is as for [`Trace::to_web_json`].
-    pub fn to_simulation_web_json(
-        &self,
-        function_name: &str,
-        contracts_json: Option<&str>,
-    ) -> SoldbResult<String> {
-        let contracts = web_contracts(contracts_json)?;
-        soldb_serializer::simulate_to_web_json_with_contracts(
-            &self.session.trace,
-            function_name,
-            contracts,
-        )
     }
 
     /// The underlying session, for callers that want the typed model.
@@ -578,8 +522,8 @@ mod tests {
             serde_json::from_str(&trace.to_json().expect("json")).expect("trace file");
         assert_eq!(&parsed, &trace.session().trace);
 
-        // The pretty-printed file the native CLI writes loads the same way.
-        let pretty = soldb_serializer::trace_to_json(&trace.session().trace).expect("pretty");
+        // The pretty-printed file the native CLI writes (`--save-trace`) loads the same way.
+        let pretty = serde_json::to_string_pretty(&trace.session().trace).expect("pretty");
         assert_eq!(Trace::from_json(&pretty).expect("from pretty"), trace);
     }
 
@@ -836,151 +780,6 @@ mod tests {
 
         let parsed: TraceSummary = serde_json::from_str(&json).expect("summary round trip");
         assert_eq!(parsed, trace.summary());
-    }
-
-    #[test]
-    fn web_document_without_contracts_matches_the_serializer() {
-        let trace = trace();
-        let json = trace.to_web_json(None).expect("web JSON");
-
-        let expected = soldb_serializer::trace_to_web_json_with_contracts(
-            &trace.session().trace,
-            BTreeMap::new(),
-        )
-        .expect("serializer");
-        assert_eq!(json, expected);
-
-        let value = document(&json);
-        assert_eq!(
-            value["schemaVersion"],
-            soldb_serializer::WEB_JSON_SCHEMA_VERSION
-        );
-        assert_eq!(value["status"], "success");
-        assert_eq!(value["backend"], "debug-rpc");
-        assert_eq!(value["steps"].as_array().map(Vec::len), Some(3));
-        assert_eq!(value["contracts"], json!({}));
-    }
-
-    #[test]
-    fn web_document_treats_blank_contracts_as_none() {
-        let trace = trace();
-        let expected = trace.to_web_json(None).expect("web JSON");
-        assert_eq!(trace.to_web_json(Some("")).expect("empty"), expected);
-        assert_eq!(trace.to_web_json(Some("   \n")).expect("blank"), expected);
-    }
-
-    #[test]
-    fn web_document_fills_the_contracts_section_from_artifacts() {
-        let trace = trace();
-        let contracts = json!({
-            "0xABCDEF": artifacts(false, Some(json!({"0": SOURCE}))),
-            "0x2": artifacts(true, None)
-        })
-        .to_string();
-
-        let value = document(&trace.to_web_json(Some(&contracts)).expect("web JSON"));
-        let statement = SOURCE.find("count += 1").expect("offset");
-
-        // Keys are lowercased, exactly as the CLI keys `--ethdebug-dir` addresses.
-        let contract = &value["contracts"]["0xabcdef"];
-        assert_eq!(
-            contract["pcToSourceMappings"],
-            json!({"0": format!("0:{}:0", SOURCE.len()), "2": format!("{statement}:10:0")})
-        );
-        assert_eq!(contract["sourcePaths"], json!({"0": "Counter.sol"}));
-        assert_eq!(contract["sources"]["0"], SOURCE);
-        assert_eq!(contract["debugAvailable"], true);
-        assert_eq!(contract["abi"][0]["name"], "increment");
-
-        // Sources embedded in the metadata serve a contract the host gave no sources for.
-        assert_eq!(value["contracts"]["0x2"]["sources"]["0"], SOURCE);
-        assert_eq!(value["contracts"].as_object().map(|map| map.len()), Some(2));
-    }
-
-    #[test]
-    fn web_document_contracts_match_the_serializer_projection() {
-        let mut trace = trace();
-        trace.attach_ethdebug(&counter_artifacts()).expect("attach");
-        let contracts = json!({"0x2": artifacts(false, Some(json!({"0": SOURCE})))}).to_string();
-
-        let session = trace.session();
-        let expected = soldb_serializer::WebContractMetadata::from_ethdebug(
-            session.ethdebug.as_ref().expect("info"),
-            &session.source_contents,
-            Some(json!([{"type": "function", "name": "increment", "inputs": [], "outputs": []}])),
-        );
-        let value = document(&trace.to_web_json(Some(&contracts)).expect("web JSON"));
-
-        assert_eq!(
-            value["contracts"]["0x2"],
-            serde_json::to_value(&expected).expect("metadata value")
-        );
-    }
-
-    #[test]
-    fn web_document_leaves_out_contracts_with_nothing_to_report() {
-        let trace = trace();
-        let contracts = json!({
-            "0x1": {"name": "Bare", "metadata": {}, "program": {}},
-            "0x2": {"name": "AbiOnly", "metadata": {}, "program": {}, "abi": []}
-        })
-        .to_string();
-
-        let value = document(&trace.to_web_json(Some(&contracts)).expect("web JSON"));
-
-        assert_eq!(value["contracts"].as_object().map(|map| map.len()), Some(1));
-        assert_eq!(value["contracts"]["0x2"]["debugAvailable"], false);
-        assert_eq!(value["contracts"]["0x2"]["abi"], json!([]));
-    }
-
-    #[test]
-    fn web_document_names_malformed_contracts() {
-        let trace = trace();
-
-        let error = trace.to_web_json(Some("[1]")).expect_err("not a map");
-        assert!(
-            error.to_string().contains("invalid contracts JSON"),
-            "{error}"
-        );
-
-        let broken = json!({"0x1": {"name": "Broken", "metadata": {}, "program": {"instructions": [{"operation": {}}]}}});
-        let error = trace
-            .to_web_json(Some(&broken.to_string()))
-            .expect_err("malformed program inside contracts");
-        assert!(error.to_string().starts_with("contract `0x1`:"), "{error}");
-        assert!(error.to_string().contains("`instructions`"), "{error}");
-    }
-
-    #[test]
-    fn simulation_web_document_carries_the_function_name_and_contracts() {
-        let trace = trace();
-        let contracts = json!({"0x2": artifacts(true, None)}).to_string();
-
-        let value = document(
-            &trace
-                .to_simulation_web_json("increment", Some(&contracts))
-                .expect("web JSON"),
-        );
-        assert_eq!(
-            value["schemaVersion"],
-            soldb_serializer::WEB_JSON_SCHEMA_VERSION
-        );
-        assert_eq!(value["status"], "success");
-        assert_eq!(value["function_name"], "increment");
-        assert_eq!(value["contracts"]["0x2"]["debugAvailable"], true);
-
-        let expected = soldb_serializer::simulate_to_web_json_with_contracts(
-            &trace.session().trace,
-            "increment",
-            BTreeMap::new(),
-        )
-        .expect("serializer");
-        assert_eq!(
-            trace
-                .to_simulation_web_json("increment", None)
-                .expect("web JSON"),
-            expected
-        );
     }
 
     #[test]

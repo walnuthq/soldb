@@ -339,35 +339,6 @@ fn attaches_debug_info_and_keeps_the_trace() {
 }
 
 #[wasm_bindgen_test]
-fn renders_the_web_documents() {
-    let trace = canned_trace();
-
-    let document = parse(&trace.to_web_json(None).expect("web JSON"));
-    assert_eq!(document["status"], "success");
-    assert_eq!(document["steps"].as_array().map(Vec::len), Some(3));
-    assert_eq!(document["contracts"], json!({}));
-
-    let contracts = json!({"0xAbC": artifacts()}).to_string();
-    let document = parse(
-        &trace
-            .to_web_json(Some(contracts.clone()))
-            .expect("web JSON"),
-    );
-    let contract = &document["contracts"]["0xabc"];
-    assert_eq!(contract["debugAvailable"], true);
-    assert_eq!(contract["sources"]["0"], SOURCE);
-    assert_eq!(contract["abi"][0]["name"], "increment");
-
-    let document = parse(
-        &trace
-            .to_simulation_web_json("increment", Some(contracts))
-            .expect("web JSON"),
-    );
-    assert_eq!(document["function_name"], "increment");
-    assert_eq!(document["contracts"]["0xabc"]["debugAvailable"], true);
-}
-
-#[wasm_bindgen_test]
 fn round_trips_trace_json_and_builds_simulations() {
     let trace = canned_trace();
     let reloaded = Trace::from_json(&trace.to_json().expect("json")).expect("reloaded");
@@ -394,5 +365,4 @@ fn surfaces_errors_as_exceptions() {
     assert!(Trace::from_json("not a trace").is_err());
     let mut trace = canned_trace();
     assert!(trace.attach_ethdebug("not artifacts").is_err());
-    assert!(trace.to_web_json(Some("[1]".to_owned())).is_err());
 }

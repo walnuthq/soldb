@@ -4,10 +4,10 @@
 # RUN: printf 'nexti\nnexti\nback\nreverse-continue\nquit\n' | %soldb run %{ethdebug_dir}/TestContract.bin "increment(uint256)" 4 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:TestContract:%{ethdebug_dir} -i 2>&1 | FileCheck %s
 
 # CHECK: Deployed locally at
-# CHECK: Step 0/
-# CHECK: Step 1/
-# CHECK: Step 2/
-# CHECK: Step 1/
+# CHECK: step 0/
+# CHECK: step 1/
+# CHECK: step 2/
+# CHECK: step 1/
 # CHECK: Start of trace at step 0
 
 # With debug info the run steps by source line like a trace does.

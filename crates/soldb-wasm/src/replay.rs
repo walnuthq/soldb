@@ -469,10 +469,9 @@ mod tests {
         assert_eq!(sstore["op"], "SSTORE");
         assert_eq!(sstore["snapshot"]["storage"]["0x0"], "0x2a");
 
-        let document: Value =
-            serde_json::from_str(&trace.to_web_json(None).expect("web JSON")).expect("document");
-        assert_eq!(document["backend"], "replay");
-        assert_eq!(document["steps"].as_array().map(Vec::len), Some(10));
+        let saved: Value = serde_json::from_str(&trace.to_json().expect("json")).expect("trace");
+        assert_eq!(saved["backend"], "replay");
+        assert_eq!(saved["steps"].as_array().map(Vec::len), Some(10));
     }
 
     #[test]
@@ -694,14 +693,9 @@ mod tests {
             serde_json::from_str(&trace.step_json(8).expect("step").expect("in range"))
                 .expect("step");
         assert_eq!(sstore["snapshot"]["storage"]["0x0"], "0x2a");
-        let document: Value = serde_json::from_str(
-            &trace
-                .to_simulation_web_json("increment", None)
-                .expect("doc"),
-        )
-        .expect("document");
-        assert_eq!(document["backend"], "replay");
-        assert_eq!(document["function_name"], "increment");
+        let saved: Value = serde_json::from_str(&trace.to_json().expect("json")).expect("trace");
+        assert_eq!(saved["backend"], "replay");
+        assert_eq!(saved["to_addr"], COUNTER);
     }
 
     #[test]

@@ -11,9 +11,9 @@
 //! Execution is split from I/O. [`ReplayInputs`] holds what the node has to say about
 //! the transaction and its block, and [`replay_debug_trace_with_state`] runs REVM over
 //! any [`ReplayStateProvider`]. The native backend in `soldb-rpc` fetches the inputs and
-//! reads state lazily over RPC; a WebAssembly host, which cannot block on the network,
-//! supplies state up front through [`PrefetchedReplayState`] and repeats the run until
-//! nothing is missing; `soldb run` describes a [`LocalChain`] and needs no node at all.
+//! reads state lazily over RPC; a host that cannot block on the network supplies state up
+//! front through [`PrefetchedReplayState`] and repeats the run until nothing is missing;
+//! `soldb run` describes a [`LocalChain`] and needs no node at all.
 //!
 //! Execution itself has two phases. [`replay_prefix_with_state`] runs the transactions
 //! before the target and returns the state they leave behind as a [`ReplayPrefix`];
@@ -242,8 +242,8 @@ pub fn replay_simulation_trace(
 /// mined in with every transaction in full, and the chain id.
 ///
 /// Gathering these first is what lets [`replay_debug_trace_with_state`] run without a
-/// client. The native backend fills them over RPC; a WebAssembly host fetches the same
-/// three responses itself and builds them with [`ReplayInputs::new`].
+/// client. The native backend fills them over RPC; a host that does its own I/O fetches
+/// the same three responses itself and builds them with [`ReplayInputs::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayInputs {
     transaction: RpcTransaction,
@@ -1340,8 +1340,8 @@ fn describe_request(request: &StateRequest) -> String {
 
 /// Parent-block state supplied up front, recording every read it cannot answer.
 ///
-/// REVM reads state synchronously and a WebAssembly host cannot block on the network, so
-/// replay there runs in rounds. A run reads what is known; anything missing is answered
+/// REVM reads state synchronously and a host may be unable to block on the network, so
+/// replay can run in rounds. A run reads what is known; anything missing is answered
 /// with an empty account, a zero slot, or a zero hash and recorded. The host fetches the
 /// recorded keys at the parent block, supplies them, and runs again. A default can send an
 /// early round down a path the real values would not take, but every value a round that

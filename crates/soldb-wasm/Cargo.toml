@@ -2,7 +2,7 @@
 name = "soldb-wasm"
 version.workspace = true
 edition.workspace = true
-description = "WebAssembly bindings for SolDB: build traces, run debug sessions, and emit the web JSON document in a browser or Node.js host"
+description = "WebAssembly bindings for SolDB: build traces and run host-driven debug sessions in a browser or Node.js host"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -35,7 +35,6 @@ soldb-ethdebug.workspace = true
 # features off; without `replay` the package links no REVM, only the node data shapes and
 # trace assembly.
 soldb-evm.workspace = true
-soldb-serializer.workspace = true
 wasm-bindgen = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

@@ -21,7 +21,6 @@ spawn `solc`, listen on sockets, and read the filesystem, none of which a
 | `soldb-debugger` | yes | source spans, functions, variables per step |
 | `soldb-profiler` | yes | gas attribution and folded stacks |
 | `soldb-repl` | yes | breakpoint and stepping state machine |
-| `soldb-serializer` | yes | the web JSON document and its per-contract metadata |
 | `soldb-evm` | yes | node data shapes and trace assembly in both packages; the REVM engine, behind the `replay` feature, only in the replay-capable one |
 | `soldb-wasm` | yes | the bindings described below |
 | `soldb-rpc` | no | the JSON-RPC transport; the bindings take the engine directly |
@@ -82,8 +81,7 @@ CI runs the same targets in the `wasm` job of `.github/workflows/ci.yml`.
 
 Inputs and outputs cross the boundary as JSON strings, so the documents are the ones
 this repository already specifies, but the trace itself stays in WebAssembly memory
-between calls: it is parsed once, and stepping, summaries, and the web document all read
-it in place. Serialization happens exactly once per output the host asks for. Failures
+between calls: it is parsed once, and stepping and summaries read it in place. Serialization happens exactly once per output the host asks for. Failures
 throw a JavaScript `Error` whose message is the debugger's own error text.
 
 | member | purpose |
@@ -96,9 +94,7 @@ throw a JavaScript `Error` whose message is the debugger's own error text.
 | `trace.stepCount()` | number of opcode steps |
 | `trace.step(index)` | one step as JSON, or `undefined` past the end |
 | `trace.summary()` | header as JSON: hash, parties, gas, status, backend, capabilities, step count, attached debug info |
-| `trace.toJson()` | the trace as JSON, the input `fromJson` accepts |
-| `trace.toWebJson(contracts?)` | the versioned document from [json.md](json.md) for a transaction |
-| `trace.toSimulationWebJson(functionName, contracts?)` | the versioned document for a simulation |
+| `trace.toJson()` | the trace as JSON, the input `fromJson` accepts and the native CLI's `--save-trace` writes |
 | `trace.free()` | release the trace; it lives outside the JavaScript heap |
 | `Replay.prepare(transaction, receipt, block, chainId)` | replay-capable package only; see below |
 | `Replay.prepareCall(from, to, calldata, value, block, chainId, txIndex?)` | a call on a fork of the chain at `block`; see below |
@@ -116,8 +112,8 @@ empty by design. That dependence on the compiler is the same in the native tool.
 
 ### Contract artifacts
 
-Debug info reaches the module as one JSON object per contract, the same shape whether it
-attaches to a trace or fills the web document:
+Debug info reaches the module as one JSON object per contract, attached to a trace so
+its steps carry source spans and variables:
 
 ```json
 {
@@ -131,17 +127,7 @@ attaches to a trace or fills the web document:
 
 `name`, `metadata`, and `program` are required. `sources` maps ETHDebug source ids to
 file contents; any id it leaves out falls back to the source the compilation metadata
-embeds, when the compiler inlined it. `abi` is copied into the web document when
-present.
-
-`toWebJson` and `toSimulationWebJson` take a map from contract address to one of these
-as their optional `contracts` argument and fill the document's `contracts` section
-exactly as `--ethdebug-dir` does for the CLI: `pcToSourceMappings`, `sourcePaths`,
-`sources`, `debugAvailable`, and `abi` per contract, keyed by the lowercased address. A
-source without contents falls back to its path, and a contract with nothing to report is
-left out, both as on the command line. Omit the argument to leave the section empty. The
-projection itself is `WebContractMetadata::from_ethdebug` in `soldb-serializer`, the
-single implementation the CLI and the module share.
+embeds, when the compiler inlined it. `abi` is accepted but not required for stepping.
 
 ### Example
 
@@ -189,9 +175,7 @@ for (let index = 0; index < trace.stepCount(); index += 1) {
   }
 }
 
-const document = JSON.parse(
-  trace.toWebJson(JSON.stringify({ [COUNTER_ADDRESS]: counter })),
-);
+const saved = trace.toJson(); // the same JSON the native CLI writes with --save-trace
 trace.free();
 ```
 
@@ -334,8 +318,8 @@ for the fork point, and its `number` says where the chain is forked. Without `tx
 call runs on top of that block's final state, so the block can be fetched without
 transaction objects; with it, the call runs inside the block after the transactions before
 that index, which must then be full objects. The call carries no nonce and pays no gas
-price, as with `eth_call`. `finish()` yields a simulation trace, the one
-`toSimulationWebJson` renders, and `exportState()` works the same way. This is how a
+price, as with `eth_call`. `finish()` yields a simulation trace, read with `toJson()`
+or stepped like any other, and `exportState()` works the same way. This is how a
 browser steps through an `eth_call` against a fork with nothing but a node that serves
 state at that block. `test/wasm/replay-live.cjs` checks the result against the node's
 `debug_traceCall` step for step.
@@ -427,10 +411,6 @@ twiggy top -n 40 target/wasm32-unknown-unknown/release/soldb_wasm.wasm
   in. `soldb-evm`, `soldb-rpc`, and `soldb-wasm` must keep building and passing their
   tests with `--no-default-features`, which `make wasm-check` verifies natively and on
   the target.
-- The web document's `steps` are streamed from the trace by `WebSteps` in
-  `soldb-serializer`, one step at a time, rather than copied into a `serde_json::Value`
-  tree first. A test pins the output byte-for-byte against the former shape, so a change
-  there is a contract change and needs `docs/json.md` updated with it.
 - The logic behind every export lives in `soldb_wasm::pipeline` and
   `soldb_wasm::replay` and is tested natively, so it counts toward the workspace coverage
   gate. `crates/soldb-wasm/tests/web.rs` proves the bindings link, hold the trace across

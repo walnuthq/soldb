@@ -3,8 +3,8 @@
 //! This is a frontend in the same sense as the CLI and the DAP server: it composes the
 //! library crates and owns no logic of its own. The exported surface is one handle,
 //! [`Trace`], plus [`version`]. Inputs and outputs cross the boundary as JSON strings, so
-//! a browser or Node.js host uses the documents this workspace already specifies rather
-//! than a second, JavaScript-shaped type system, while the trace itself stays in
+//! a browser or Node.js host reads the trace shapes this workspace already specifies
+//! rather than a second, JavaScript-shaped type system, while the trace itself stays in
 //! WebAssembly memory between calls and is never re-parsed.
 //!
 //! The host is responsible for I/O. A `wasm32-unknown-unknown` module has no network and
@@ -134,31 +134,6 @@ impl Trace {
     #[wasm_bindgen(js_name = toJson)]
     pub fn to_json(&self) -> Result<String, JsError> {
         self.inner.to_json().map_err(js_error)
-    }
-
-    /// Renders the versioned web document from `docs/json.md`.
-    ///
-    /// `contracts_json` maps contract address to a contract artifacts object and fills
-    /// the document's `contracts` section the way `--ethdebug-dir` does for the CLI.
-    /// Omit it to leave that section empty.
-    #[wasm_bindgen(js_name = toWebJson)]
-    pub fn to_web_json(&self, contracts_json: Option<String>) -> Result<String, JsError> {
-        self.inner
-            .to_web_json(contracts_json.as_deref())
-            .map_err(js_error)
-    }
-
-    /// Renders the simulation form of the web document, as `soldb simulate --json` does.
-    /// `contracts_json` is as for `toWebJson`.
-    #[wasm_bindgen(js_name = toSimulationWebJson)]
-    pub fn to_simulation_web_json(
-        &self,
-        function_name: &str,
-        contracts_json: Option<String>,
-    ) -> Result<String, JsError> {
-        self.inner
-            .to_simulation_web_json(function_name, contracts_json.as_deref())
-            .map_err(js_error)
     }
 }
 
