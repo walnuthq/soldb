@@ -10,7 +10,7 @@
 
 SolDB is an open-source, ETHDebug-first, LLDB-style debugger for Solidity and the EVM.
 
-![SolDB full-screen view](docs/assets/soldb-tui.png)
+![SolDB full-screen view](assets/soldb-tui.png)
 
 ---
 
