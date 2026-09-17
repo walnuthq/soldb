@@ -12,13 +12,16 @@ name: Release
 #
 # A crate added to the workspace does not publish from here on its first release.
 # A trusted-publishing token cannot create a crate, so the upload fails with
-# `403 Trusted Publishing tokens do not support creating new crates`, and every
-# crate cargo had not reached yet is left unpublished. Before tagging a release
-# that introduces one, publish it once by hand from the release commit
-# (`cargo publish -p <crate>`, with a token carrying the `publish-new` scope),
-# give it the same owners as its siblings, and add its trusted-publisher config
-# on crates.io for this repository, this workflow filename, and the `release`
-# environment. `soldb-evm` was added in 0.3.0 and hit exactly this.
+# `403 Trusted Publishing tokens do not support creating new crates`, and that
+# crate and everything downstream of it are left unpublished. Publishing it by
+# hand before the release does not help either: it requires its siblings at the
+# version being released, which are not on crates.io yet. Such a release is
+# finished by hand from the release commit, with a token carrying the
+# `publish-new` scope, and the new crate gets its owners and its
+# trusted-publisher config (this repository, this filename, the `release`
+# environment) so the next release publishes it from here. See the release
+# section of CONTRIBUTING.md. `soldb-evm` was added in 0.3.0 and `soldb-tui` in
+# 0.4.0, and both went this way.
 
 on:
   release:
