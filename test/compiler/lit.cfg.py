@@ -43,6 +43,21 @@ solc_optimization = {
     "size": "--optimize --optimize-runs 1",
 }[optimization]
 config.substitutions = [("%soldb", soldb), ("FileCheck", filecheck)]
+
+# `verdict.jq` judges a debug-diff or profile report: debugger invariants fail
+# the test, attribution the optimizer dropped is reported. solc 0.8.36 is the
+# pinned oracle, so its reports are always strict; Solar is a moving target, so
+# its optimized builds only report what they kept. `%verdict-cross` judges a
+# solc-versus-Solar comparison, where the candidate alone may have lost stops.
+verdict = f"jq -er -f {shlex.quote(str(Path(config.test_source_root) / 'verdict.jq'))}"
+solar_strict = "true" if optimization == "none" else "false"
+config.substitutions.extend(
+    [
+        ("%verdict-solc", f"{verdict} --arg strict true --arg asymmetric false"),
+        ("%verdict-solar", f"{verdict} --arg strict {solar_strict} --arg asymmetric false"),
+        ("%verdict-cross", f"{verdict} --arg strict {solar_strict} --arg asymmetric true"),
+    ]
+)
 if compiler in ("solar", "both"):
     solar = require_tool("Solar (set SOLAR)", os.environ.get("SOLAR", "solar"))
     config.substitutions.append(("%solar", f"{solar} --evm-version=cancun -O{optimization}"))

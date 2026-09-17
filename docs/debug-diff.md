@@ -162,18 +162,28 @@ selects named source checkpoints. There is no Python preparation adapter.
 Compilation diagnostics remain beside the artifacts, and a failed compiler
 or missing requested JSON field stops the test.
 
-There is no expected-failure allowlist. Positive checkpoint tests require the
-specified stops in both compilers: two debug formats dropping the same
-statement cannot make the comparison pass. The gas-mode `bytes-length` case
-instead verifies an intentional unknown location after return-tail sharing
-and fallthrough elimination. It requires failed comparisons with the exact
-missing-source diagnostics, correct execution, and sourceless legacy profiling.
-ETHDebug may retain alternatives the profiler can resolve with compiler-authored
-function identity; any attributed source gas must belong to the executed
-checkpoint. Both profiles must account for all program gas. The `none` and
-`size` versions still require the checkpoint. This does not change codegen or
-relax `debug-diff`'s handling of empty traces. These are source-coverage checks,
-not a claim of exact function-frame, variable-location, or full span parity.
+There is no expected-failure allowlist, and no test pins what a particular
+optimizer happens to do. Every `debug-diff` and `profile` report goes through
+`test/compiler/verdict.jq`, which separates debugger invariants from compiler
+debug-info coverage. The invariants always hold: both executions behave the
+same, the two formats read from one machine trace agree stop for stop, every
+coverage difference is explained by a checkpoint the candidate compiler lost,
+diagnostics name nothing but lost attribution, and both profiles account for
+all program gas. What the optimizer left attributable is written as one verdict
+line per report into the test's `verdicts.txt`, for example `agree, 3 source
+step(s)`, `candidate lost Dynamic.sol:6`, or `no gas attributed to source`.
+
+Attribution is required, not just reported, where its loss has no legitimate
+cause: solc 0.8.36 is the pinned oracle, so its reports are always strict, and
+Solar's `-Onone` build must reach every checkpoint and attribute gas to source.
+Solar's `-Ogas` and `-Osize` builds may merge a return tail, drop a dead store,
+or fold `data.length` into ABI decoding; the tests then record the lost stop
+instead of failing, and the Solar job summary lists every verdict so a change
+in coverage is visible without turning a compiler improvement into a debugger
+failure. Two formats dropping the same statement can never make a comparison
+pass, and a stop only one format reads is a failure in every mode. These are
+source-coverage checks, not a claim of exact function-frame, variable-location,
+or full span parity.
 
 The `solar-main-compatibility` artifact contains the exact Solar revision,
 compiler versions, CLI artifacts and diagnostics, REVM traces, comparison
