@@ -4,7 +4,9 @@
 [![License: GPL v3 or MIT](https://img.shields.io/badge/License-GPLv3%20or%20MIT-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 
-> SolDB is in public beta. Expect changes and the occasional inaccuracy.
+> **Note**: SolDB is in public beta; expect ongoing changes and occasional inaccuracies.  
+
+> **Note**: SolDB relies on compiler-generated debug metadata. ETHDebug gives the richest breakpoints, stepping, and variable views; legacy source maps provide source-level fallback.
 
 SolDB is an LLDB-style debugger for Solidity and the EVM. It reads the ETHDebug metadata
 that solc emits (legacy source maps work too), replays a transaction, and lets you step
