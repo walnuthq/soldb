@@ -2,7 +2,7 @@
 name = "soldb"
 version.workspace = true
 edition.workspace = true
-description = "An ETHDebug-first, LLDB-style debugger for Solidity and the EVM"
+description = "An ETHDebug-first, GDB-style debugger for Solidity and the EVM"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

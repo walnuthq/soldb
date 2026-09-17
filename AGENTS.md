@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository.
 
 ## Project Overview
 
-SolDB is an ETHDebug-first, LLDB-style debugger for Solidity and the EVM, written in
+SolDB is an ETHDebug-first, GDB-style debugger for Solidity and the EVM, written in
 Rust. It maps EVM execution back to Solidity source using compiler-generated debug
 information, and exposes that as a CLI (`trace`, `simulate`, `run`, `replay`,
 `list-events`, `list-contracts`, `bridge`), an interactive REPL with a full-screen view,
