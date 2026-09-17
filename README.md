@@ -10,16 +10,16 @@
 
 SolDB is an open-source, ETHDebug-first, LLDB-style debugger for Solidity and the EVM.
 
-![SolDB full-screen view](assets/soldb-tui.png)
+![SolDB full-screen view](https://raw.githubusercontent.com/walnuthq/soldb/main/assets/soldb-tui.png)
 
 ---
 
 ## Try It in Two Minutes
 
 No node, no project: `soldb run` deploys a contract on a chain that exists only for the
-run and calls it. [`examples/Shop.sol`](examples/Shop.sol) has one of everything the
+run and calls it. [`examples/Shop.sol`](https://github.com/walnuthq/soldb/blob/main/examples/Shop.sol) has one of everything the
 debugger can show. Compile it with solc's legacy pipeline, whose fixed stack layout is
-what lets the debugger read local variables (see [Variables](docs/commands.md#variables)):
+what lets the debugger read local variables (see [Variables](https://github.com/walnuthq/soldb/blob/main/docs/commands.md#variables)):
 
 ```bash
 cargo install soldb
@@ -144,7 +144,7 @@ soldb profile <tx_hash> --backend replay \
   --rpc http://localhost:8545 --flamegraph profile.svg
 ```
 
-See [docs/profiling.md](docs/profiling.md) for captured traces, folded stacks,
+See [docs/profiling.md](https://github.com/walnuthq/soldb/blob/main/docs/profiling.md) for captured traces, folded stacks,
 multi-contract attribution, and the reusable library API.
 
 Compare the source-level debugging experience of two compiler outputs:
@@ -158,7 +158,7 @@ soldb debug-diff \
   --rpc http://localhost:8545
 ```
 
-See [docs/debug-diff.md](docs/debug-diff.md) for strict source-step, exact-span,
+See [docs/debug-diff.md](https://github.com/walnuthq/soldb/blob/main/docs/debug-diff.md) for strict source-step, exact-span,
 and optimization-tolerant coverage comparisons.
 
 ---
@@ -275,9 +275,9 @@ lines, opcodes, and instructions using compiler-generated debug metadata. It
 can also generate an interactive flame graph. Legacy source maps retain exact
 source-line attribution but do not carry ETHDebug function identities.
 
-![SolDB gas profile flame graph](docs/assets/profile.png)
+![SolDB gas profile flame graph](https://raw.githubusercontent.com/walnuthq/soldb/main/docs/assets/profile.png)
 
-See the [profiling guide](docs/profiling.md) for usage and integration details.
+See the [profiling guide](https://github.com/walnuthq/soldb/blob/main/docs/profiling.md) for usage and integration details.
 
 ---
 
@@ -288,7 +288,7 @@ It maps two EVM traces through their compiler artifacts and compares normalized
 source steps instead of raw bytecode offsets. ETHDebug and legacy source maps
 can be compared in any combination.
 
-See the [debug-info differential guide](docs/debug-diff.md) for CI and offline
+See the [debug-info differential guide](https://github.com/walnuthq/soldb/blob/main/docs/debug-diff.md) for CI and offline
 usage. A non-blocking CI job also tracks Solar `main`, testing its ETHDebug and
 legacy source maps through local debugging and profiling, with saved failure
 reports and flamegraphs.
@@ -305,7 +305,7 @@ can be given on the command line (`-x`, repeatable, `--batch` to leave afterward
 whole session is one shell command, and `--json` turns every answer into one JSON
 object per line with the raw words next to the decoded values. Editors and tools that
 speak the Debug Adapter Protocol get the same engine through `soldb-dap`. See
-[`docs/commands.md`](docs/commands.md#scripting-and-json).
+[`docs/commands.md`](https://github.com/walnuthq/soldb/blob/main/docs/commands.md#scripting-and-json).
 
 ## Features
 
@@ -384,12 +384,12 @@ legacy combined-JSON artifact directory with
 function, variable, and ABI context; legacy source maps provide PC-to-source
 mapping and ABI data without inventing the missing metadata. The debugger-side
 ETHDebug contract is documented in
-[docs/ethdebug-debugger-contract.md](docs/ethdebug-debugger-contract.md).
+[docs/ethdebug-debugger-contract.md](https://github.com/walnuthq/soldb/blob/main/docs/ethdebug-debugger-contract.md).
 
 `--save-trace <FILE>` on `trace`, `simulate`, `run`, and `replay` writes the complete
 trace as JSON, the format `debug-diff` and `profile` read offline; `--json` in a
 debugging session answers every command as JSON (see [Scripting and
-JSON](docs/commands.md#scripting-and-json)).
+JSON](https://github.com/walnuthq/soldb/blob/main/docs/commands.md#scripting-and-json)).
 
 ### Execution Backends
 
@@ -463,7 +463,7 @@ backward as freely as forward: `reverse-next`, `reverse-step`, `reverse-finish`,
 `goto <step>` rewinds to any instruction, mid-transaction included, and an editor's
 step-back button works. Breakpoints are predicates on a step, so `break storage 0` or
 `break revert` is a search over the tape in either direction. See
-[docs/commands.md](docs/commands.md).
+[docs/commands.md](https://github.com/walnuthq/soldb/blob/main/docs/commands.md).
 
 ### Crates
 
@@ -505,7 +505,7 @@ The goal is for developers to debug cross-environment transactions without switc
 
 Stylus is the first integrated non-EVM environment. Additional runtimes can follow the same bridge-oriented model.
 
-See [docs/Stylus.md](docs/Stylus.md) for the current Stylus integration.
+See [docs/Stylus.md](https://github.com/walnuthq/soldb/blob/main/docs/Stylus.md) for the current Stylus integration.
 
 ---
 
@@ -591,7 +591,7 @@ make wasm         # crates/soldb-wasm/pkg (lean) and pkg-replay (with REVM)
 make wasm-test    # bindings smoke tests under Node.js
 ```
 
-See [docs/wasm.md](docs/wasm.md) for the API, what runs in WebAssembly and what stays
+See [docs/wasm.md](https://github.com/walnuthq/soldb/blob/main/docs/wasm.md) for the API, what runs in WebAssembly and what stays
 native, and how CI checks the build.
 
 ---
@@ -603,7 +603,7 @@ license, at your option: use, redistribute, and modify it under the terms of
 either one. Unless you state otherwise, contributions you submit are
 dual-licensed the same way.
 
-📄 [GPL-3.0](./LICENSE.md) · [MIT](./LICENSE-MIT.md)
+📄 [GPL-3.0](https://github.com/walnuthq/soldb/blob/main/LICENSE.md) · [MIT](https://github.com/walnuthq/soldb/blob/main/LICENSE-MIT.md)
 
 ## Community & Support
 📬 Email: hi@walnut.dev
