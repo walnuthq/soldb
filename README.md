@@ -11,7 +11,7 @@
 SolDB is a GDB-style debugger for Solidity and the EVM. It reads the ETHDebug metadata
 a Solidity compiler emits, replays a transaction, and lets you step through it by source
 line, forward and backward, with variables decoded. It is the engine behind
-[Walnut](https://github.com/walnuthq/walnut). Legacy source maps work too.
+[Walnut](https://github.com/walnuthq/walnut).
 
 ![SolDB full-screen view](https://raw.githubusercontent.com/walnuthq/soldb/main/assets/soldb-tui.png)
 
