@@ -8,7 +8,7 @@
 
 > **Note**: SolDB relies on compiler-generated debug metadata. ETHDebug gives the richest breakpoints, stepping, and variable views; legacy source maps provide source-level fallback.
 
-SolDB is an LLDB-style debugger for Solidity and the EVM. It reads the ETHDebug metadata
+SolDB is a GDB-style debugger for Solidity and the EVM. It reads the ETHDebug metadata
 a Solidity compiler emits, replays a transaction, and lets you step through it by source
 line, forward and backward, with variables decoded. It is the engine behind
 [Walnut](https://github.com/walnuthq/walnut). Legacy source maps work too.
@@ -256,7 +256,7 @@ banner, or colour. Editors use the same engine through `soldb-dap`. See
 ## Features
 
 - Source-level debugging from ETHDebug metadata, with legacy `srcmap` fallback
-- Use it from a gdb-style command prompt, a full-screen terminal UI (`--tui`), or your editor through the Debug Adapter Protocol (`soldb-dap`)
+- Use it from a GDB-style command prompt, a full-screen terminal UI (`--tui`), or your editor through the Debug Adapter Protocol (`soldb-dap`)
 - Step forward and backward by source line or instruction; `goto` any step
 - Breakpoints on lines, functions, storage writes, reverts, calls, and opcodes, with conditions on variables
 - Locals and state variables decoded by type, including memory structs, arrays, strings, calldata slices, mappings, and enums; `print` follows paths such as `orders[1].status`
