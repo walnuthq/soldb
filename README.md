@@ -254,7 +254,7 @@ banner, or colour. Editors use the same engine through `soldb-dap`. See
 ## Features
 
 - Source-level debugging from ETHDebug metadata, with legacy `srcmap` fallback
-- Three frontends over one engine: REPL, full-screen TUI, and a Debug Adapter Protocol server
+- Use it from a gdb-style command prompt, a full-screen terminal UI (`--tui`), or your editor through the Debug Adapter Protocol (`soldb-dap`)
 - Step forward and backward by source line or instruction; `goto` any step
 - Breakpoints on lines, functions, storage writes, reverts, calls, and opcodes, with conditions on variables
 - Locals and state variables decoded by type, including memory structs, arrays, strings, calldata slices, mappings, and enums; `print` follows paths such as `orders[1].status`
