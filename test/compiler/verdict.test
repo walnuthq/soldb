@@ -1,0 +1,59 @@
+# REQUIRES: soldb
+# RUN: rm -rf %t && mkdir -p %t
+# Exercise verdict.jq on hand-written reports, with explicit strictness so the
+# outcome does not depend on the optimization parameter of this lit run.
+
+# Full agreement passes at any strictness.
+# RUN: echo '{"schemaVersion":1,"equivalent":true,"comparable":true,"diagnostics":[],"executionEquivalent":true,"executionDifferences":[],"reference":{"sourceSteps":2},"candidate":{"sourceSteps":2},"differenceCount":0,"differences":[],"differencesTruncated":false}' > %t/agree.json
+# RUN: jq -er -f %S/verdict.jq --arg strict true --arg asymmetric false %t/agree.json | FileCheck %s --check-prefix=AGREE
+# AGREE: verdict.test agree: agree, 2 source step(s)
+
+# A checkpoint both sides lost is reported when lenient and fails when strict.
+# RUN: echo '{"schemaVersion":1,"equivalent":false,"comparable":false,"diagnostics":["reference: checkpoint C.sol:4 was not reached","candidate: checkpoint C.sol:4 was not reached"],"executionEquivalent":true,"executionDifferences":[],"reference":{"sourceSteps":1},"candidate":{"sourceSteps":1},"differenceCount":0,"differences":[],"differencesTruncated":false}' > %t/lost.json
+# RUN: jq -er -f %S/verdict.jq --arg strict false --arg asymmetric false %t/lost.json | FileCheck %s --check-prefix=LOST
+# LOST: verdict.test lost: lost C.sol:4
+# RUN: not jq -er -f %S/verdict.jq --arg strict true --arg asymmetric false %t/lost.json 2>&1 | FileCheck %s --check-prefix=LOST-STRICT
+# LOST-STRICT: verdict.test lost: lost C.sol:4
+
+# A stop only the candidate lost is explained by a second compiler, never by a second format.
+# RUN: echo '{"schemaVersion":1,"equivalent":false,"comparable":false,"diagnostics":["candidate: checkpoint C.sol:4 was not reached"],"executionEquivalent":true,"executionDifferences":[],"reference":{"sourceSteps":2},"candidate":{"sourceSteps":1},"differenceCount":1,"differences":[{"kind":"missing","index":0,"reference":{"contract":"C","source":"C.sol","line":4,"function":"f"}}],"differencesTruncated":false}' > %t/candidate.json
+# RUN: jq -er -f %S/verdict.jq --arg strict false --arg asymmetric true %t/candidate.json | FileCheck %s --check-prefix=CANDIDATE
+# CANDIDATE: verdict.test candidate: candidate lost C.sol:4
+# RUN: not jq -er -f %S/verdict.jq --arg strict false --arg asymmetric false %t/candidate.json 2>&1 | FileCheck %s --check-prefix=CANDIDATE-FORMATS
+# CANDIDATE-FORMATS: verdict.test candidate: candidate lost C.sol:4 while the reference kept it
+# RUN: not jq -er -f %S/verdict.jq --arg strict true --arg asymmetric true %t/candidate.json 2>&1 | FileCheck %s --check-prefix=CANDIDATE-STRICT
+# CANDIDATE-STRICT: verdict.test candidate: lost C.sol:4
+
+# The reference is the oracle: what it lost and the candidate kept is never explained.
+# RUN: echo '{"schemaVersion":1,"equivalent":false,"comparable":false,"diagnostics":["reference: checkpoint C.sol:4 was not reached"],"executionEquivalent":true,"executionDifferences":[],"reference":{"sourceSteps":1},"candidate":{"sourceSteps":2},"differenceCount":1,"differences":[{"kind":"unexpected","index":0,"candidate":{"contract":"C","source":"C.sol","line":4,"function":"f"}}],"differencesTruncated":false}' > %t/reference.json
+# RUN: not jq -er -f %S/verdict.jq --arg strict false --arg asymmetric true %t/reference.json 2>&1 | FileCheck %s --check-prefix=REFERENCE
+# REFERENCE: verdict.test reference: reference lost C.sol:4 while the candidate kept it
+
+# A coverage difference nobody lost a checkpoint for is a real disagreement.
+# RUN: echo '{"schemaVersion":1,"equivalent":false,"comparable":true,"diagnostics":[],"executionEquivalent":true,"executionDifferences":[],"reference":{"sourceSteps":2},"candidate":{"sourceSteps":2},"differenceCount":1,"differences":[{"kind":"changed","index":1}],"differencesTruncated":false}' > %t/disagree.json
+# RUN: not jq -er -f %S/verdict.jq --arg strict false --arg asymmetric true %t/disagree.json 2>&1 | FileCheck %s --check-prefix=DISAGREE
+# DISAGREE: verdict.test disagree: 1 coverage difference(s), first: {"kind":"changed","index":1}
+
+# Diagnostics the optimizer cannot explain stay inconclusive, and executions must match.
+# RUN: echo '{"schemaVersion":1,"equivalent":false,"comparable":false,"diagnostics":["candidate: source identity is unavailable"],"executionEquivalent":true,"executionDifferences":[],"reference":{"sourceSteps":1},"candidate":{"sourceSteps":1},"differenceCount":0,"differences":[],"differencesTruncated":false}' > %t/inconclusive.json
+# RUN: not jq -er -f %S/verdict.jq --arg strict false --arg asymmetric true %t/inconclusive.json 2>&1 | FileCheck %s --check-prefix=INCONCLUSIVE
+# INCONCLUSIVE: verdict.test inconclusive: inconclusive: candidate: source identity is unavailable
+# RUN: echo '{"schemaVersion":1,"equivalent":false,"comparable":true,"diagnostics":[],"executionEquivalent":false,"executionDifferences":["return data differs"],"reference":{"sourceSteps":1},"candidate":{"sourceSteps":1},"differenceCount":0,"differences":[],"differencesTruncated":false}' > %t/execution.json
+# RUN: not jq -er -f %S/verdict.jq --arg strict false --arg asymmetric true %t/execution.json 2>&1 | FileCheck %s --check-prefix=EXECUTION
+# EXECUTION: verdict.test execution: executions differ: return data differs
+
+# Profiles must account for all gas; attributing some of it to source is required only when strict.
+# RUN: echo '{"totals":{"stepGas":362,"programGas":362,"sourceGas":51,"unmappedGas":0,"sourcelessGas":311},"sourceLines":[{"line":6,"gas":51}]}' > %t/profile.json
+# RUN: jq -er -f %S/verdict.jq --arg strict true --arg asymmetric false %t/profile.json | FileCheck %s --check-prefix=PROFILE
+# PROFILE: verdict.test profile: 51 of 362 gas on 1 source line(s)
+# RUN: echo '{"totals":{"stepGas":362,"programGas":362,"sourceGas":0,"unmappedGas":0,"sourcelessGas":362},"sourceLines":[]}' > %t/sourceless.json
+# RUN: jq -er -f %S/verdict.jq --arg strict false --arg asymmetric false %t/sourceless.json | FileCheck %s --check-prefix=SOURCELESS
+# SOURCELESS: verdict.test sourceless: no gas attributed to source
+# RUN: not jq -er -f %S/verdict.jq --arg strict true --arg asymmetric false %t/sourceless.json 2>&1 | FileCheck %s --check-prefix=SOURCELESS-STRICT
+# SOURCELESS-STRICT: verdict.test sourceless: no gas attributed to source
+# RUN: echo '{"totals":{"stepGas":362,"programGas":360,"sourceGas":51,"unmappedGas":2,"sourcelessGas":309},"sourceLines":[{"line":6,"gas":51}]}' > %t/unmapped.json
+# RUN: not jq -er -f %S/verdict.jq --arg strict false --arg asymmetric false %t/unmapped.json 2>&1 | FileCheck %s --check-prefix=UNMAPPED
+# UNMAPPED: verdict.test unmapped: 2 gas on instructions the artifact does not describe
+# RUN: echo '{"totals":{"stepGas":362,"programGas":362,"sourceGas":51,"unmappedGas":0,"sourcelessGas":311},"sourceLines":[{"line":6,"gas":50}]}' > %t/lines.json
+# RUN: not jq -er -f %S/verdict.jq --arg strict false --arg asymmetric false %t/lines.json 2>&1 | FileCheck %s --check-prefix=LINES
+# LINES: verdict.test lines: per-line gas does not add up to the source gas

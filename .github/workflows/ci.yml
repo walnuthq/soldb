@@ -479,6 +479,12 @@ jobs:
             else
               echo "No test report produced; see the build logs." >> "$GITHUB_STEP_SUMMARY"
             fi
+            # What each report concluded, including attribution the optimizer dropped: a
+            # verdict is information about Solar's debug output, not a failed test.
+            verdicts=$(find "target/solar-ci/lit/both/$optimization" -name verdicts.txt -exec cat {} + 2>/dev/null | sort)
+            if test -n "$verdicts"; then
+              printf '<details><summary>Verdicts</summary>\n\n```\n%s\n```\n\n</details>\n' "$verdicts" >> "$GITHUB_STEP_SUMMARY"
+            fi
           done
 
       - uses: actions/upload-artifact@v4
