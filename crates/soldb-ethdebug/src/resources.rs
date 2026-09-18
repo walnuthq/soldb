@@ -21,7 +21,7 @@ use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult};
 
 use crate::metadata::SourceLocation;
-use crate::pointers::PointerTemplate;
+use crate::pointers::{dereference_pointer, read_region, Machine, Pointer, PointerTemplate};
 use crate::storage_layout::word_to_decimal;
 
 /// The tables of an ETHDebug resources record.
@@ -247,6 +247,13 @@ fn first_region_name(pointer: &crate::pointers::Pointer) -> Option<&str> {
         Pointer::Conditional { then, .. } => first_region_name(then),
         Pointer::Scope { inner, .. } | Pointer::Templates { inner, .. } => first_region_name(inner),
         Pointer::Template { .. } => None,
+    }
+}
+
+impl TypeReference {
+    /// Parses an ethdebug/format/type/specifier: a reference by id or an inline document.
+    pub fn parse(specifier: &Value) -> SoldbResult<Self> {
+        parse_specifier(specifier, 0)
     }
 }
 
@@ -495,6 +502,119 @@ fn fixed_point(decimal: String, places: u64) -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// One region of a state variable, read: its name and what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateValue {
+    /// The region's name: the variable's identifier for its own value, `<identifier>-<member>`
+    /// for a struct member, `<identifier>-item` for an array element, nested as the value is.
+    pub name: String,
+    /// The value as the debugger shows it, or, when `available` is false, why it could not
+    /// be read.
+    pub display: String,
+    pub available: bool,
+}
+
+impl Resources {
+    /// Reads the state variable `identifier` of type `ty` through `pointer`, the pointer
+    /// its program context inlines, against `machine`: one value per region the pointer
+    /// names, decoded by the type the region's name leads to. Regions that only carry
+    /// bookkeeping, such as a dynamic array's length or a string's length flag, are left
+    /// out. A region the machine has no words for is reported, not read as zero.
+    pub fn read_variable(
+        &self,
+        identifier: &str,
+        ty: &TypeReference,
+        pointer: &Pointer,
+        machine: &dyn Machine,
+    ) -> SoldbResult<Vec<StateValue>> {
+        let root = self.resolve(ty)?;
+        let regions = dereference_pointer(pointer, &self.pointers, machine)?;
+        let mut values = Vec::with_capacity(regions.len());
+        for region in &regions {
+            let name = region.name.clone().unwrap_or_else(|| identifier.to_owned());
+            let path = match name.strip_prefix(identifier) {
+                Some("") => Vec::new(),
+                Some(rest) if rest.starts_with('-') => rest[1..].split('-').collect(),
+                _ => {
+                    values.push(StateValue {
+                        display: format!("<region `{name}` is not part of `{identifier}`>"),
+                        name,
+                        available: false,
+                    });
+                    continue;
+                }
+            };
+            if is_bookkeeping(&path) {
+                continue;
+            }
+            let Some(document) = self.type_at_path(root, &path) else {
+                values.push(StateValue {
+                    display: format!("<no type for region `{name}`>"),
+                    name,
+                    available: false,
+                });
+                continue;
+            };
+            values.push(match read_region(region, machine) {
+                Ok(bytes) => match document.decode(&bytes, self) {
+                    Ok(display) => StateValue {
+                        name,
+                        display,
+                        available: true,
+                    },
+                    Err(error) => StateValue {
+                        name,
+                        display: format!("<{error}>"),
+                        available: false,
+                    },
+                },
+                Err(error) => StateValue {
+                    name,
+                    display: format!("<{error}>"),
+                    available: false,
+                },
+            });
+        }
+        Ok(values)
+    }
+
+    /// The type a region's name leads to from the variable's type: `item` steps into an
+    /// array's element, a member name into a struct's member, an alias into what it wraps.
+    fn type_at_path<'a>(
+        &'a self,
+        root: &'a TypeDocument,
+        path: &[&str],
+    ) -> Option<&'a TypeDocument> {
+        let mut current = root;
+        for segment in path {
+            current = match current {
+                TypeDocument::Alias { contains, .. } => self.resolve(contains).ok()?,
+                _ => current,
+            };
+            current = match current {
+                TypeDocument::Array { contains, .. } if *segment == "item" => {
+                    self.resolve(contains).ok()?
+                }
+                TypeDocument::Struct { members, .. } => {
+                    let member = members
+                        .iter()
+                        .find(|member| member.name.as_deref() == Some(segment))?;
+                    self.resolve(&member.ty).ok()?
+                }
+                _ => return None,
+            };
+        }
+        Some(current)
+    }
+}
+
+/// Whether a region name path ends in the bookkeeping the storage layouts add: the
+/// `length` of a dynamic array, the `length-flag` and `long-length` of bytes and strings.
+/// The segments come from splitting the name on `-`.
+fn is_bookkeeping(path: &[&str]) -> bool {
+    matches!(path, [.., "length"] | [.., "length", "flag"])
 }
 
 // ---------------------------------------------------------------------------
@@ -778,16 +898,22 @@ fn parse_wrapper(value: &Value, depth: usize) -> SoldbResult<Member> {
     let ty = object
         .get("type")
         .ok_or_else(|| SoldbError::Message("a type wrapper has no `type`".to_owned()))?;
-    let specifier = ty
+    let ty = parse_specifier(ty, depth)?;
+    Ok(Member { name, ty })
+}
+
+/// A type specifier: a reference `{ "id": ... }` or a type document.
+fn parse_specifier(value: &Value, depth: usize) -> SoldbResult<TypeReference> {
+    let specifier = value
         .as_object()
         .ok_or_else(|| SoldbError::Message("a type specifier is not an object".to_owned()))?;
-    let ty = if let Some(id) = specifier.get("id") {
+    if let Some(id) = specifier.get("id") {
         if specifier.len() != 1 {
             return Err(SoldbError::Message(
                 "a type reference has only an `id`".to_owned(),
             ));
         }
-        TypeReference::Id(match id {
+        return Ok(TypeReference::Id(match id {
             Value::String(id) => id.clone(),
             Value::Number(id) => id.to_string(),
             _ => {
@@ -795,11 +921,9 @@ fn parse_wrapper(value: &Value, depth: usize) -> SoldbResult<Member> {
                     "a type id is a string or a number".to_owned(),
                 ))
             }
-        })
-    } else {
-        TypeReference::Inline(Box::new(parse_type(ty, depth)?))
-    };
-    Ok(Member { name, ty })
+        }));
+    }
+    Ok(TypeReference::Inline(Box::new(parse_type(value, depth)?)))
 }
 
 fn parse_members(value: &Value, depth: usize) -> SoldbResult<Vec<Member>> {
@@ -921,14 +1045,18 @@ mod tests {
 
     use serde_json::{json, Value};
 
-    use super::{Resources, TypeDocument, TypeReference};
-    use crate::pointers::{dereference, read_region, Location, Machine};
+    use super::{Resources, StateValue, TypeDocument, TypeReference};
+    use crate::abi::keccak256;
+    use crate::metadata::{parse_context_variables, ContextVariable, EthdebugInfo};
+    use crate::pointers::{dereference, read_region, Location, Machine, Pointer};
     use crate::storage_layout::{mapping_slot, parse_word, StorageLayout, Word};
 
     const FIXTURE: &str =
         include_str!("../../../test/fixtures/ethdebug-resources/ethdebug_resources.json");
     const LAYOUT: &str =
         include_str!("../../../test/fixtures/ethdebug-resources/Resources_storage.json");
+    const PROGRAM: &str =
+        include_str!("../../../test/fixtures/ethdebug-resources/Resources_ethdebug-runtime.json");
 
     fn fixture() -> Resources {
         let value: Value = serde_json::from_str(FIXTURE).expect("fixture json");
@@ -1350,5 +1478,154 @@ mod tests {
         .expect("total");
         assert_eq!(regions[0].slot, Some(total.slot));
         assert!(resources.template_of(contract_id, u64::MAX).is_none());
+    }
+
+    fn program() -> EthdebugInfo {
+        let resources: Value = serde_json::from_str(FIXTURE).expect("fixture json");
+        let program: Value = serde_json::from_str(PROGRAM).expect("program json");
+        EthdebugInfo::from_artifacts("Resources", "call", &resources, &program).expect("program")
+    }
+
+    #[test]
+    fn the_program_context_lists_the_state_variables() {
+        let program = program();
+        let layout = layout();
+        let mut expected = layout
+            .variables
+            .iter()
+            .map(|variable| variable.label.clone())
+            .collect::<Vec<_>>();
+        expected.push("scratch".to_owned());
+        assert_eq!(
+            program
+                .state_variables
+                .iter()
+                .map(ContextVariable::name)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let flag = &program.state_variables[3];
+        assert_eq!(flag.identifier.as_deref(), Some("flag"));
+        assert_eq!(
+            flag.declaration
+                .as_ref()
+                .map(|declaration| declaration.source_id),
+            Some(0)
+        );
+        assert_eq!(
+            flag.type_reference().expect("type"),
+            Some(TypeReference::Id("t_bool".to_owned()))
+        );
+        assert!(matches!(
+            flag.parsed_pointer().expect("pointer"),
+            Some(Pointer::Region(_))
+        ));
+        let balances = program
+            .state_variables
+            .iter()
+            .find(|variable| variable.identifier.as_deref() == Some("balances"))
+            .expect("balances");
+        assert_eq!(balances.parsed_pointer().expect("no pointer"), None);
+
+        // A compiler that does not emit the context lists nothing; a context of the wrong
+        // shape is an error rather than a guess.
+        assert!(parse_context_variables(&json!({"instructions": []}))
+            .expect("no context")
+            .is_empty());
+        assert!(parse_context_variables(&json!({"context": {"code": {}}}))
+            .expect("no variables")
+            .is_empty());
+        assert!(parse_context_variables(&json!({"context": {"variables": 1}})).is_err());
+        assert!(parse_context_variables(&json!({"context": {"variables": [{}]}})).is_err());
+        assert!(
+            parse_context_variables(&json!({"context": {"variables": [{"identifier": ""}]}}))
+                .is_err()
+        );
+        assert!(parse_context_variables(
+            &json!({"context": {"variables": [{"declaration": {"source": {}}}]}})
+        )
+        .is_err());
+        let declared_only = parse_context_variables(&json!({"context": {"variables": [
+            {"declaration": {"source": {"id": 0}, "range": {"offset": 5, "length": 3}}}
+        ]}}))
+        .expect("declaration only");
+        assert_eq!(declared_only[0].name(), "<declared at 0:5>");
+    }
+
+    #[test]
+    fn state_variables_are_read_through_their_context() {
+        let resources = fixture();
+        let program = program();
+        let mut packed = [0_u8; 32];
+        for (index, element) in [1_u8, 2, 3, 4].into_iter().enumerate() {
+            // Two-byte elements packed from the least significant byte.
+            packed[31 - index * 2] = element;
+        }
+        let mut origin = [0_u8; 32];
+        origin[31] = 1; // x
+        origin[30] = 2; // y
+        let mut text = [0_u8; 32];
+        text[..2].copy_from_slice(b"hi");
+        text[31] = 4;
+        let values_data = keccak256(&word(7));
+        let mut second_value = values_data;
+        second_value[31] += 1;
+        let mut packed_slot = [0_u8; 32];
+        packed_slot[30] = 1; // flag
+        packed_slot[31] = 9; // small
+        let storage = Storage(
+            [
+                (word(2), packed_slot),
+                (word(5), origin),
+                (word(6), packed),
+                (word(7), word(2)),
+                (values_data, word(10)),
+                (second_value, word(20)),
+                (word(9), text),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let read = |identifier: &str| -> Vec<StateValue> {
+            let variable = program
+                .state_variables
+                .iter()
+                .find(|variable| variable.identifier.as_deref() == Some(identifier))
+                .expect(identifier);
+            let ty = variable.type_reference().expect("type").expect("typed");
+            let pointer = variable.parsed_pointer().expect("pointer").expect("closed");
+            resources
+                .read_variable(identifier, &ty, &pointer, &storage)
+                .expect(identifier)
+        };
+        let shown = |values: Vec<StateValue>| {
+            values
+                .into_iter()
+                .map(|value| format!("{}={}", value.name, value.display))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(read("flag")), ["flag=true"]);
+        assert_eq!(shown(read("small")), ["small=9"]);
+        assert_eq!(shown(read("origin")), ["origin-x=1", "origin-y=2"]);
+        assert_eq!(
+            shown(read("packed")),
+            [
+                "packed-item=1",
+                "packed-item=2",
+                "packed-item=3",
+                "packed-item=4"
+            ]
+        );
+        // The length region is bookkeeping; the elements are read at keccak256(slot).
+        assert_eq!(shown(read("values")), ["values-item=10", "values-item=20"]);
+        assert_eq!(shown(read("text")), ["text=\"hi\""]);
+        // A slot the machine never recorded is reported, not read as zero.
+        let total = read("total");
+        assert_eq!(total.len(), 1);
+        assert!(
+            !total[0].available && total[0].display.contains("slot"),
+            "{}",
+            total[0].display
+        );
     }
 }
