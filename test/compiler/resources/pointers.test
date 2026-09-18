@@ -13,17 +13,19 @@
 # NAMES: [17,true]
 
 # Every variable of the storage layout has a template that addresses it where the
-# layout says; `pointers.jq` fails on a template that disagrees with the layout.
+# layout says; `pointers.jq` fails on a template that disagrees with the layout. A packed
+# value's offset counts from the most significant byte of the slot, so the `uint8` the
+# layout puts at its least significant byte is at offset 31.
 # RUN: jq -r --slurpfile layout %t/Resources_storage.json -f %S/pointers.jq %t/ethdebug_resources.json > %t/pointers.txt
 # RUN: FileCheck %s --check-prefix=LAYOUT < %t/pointers.txt
 # LAYOUT: inherited: region at slot 0
 # LAYOUT-NEXT: total: region at slot 1
-# LAYOUT-NEXT: small: region at slot 2, length 1
-# LAYOUT-NEXT: flag: region at slot 2 offset 1, length 1
-# LAYOUT-NEXT: owner: region at slot 2 offset 2, length 20
+# LAYOUT-NEXT: small: region at slot 2 offset 31, length 1
+# LAYOUT-NEXT: flag: region at slot 2 offset 30, length 1
+# LAYOUT-NEXT: owner: region at slot 2 offset 10, length 20
 # LAYOUT-NEXT: hash: region at slot 3
-# LAYOUT-NEXT: color: region at slot 4, length 1
-# LAYOUT-NEXT: price: region at slot 4 offset 1, length 16
+# LAYOUT-NEXT: color: region at slot 4 offset 31, length 1
+# LAYOUT-NEXT: price: region at slot 4 offset 15, length 16
 # LAYOUT-NEXT: origin: group of origin-x origin-y
 # LAYOUT-NEXT: packed: list of packed-item
 # LAYOUT-NEXT: values: group of values-length values-item
