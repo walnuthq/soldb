@@ -1335,6 +1335,7 @@ mod tests {
                 instructions,
                 sources: BTreeMap::from([(0, "Shared.sol".to_owned())]),
                 variable_locations: BTreeMap::new(),
+                state_variables: Vec::new(),
             },
             BTreeMap::from([(0, source.to_owned())]),
         )
@@ -1576,6 +1577,7 @@ mod tests {
             instructions: Vec::new(),
             sources: BTreeMap::new(),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let error = ProfileProgram::new(None, invalid_environment, BTreeMap::new())
             .expect_err("invalid environment");
@@ -1595,6 +1597,7 @@ mod tests {
             instructions: vec![instruction.clone(), instruction],
             sources: BTreeMap::new(),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let error = ProfileProgram::new(None, duplicate_instructions, BTreeMap::new())
             .expect_err("duplicate PC");
@@ -1709,6 +1712,7 @@ mod tests {
                 instructions,
                 sources: BTreeMap::from([(0, format!("{name}.sol"))]),
                 variable_locations: BTreeMap::new(),
+                state_variables: Vec::new(),
             },
             BTreeMap::from([(0, source.to_owned())]),
         )

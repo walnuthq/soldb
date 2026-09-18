@@ -48,15 +48,16 @@ pub use events::{
     EventParam, EventRegistry, EventRegistryEntry,
 };
 pub use metadata::{
-    parse_compilation_sources, parse_ethdebug_spec, parse_multi_contract_spec,
-    parse_single_contract_spec, parse_variable_locations, read_compilation_source, EthdebugInfo,
-    EthdebugSpec, FunctionExit, FunctionIdentity, Instruction, SourceLocation, VariableLocation,
+    parse_compilation_sources, parse_context_variables, parse_ethdebug_spec,
+    parse_multi_contract_spec, parse_single_contract_spec, parse_variable_locations,
+    read_compilation_source, ContextVariable, EthdebugInfo, EthdebugSpec, FunctionExit,
+    FunctionIdentity, Instruction, SourceLocation, VariableLocation,
 };
 pub use pointers::{
     dereference, dereference_pointer, is_identifier, read_region, Expression, Location, Machine,
     Pointer, PointerTemplate, Property, Region, RegionPointer, StorageMachine, WordReader,
 };
-pub use resources::{Definition, Member, Resources, TypeDocument, TypeReference};
+pub use resources::{Definition, Member, Resources, StateValue, TypeDocument, TypeReference};
 pub use source_map::{
     build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program,
     load_source_map_program_with_sources, parse_srcmap, SourceMapEntry, SourceMapEnvironment,

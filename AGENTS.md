@@ -301,7 +301,12 @@ rather than to guess values from the stack. Do not "fix" it by inferring locatio
 *State* variables do not depend on that gap: `solc --storage-layout` has always said where
 they live, so `vars` and `print` read them through `StorageLayout` for ETHDebug and legacy
 artifacts alike, `break <name>` stops where one is written, and the web document carries
-the layout and the final values. A *memory* value is the same kind of fact: the layout of
+the layout and the final values. From the ETHDebug program-context change on, solc also
+lists them in the program-level `context.variables` of each program, with the type by
+identifier into the resources' type table and the pointer inlined from the variable's
+template; `EthdebugInfo::state_variables` carries that list and
+`Resources::read_variable` reads a variable through it. The frontends still go through
+the layout; switching them over, with the layout as the fallback, is the next step. A *memory* value is the same kind of fact: the layout of
 a `string`, `bytes`, or array in memory is the language's, so a frame's memory arguments
 are read through it rather than shown as offsets. That is the line to hold when a piece of debug info is missing — take
 what the compiler does emit, prove what you can from the recording, and say plainly what
@@ -389,7 +394,9 @@ solc's version and adds a `solc-at-least-<version>` feature for every version in
 `REQUIRES: solc-at-least-0.8.38` and is skipped on the pinned channels until the pinned
 version catches up. `test/compiler/resources/` pins the ETHDebug type and pointer tables
 that way; it also needs `optimization-none`, because solc refuses ETHDebug output with
-the optimizer.
+the optimizer. Where a version cannot tell, the config probes: it compiles a one-variable
+contract and adds `solc-ethdebug-program-context` when the runtime program lists the
+variable in its program-level context, which `test/compiler/resources/context.test` needs.
 
 **solc flag drift is a real, tested compatibility surface.** Older compilers accept
 `--ethdebug --ethdebug-runtime`; solc dropped those around 0.8.32 in favor of
