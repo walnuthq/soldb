@@ -134,9 +134,14 @@ belongs in `soldb-debugger`, not in a second copy.
   agrees on.
 - **soldb-ethdebug**: ETHDebug artifact loading (`metadata.rs`), legacy `srcmap` parsing
   (`source_map.rs`), ABI encode/decode and signature parsing (`abi.rs`), event decoding
-  (`events.rs`), and the storage layout (`storage_layout.rs`): where solc put each state
+  (`events.rs`), the storage layout (`storage_layout.rs`): where solc put each state
   variable, the slot arithmetic for mappings, arrays, and structs, and the decoding of a
-  word by its declared type. Pure functions over files and bytes; no network.
+  word by its declared type, and the ETHDebug resources tables (`resources.rs`,
+  `pointers.rs`): the type documents and pointer templates solc emits from 0.8.38, and
+  the dereferencing of a template against a recorded machine state into the regions it
+  names. A region's byte offset counts from the most significant byte of the slot, as
+  the format's segment addressing does; the storage layout counts from the least
+  significant one. Pure functions over files and bytes; no network.
 - **soldb-evm**: the execution engine, with no I/O. The node data shapes
   (`RpcTransaction`, `RpcReceipt`, `DebugTraceResult`, the block types) are what JSON-RPC
   answers deserialize into, wherever they were fetched; `debug_rpc_transaction_trace` and
