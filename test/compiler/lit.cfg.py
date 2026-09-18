@@ -1,10 +1,12 @@
 """Shared compiler-backed tests using the ordinary node-free lit shell format."""
 
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import lit.formats
@@ -50,6 +52,32 @@ def solc_version(path):
     return tuple(int(part) for part in match.groups())
 
 
+def solc_emits_program_context(path):
+    """Whether the compiler lists the state variables in the program-level context of a
+    program, which a version alone does not say: it arrives on develop after the type and
+    pointer tables do. Tests that read it gate on `solc-ethdebug-program-context`."""
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "Probe.sol"
+        source.write_text(
+            "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\ncontract Probe { uint256 x; }\n"
+        )
+        result = subprocess.run(
+            [
+                path, "--evm-version=cancun", "--via-ir", "--debug-info", "ethdebug",
+                "--experimental", "--ethdebug-program-runtime", "-o", directory, str(source),
+            ],
+            capture_output=True, text=True, check=False, cwd=directory,
+        )
+        program = Path(directory) / "Probe_ethdebug-runtime.json"
+        if result.returncode != 0 or not program.is_file():
+            return False
+        try:
+            variables = json.loads(program.read_text())["context"]["variables"]
+        except (ValueError, KeyError, TypeError):
+            return False
+        return any(variable.get("identifier") == "x" for variable in variables)
+
+
 # Unlike the live-node suite, missing prerequisites must fail configuration.
 soldb = require_tool("soldb", os.environ.get("SOLDB_BIN", root / "target/debug/soldb"))
 filecheck = require_tool("FileCheck", os.environ.get("FILECHECK", "FileCheck"))
@@ -92,6 +120,9 @@ if compiler in ("solc", "both"):
     for gate in SOLC_VERSION_GATES:
         if version >= tuple(int(part) for part in gate.split(".")):
             config.available_features.add(f"solc-at-least-{gate}")
+    if solc_emits_program_context(solc):
+        config.available_features.add("solc-ethdebug-program-context")
+        lit_config.note("solc lists the state variables in the program-level context")
 if compiler == "both":
     config.available_features.add("compiler-diff")
 config.available_features.add("soldb")
