@@ -373,6 +373,14 @@ version gate reads only the leading `major.minor.patch`; do not reintroduce a pa
 chokes on the suffix, or the one compiler that matters most for new ETHDebug output gets
 rejected as unsupported.
 
+The compiler suite gates the same way: `test/compiler/lit.cfg.py` reads the selected
+solc's version and adds a `solc-at-least-<version>` feature for every version in its
+`SOLC_VERSION_GATES`, so a test for output only a newer compiler emits says
+`REQUIRES: solc-at-least-0.8.38` and is skipped on the pinned channels until the pinned
+version catches up. `test/compiler/resources/` pins the ETHDebug type and pointer tables
+that way; it also needs `optimization-none`, because solc refuses ETHDebug output with
+the optimizer.
+
 **solc flag drift is a real, tested compatibility surface.** Older compilers accept
 `--ethdebug --ethdebug-runtime`; solc dropped those around 0.8.32 in favor of
 `--experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources`.
