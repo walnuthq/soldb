@@ -345,6 +345,7 @@ CI runs the lit suite against three compilers, for three different reasons:
 | solc 0.8.31 (pinned) | the legacy `--ethdebug`/`--ethdebug-runtime` flag generation |
 | solc 0.8.36 (pinned) | the modern `--experimental --ethdebug-program …` generation |
 | solc `develop`, built from source | where ETHDebug output changes first |
+| solc `feature/ethdebug-program-context` of the `walnuthq/solidity` fork, built from source | the ETHDebug type and pointer tables, until argotorg/solidity#16990 and its follow-ups land on `develop` |
 
 A separate non-blocking `solar-main` job builds `paradigmxyz/solar@main` and
 runs `lit test/compiler --param compiler=both` over CLI debug artifacts in local
@@ -366,12 +367,16 @@ Python compiler-preparation adapter. The Solar binary must support the debug
 output selectors; CI still tracks main and does not fall back to Standard JSON.
 See `docs/debug-diff.md` for local commands and retained reports.
 
-The `develop` job builds `argotorg/solidity@develop`, caches the binary by commit, and is
-**non-blocking** (`continue-on-error: true`): that branch moves without us, so a break
+The `develop` job is a matrix over the sources it builds solc from: `argotorg/solidity@develop`
+and, until the ETHDebug type and pointer tables land there, the stacked branch of the
+`walnuthq/solidity` fork that carries them. Each build is cached by commit, and the job is
+**non-blocking** (`continue-on-error: true`): those branches move without us, so a break
 there is an early warning, not a reason to hold up a pull request. It also runs on a daily
 schedule so a change lands in front of us without needing a soldb pull request, and it
 prints whether the build emits ETHDebug variable locations yet — the thing `vars` and
-`print` read. As of `f985208` it does not; instruction `context` carries only `code`.
+`print` read — and whether it fills the type and pointer tables. As of `f985208` develop
+emits neither; instruction `context` carries only `code`. Remove the fork entry from the
+matrix once `develop` reports the tables as present.
 
 Development builds report a prerelease version such as `0.8.37-develop.2026.8.22`. The
 version gate reads only the leading `major.minor.patch`; do not reintroduce a parser that

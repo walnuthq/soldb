@@ -222,9 +222,24 @@ jobs:
     # Deliberately non-blocking: `develop` is a moving target we do not control, so a break
     # there is an early warning for us, not a reason to hold up a soldb pull request. When
     # this job goes red, read it before assuming the fault is ours.
-    name: lit (solc develop)
+    #
+    # The matrix names each source the compiler is built from. Besides `develop`, the
+    # stacked branch carrying the ETHDebug type and pointer tables (argotorg/solidity#16990
+    # and its follow-ups) runs here until it lands on `develop`, so that the tests gated on
+    # `solc-at-least-0.8.38` are exercised before then; drop that entry once they have.
+    name: lit (solc ${{ matrix.source.name }})
     runs-on: ubuntu-latest
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        source:
+          - name: develop
+            repository: argotorg/solidity
+            ref: develop
+          - name: ethdebug-stack
+            repository: walnuthq/solidity
+            ref: feature/ethdebug-program-context
     steps:
       - uses: actions/checkout@v4
 
@@ -236,32 +251,39 @@ jobs:
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
-      - name: Resolve the solc develop commit
+      - name: Resolve the solc commit
         id: solc-develop
+        env:
+          SOLC_REPOSITORY: ${{ matrix.source.repository }}
+          SOLC_REF: ${{ matrix.source.ref }}
         run: |
           set -euo pipefail
-          commit="$(git ls-remote https://github.com/argotorg/solidity.git refs/heads/develop | cut -f1)"
+          commit="$(git ls-remote "https://github.com/$SOLC_REPOSITORY.git" "refs/heads/$SOLC_REF" | cut -f1)"
           if [ -z "$commit" ]; then
-            echo "Could not resolve argotorg/solidity develop" >&2
+            echo "Could not resolve $SOLC_REPOSITORY $SOLC_REF" >&2
             exit 1
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "Testing against argotorg/solidity@$commit"
+          echo "Testing against $SOLC_REPOSITORY@$commit ($SOLC_REF)"
 
       - name: Restore the cached solc build
         id: solc-cache
         uses: actions/cache@v4
         with:
-          path: ~/.local/bin/solc-develop
-          key: solc-develop-${{ runner.os }}-${{ steps.solc-develop.outputs.commit }}
+          path: ~/.local/bin/solc-${{ matrix.source.name }}
+          key: solc-${{ matrix.source.name }}-${{ runner.os }}-${{ steps.solc-develop.outputs.commit }}
 
       - name: Restore the compiler ccache
         if: steps.solc-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: solc-develop-ccache-${{ runner.os }}-${{ steps.solc-develop.outputs.commit }}
-          restore-keys: solc-develop-ccache-${{ runner.os }}-
+          key: solc-${{ matrix.source.name }}-ccache-${{ runner.os }}-${{ steps.solc-develop.outputs.commit }}
+          # A branch off develop compiles mostly the same sources, so it can start from
+          # develop's cache.
+          restore-keys: |
+            solc-${{ matrix.source.name }}-ccache-${{ runner.os }}-
+            solc-develop-ccache-${{ runner.os }}-
 
       - name: Install compiler build dependencies
         if: steps.solc-cache.outputs.cache-hit != 'true'
@@ -272,15 +294,17 @@ jobs:
             libboost-filesystem-dev libboost-program-options-dev \
             libboost-system-dev libboost-test-dev
 
-      - name: Build solc from develop
+      - name: Build solc from source
         if: steps.solc-cache.outputs.cache-hit != 'true'
         env:
           SOLC_COMMIT: ${{ steps.solc-develop.outputs.commit }}
+          SOLC_REPOSITORY: ${{ matrix.source.repository }}
+          SOLC_NAME: ${{ matrix.source.name }}
         run: |
           set -euo pipefail
           git init solidity
           cd solidity
-          git remote add origin https://github.com/argotorg/solidity.git
+          git remote add origin "https://github.com/$SOLC_REPOSITORY.git"
           git fetch --depth 1 origin "$SOLC_COMMIT"
           git checkout --detach FETCH_HEAD
           # Only the submodules the compiler links against; the others are test-only.
@@ -298,7 +322,7 @@ jobs:
             -DSTRICT_Z3_VERSION=OFF
           cmake --build build --target solc
           mkdir -p "$HOME/.local/bin"
-          install -m 755 build/solc/solc "$HOME/.local/bin/solc-develop"
+          install -m 755 build/solc/solc "$HOME/.local/bin/solc-$SOLC_NAME"
 
       - name: Install system test tools
         run: |
@@ -311,6 +335,8 @@ jobs:
         run: python -m pip install lit
 
       - name: Select the Solidity compilers
+        env:
+          SOLC_NAME: ${{ matrix.source.name }}
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
@@ -320,10 +346,10 @@ jobs:
             https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.16+commit.07a7930e
           echo "1632786c6c1f856a4a899232ec975a12f305118f43cce90e724ed0b2eebfeee1  $HOME/.local/bin/solc-0.8.16" | sha256sum -c -
           chmod +x "$HOME/.local/bin/solc-0.8.16"
-          # Some tests invoke bare `solc`, so point it at the development build.
-          ln -sf "$HOME/.local/bin/solc-develop" "$HOME/.local/bin/solc"
+          # Some tests invoke bare `solc`, so point it at the build under test.
+          ln -sf "$HOME/.local/bin/solc-$SOLC_NAME" "$HOME/.local/bin/solc"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "SOLC_PATH=$HOME/.local/bin/solc-develop" >> "$GITHUB_ENV"
+          echo "SOLC_PATH=$HOME/.local/bin/solc-$SOLC_NAME" >> "$GITHUB_ENV"
 
       - name: Report the ETHDebug output this build produces
         run: |
@@ -346,6 +372,14 @@ jobs:
             echo "ETHDebug variable locations: PRESENT - the debugger can decode locals"
           else
             echo "ETHDebug variable locations: not emitted by this build yet"
+          fi
+          # The type and pointer tables of the resources are what `test/compiler/resources/`
+          # pins; they are empty before solc 0.8.38.
+          resources="$out/ethdebug_resources.json"
+          if [ -f "$resources" ] && jq -e '(.types | length) > 0 and (.pointers | length) > 0' "$resources" > /dev/null 2>&1; then
+            echo "ETHDebug type and pointer tables: PRESENT"
+          else
+            echo "ETHDebug type and pointer tables: not emitted by this build yet"
           fi
 
       - name: Install Rust toolchain
