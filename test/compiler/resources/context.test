@@ -1,0 +1,56 @@
+# The program-level context of a contract's programs lists its state variables: the
+# identifier, the declaration, the type by identifier into the type table and, unless the
+# template expects parameters, the pointer inlined from the template. It is the first
+# ETHDebug output that tells the debugger where the state lives without the storage
+# layout. solc refuses ETHDebug output with the optimizer, so this needs no optimization.
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-program-context, optimization-none
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug --experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr
+
+# Every variable of the storage layout is listed, in order, with the type identifier the
+# layout uses for it; the transient storage variable follows.
+# RUN: jq -r '.context.variables[] | "\(.identifier) \(.type.id)"' %t/Resources_ethdebug-runtime.json | FileCheck %s --check-prefix=VARIABLES
+# VARIABLES: inherited t_uint256
+# VARIABLES-NEXT: total t_uint256
+# VARIABLES-NEXT: small t_uint8
+# VARIABLES-NEXT: flag t_bool
+# VARIABLES-NEXT: owner t_address
+# VARIABLES-NEXT: hash t_bytes32
+# VARIABLES-NEXT: color t_enum$_Color_${{[0-9]+}}
+# VARIABLES-NEXT: price t_userDefinedValueType$_Price_${{[0-9]+}}
+# VARIABLES-NEXT: origin t_struct$_Point_${{[0-9]+}}_storage
+# VARIABLES-NEXT: packed t_array$_t_uint16_$4_storage
+# VARIABLES-NEXT: values t_array$_t_uint256_$dyn_storage
+# VARIABLES-NEXT: blob t_bytes_storage
+# VARIABLES-NEXT: text t_string_storage
+# VARIABLES-NEXT: balances t_mapping$_t_address_$_t_uint256_$
+# VARIABLES-NEXT: nested t_mapping$_t_address_$_t_mapping$_t_uint256_$_t_bool_$_$
+# VARIABLES-NEXT: scratch t_uint256
+
+# The types resolve in the type table, and every declaration points into the source.
+# RUN: jq -c --slurpfile resources %t/ethdebug_resources.json '[.context.variables[] | .type.id] | [length, all(. as $id | $resources[0].types | has($id))]' %t/Resources_ethdebug-runtime.json | FileCheck %s --check-prefix=TYPES
+# TYPES: [16,true]
+# RUN: jq -c '[.context.variables[] | .declaration | [.source.id, (.range | has("offset") and has("length"))]] | unique[]' %t/Resources_ethdebug-runtime.json | FileCheck %s --check-prefix=DECLARED
+# DECLARED: [0,true]
+
+# A pointer is the body of the variable's template with the top-level region unnamed; a
+# mapping's template expects its keys, so the variable is listed without a pointer.
+# RUN: jq -r --slurpfile resources %t/ethdebug_resources.json -f %S/context.jq %t/Resources_ethdebug-runtime.json > %t/context.txt
+# RUN: FileCheck %s --check-prefix=POINTERS < %t/context.txt
+# POINTERS: inherited: inlined from its template
+# POINTERS-NEXT: total: inlined from its template
+# POINTERS: text: inlined from its template
+# POINTERS-NEXT: balances: no pointer, template expects key
+# POINTERS-NEXT: nested: no pointer, template expects key key1
+# POINTERS-NEXT: scratch: inlined from its template
+
+# The creation program lists the same variables; a base contract lists its own only; a
+# contract without state variables has no program-level context.
+# RUN: jq -c '[.context.variables[].identifier]' %t/Resources_ethdebug.json > %t/creation.json
+# RUN: jq -c '[.context.variables[].identifier]' %t/Resources_ethdebug-runtime.json > %t/runtime.json
+# RUN: cmp %t/creation.json %t/runtime.json
+# RUN: jq -c '[.context.variables[].identifier]' %t/Base_ethdebug-runtime.json | FileCheck %s --check-prefix=BASE
+# BASE: ["inherited"]
+# RUN: jq -c '.context' %t/Stateless_ethdebug-runtime.json | FileCheck %s --check-prefix=STATELESS
+# STATELESS: null

@@ -49,3 +49,6 @@ contract Resources is Base {
         return total + inherited;
     }
 }
+
+// No state variables: its programs carry no program-level context.
+contract Stateless {}
