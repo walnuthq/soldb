@@ -1,0 +1,63 @@
+# The pointer table of the ETHDebug resources: one template per state variable in storage
+# or transient storage, named after the AST IDs of the contract and the variable, whose
+# regions are named after the variable. A mapping's keys are the template's parameters;
+# every other template is closed. solc emits the tables from 0.8.38 and refuses ETHDebug
+# output with the optimizer, so this needs a new enough compiler and no optimization.
+# REQUIRES: soldb, compiler-solc, solc-at-least-0.8.38, optimization-none
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug --experimental --ethdebug-program-runtime --ethdebug-resources --storage-layout --bin --abi -o %t > %t/compile.stdout 2> %t/compile.stderr
+
+# Templates are named after the contract and the variable, by AST ID.
+# RUN: jq -c '.pointers | keys | [length, all(test("^(storage|transient)_[0-9]+_[0-9]+$"))]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=NAMES
+# NAMES: [17,true]
+
+# Every variable of the storage layout has a template that addresses it where the
+# layout says; `pointers.jq` fails on a template that disagrees with the layout.
+# RUN: jq -r --slurpfile layout %t/Resources_storage.json -f %S/pointers.jq %t/ethdebug_resources.json > %t/pointers.txt
+# RUN: FileCheck %s --check-prefix=LAYOUT < %t/pointers.txt
+# LAYOUT: inherited: region at slot 0
+# LAYOUT-NEXT: total: region at slot 1
+# LAYOUT-NEXT: small: region at slot 2, length 1
+# LAYOUT-NEXT: flag: region at slot 2 offset 1, length 1
+# LAYOUT-NEXT: owner: region at slot 2 offset 2, length 20
+# LAYOUT-NEXT: hash: region at slot 3
+# LAYOUT-NEXT: color: region at slot 4, length 1
+# LAYOUT-NEXT: price: region at slot 4 offset 1, length 16
+# LAYOUT-NEXT: origin: group of origin-x origin-y
+# LAYOUT-NEXT: packed: list of packed-item
+# LAYOUT-NEXT: values: group of values-length values-item
+# LAYOUT-NEXT: blob: group of blob-length-flag blob-long-length blob
+# LAYOUT-NEXT: text: group of text-length-flag text-long-length text
+# LAYOUT-NEXT: balances: keyed by key
+# LAYOUT-NEXT: nested: keyed by key key1
+
+# A mapping's value lives at keccak256 of the key and of the slot, both as words; a
+# nested mapping takes one key per level, the outermost first.
+# RUN: jq -c '[.pointers[] | select(.expect | length > 0)] | sort_by(.for.name)[] | [.for.name, .expect, .for.slot]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=MAPPING
+# MAPPING: ["balances",["key"],{"$keccak256":[{"$wordsized":"key"},{"$wordsized":"0x0a"}]}]
+# MAPPING-NEXT: ["nested",["key","key1"],{"$keccak256":[{"$wordsized":"key1"},{"$wordsized":{"$keccak256":[{"$wordsized":"key"},{"$wordsized":"0x0b"}]}}]}]
+
+# A dynamic array keeps its length in the slot and its elements at keccak256 of the slot,
+# one per index of the list; bytes and strings choose between the short and the long
+# encoding by the length flag in the slot.
+# RUN: jq -c '.pointers[] | select(.for.group[0].name? == "values-length") | .for.group[1] | [.define, .in.list.count, .in.list.each, .in.list.is.slot]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=ARRAY
+# ARRAY: [{"values-data":{"$keccak256":[{"$wordsized":"0x07"}]}},{"$read":"values-length"},"values-index",{"$sum":["values-data","values-index"]}]
+# RUN: jq -c '.pointers[] | select(.for.group[0].name? == "text-length-flag") | .for.group | [.[0].offset, .[0].length, (.[1] | keys)]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=STRING
+# STRING: [{"$difference":["$wordsize","0x01"]},"0x01",["else","if","then"]]
+
+# Transient storage variables are addressed in their own location; constants and
+# immutables occupy no storage and have no template.
+# RUN: jq -c '.pointers[] | select(.for.location? == "transient") | [.for.name, .for.slot, .expect]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=TRANSIENT
+# TRANSIENT: ["scratch","0x00",[]]
+# RUN: jq -c '[.pointers[] | .. | objects | select(has("location")) | .name] | map(select(. == "LIMIT" or . == "createdAt"))' %t/ethdebug_resources.json | FileCheck %s --check-prefix=CONSTANT
+# CONSTANT: []
+
+# The debugger loads what this compiler wrote: the resources next to the runtime program,
+# and the state variables through the storage layout.
+# RUN: %soldb run %t/Resources.bin "read()" --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Resources:%t --json -x "info resources --json" -x "vars" --batch > %t/session.json
+# RUN: jq -c 'select(.kind == "resources") | .contracts[] | [.name, .environment, .sources]' %t/session.json | FileCheck %s --check-prefix=LOADED
+# LOADED: ["Resources","call",["Resources.sol"]]
+# RUN: jq -r 'select(.kind == "variables") | .state.variables[] | "\(.name) \(.ty) \(.place)"' %t/session.json | FileCheck %s --check-prefix=STATE
+# STATE: inherited uint256 slot 0x0
+# STATE-NEXT: total uint256 slot 0x1

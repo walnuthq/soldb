@@ -1,0 +1,58 @@
+# The type table of the ETHDebug resources: one document per type of a state variable,
+# keyed by the identifier the storage layout uses for it, with composed types referencing
+# their parts by identifier. solc emits the tables from 0.8.38 and refuses ETHDebug output
+# with the optimizer, so this needs a new enough compiler and no optimization.
+# REQUIRES: soldb, compiler-solc, solc-at-least-0.8.38, optimization-none
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug --experimental --ethdebug-resources --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr
+
+# Every variable of the storage layout has a document under its type identifier, which
+# the layout spells with `(`, `)` and `,` where the table has `$_`, `_$` and `_$_`.
+# RUN: jq -r --slurpfile layout %t/Resources_storage.json 'def escaped: gsub("\\("; "$_") | gsub("\\)"; "_$") | gsub(","; "_$_"); . as $resources | $layout[0].storage[] | "\(.label) \(.type | escaped) \($resources.types[.type | escaped].kind)"' %t/ethdebug_resources.json | FileCheck %s --check-prefix=LAYOUT
+# LAYOUT: inherited t_uint256 uint
+# LAYOUT-NEXT: total t_uint256 uint
+# LAYOUT-NEXT: small t_uint8 uint
+# LAYOUT-NEXT: flag t_bool bool
+# LAYOUT-NEXT: owner t_address address
+# LAYOUT-NEXT: hash t_bytes32 bytes
+# LAYOUT-NEXT: color t_enum$_Color_${{[0-9]+}} enum
+# LAYOUT-NEXT: price t_userDefinedValueType$_Price_${{[0-9]+}} alias
+# LAYOUT-NEXT: origin t_struct$_Point_${{[0-9]+}}_storage struct
+# LAYOUT-NEXT: packed t_array$_t_uint16_$4_storage array
+# LAYOUT-NEXT: values t_array$_t_uint256_$dyn_storage array
+# LAYOUT-NEXT: blob t_bytes_storage bytes
+# LAYOUT-NEXT: text t_string_storage string
+# LAYOUT-NEXT: balances t_mapping$_t_address_$_t_uint256_$ mapping
+# LAYOUT-NEXT: nested t_mapping$_t_address_$_t_mapping$_t_uint256_$_t_bool_$_$ mapping
+
+# The elementary documents carry the width or size a decoder needs; arrays and mappings
+# reference their element, key and value types and a static array carries its count.
+# RUN: jq -c '.types | .t_uint8, .t_bool, .t_address, .t_bytes32, .t_bytes_storage, .t_string_storage, .t_uint256, .["t_array$_t_uint16_$4_storage"], .["t_array$_t_uint256_$dyn_storage"], .["t_mapping$_t_address_$_t_uint256_$"]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=DOCUMENT
+# DOCUMENT: {"bits":8,"kind":"uint"}
+# DOCUMENT-NEXT: {"kind":"bool"}
+# DOCUMENT-NEXT: {"kind":"address","payable":false}
+# DOCUMENT-NEXT: {"kind":"bytes","size":32}
+# DOCUMENT-NEXT: {"kind":"bytes"}
+# DOCUMENT-NEXT: {"kind":"string"}
+# DOCUMENT-NEXT: {"bits":256,"kind":"uint"}
+# DOCUMENT-NEXT: {"contains":{"type":{"id":"t_uint16"}},"count":"0x04","kind":"array"}
+# DOCUMENT-NEXT: {"contains":{"type":{"id":"t_uint256"}},"kind":"array"}
+# DOCUMENT-NEXT: {"contains":{"key":{"type":{"id":"t_address"}},"value":{"type":{"id":"t_uint256"}}},"kind":"mapping"}
+
+# User-defined types carry their definition: the enum its values, the struct its named
+# members, the alias its underlying type, all of them the name and the source range.
+# RUN: jq -c '.types[] | select(.kind == "enum") | [.definition.name, .values]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=ENUM
+# ENUM: ["Color",["Red","Green","Blue"]]
+# RUN: jq -c '.types[] | select(.kind == "struct") | [.definition.name, [.contains[] | "\(.name):\(.type.id)"]]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=STRUCT
+# STRUCT: ["Point",["x:t_uint8","y:t_uint8"]]
+# RUN: jq -c '.types[] | select(.kind == "alias") | [.definition.name, .contains.type.id]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=ALIAS
+# ALIAS: ["Price","t_uint128"]
+# RUN: jq -c '.types[] | select(has("definition")) | .definition.location | [.source.id, (.range | has("offset") and has("length"))]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=LOCATION
+# LOCATION: [0,true]
+# LOCATION-NEXT: [0,true]
+# LOCATION-NEXT: [0,true]
+
+# The table is closed: every type a document references has a document of its own.
+# RUN: jq -c '. as $resources | [.types | .. | objects | select(has("type") and (.type | type == "object")) | .type.id] | [length, all(. as $id | $resources.types | has($id))]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=CLOSED
+# CLOSED: [{{[1-9][0-9]*}},true]

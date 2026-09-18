@@ -1,8 +1,10 @@
 """Shared compiler-backed tests using the ordinary node-free lit shell format."""
 
 import os
+import re
 import shlex
 import shutil
+import subprocess
 from pathlib import Path
 
 import lit.formats
@@ -25,12 +27,27 @@ config.test_exec_root = str(
 )
 config.environment["NO_COLOR"] = "1"
 
+# Tests that need a compiler release gate on it with `REQUIRES: solc-at-least-<version>`;
+# every version listed here becomes such a feature when the selected solc is at least
+# that new. A development build such as `0.8.38-develop.2026.9.17` counts as its
+# leading `major.minor.patch`.
+SOLC_VERSION_GATES = ("0.8.38",)
+
 
 def require_tool(name, value):
     path = shutil.which(str(value))
     if path is None:
         lit_config.fatal(f"{name} is required; could not find {value}")
-    return shlex.quote(path)
+    return path
+
+
+def solc_version(path):
+    """The leading `major.minor.patch` of `solc --version`, ignoring a prerelease suffix."""
+    output = subprocess.run([path, "--version"], capture_output=True, text=True, check=False)
+    match = re.search(r"Version: (\d+)\.(\d+)\.(\d+)", output.stdout)
+    if match is None:
+        lit_config.fatal(f"could not read the solc version from {path}")
+    return tuple(int(part) for part in match.groups())
 
 
 # Unlike the live-node suite, missing prerequisites must fail configuration.
@@ -42,7 +59,7 @@ solc_optimization = {
     "gas": "--optimize --optimize-runs 200",
     "size": "--optimize --optimize-runs 1",
 }[optimization]
-config.substitutions = [("%soldb", soldb), ("FileCheck", filecheck)]
+config.substitutions = [("%soldb", shlex.quote(soldb)), ("FileCheck", shlex.quote(filecheck))]
 
 # `verdict.jq` judges a debug-diff or profile report: debugger invariants fail
 # the test, attribution the optimizer dropped is reported. solc 0.8.36 is the
@@ -60,12 +77,21 @@ config.substitutions.extend(
 )
 if compiler in ("solar", "both"):
     solar = require_tool("Solar (set SOLAR)", os.environ.get("SOLAR", "solar"))
-    config.substitutions.append(("%solar", f"{solar} --evm-version=cancun -O{optimization}"))
+    config.substitutions.append(
+        ("%solar", f"{shlex.quote(solar)} --evm-version=cancun -O{optimization}")
+    )
     config.available_features.add("compiler-solar")
 if compiler in ("solc", "both"):
     solc = require_tool("solc (set SOLC_PATH)", os.environ.get("SOLC_PATH", "solc"))
-    config.substitutions.append(("%solc", f"{solc} --evm-version=cancun {solc_optimization}"))
+    config.substitutions.append(
+        ("%solc", f"{shlex.quote(solc)} --evm-version=cancun {solc_optimization}")
+    )
     config.available_features.add("compiler-solc")
+    version = solc_version(solc)
+    lit_config.note(f"solc {'.'.join(str(part) for part in version)} at {solc}")
+    for gate in SOLC_VERSION_GATES:
+        if version >= tuple(int(part) for part in gate.split(".")):
+            config.available_features.add(f"solc-at-least-{gate}")
 if compiler == "both":
     config.available_features.add("compiler-diff")
 config.available_features.add("soldb")
