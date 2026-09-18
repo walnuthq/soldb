@@ -134,9 +134,14 @@ belongs in `soldb-debugger`, not in a second copy.
   agrees on.
 - **soldb-ethdebug**: ETHDebug artifact loading (`metadata.rs`), legacy `srcmap` parsing
   (`source_map.rs`), ABI encode/decode and signature parsing (`abi.rs`), event decoding
-  (`events.rs`), and the storage layout (`storage_layout.rs`): where solc put each state
+  (`events.rs`), the storage layout (`storage_layout.rs`): where solc put each state
   variable, the slot arithmetic for mappings, arrays, and structs, and the decoding of a
-  word by its declared type. Pure functions over files and bytes; no network.
+  word by its declared type, and the ETHDebug resources tables (`resources.rs`,
+  `pointers.rs`): the type documents and pointer templates solc emits from 0.8.38, and
+  the dereferencing of a template against a recorded machine state into the regions it
+  names. A region's byte offset counts from the most significant byte of the slot, as
+  the format's segment addressing does; the storage layout counts from the least
+  significant one. Pure functions over files and bytes; no network.
 - **soldb-evm**: the execution engine, with no I/O. The node data shapes
   (`RpcTransaction`, `RpcReceipt`, `DebugTraceResult`, the block types) are what JSON-RPC
   answers deserialize into, wherever they were fetched; `debug_rpc_transaction_trace` and
@@ -296,7 +301,12 @@ rather than to guess values from the stack. Do not "fix" it by inferring locatio
 *State* variables do not depend on that gap: `solc --storage-layout` has always said where
 they live, so `vars` and `print` read them through `StorageLayout` for ETHDebug and legacy
 artifacts alike, `break <name>` stops where one is written, and the web document carries
-the layout and the final values. A *memory* value is the same kind of fact: the layout of
+the layout and the final values. From the ETHDebug program-context change on, solc also
+lists them in the program-level `context.variables` of each program, with the type by
+identifier into the resources' type table and the pointer inlined from the variable's
+template; `EthdebugInfo::state_variables` carries that list and
+`Resources::read_variable` reads a variable through it. The frontends still go through
+the layout; switching them over, with the layout as the fallback, is the next step. A *memory* value is the same kind of fact: the layout of
 a `string`, `bytes`, or array in memory is the language's, so a frame's memory arguments
 are read through it rather than shown as offsets. That is the line to hold when a piece of debug info is missing — take
 what the compiler does emit, prove what you can from the recording, and say plainly what
@@ -340,6 +350,7 @@ CI runs the lit suite against three compilers, for three different reasons:
 | solc 0.8.31 (pinned) | the legacy `--ethdebug`/`--ethdebug-runtime` flag generation |
 | solc 0.8.36 (pinned) | the modern `--experimental --ethdebug-program …` generation |
 | solc `develop`, built from source | where ETHDebug output changes first |
+| solc `feature/ethdebug-program-context` of the `walnuthq/solidity` fork, built from source | the ETHDebug type and pointer tables, until argotorg/solidity#16990 and its follow-ups land on `develop` |
 
 A separate non-blocking `solar-main` job builds `paradigmxyz/solar@main` and
 runs `lit test/compiler --param compiler=both` over CLI debug artifacts in local
@@ -361,17 +372,31 @@ Python compiler-preparation adapter. The Solar binary must support the debug
 output selectors; CI still tracks main and does not fall back to Standard JSON.
 See `docs/debug-diff.md` for local commands and retained reports.
 
-The `develop` job builds `argotorg/solidity@develop`, caches the binary by commit, and is
-**non-blocking** (`continue-on-error: true`): that branch moves without us, so a break
+The `develop` job is a matrix over the sources it builds solc from: `argotorg/solidity@develop`
+and, until the ETHDebug type and pointer tables land there, the stacked branch of the
+`walnuthq/solidity` fork that carries them. Each build is cached by commit, and the job is
+**non-blocking** (`continue-on-error: true`): those branches move without us, so a break
 there is an early warning, not a reason to hold up a pull request. It also runs on a daily
 schedule so a change lands in front of us without needing a soldb pull request, and it
 prints whether the build emits ETHDebug variable locations yet — the thing `vars` and
-`print` read. As of `f985208` it does not; instruction `context` carries only `code`.
+`print` read — and whether it fills the type and pointer tables. As of `f985208` develop
+emits neither; instruction `context` carries only `code`. Remove the fork entry from the
+matrix once `develop` reports the tables as present.
 
 Development builds report a prerelease version such as `0.8.37-develop.2026.8.22`. The
 version gate reads only the leading `major.minor.patch`; do not reintroduce a parser that
 chokes on the suffix, or the one compiler that matters most for new ETHDebug output gets
 rejected as unsupported.
+
+The compiler suite gates the same way: `test/compiler/lit.cfg.py` reads the selected
+solc's version and adds a `solc-at-least-<version>` feature for every version in its
+`SOLC_VERSION_GATES`, so a test for output only a newer compiler emits says
+`REQUIRES: solc-at-least-0.8.38` and is skipped on the pinned channels until the pinned
+version catches up. `test/compiler/resources/` pins the ETHDebug type and pointer tables
+that way; it also needs `optimization-none`, because solc refuses ETHDebug output with
+the optimizer. Where a version cannot tell, the config probes: it compiles a one-variable
+contract and adds `solc-ethdebug-program-context` when the runtime program lists the
+variable in its program-level context, which `test/compiler/resources/context.test` needs.
 
 **solc flag drift is a real, tested compatibility surface.** Older compilers accept
 `--ethdebug --ethdebug-runtime`; solc dropped those around 0.8.32 in favor of

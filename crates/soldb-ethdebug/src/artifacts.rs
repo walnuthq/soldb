@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
 use crate::metadata::{read_compilation_source, EthdebugInfo};
+use crate::resources::Resources;
 use crate::source_map::{load_source_map_program_with_sources, SourceMapEnvironment};
 use crate::storage_layout::StorageLayout;
 
@@ -53,6 +54,15 @@ pub struct DebugProgram {
 }
 
 impl DebugProgram {
+    /// The type and pointer tables of the resources, parsed. A compiler that does not
+    /// fill them yet gives empty tables; tables that do not follow the schemas are an
+    /// error, reported when a frontend first needs them rather than when the program is
+    /// loaded, so that a program whose resources a debugger cannot read entirely still
+    /// steps through its code.
+    pub fn resources_tables(&self) -> SoldbResult<Resources> {
+        Resources::parse(&self.resources)
+    }
+
     /// The code generator the program came from. A legacy `srcmap` is taken to come from
     /// the legacy pipeline, which is the only one that emits nothing else; ETHDebug comes
     /// from solc's via-IR pipeline or from a compiler built on IR.

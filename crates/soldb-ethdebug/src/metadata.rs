@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult};
 
+use crate::pointers::Pointer;
+use crate::resources::TypeReference;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceLocation {
     pub source_id: u64,
@@ -159,6 +162,119 @@ fn parse_source_location(value: &Value) -> Option<SourceLocation> {
     })
 }
 
+/// A state variable as the program-level context of a program lists it: where the
+/// compiler says it lives, without the storage layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextVariable {
+    pub identifier: Option<String>,
+    pub declaration: Option<SourceLocation>,
+    /// The type specifier as written: `{"id": ...}` into the resources' type table, or a
+    /// type document inline. Read it through [`ContextVariable::type_reference`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ty: Option<Value>,
+    /// The pointer as written, inlined from the variable's template. Absent when the
+    /// template expects parameters, as a mapping's does for its keys; the resources'
+    /// pointer table has the template then. Read it through
+    /// [`ContextVariable::parsed_pointer`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<Value>,
+}
+
+impl ContextVariable {
+    /// The name the variable is shown by: its identifier, or where it was declared.
+    #[must_use]
+    pub fn name(&self) -> String {
+        match (&self.identifier, &self.declaration) {
+            (Some(identifier), _) => identifier.clone(),
+            (None, Some(declaration)) => format!(
+                "<declared at {}:{}>",
+                declaration.source_id, declaration.offset
+            ),
+            (None, None) => "<unnamed>".to_owned(),
+        }
+    }
+
+    /// The type, parsed. `None` when the compiler wrote none.
+    pub fn type_reference(&self) -> SoldbResult<Option<TypeReference>> {
+        self.ty
+            .as_ref()
+            .map(|ty| {
+                TypeReference::parse(ty).map_err(|error| {
+                    SoldbError::Message(format!("type of `{}`: {error}", self.name()))
+                })
+            })
+            .transpose()
+    }
+
+    /// The pointer, parsed. `None` when the variable is listed without one.
+    pub fn parsed_pointer(&self) -> SoldbResult<Option<Pointer>> {
+        self.pointer
+            .as_ref()
+            .map(|pointer| {
+                Pointer::parse(pointer).map_err(|error| {
+                    SoldbError::Message(format!("pointer of `{}`: {error}", self.name()))
+                })
+            })
+            .transpose()
+    }
+}
+
+/// The state variables the program-level `context` of a program lists. A program without
+/// one lists none; a context whose `variables` is not a list of objects with an
+/// identifier or a declaration is an error, since the shape is the schema's.
+pub fn parse_context_variables(program: &Value) -> SoldbResult<Vec<ContextVariable>> {
+    let Some(variables) = program
+        .get("context")
+        .and_then(|context| context.get("variables"))
+    else {
+        return Ok(Vec::new());
+    };
+    let variables = variables.as_array().ok_or_else(|| {
+        SoldbError::Message("the program-level context's `variables` is not an array".to_owned())
+    })?;
+    variables
+        .iter()
+        .enumerate()
+        .map(|(index, variable)| {
+            let object = variable.as_object().ok_or_else(|| {
+                SoldbError::Message(format!("context variable {index} is not an object"))
+            })?;
+            let identifier = match object.get("identifier") {
+                None => None,
+                Some(Value::String(identifier)) if !identifier.is_empty() => {
+                    Some(identifier.clone())
+                }
+                Some(_) => {
+                    return Err(SoldbError::Message(format!(
+                        "context variable {index} has an identifier that is not a non-empty string"
+                    )))
+                }
+            };
+            let declaration = object
+                .get("declaration")
+                .map(|declaration| {
+                    parse_source_location(declaration).ok_or_else(|| {
+                        SoldbError::Message(format!(
+                            "context variable {index} has a declaration that is not a source range"
+                        ))
+                    })
+                })
+                .transpose()?;
+            if identifier.is_none() && declaration.is_none() {
+                return Err(SoldbError::Message(format!(
+                    "context variable {index} has neither an identifier nor a declaration"
+                )));
+            }
+            Ok(ContextVariable {
+                identifier,
+                declaration,
+                ty: object.get("type").cloned(),
+                pointer: object.get("pointer").cloned(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VariableLocation {
     pub name: String,
@@ -184,6 +300,10 @@ pub struct EthdebugInfo {
     pub sources: BTreeMap<u64, String>,
     #[serde(default)]
     pub variable_locations: BTreeMap<u64, Vec<VariableLocation>>,
+    /// The state variables the program-level context lists, in the compiler's order.
+    /// Empty for a compiler that does not emit the context yet.
+    #[serde(default)]
+    pub state_variables: Vec<ContextVariable>,
 }
 
 impl EthdebugInfo {
@@ -221,6 +341,7 @@ impl EthdebugInfo {
             .unwrap_or_else(|| metadata.clone());
         let sources = parse_compilation_sources(&compilation);
         let variable_locations = parse_variable_locations(program)?;
+        let state_variables = parse_context_variables(program)?;
         Ok(Self {
             compilation,
             contract_name: contract_name.to_owned(),
@@ -228,6 +349,7 @@ impl EthdebugInfo {
             instructions,
             sources,
             variable_locations,
+            state_variables,
         })
     }
 
@@ -745,6 +867,7 @@ mod tests {
             instructions: vec![instruction],
             sources,
             variable_locations,
+            state_variables: Vec::new(),
         };
 
         assert_eq!(info.source_info(3), Some(("Counter.sol", 9, 5)));
