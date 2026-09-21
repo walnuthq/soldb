@@ -19,14 +19,17 @@ def names_variable($label): region_names | any(. == $label or startswith($label 
 
 # A variable of value type is one region at the layout's slot. The region's offset counts
 # from the most significant byte of the slot and the layout's from the least significant
-# one, so a value of `length` bytes at layout offset `o` starts at byte `32 - o - length`;
-# a whole word has neither.
+# one, so a value of `length` bytes at layout offset `o` starts at byte `32 - o - length`.
+# A region without a length covers the rest of its slot, and one whose length exceeds a
+# slot starts at the beginning of the first one and continues into those that follow.
 def check_region($variable; $template):
   if (.slot | type) != "string" then
     error("\($variable.label): \($template) computes its slot, the layout gives one")
   elif (.slot | hex) != ($variable.slot | tonumber) then
     error("\($variable.label): \($template) addresses slot \(.slot), the layout says \($variable.slot)")
-  elif has("length") and ((.offset // "0x00") | hex) + (.length | hex) + $variable.offset != 32 then
+  elif has("length") and (.length | hex) >= 32 and (((.offset // "0x00") | hex) != 0 or $variable.offset != 0) then
+    error("\($variable.label): \($template) spans whole slots but starts at an offset")
+  elif has("length") and (.length | hex) < 32 and ((.offset // "0x00") | hex) + (.length | hex) + $variable.offset != 32 then
     error("\($variable.label): \($template) covers bytes \(.offset // "0x00")+\(.length), the layout says offset \($variable.offset)")
   elif (has("length") | not) and ($variable.offset != 0 or has("offset")) then
     error("\($variable.label): \($template) is a whole word, the layout says offset \($variable.offset)")

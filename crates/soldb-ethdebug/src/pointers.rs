@@ -1565,6 +1565,47 @@ mod tests {
     }
 
     #[test]
+    fn a_region_longer_than_a_slot_covers_the_slots_that_follow() {
+        // What solc emits for a struct it does not decompose, one nested in itself
+        // through an array: the element is three slots of a recursive `Node`.
+        let template = parse_template(json!({
+            "expect": [],
+            "for": {"list": {"count": "0x02", "each": "i", "is": {
+                "name": "tree-children-item",
+                "location": "storage",
+                "slot": {"$sum": ["0x10", {"$product": ["i", "0x03"]}]},
+                "length": "0x60"
+            }}}
+        }));
+        let mut storage = BTreeMap::new();
+        for slot in 16..22_u64 {
+            storage.insert(word(slot), word(slot));
+        }
+        let storage = Storage(storage);
+        let regions = dereferenced(&template, &[], &storage);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            regions
+                .iter()
+                .map(|region| (region.slot, region.offset, region.length))
+                .collect::<Vec<_>>(),
+            vec![(Some(word(16)), 0, 96), (Some(word(19)), 0, 96)]
+        );
+        // The bytes are the three slots from the one addressed, concatenated.
+        let bytes = read_region(&regions[0], &storage).expect("bytes");
+        assert_eq!(bytes.len(), 96);
+        assert_eq!(&bytes[..32], &word(16)[..]);
+        assert_eq!(&bytes[32..64], &word(17)[..]);
+        assert_eq!(&bytes[64..], &word(18)[..]);
+        // Without a length the region would have covered the first slot alone.
+        let one_slot = parse_template(json!({
+            "expect": [],
+            "for": {"name": "tree-children-item", "location": "storage", "slot": "0x10"}
+        }));
+        assert_eq!(dereferenced(&one_slot, &[], &storage)[0].length, 32);
+    }
+
+    #[test]
     fn arithmetic_follows_the_format() {
         let storage = Storage(BTreeMap::new());
         let evaluate = |expression: serde_json::Value| {
