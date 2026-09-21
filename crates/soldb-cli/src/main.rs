@@ -3893,6 +3893,7 @@ mod tests {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let debug =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]));
