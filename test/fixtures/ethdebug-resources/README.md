@@ -8,5 +8,5 @@ program with the program-level context listing the state variables. They were pr
 by the solc branch that adds the tables and the context (argotorg/solidity#16990 and
 its follow-ups) and are read by the unit tests of `soldb-ethdebug`.
 
-Regenerate all three together when that output changes; the template names carry AST
-ids, so they change whenever `Resources.sol` does.
+Regenerate all three together when that output changes; the identifiers of user-defined
+types carry AST ids, so they change whenever `Resources.sol` does.

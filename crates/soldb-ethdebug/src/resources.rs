@@ -3,11 +3,15 @@
 //! `ethdebug_resources.json` carries, next to the compilation, a `types` table with one
 //! ethdebug/format/type document per type the compiler describes, keyed by the type
 //! identifier the storage layout uses too (`t_uint256`, `t_mapping$_t_address_$_t_uint256_$`),
-//! and a `pointers` table with one ethdebug/format/pointer/template per state variable
-//! in storage or transient storage, named `storage_<contract>_<variable>` or
-//! `transient_<contract>_<variable>` after the AST ids. solc fills both from 0.8.38;
-//! earlier releases write empty tables, which parse to empty tables here, and a debugger
-//! then reads state variables through the storage layout as before.
+//! and a `pointers` table with one ethdebug/format/pointer/template per struct, array and
+//! mapping type a state variable has or is composed of, keyed by the same identifier:
+//! how a value of the type is laid out from a base slot, which the template expects as
+//! `slot`; a mapping's template expects `key` as well and locates one entry. Value types
+//! have no template, they are single regions wherever they occur, and where a state
+//! variable starts is what the storage layout and the program-level context say. solc
+//! fills both tables from 0.8.38; earlier releases write empty tables, which parse to
+//! empty tables here, and a debugger then reads state variables through the storage
+//! layout as before.
 //!
 //! [`Resources::parse`] reads the tables and rejects documents that do not follow the
 //! schemas, since a type read loosely decodes the wrong bytes. A type document says how
@@ -193,36 +197,11 @@ impl Resources {
         dangling
     }
 
-    /// The pointer templates of a state variable, by the name their regions carry: the
-    /// template whose first region is `label` or starts with `label-`. A variable inherited
-    /// by several contracts has one template per contract, so the caller picks by the
-    /// contract's AST id in the name when it knows it.
+    /// The template of a struct, array or mapping type, by the identifier the type table
+    /// uses; `None` for a value type, whose values are single regions.
     #[must_use]
-    pub fn templates_of_variable(&self, label: &str) -> Vec<(&str, &PointerTemplate)> {
-        self.pointers
-            .iter()
-            .filter(|(_, template)| {
-                first_region_name(&template.body)
-                    .is_some_and(|name| name == label || name.starts_with(&format!("{label}-")))
-            })
-            .map(|(name, template)| (name.as_str(), template))
-            .collect()
-    }
-
-    /// The template of the variable with AST id `variable_id` in the contract with AST id
-    /// `contract_id`, in storage or transient storage.
-    #[must_use]
-    pub fn template_of(
-        &self,
-        contract_id: u64,
-        variable_id: u64,
-    ) -> Option<(&str, &PointerTemplate)> {
-        ["storage", "transient"].into_iter().find_map(|location| {
-            let name = format!("{location}_{contract_id}_{variable_id}");
-            self.pointers
-                .get_key_value(&name)
-                .map(|(name, template)| (name.as_str(), template))
-        })
+    pub fn template_for_type(&self, type_id: &str) -> Option<&PointerTemplate> {
+        self.pointers.get(type_id)
     }
 
     /// The Solidity-like spelling of a type, such as `mapping(address => uint256)`.
@@ -235,18 +214,6 @@ impl Resources {
                 TypeReference::Inline(_) => "?".to_owned(),
             },
         }
-    }
-}
-
-fn first_region_name(pointer: &crate::pointers::Pointer) -> Option<&str> {
-    use crate::pointers::Pointer;
-    match pointer {
-        Pointer::Region(region) => region.name.as_deref(),
-        Pointer::Group(members) => members.iter().find_map(first_region_name),
-        Pointer::List { is, .. } => first_region_name(is),
-        Pointer::Conditional { then, .. } => first_region_name(then),
-        Pointer::Scope { inner, .. } | Pointer::Templates { inner, .. } => first_region_name(inner),
-        Pointer::Template { .. } => None,
     }
 }
 
@@ -418,13 +385,16 @@ impl TypeDocument {
             }
             Self::Alias { contains, .. } => resources.resolve(contains)?.decode(bytes, resources),
             Self::Function { .. } => Ok(format!("0x{}", hex(bytes))),
-            Self::Array { .. }
-            | Self::Mapping { .. }
-            | Self::Struct { .. }
-            | Self::Tuple { .. } => Err(SoldbError::Message(format!(
-                "a {} is read through the regions of its parts, not from bytes",
-                self.kind()
-            ))),
+            Self::Mapping { .. } => Err(SoldbError::Message(
+                "a mapping's entries are located through its pointer template; index it with a key"
+                    .to_owned(),
+            )),
+            Self::Array { .. } | Self::Struct { .. } | Self::Tuple { .. } => {
+                Err(SoldbError::Message(format!(
+                    "a {} is read through the regions of its parts, not from bytes",
+                    self.kind()
+                )))
+            }
         }
     }
 
@@ -517,14 +487,16 @@ pub struct StateValue {
 }
 
 impl Resources {
-    /// Reads the state variable `identifier` of type `ty` through `pointer`, the pointer
-    /// its program context inlines, against `machine`: one value per region the pointer
-    /// names, decoded by the type the region's name leads to. Regions that only carry
-    /// bookkeeping, such as a dynamic array's length or a string's length flag, are left
-    /// out. A region the machine has no words for is reported, not read as zero.
+    /// Reads a state variable of type `ty` through `pointer`, the pointer its program
+    /// context carries, against `machine`: one value per region the pointer names,
+    /// decoded by the type the region's name leads to from `ty`. The names are relative
+    /// to the variable: `x` is a struct member, `item` an array element, `from-x` a member
+    /// of a member, and the `data` of a `bytes` or `string` is the value itself. Regions
+    /// that only carry bookkeeping, such as a dynamic array's length or a string's length
+    /// flag, are left out. A region the machine has no words for is reported, not read
+    /// as zero.
     pub fn read_variable(
         &self,
-        identifier: &str,
         ty: &TypeReference,
         pointer: &Pointer,
         machine: &dyn Machine,
@@ -533,30 +505,40 @@ impl Resources {
         let regions = dereference_pointer(pointer, &self.pointers, machine)?;
         let mut values = Vec::with_capacity(regions.len());
         for region in &regions {
-            let name = region.name.clone().unwrap_or_else(|| identifier.to_owned());
-            let path = match name.strip_prefix(identifier) {
-                Some("") => Vec::new(),
-                Some(rest) if rest.starts_with('-') => rest[1..].split('-').collect(),
-                _ => {
+            let mut path = region
+                .name
+                .as_deref()
+                .map_or_else(Vec::new, |name| name.split('-').collect::<Vec<_>>());
+            let document = match self.type_at_path(root, &path) {
+                Some(document) => document,
+                None if is_bookkeeping(&path) => continue,
+                None => {
                     values.push(StateValue {
-                        display: format!("<region `{name}` is not part of `{identifier}`>"),
-                        name,
+                        name: path.join("-"),
+                        display: format!("<no type for region `{}`>", path.join("-")),
                         available: false,
                     });
                     continue;
                 }
             };
-            if is_bookkeeping(&path) {
-                continue;
+            // The `data` of a `bytes` or `string` is the value, not a part of it.
+            let is_bytes = matches!(
+                document,
+                TypeDocument::Bytes { size: None } | TypeDocument::String { .. }
+            );
+            if path.last() == Some(&"data") && is_bytes {
+                path.pop();
             }
-            let Some(document) = self.type_at_path(root, &path) else {
+            let name = path.join("-");
+            // A mapping's base slot holds nothing to read; its entries are elsewhere.
+            if let TypeDocument::Mapping { .. } = document {
                 values.push(StateValue {
-                    display: format!("<no type for region `{name}`>"),
                     name,
+                    display: "<mapping; index it with a key>".to_owned(),
                     available: false,
                 });
                 continue;
-            };
+            }
             values.push(match read_region(region, machine) {
                 Ok(bytes) => match document.decode(&bytes, self) {
                     Ok(display) => StateValue {
@@ -581,7 +563,8 @@ impl Resources {
     }
 
     /// The type a region's name leads to from the variable's type: `item` steps into an
-    /// array's element, a member name into a struct's member, an alias into what it wraps.
+    /// array's element, a member name into a struct's member, `value` into a mapping's
+    /// value, `data` stays at a `bytes` or `string`, an alias into what it wraps.
     fn type_at_path<'a>(
         &'a self,
         root: &'a TypeDocument,
@@ -596,6 +579,14 @@ impl Resources {
             current = match current {
                 TypeDocument::Array { contains, .. } if *segment == "item" => {
                     self.resolve(contains).ok()?
+                }
+                TypeDocument::Mapping { value, .. } if *segment == "value" => {
+                    self.resolve(value).ok()?
+                }
+                TypeDocument::Bytes { size: None } | TypeDocument::String { .. }
+                    if *segment == "data" =>
+                {
+                    current
                 }
                 TypeDocument::Struct { members, .. } => {
                     let member = members
@@ -612,7 +603,8 @@ impl Resources {
 
 /// Whether a region name path ends in the bookkeeping the storage layouts add: the
 /// `length` of a dynamic array, the `length-flag` and `long-length` of bytes and strings.
-/// The segments come from splitting the name on `-`.
+/// The segments come from splitting the name on `-`; a struct member that happens to be
+/// called `length` resolves to its type first and is never taken for bookkeeping.
 fn is_bookkeeping(path: &[&str]) -> bool {
     matches!(path, [.., "length"] | [.., "length", "flag"])
 }
@@ -1048,7 +1040,7 @@ mod tests {
     use super::{Resources, StateValue, TypeDocument, TypeReference};
     use crate::abi::keccak256;
     use crate::metadata::{parse_context_variables, ContextVariable, EthdebugInfo};
-    use crate::pointers::{dereference, read_region, Location, Machine, Pointer};
+    use crate::pointers::{dereference, Location, Machine, Pointer};
     use crate::storage_layout::{mapping_slot, parse_word, StorageLayout, Word};
 
     const FIXTURE: &str =
@@ -1322,162 +1314,130 @@ mod tests {
     }
 
     #[test]
-    fn every_layout_variable_has_a_template_at_the_layout_slot() {
+    fn every_composed_layout_type_has_a_template_and_no_value_type_does() {
         let resources = fixture();
         let layout = layout();
-        let storage = Storage(BTreeMap::new());
         for variable in &layout.variables {
-            let templates = resources.templates_of_variable(&variable.label);
-            assert!(
-                !templates.is_empty(),
-                "no template names {}",
-                variable.label
-            );
-            let ty = layout.type_of(&variable.type_id).expect("type");
-            for (name, template) in templates {
-                if !template.expect.is_empty() {
-                    assert!(
-                        variable.type_id.starts_with("t_mapping"),
-                        "{name} expects keys"
+            let type_id = escaped(&variable.type_id);
+            let document = resources.type_document(&type_id).expect(&type_id);
+            let template = resources.template_for_type(&type_id);
+            match document {
+                TypeDocument::Mapping { .. } => {
+                    assert_eq!(
+                        template.expect(&type_id).expect,
+                        ["slot", "key"],
+                        "{type_id}"
                     );
-                    continue;
                 }
-                let regions = dereference(template, &[], &resources.pointers, &storage)
-                    .or_else(|error| {
-                        // Dynamic arrays and strings read their length first; give them one.
-                        let _ = error;
-                        let with_length = Storage([(variable.slot, word(0))].into_iter().collect());
-                        dereference(template, &[], &resources.pointers, &with_length)
-                    })
-                    .expect(name);
-                let first = &regions[0];
-                assert_eq!(first.slot, Some(variable.slot), "{name}");
-                if ty.encoding == crate::storage_layout::StorageEncoding::Inplace
-                    && ty.members.is_empty()
-                    && ty.base.is_none()
-                {
-                    // A value type: one region of the type's width, at the layout's offset
-                    // counted from the other end of the slot.
-                    assert_eq!(regions.len(), 1, "{name}");
-                    assert_eq!(first.length, ty.number_of_bytes, "{name}");
-                    assert_eq!(first.offset + first.length + variable.offset, 32, "{name}");
+                TypeDocument::Struct { .. }
+                | TypeDocument::Array { .. }
+                | TypeDocument::Bytes { size: None }
+                | TypeDocument::String { .. } => {
+                    assert_eq!(template.expect(&type_id).expect, ["slot"], "{type_id}");
                 }
+                _ => assert!(template.is_none(), "{type_id} is a value type"),
+            }
+        }
+        // Every template dereferences against an empty machine up to the lengths it
+        // reads, so it references only templates that are in the table.
+        for (name, template) in &resources.pointers {
+            let storage = Storage(BTreeMap::new());
+            let mut arguments = vec![("slot".to_owned(), vec![7])];
+            if template.expect.len() > 1 {
+                arguments.push(("key".to_owned(), vec![1]));
+            }
+            match dereference(template, &arguments, &resources.pointers, &storage) {
+                Ok(regions) => assert!(!regions.is_empty(), "{name}"),
+                Err(error) => assert!(
+                    error.to_string().contains("has not been read"),
+                    "{name}: {error}"
+                ),
             }
         }
     }
 
     #[test]
-    fn a_mapping_template_agrees_with_the_layout_arithmetic() {
+    fn a_template_bound_to_a_layout_slot_starts_where_the_layout_says() {
         let resources = fixture();
         let layout = layout();
-        let balances = layout.variable("balances").expect("balances");
-        let (_, template) = resources
-            .templates_of_variable("balances")
-            .into_iter()
-            .next()
-            .expect("template");
-        assert_eq!(template.expect, vec!["key".to_owned()]);
+        for variable in &layout.variables {
+            let type_id = escaped(&variable.type_id);
+            let Some(template) = resources.template_for_type(&type_id) else {
+                continue;
+            };
+            // A zero word at the slot makes a dynamic array empty and a string short.
+            let storage = Storage([(variable.slot, word(0))].into_iter().collect());
+            let mut arguments = vec![("slot".to_owned(), variable.slot.to_vec())];
+            let mut expected_slot = variable.slot;
+            if template.expect.len() > 1 {
+                // A 20-byte key, which the template pads to a word before hashing.
+                let mut key = [0_u8; 32];
+                key[12..].fill(0xab);
+                arguments.push(("key".to_owned(), key[12..].to_vec()));
+                expected_slot = mapping_slot(&variable.slot, &key);
+            }
+            let regions = dereference(template, &arguments, &resources.pointers, &storage)
+                .unwrap_or_else(|error| panic!("{}: {error}", variable.label));
+            // The first region is in the base slot: a member, the first element, a length.
+            assert_eq!(regions[0].slot, Some(expected_slot), "{}", variable.label);
+        }
+    }
+
+    #[test]
+    fn a_nested_mapping_is_followed_one_key_per_level() {
+        let resources = fixture();
+        let layout = layout();
+        let nested = layout.variable("nested").expect("nested");
+        let outer = resources
+            .template_for_type(&escaped(&nested.type_id))
+            .expect("outer template");
         let key = parse_word("0x000000000000000000000000abababababababababababababababababababab")
             .expect("key");
+        let storage = Storage(BTreeMap::new());
         let regions = dereference(
-            template,
-            &[("key".to_owned(), key[12..].to_vec())],
-            &resources.pointers,
-            &Storage(BTreeMap::new()),
-        )
-        .expect("dereference");
-        assert_eq!(regions[0].slot, Some(mapping_slot(&balances.slot, &key)));
-
-        let nested = layout.variable("nested").expect("nested");
-        let (_, template) = resources
-            .templates_of_variable("nested")
-            .into_iter()
-            .next()
-            .expect("template");
-        assert_eq!(template.expect, vec!["key".to_owned(), "key1".to_owned()]);
-        let regions = dereference(
-            template,
+            outer,
             &[
+                ("slot".to_owned(), nested.slot.to_vec()),
                 ("key".to_owned(), key[12..].to_vec()),
-                ("key1".to_owned(), vec![5]),
             ],
             &resources.pointers,
-            &Storage(BTreeMap::new()),
+            &storage,
         )
-        .expect("dereference");
-        let inner = mapping_slot(&nested.slot, &key);
-        assert_eq!(regions[0].slot, Some(mapping_slot(&inner, &word(5))));
+        .expect("outer entry");
+        // The entry of the outer mapping is the base slot of the inner one, a whole slot.
+        let inner_slot = mapping_slot(&nested.slot, &key);
+        assert_eq!(regions[0].slot, Some(inner_slot));
+        assert_eq!((regions[0].offset, regions[0].length), (0, 32));
+        let inner = resources
+            .template_for_type("t_mapping$_t_uint256_$_t_bool_$")
+            .expect("inner template");
+        let regions = dereference(
+            inner,
+            &[
+                ("slot".to_owned(), inner_slot.to_vec()),
+                ("key".to_owned(), vec![5]),
+            ],
+            &resources.pointers,
+            &storage,
+        )
+        .expect("inner entry");
+        assert_eq!(regions[0].slot, Some(mapping_slot(&inner_slot, &word(5))));
         assert_eq!((regions[0].offset, regions[0].length), (31, 1));
     }
 
     #[test]
-    fn a_state_variable_is_read_through_its_template_and_type() {
+    fn templates_are_keyed_by_type() {
         let resources = fixture();
-        let layout = layout();
-        let flag = layout.variable("flag").expect("flag");
-        let mut slot = [0_u8; 32];
-        slot[30] = 1; // `flag` is the byte before the least significant one of slot 2.
-        slot[31] = 9; // `small`
-        let storage = Storage([(flag.slot, slot)].into_iter().collect());
-        let read = |label: &str| {
-            let variable = layout.variable(label).expect(label);
-            let (_, template) = resources
-                .templates_of_variable(label)
-                .into_iter()
-                .next()
-                .expect(label);
-            let regions = dereference(template, &[], &resources.pointers, &storage).expect(label);
-            let bytes = read_region(&regions[0], &storage).expect(label);
-            resources
-                .type_document(&escaped(&variable.type_id))
-                .expect(label)
-                .decode(&bytes, &resources)
-                .expect(label)
-        };
-        assert_eq!(read("flag"), "true");
-        assert_eq!(read("small"), "9");
-    }
-
-    #[test]
-    fn templates_are_found_by_ast_ids() {
-        let resources = fixture();
-        let layout = layout();
-        let total = layout
-            .variables
-            .iter()
-            .find(|variable| variable.label == "total")
-            .expect("total");
-        let source: Value = serde_json::from_str(LAYOUT).expect("layout");
-        let ast_id = source["storage"]
-            .as_array()
-            .expect("storage")
-            .iter()
-            .find(|entry| entry["label"] == "total")
-            .and_then(|entry| entry["astId"].as_u64())
-            .expect("astId");
-        let contract_id = resources
-            .pointers
-            .keys()
-            .find_map(|name| {
-                let mut parts = name.rsplitn(3, '_');
-                let variable = parts.next()?.parse::<u64>().ok()?;
-                let contract = parts.next()?.parse::<u64>().ok()?;
-                (variable == ast_id).then_some(contract)
-            })
-            .expect("contract id");
-        let (name, template) = resources
-            .template_of(contract_id, ast_id)
-            .expect("template");
-        assert!(name.starts_with("storage_"));
-        let regions = dereference(
-            template,
-            &[],
-            &resources.pointers,
-            &Storage(BTreeMap::new()),
-        )
-        .expect("total");
-        assert_eq!(regions[0].slot, Some(total.slot));
-        assert!(resources.template_of(contract_id, u64::MAX).is_none());
+        let point = resources
+            .template_for_type("t_struct$_Point_$12_storage")
+            .expect("Point");
+        assert_eq!(point.expect, vec!["slot".to_owned()]);
+        assert!(resources.template_for_type("t_uint256").is_none());
+        assert!(resources.template_for_type("t_enum$_Color_$7").is_none());
+        // The same identifier keys the type document.
+        assert!(resources
+            .type_document("t_struct$_Point_$12_storage")
+            .is_some());
     }
 
     fn program() -> EthdebugInfo {
@@ -1525,7 +1485,21 @@ mod tests {
             .iter()
             .find(|variable| variable.identifier.as_deref() == Some("balances"))
             .expect("balances");
-        assert_eq!(balances.parsed_pointer().expect("no pointer"), None);
+        // A mapping is listed with the region of its base slot; a struct with a reference
+        // to the template of its type, the slot bound.
+        assert!(matches!(
+            balances.parsed_pointer().expect("pointer"),
+            Some(Pointer::Region(_))
+        ));
+        let origin = program
+            .state_variables
+            .iter()
+            .find(|variable| variable.identifier.as_deref() == Some("origin"))
+            .expect("origin");
+        assert!(matches!(
+            origin.parsed_pointer().expect("pointer"),
+            Some(Pointer::Scope { .. })
+        ));
 
         // A compiler that does not emit the context lists nothing; a context of the wrong
         // shape is an error rather than a guess.
@@ -1595,7 +1569,7 @@ mod tests {
             let ty = variable.type_reference().expect("type").expect("typed");
             let pointer = variable.parsed_pointer().expect("pointer").expect("closed");
             resources
-                .read_variable(identifier, &ty, &pointer, &storage)
+                .read_variable(&ty, &pointer, &storage)
                 .expect(identifier)
         };
         let shown = |values: Vec<StateValue>| {
@@ -1604,21 +1578,24 @@ mod tests {
                 .map(|value| format!("{}={}", value.name, value.display))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(shown(read("flag")), ["flag=true"]);
-        assert_eq!(shown(read("small")), ["small=9"]);
-        assert_eq!(shown(read("origin")), ["origin-x=1", "origin-y=2"]);
+        assert_eq!(shown(read("flag")), ["=true"]);
+        assert_eq!(shown(read("small")), ["=9"]);
+        assert_eq!(shown(read("origin")), ["x=1", "y=2"]);
         assert_eq!(
             shown(read("packed")),
-            [
-                "packed-item=1",
-                "packed-item=2",
-                "packed-item=3",
-                "packed-item=4"
-            ]
+            ["item=1", "item=2", "item=3", "item=4"]
         );
         // The length region is bookkeeping; the elements are read at keccak256(slot).
-        assert_eq!(shown(read("values")), ["values-item=10", "values-item=20"]);
-        assert_eq!(shown(read("text")), ["text=\"hi\""]);
+        assert_eq!(shown(read("values")), ["item=10", "item=20"]);
+        assert_eq!(shown(read("text")), ["=\"hi\""]);
+        // A mapping's base slot holds no value; its entries need a key.
+        let balances = read("balances");
+        assert_eq!(balances.len(), 1);
+        assert!(
+            !balances[0].available && balances[0].display.contains("key"),
+            "{}",
+            balances[0].display
+        );
         // A slot the machine never recorded is reported, not read as zero.
         let total = read("total");
         assert_eq!(total.len(), 1);
