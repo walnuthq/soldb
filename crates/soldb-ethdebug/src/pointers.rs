@@ -355,7 +355,13 @@ impl Dereferencer<'_> {
     ) -> SoldbResult<()> {
         match pointer {
             Pointer::Region(region) => {
+                let inner_name = region.name.clone();
                 let region = self.region(region, bindings, renames)?;
+                // The template's own expressions refer to the region by the name it
+                // declares; what encloses the template, by the name a reference gave it.
+                if let Some(name) = inner_name {
+                    self.named.insert(name, region.clone());
+                }
                 if let Some(name) = &region.name {
                     self.named.insert(name.clone(), region.clone());
                 }
