@@ -137,9 +137,9 @@ belongs in `soldb-debugger`, not in a second copy.
   (`events.rs`), the storage layout (`storage_layout.rs`): where solc put each state
   variable, the slot arithmetic for mappings, arrays, and structs, and the decoding of a
   word by its declared type, and the ETHDebug resources tables (`resources.rs`,
-  `pointers.rs`): the type documents and pointer templates solc emits from 0.8.38, and
-  the dereferencing of a template against a recorded machine state into the regions it
-  names. A region's byte offset counts from the most significant byte of the slot, as
+  `pointers.rs`): the type documents solc emits from 0.8.38 and the pointer templates,
+  one per struct, array and mapping type keyed like its document, and the dereferencing
+  of a template against a recorded machine state into the regions it names. A region's byte offset counts from the most significant byte of the slot, as
   the format's segment addressing does; the storage layout counts from the least
   significant one. Pure functions over files and bytes; no network.
 - **soldb-evm**: the execution engine, with no I/O. The node data shapes
@@ -303,8 +303,10 @@ they live, so `vars` and `print` read them through `StorageLayout` for ETHDebug 
 artifacts alike, `break <name>` stops where one is written, and the web document carries
 the layout and the final values. From the ETHDebug program-context change on, solc also
 lists them in the program-level `context.variables` of each program, with the type by
-identifier into the resources' type table and the pointer inlined from the variable's
-template; `EthdebugInfo::state_variables` carries that list and
+identifier into the resources' type table and a pointer: a region for a value type and
+for a mapping's base slot, a reference to the type's template in the resources' pointer
+table (keyed by the type identifier, expecting the base slot as `slot`) for a struct, an
+array, `bytes` or `string`; `EthdebugInfo::state_variables` carries that list and
 `Resources::read_variable` reads a variable through it. The frontends still go through
 the layout; switching them over, with the layout as the fallback, is the next step. A *memory* value is the same kind of fact: the layout of
 a `string`, `bytes`, or array in memory is the language's, so a frame's memory arguments

@@ -172,9 +172,9 @@ pub struct ContextVariable {
     /// type document inline. Read it through [`ContextVariable::type_reference`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ty: Option<Value>,
-    /// The pointer as written, inlined from the variable's template. Absent when the
-    /// template expects parameters, as a mapping's does for its keys; the resources'
-    /// pointer table has the template then. Read it through
+    /// The pointer as written: a region for a value type and for a mapping's base slot,
+    /// a reference to the template of the variable's type in the resources' pointer table,
+    /// with the slot bound, for any other type. Read it through
     /// [`ContextVariable::parsed_pointer`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer: Option<Value>,
