@@ -103,7 +103,7 @@ anvil --steps-tracing
 Compile with ETHDebug (Solidity 0.8.29+):
 
 ```bash
-solc --via-ir --debug-info ethdebug --ethdebug --ethdebug-runtime --bin --abi --overwrite -o out examples/Counter.sol
+solc --via-ir --debug-info ethdebug,ast-id --ethdebug --ethdebug-runtime --bin --abi --overwrite -o out examples/Counter.sol
 ```
 
 Or let SolDB drive solc, which also requests the storage layout used to read state variables:
@@ -275,7 +275,7 @@ parsing, CLI presentation, and interactive debugging can evolve independently.
 
 ```mermaid
 flowchart TD
-    contracts["Solidity contracts"] --> solc["solc<br/>--debug-info ethdebug<br/>--ethdebug --ethdebug-runtime"]
+    contracts["Solidity contracts"] --> solc["solc<br/>--debug-info ethdebug,ast-id<br/>--ethdebug --ethdebug-runtime"]
     solc --> artifacts["ETHDebug + ABI artifacts"]
 
     cli["soldb trace / simulate / profile"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]

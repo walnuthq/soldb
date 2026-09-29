@@ -13,7 +13,7 @@ a DAP server for editors, and a WebAssembly module for browser and Node.js hosts
 Two premises drive most design decisions:
 
 - **Debug info comes from the compiler, not from guessing.** We consume
-  `solc --debug-info ethdebug` artifacts. When metadata is missing or incomplete, the
+  `solc --debug-info ethdebug,ast-id` artifacts. When metadata is missing or incomplete, the
   right behavior is to degrade visibly (say what is unavailable), never to invent a
   source mapping from heuristics. Legacy `srcmap` support exists only as a fallback for
   pre-ETHDebug compilers.
