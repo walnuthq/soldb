@@ -7,7 +7,7 @@
 # REQUIRES: soldb, compiler-solc, solc-ethdebug-program-context, optimization-none
 # RUN: rm -rf %t
 # RUN: mkdir -p %t
-# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug --experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr
 
 # Every variable of the storage layout is listed, in order, with the type identifier the
 # layout uses for it; the transient storage variable follows.

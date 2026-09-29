@@ -63,7 +63,7 @@ def solc_emits_program_context(path):
         )
         result = subprocess.run(
             [
-                path, "--evm-version=cancun", "--via-ir", "--debug-info", "ethdebug",
+                path, "--evm-version=cancun", "--via-ir", "--debug-info", "ethdebug,ast-id",
                 "--experimental", "--ethdebug-program-runtime", "-o", directory, str(source),
             ],
             capture_output=True, text=True, check=False, cwd=directory,
