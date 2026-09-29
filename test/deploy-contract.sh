@@ -135,9 +135,11 @@ if [ "$USE_ETHDEBUG" = true ]; then
     
     # ETHDebug compilation flags
     # Note: ETHDebug doesn't support optimization flags yet
+    # solc develop (0.8.38) requires `ast-id` next to `ethdebug` in --debug-info; every
+    # ETHDebug-capable release accepts the pair and emits the same artifacts for it.
     COMPILE_FLAGS=(
         --via-ir
-        --debug-info ethdebug
+        --debug-info ethdebug,ast-id
         --ethdebug
         --ethdebug-runtime
         --bin
@@ -176,7 +178,7 @@ if [ "$USE_ETHDEBUG" = true ] && [ $COMPILE_EXIT_CODE -ne 0 ] && grep -q "unreco
     echo -e "${YELLOW}Legacy ETHDebug flags not recognised by this solc; retrying with modern flag names...${NC}"
     COMPILE_FLAGS=(
         --via-ir
-        --debug-info ethdebug
+        --debug-info ethdebug,ast-id
         --experimental
         --ethdebug-program
         --ethdebug-program-runtime

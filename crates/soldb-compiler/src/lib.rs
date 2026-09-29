@@ -215,8 +215,10 @@ impl Default for CompilerConfig {
             project: ProjectLayout::default(),
             ethdebug_flags: vec![
                 "--via-ir".to_owned(),
+                // solc develop (0.8.38) requires `ast-id` next to `ethdebug`; every
+                // ETHDebug-capable release accepts the pair and emits the same artifacts.
                 "--debug-info".to_owned(),
-                "ethdebug".to_owned(),
+                "ethdebug,ast-id".to_owned(),
                 "--ethdebug".to_owned(),
                 "--ethdebug-runtime".to_owned(),
                 "--bin".to_owned(),

@@ -7,7 +7,7 @@
 # REQUIRES: soldb, compiler-solc, solc-at-least-0.8.38, optimization-none
 # RUN: rm -rf %t
 # RUN: mkdir -p %t
-# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug --experimental --ethdebug-program-runtime --ethdebug-resources --storage-layout --bin --abi -o %t > %t/compile.stdout 2> %t/compile.stderr
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime --ethdebug-resources --storage-layout --bin --abi -o %t > %t/compile.stdout 2> %t/compile.stderr
 
 # Templates are keyed like the type documents.
 # RUN: jq -c '. as $r | [.pointers | keys[] | . as $id | $r.types | has($id)] | [length, all]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=NAMES

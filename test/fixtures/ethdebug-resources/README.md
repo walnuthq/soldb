@@ -1,7 +1,7 @@
 # ETHDebug resources fixture
 
 `Resources.sol` is `test/compiler/Resources.sol`, and the JSON files are what
-`solc --via-ir --debug-info ethdebug --experimental --ethdebug-program-runtime
+`solc --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime
 --ethdebug-resources --storage-layout --evm-version=cancun` wrote for it: the resources
 with their type and pointer tables, the storage layout of `Resources`, and its runtime
 program with the program-level context listing the state variables. They were produced
