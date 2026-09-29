@@ -5,7 +5,7 @@
 # REQUIRES: soldb, compiler-solc, solc-at-least-0.8.38, optimization-none
 # RUN: rm -rf %t
 # RUN: mkdir -p %t
-# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug --experimental --ethdebug-resources --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-resources --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr
 
 # Every variable of the storage layout has a document under its type identifier, which
 # the layout spells with `(`, `)` and `,` where the table has `$_`, `_$` and `_$_`.
