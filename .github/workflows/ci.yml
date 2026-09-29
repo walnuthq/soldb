@@ -332,10 +332,10 @@ jobs:
           # Informational, never a gate. `vars` and `print` in the debugger read ETHDebug
           # variable locations, so record whether this build emits them yet.
           out="$(mktemp -d)"
-          "$SOLC_PATH" --via-ir --debug-info ethdebug --experimental \
+          "$SOLC_PATH" --via-ir --debug-info ethdebug,ast-id --experimental \
             --ethdebug-program --ethdebug-program-runtime --ethdebug-resources \
             --bin --abi --overwrite -o "$out" examples/Counter.sol > /dev/null 2>&1 \
-            || "$SOLC_PATH" --via-ir --debug-info ethdebug \
+            || "$SOLC_PATH" --via-ir --debug-info ethdebug,ast-id \
               --ethdebug --ethdebug-runtime \
               --bin --abi --overwrite -o "$out" examples/Counter.sol > /dev/null 2>&1 \
             || echo "ETHDebug compilation failed with both flag generations"

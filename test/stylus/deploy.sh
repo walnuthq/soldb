@@ -129,7 +129,7 @@ echo "Using solc version: ${SOLC_VERSION}"
 
 mkdir -p "${SCRIPT_DIR}/solidity-caller/out"
 solc --via-ir \
-    --debug-info ethdebug \
+    --debug-info ethdebug,ast-id \
     --ethdebug \
     --ethdebug-runtime \
     --bin \

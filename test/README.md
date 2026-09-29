@@ -231,7 +231,7 @@ The test suite uses the following configuration files:
 
 2. **Contract Deployment Failed**
    - Verify Solidity compiler: `solc --version` (needs 0.8.29+ for ETHDebug)
-   - Check compilation: `cd examples && solc --via-ir --debug-info ethdebug TestContract.sol`
+   - Check compilation: `cd examples && solc --via-ir --debug-info ethdebug,ast-id TestContract.sol`
 
 3. **FileCheck Not Found**
    - Install LLVM: `brew install llvm`
