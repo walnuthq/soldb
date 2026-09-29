@@ -970,7 +970,7 @@ mod tests {
     #[cfg(unix)]
     fn compiles_ethdebug_and_discovers_outputs() {
         let temp = temp_dir("compile");
-        let solc = fake_solc(&temp, "0.8.31", false);
+        let solc = fake_solc("0.8.31", false);
         let contract = temp.join("Counter.sol");
         std::fs::write(&contract, "contract Counter {}").expect("write contract");
         let out = temp.join("out");
@@ -995,9 +995,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn verifies_solc_ethdebug_version_floor() {
-        let temp = temp_dir("version");
-        let new_solc = fake_solc(&temp, "0.8.31", false);
-        let old_solc = fake_solc(&temp, "0.8.28", false);
+        let new_solc = fake_solc("0.8.31", false);
+        let old_solc = fake_solc("0.8.28", false);
 
         let new_info = CompilerConfig {
             solc_path: new_solc.to_string_lossy().into_owned(),
@@ -1010,7 +1009,7 @@ mod tests {
         }
         .verify_solc_version();
 
-        assert!(new_info.supported);
+        assert!(new_info.supported, "{:?}", new_info.error);
         assert!(!old_info.supported);
         assert_eq!(old_info.version.as_deref(), Some("0.8.28"));
     }
@@ -1033,8 +1032,7 @@ mod tests {
 
     #[test]
     fn reports_the_full_prerelease_version_string() {
-        let temp = temp_dir("prerelease-version");
-        let solc = fake_solc(&temp, "0.8.37-develop.2026.8.22", false);
+        let solc = fake_solc("0.8.37-develop.2026.8.22", false);
 
         let info = CompilerConfig {
             solc_path: solc.to_string_lossy().into_owned(),
@@ -1042,7 +1040,11 @@ mod tests {
         }
         .verify_solc_version();
 
-        assert!(info.supported, "develop builds support ETHDebug");
+        assert!(
+            info.supported,
+            "develop builds support ETHDebug: {:?}",
+            info.error
+        );
         assert_eq!(info.version.as_deref(), Some("0.8.37-develop.2026.8.22"));
     }
 
@@ -1050,7 +1052,7 @@ mod tests {
     #[cfg(unix)]
     fn dual_compile_reports_both_outputs() {
         let temp = temp_dir("dual");
-        let solc = fake_solc(&temp, "0.8.31", false);
+        let solc = fake_solc("0.8.31", false);
         let contract = temp.join("Counter.sol");
         std::fs::write(&contract, "contract Counter {}").expect("write contract");
         let cfg = CompilerConfig::with_paths(
@@ -1061,15 +1063,15 @@ mod tests {
 
         let result = dual_compile(&contract, &cfg);
 
-        assert!(result.production.is_ok());
-        assert!(result.debug.is_ok());
+        result.production.expect("production compile");
+        result.debug.expect("debug compile");
     }
 
     #[test]
     #[cfg(unix)]
     fn auto_deploy_compiles_sends_transaction_and_writes_metadata() {
         let temp = temp_dir("deploy");
-        let solc = fake_solc(&temp, "0.8.31", true);
+        let solc = fake_solc("0.8.31", true);
         let contract = temp.join("Counter.sol");
         std::fs::write(&contract, "contract Counter { constructor(uint256 n) {} }")
             .expect("write contract");
@@ -1092,7 +1094,38 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn fake_solc(root: &std::path::Path, version: &str, constructor: bool) -> std::path::PathBuf {
+    /// Every fake compiler a test runs, as (version, has a constructor).
+    const FAKE_SOLCS: [(&str, bool); 4] = [
+        ("0.8.28", false),
+        ("0.8.31", false),
+        ("0.8.31", true),
+        ("0.8.37-develop.2026.8.22", false),
+    ];
+
+    /// A fake compiler, written once for the whole test run before any of them executes.
+    ///
+    /// Tests run in parallel. A script one test is still writing when another test forks
+    /// its compiler is inherited by that child as an open write descriptor, and Linux then
+    /// refuses to execute the script with `ETXTBSY`. Writing every script up front keeps
+    /// the writes and the executions apart.
+    fn fake_solc(version: &str, constructor: bool) -> std::path::PathBuf {
+        static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let root = ROOT.get_or_init(|| {
+            let root = temp_dir("solc");
+            for (version, constructor) in FAKE_SOLCS {
+                write_fake_solc(&root, version, constructor);
+            }
+            root
+        });
+        let path = root.join(format!("solc-{version}-{constructor}"));
+        assert!(
+            path.exists(),
+            "no fake solc {version} (constructor: {constructor}); add it to FAKE_SOLCS"
+        );
+        path
+    }
+
+    fn write_fake_solc(root: &std::path::Path, version: &str, constructor: bool) {
         use std::os::unix::fs::PermissionsExt;
 
         let path = root.join(format!("solc-{version}-{constructor}"));
@@ -1138,7 +1171,6 @@ EOF
         let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod");
-        path
     }
 
     fn start_deploy_rpc_server() -> String {
