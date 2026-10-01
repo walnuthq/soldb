@@ -220,10 +220,14 @@ pub trait Machine {
 /// A callback reading the word at a slot, `None` when it is not known.
 pub type WordReader<'a> = &'a dyn Fn(&Word) -> Option<Word>;
 
-/// Storage words read through a callback, for the common case of a storage-only machine.
+/// Storage words read through a callback, for the common case of a machine that only
+/// knows the state of the contract: its storage and transient storage, and its code,
+/// which holds the values of its immutables.
 pub struct StorageMachine<'a> {
     pub storage: WordReader<'a>,
     pub transient: Option<WordReader<'a>>,
+    /// The code being run; for a runtime program, the deployed code.
+    pub code: Option<&'a [u8]>,
 }
 
 impl Machine for StorageMachine<'_> {
@@ -235,8 +239,16 @@ impl Machine for StorageMachine<'_> {
         }
     }
 
-    fn bytes(&self, _location: Location, _offset: u64, _length: u64) -> Option<Vec<u8>> {
-        None
+    fn bytes(&self, location: Location, offset: u64, length: u64) -> Option<Vec<u8>> {
+        match location {
+            // A region past the end of the code is not of this code.
+            Location::Code => {
+                let start = usize::try_from(offset).ok()?;
+                let end = start.checked_add(usize::try_from(length).ok()?)?;
+                self.code?.get(start..end).map(<[u8]>::to_vec)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1558,6 +1570,7 @@ mod tests {
         let machine = StorageMachine {
             storage: &|slot| storage.0.get(slot).copied(),
             transient: None,
+            code: None,
         };
         assert_eq!(
             read_region(&region, &machine).expect("bytes"),
@@ -1568,6 +1581,36 @@ mod tests {
             ..region.clone()
         };
         assert!(read_region(&transient, &machine).is_err());
+    }
+
+    #[test]
+    fn code_regions_read_the_code() {
+        // An immutable: solc points into the copy of its value the code carries.
+        let code = [0x7f_u8, 0, 0, 0xde, 0xad];
+        let machine = StorageMachine {
+            storage: &|_| None,
+            transient: None,
+            code: Some(&code),
+        };
+        let region = |offset, length| Region {
+            name: None,
+            location: Location::Code,
+            slot: None,
+            offset,
+            length,
+        };
+        assert_eq!(
+            read_region(&region(3, 2), &machine).expect("bytes"),
+            vec![0xde, 0xad]
+        );
+        // Past the end of the code, and without code, there is nothing to read.
+        assert!(read_region(&region(4, 2), &machine).is_err());
+        assert!(read_region(&region(u64::MAX, 2), &machine).is_err());
+        let without_code = StorageMachine {
+            code: None,
+            ..machine
+        };
+        assert!(read_region(&region(3, 2), &without_code).is_err());
     }
 
     #[test]

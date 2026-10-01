@@ -4,8 +4,9 @@
 #
 # One line per context variable, in order, saying how its pointer locates it: a value
 # type is a region at the layout's slot, a mapping the region of its base slot, any other
-# type a reference to the template of the type with the layout's slot bound. A pointer
-# that disagrees with the layout or names an unknown template fails with the reason.
+# type a reference to the template of the type with the layout's slot bound, and an
+# immutable, which the layout does not list, a region of the code. A pointer that
+# disagrees with the layout or names an unknown template fails with the reason.
 
 def escaped: gsub("\\("; "$_") | gsub("\\)"; "_$") | gsub(","; "_$_");
 def hex: ascii_downcase | ltrimstr("0x") | explode
@@ -17,6 +18,14 @@ def hex: ascii_downcase | ltrimstr("0x") | explode
 | $variable.pointer as $pointer
 | if $pointer == null then
     error("\($variable.identifier): no pointer")
+  elif $pointer.location == "code" then
+    if $entry != null then
+      error("\($variable.identifier): a code region, the layout puts it at slot \($entry.slot)")
+    elif $pointer | has("slot") then
+      error("\($variable.identifier): a code region has no slot")
+    else
+      "\($variable.identifier): code region offset \($pointer.offset) length \($pointer.length)"
+    end
   elif $pointer | has("location") then
     if $pointer.location == "transient" then
       "\($variable.identifier): transient region at slot \($pointer.slot)"

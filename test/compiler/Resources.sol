@@ -48,6 +48,11 @@ contract Resources is Base {
     function read() public view returns (uint256) {
         return total + inherited;
     }
+
+    // Reading `createdAt` puts a copy of its value in the runtime code.
+    function age() public view returns (uint256) {
+        return block.number - createdAt;
+    }
 }
 
 // No state variables: its programs carry no program-level context.
