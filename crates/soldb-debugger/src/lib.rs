@@ -1225,6 +1225,7 @@ mod tests {
             }],
             sources,
             variable_locations,
+            state_variables: Vec::new(),
         };
 
         let session = DebugSession::with_ethdebug(trace, info, source_contents);
@@ -1278,6 +1279,7 @@ mod tests {
             instructions: Vec::new(),
             sources: BTreeMap::new(),
             variable_locations,
+            state_variables: Vec::new(),
         };
 
         let session = DebugSession::with_ethdebug(trace, info, BTreeMap::new());
@@ -1308,6 +1310,7 @@ mod tests {
             }],
             sources: BTreeMap::from([(0, "Counter.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let source_contents = BTreeMap::from([(0, source.to_owned())]);
 
@@ -1337,6 +1340,7 @@ mod tests {
             instructions: Vec::new(),
             sources: BTreeMap::new(),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         attached.attach_ethdebug(other, BTreeMap::new());
         assert_eq!(
