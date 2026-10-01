@@ -1040,7 +1040,7 @@ mod tests {
     use super::{Resources, StateValue, TypeDocument, TypeReference};
     use crate::abi::keccak256;
     use crate::metadata::{parse_context_variables, ContextVariable, EthdebugInfo};
-    use crate::pointers::{dereference, Location, Machine, Pointer};
+    use crate::pointers::{dereference, Location, Machine, Pointer, StorageMachine};
     use crate::storage_layout::{mapping_slot, parse_word, StorageLayout, Word};
 
     const FIXTURE: &str =
@@ -1455,7 +1455,9 @@ mod tests {
             .iter()
             .map(|variable| variable.label.clone())
             .collect::<Vec<_>>();
+        // The transient variable follows, then the immutable the runtime code reads.
         expected.push("scratch".to_owned());
+        expected.push("createdAt".to_owned());
         assert_eq!(
             program
                 .state_variables
@@ -1603,6 +1605,61 @@ mod tests {
             !total[0].available && total[0].display.contains("slot"),
             "{}",
             total[0].display
+        );
+    }
+
+    #[test]
+    fn immutables_are_read_from_the_code() {
+        let resources = fixture();
+        let program = program();
+        let created_at = program
+            .state_variables
+            .iter()
+            .find(|variable| variable.identifier.as_deref() == Some("createdAt"))
+            .expect("createdAt");
+        let ty = created_at.type_reference().expect("type").expect("typed");
+        let pointer = created_at
+            .parsed_pointer()
+            .expect("pointer")
+            .expect("closed");
+        let no_state = StorageMachine {
+            storage: &|_| None,
+            transient: None,
+            code: None,
+        };
+        let regions =
+            super::dereference_pointer(&pointer, &resources.pointers, &no_state).expect("regions");
+        assert_eq!(regions.len(), 1);
+        assert_eq!(
+            (regions[0].location, regions[0].length),
+            (Location::Code, 32)
+        );
+        // The deployed code, with the value filled into the copy the region covers.
+        let offset = usize::try_from(regions[0].offset).expect("offset");
+        let mut code = vec![0_u8; offset + 64];
+        code[offset..offset + 32].copy_from_slice(&word(1234));
+        let read = |code: Option<&[u8]>| {
+            let machine = StorageMachine {
+                storage: &|_| None,
+                transient: None,
+                code,
+            };
+            resources
+                .read_variable(&ty, &pointer, &machine)
+                .expect("createdAt")
+        };
+        let values = read(Some(&code));
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            (values[0].display.as_str(), values[0].available),
+            ("1234", true)
+        );
+        // Without the code, the value is reported missing.
+        let values = read(None);
+        assert!(
+            !values[0].available && values[0].display.contains("code"),
+            "{}",
+            values[0].display
         );
     }
 }
