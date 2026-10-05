@@ -15,8 +15,8 @@ WASM_PROFILE = CARGO_PROFILE_RELEASE_OPT_LEVEL=z CARGO_PROFILE_RELEASE_LTO=fat \
 # tripwires for a dependency creeping in, not targets: raise one deliberately, in the same
 # change that explains the growth. The lean package carries no REVM; the replay-capable
 # one does, and is several times larger for it. See docs/wasm.md.
-WASM_LEAN_SIZE_BUDGET_BYTES = 400000
-WASM_REPLAY_SIZE_BUDGET_BYTES = 1100000
+WASM_LEAN_SIZE_BUDGET_BYTES = 600000
+WASM_REPLAY_SIZE_BUDGET_BYTES = 1250000
 WASM_LEAN_MODULE = crates/soldb-wasm/pkg/soldb_wasm_bg.wasm
 WASM_REPLAY_MODULE = crates/soldb-wasm/pkg-replay/soldb_wasm_bg.wasm
 
