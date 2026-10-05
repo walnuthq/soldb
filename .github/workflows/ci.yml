@@ -226,7 +226,8 @@ jobs:
     # The matrix names each source the compiler is built from. Besides `develop`, the
     # stacked branch carrying the ETHDebug type and pointer tables (argotorg/solidity#16990
     # and its follow-ups) runs here until it lands on `develop`, so that the tests gated on
-    # `solc-at-least-0.8.38` are exercised before then; drop that entry once they have.
+    # the `solc-ethdebug-resource-tables` and `solc-ethdebug-program-context` probes are
+    # exercised before then; drop that entry once they are on `develop`.
     name: lit (solc ${{ matrix.source.name }})
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -374,7 +375,7 @@ jobs:
             echo "ETHDebug variable locations: not emitted by this build yet"
           fi
           # The type and pointer tables of the resources are what `test/compiler/resources/`
-          # pins; they are empty before solc 0.8.38.
+          # pins; they are empty until argotorg/solidity#16990 lands.
           resources="$out/ethdebug_resources.json"
           if [ -f "$resources" ] && jq -e '(.types | length) > 0 and (.pointers | length) > 0' "$resources" > /dev/null 2>&1; then
             echo "ETHDebug type and pointer tables: PRESENT"
