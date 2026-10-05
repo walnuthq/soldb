@@ -21,8 +21,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult, TraceCapabilities, TransactionTrace};
-use soldb_debugger::DebugSession;
-use soldb_ethdebug::{read_compilation_source, EthdebugInfo};
+use soldb_debugger::{
+    code_from_hex, context_state_variables, state_variables, ContractDebugInfo, DebugSession,
+    DebugValueStatus, KnownCode, StateSource, StateVariable, StepMap, StorageTape,
+};
+use soldb_ethdebug::{read_compilation_source, EthdebugInfo, Resources, StorageLayout};
 use soldb_evm::{DebugTraceResult, RpcReceipt, RpcTransaction, SimulateCallRequest};
 
 /// One contract's compiler output, as the host supplies it.
@@ -46,6 +49,69 @@ pub struct ContractArtifacts {
     /// The contract ABI, copied into the web document when present.
     #[serde(default)]
     pub abi: Option<Value>,
+    /// The address the contract is deployed at, whose code holds its immutables. Without
+    /// it, the code of the account whose storage a step runs in is used.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// The parsed `<name>_storage.json`, when the contract was compiled with
+    /// `--storage-layout`. The state view falls back to it for a compiler that does not
+    /// list the state variables in the program-level context, and takes its spelling of
+    /// the types.
+    #[serde(default, rename = "storageLayout")]
+    pub storage_layout: Option<Value>,
+}
+
+/// The state of the contract at a step, as [`Trace::state_json`] gives it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
+#[serde(rename_all = "camelCase")]
+pub struct StateDocument {
+    /// What the variables were read through: `ethdebug` for the pointers of the
+    /// program-level context, `storageLayout` for the layout, or `None` when neither is
+    /// attached.
+    pub origin: Option<String>,
+    pub variables: Vec<StateEntry>,
+}
+
+/// One state variable with its value at a step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
+#[serde(rename_all = "camelCase")]
+pub struct StateEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// The slot, as `0x`-prefixed hex without leading zeros, or the offset of the value
+    /// in the code when `in_code` is set.
+    pub slot: String,
+    /// The byte offset within the slot, from its least significant byte.
+    pub offset: u64,
+    /// Whether the value is in the deployed code, as an immutable's is.
+    pub in_code: bool,
+    pub value: String,
+    pub status: DebugValueStatus,
+    /// Whether the value came from the trace or was supplied for an untouched slot:
+    /// `trace` or `chain`.
+    pub source: String,
+}
+
+impl From<StateVariable> for StateEntry {
+    fn from(variable: StateVariable) -> Self {
+        Self {
+            name: variable.name,
+            ty: variable.ty,
+            slot: variable.slot,
+            offset: variable.offset,
+            in_code: variable.in_code,
+            value: variable.value.display,
+            status: variable.value.status,
+            source: match variable.source {
+                StateSource::Trace => "trace",
+                StateSource::Chain => "chain",
+            }
+            .to_owned(),
+        }
+    }
 }
 
 /// What a host can learn about a trace without walking its steps.
@@ -88,6 +154,20 @@ pub struct DebugInfoSummary {
 struct LoadedArtifacts {
     info: EthdebugInfo,
     sources: BTreeMap<u64, String>,
+    /// The type and pointer tables of the resources; tables a debugger cannot read leave
+    /// the state to the storage layout.
+    resources: Option<Resources>,
+    storage_layout: Option<StorageLayout>,
+    address: Option<String>,
+}
+
+/// What the state view reads once debug info is attached: the contract with its resource
+/// tables and layout, and the storage the trace recorded, by step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateView {
+    contract: ContractDebugInfo,
+    map: StepMap,
+    tape: StorageTape,
 }
 
 /// A trace held in memory, with debug info attached on request.
@@ -97,6 +177,9 @@ struct LoadedArtifacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trace {
     session: DebugSession,
+    state: Option<StateView>,
+    /// Deployed code the host supplied, which holds the values of the immutables.
+    known_code: KnownCode,
 }
 
 /// Parses one JSON argument, naming it in the error so a caller with several string
@@ -117,8 +200,15 @@ fn load_artifacts(artifacts: ContractArtifacts) -> SoldbResult<LoadedArtifacts> 
         program,
         mut sources,
         abi: _,
+        address,
+        storage_layout,
     } = artifacts;
     let info = EthdebugInfo::from_artifacts(&name, "runtime", &metadata, &program)?;
+    let resources = Resources::parse(&metadata).ok();
+    let storage_layout = storage_layout
+        .as_ref()
+        .map(StorageLayout::parse)
+        .transpose()?;
     for source_id in info.sources.keys() {
         if sources.contains_key(source_id) {
             continue;
@@ -127,7 +217,13 @@ fn load_artifacts(artifacts: ContractArtifacts) -> SoldbResult<LoadedArtifacts> 
             sources.insert(*source_id, contents);
         }
     }
-    Ok(LoadedArtifacts { info, sources })
+    Ok(LoadedArtifacts {
+        info,
+        sources,
+        resources,
+        storage_layout,
+        address,
+    })
 }
 
 impl Trace {
@@ -183,6 +279,8 @@ impl Trace {
     pub(crate) fn from_trace(trace: TransactionTrace) -> Self {
         Self {
             session: DebugSession::new(trace),
+            state: None,
+            known_code: KnownCode::default(),
         }
     }
 
@@ -192,8 +290,71 @@ impl Trace {
     pub fn attach_ethdebug(&mut self, artifacts_json: &str) -> SoldbResult<()> {
         let artifacts = parse_json::<ContractArtifacts>("contract artifacts", artifacts_json)?;
         let loaded = load_artifacts(artifacts)?;
+        let contract = ContractDebugInfo::new(
+            loaded.address.as_deref(),
+            &loaded.info.contract_name,
+            loaded.info.clone(),
+            loaded.sources.clone(),
+        )
+        .with_resources(loaded.resources)
+        .with_storage_layout(loaded.storage_layout);
+        let map = StepMap::new(&self.session.trace, vec![contract.clone()]);
+        let tape = StorageTape::new(&self.session.trace, &map);
+        self.state = Some(StateView {
+            contract,
+            map,
+            tape,
+        });
         self.session.attach_ethdebug(loaded.info, loaded.sources);
         Ok(())
+    }
+
+    /// Supplies the deployed code of `address` as the node's `eth_getCode` gives it, so
+    /// the state view can read the immutables it holds.
+    pub fn provide_code(&mut self, address: &str, code: &str) -> SoldbResult<()> {
+        let code = code_from_hex(code)
+            .ok_or_else(|| SoldbError::Message(format!("invalid code for `{address}`: not hex")))?;
+        self.known_code = std::mem::take(&mut self.known_code).with(address, code);
+        Ok(())
+    }
+
+    /// The state of the attached contract at a step, or `None` past the end of the trace:
+    /// its state variables with their values, read through the pointers of the
+    /// program-level context when the compiler gave one and through the storage layout
+    /// otherwise. Storage is what the trace recorded in the storage context the step runs
+    /// in, so a slot the transaction never touched is unknown; immutables are read from
+    /// the code supplied with [`Trace::provide_code`].
+    #[must_use]
+    pub fn state(&self, index: usize) -> Option<StateDocument> {
+        if index >= self.session.trace.steps.len() {
+            return None;
+        }
+        let Some(view) = &self.state else {
+            return Some(StateDocument {
+                origin: None,
+                variables: Vec::new(),
+            });
+        };
+        let words = view
+            .tape
+            .at_step(&view.map, index)
+            .with_known_code(Some(&self.known_code));
+        let (origin, variables) = match context_state_variables(&view.contract, &words) {
+            Some(variables) => (Some("ethdebug"), variables),
+            None => match &view.contract.storage_layout {
+                Some(layout) => (Some("storageLayout"), state_variables(layout, &words)),
+                None => (None, Vec::new()),
+            },
+        };
+        Some(StateDocument {
+            origin: origin.map(str::to_owned),
+            variables: variables.into_iter().map(StateEntry::from).collect(),
+        })
+    }
+
+    /// [`Trace::state`] as JSON.
+    pub fn state_json(&self, index: usize) -> SoldbResult<Option<String>> {
+        self.state(index).map(|state| to_json(&state)).transpose()
     }
 
     #[must_use]
@@ -267,7 +428,7 @@ mod tests {
     use soldb_core::TransactionTrace;
     use soldb_debugger::{DebugStep, DebugValueStatus};
 
-    use super::{Trace, TraceSummary};
+    use super::{StateDocument, Trace, TraceSummary};
 
     const SOURCE: &str = "contract Counter {\n    uint256 public count;\n\n    function increment() public {\n        count += 1;\n    }\n}\n";
     const SENDER: &str = "0x1111111111111111111111111111111111111111";
@@ -555,6 +716,91 @@ mod tests {
             .map(|index| step_at(&trace, index).pc)
             .collect();
         assert_eq!(pcs, [0, 2, 3]);
+    }
+
+    const RESOURCES: &str =
+        include_str!("../../../test/fixtures/ethdebug-resources/ethdebug_resources.json");
+    const RESOURCES_PROGRAM: &str =
+        include_str!("../../../test/fixtures/ethdebug-resources/Resources_ethdebug-runtime.json");
+
+    /// A storage word as `structLogs` spell slots and values: 64 hex digits, no prefix.
+    fn word(value: u64) -> String {
+        format!("{value:064x}")
+    }
+
+    #[test]
+    fn the_state_is_read_through_the_program_context() {
+        // The fixture's `Resources` contract, which keeps `total` at slot 1, read once.
+        let debug_trace = json!({
+            "gas": 21000,
+            "returnValue": "",
+            "structLogs": [
+                {"pc": 0, "op": "SLOAD", "gas": 3000, "gasCost": 2100, "depth": 1, "stack": [], "storage": {word(1): word(7)}},
+                {"pc": 1, "op": "STOP", "gas": 900, "gasCost": 0, "depth": 1}
+            ]
+        })
+        .to_string();
+        let mut trace = Trace::from_transaction(&debug_trace, &transaction_json(), &receipt_json())
+            .expect("trace");
+        let state = |trace: &Trace, index: usize| -> StateDocument {
+            serde_json::from_str(&trace.state_json(index).expect("state").expect("step"))
+                .expect("document")
+        };
+        // Nothing to read the state through before the artifacts are attached.
+        assert!(state(&trace, 1).origin.is_none());
+
+        let program: Value = serde_json::from_str(RESOURCES_PROGRAM).expect("program");
+        let artifacts = json!({
+            "name": "Resources",
+            "metadata": serde_json::from_str::<Value>(RESOURCES).expect("resources"),
+            "program": program,
+            "address": "0x2"
+        });
+        trace
+            .attach_ethdebug(&artifacts.to_string())
+            .expect("attach");
+        let document = state(&trace, 1);
+        assert_eq!(document.origin.as_deref(), Some("ethdebug"));
+        let variable = |document: &StateDocument, name: &str| {
+            document
+                .variables
+                .iter()
+                .find(|variable| variable.name == name)
+                .unwrap_or_else(|| panic!("{name}"))
+                .clone()
+        };
+        let total = variable(&document, "total");
+        assert_eq!(
+            (total.value.as_str(), total.slot.as_str(), total.ty.as_str()),
+            ("7", "0x1", "uint256")
+        );
+        // The immutable is in the code, which the host has not supplied yet.
+        let created_at = variable(&document, "createdAt");
+        assert_eq!(created_at.status, DebugValueStatus::Unavailable);
+        assert!(created_at.in_code);
+
+        // With the deployed code, it is read from the copy of its value the code holds.
+        let offset = program["context"]["variables"]
+            .as_array()
+            .expect("variables")
+            .iter()
+            .find(|variable| variable["identifier"] == "createdAt")
+            .and_then(|variable| variable["pointer"]["offset"].as_str())
+            .map(|offset| usize::from_str_radix(offset.trim_start_matches("0x"), 16).expect("hex"))
+            .expect("offset");
+        let mut code = "00".repeat(offset + 32);
+        code.replace_range((offset + 30) * 2..(offset + 32) * 2, "04d2");
+        trace
+            .provide_code("0x2", &format!("0x{code}"))
+            .expect("code");
+        let created_at = variable(&state(&trace, 1), "createdAt");
+        assert_eq!(
+            (created_at.value.as_str(), created_at.status),
+            ("1234", DebugValueStatus::Decoded)
+        );
+
+        assert!(trace.state_json(2).expect("state").is_none());
+        assert!(trace.provide_code("0x2", "0xzz").is_err());
     }
 
     #[test]

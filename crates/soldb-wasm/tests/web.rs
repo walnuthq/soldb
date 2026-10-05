@@ -339,6 +339,48 @@ fn attaches_debug_info_and_keeps_the_trace() {
 }
 
 #[wasm_bindgen_test]
+fn reads_the_state_through_the_program_context() {
+    // The fixture's `Resources` contract keeps `total` at slot 1; the trace reads it once.
+    let word = |value: u64| format!("{value:064x}");
+    let debug_trace = json!({
+        "gas": 21000,
+        "returnValue": "",
+        "structLogs": [
+            {"pc": 0, "op": "SLOAD", "gas": 3000, "gasCost": 2100, "depth": 1, "stack": [], "storage": {word(1): word(7)}},
+            {"pc": 1, "op": "STOP", "gas": 900, "gasCost": 0, "depth": 1}
+        ]
+    })
+    .to_string();
+    let transaction = json!({"hash": "0xabc", "from": "0x1", "to": "0x2"}).to_string();
+    let receipt = json!({"gasUsed": "0x5208", "status": "0x1"}).to_string();
+    let mut trace = Trace::from_transaction(&debug_trace, &transaction, &receipt).expect("trace");
+    let artifacts = json!({
+        "name": "Resources",
+        "metadata": parse(include_str!("../../../test/fixtures/ethdebug-resources/ethdebug_resources.json")),
+        "program": parse(include_str!("../../../test/fixtures/ethdebug-resources/Resources_ethdebug-runtime.json")),
+        "address": "0x2"
+    });
+    trace
+        .attach_ethdebug(&artifacts.to_string())
+        .expect("attach");
+    trace.provide_code("0x2", "0x6080").expect("code");
+
+    let state = parse(&trace.state(1).expect("state").expect("in range"));
+    assert_eq!(state["origin"], "ethdebug");
+    let total = state["variables"]
+        .as_array()
+        .expect("variables")
+        .iter()
+        .find(|variable| variable["name"] == "total")
+        .expect("total")
+        .clone();
+    assert_eq!(total["value"], "7");
+    assert_eq!(total["slot"], "0x1");
+    assert!(trace.state(2).expect("state").is_none());
+    assert!(trace.provide_code("0x2", "not hex").is_err());
+}
+
+#[wasm_bindgen_test]
 fn round_trips_trace_json_and_builds_simulations() {
     let trace = canned_trace();
     let reloaded = Trace::from_json(&trace.to_json().expect("json")).expect("reloaded");
