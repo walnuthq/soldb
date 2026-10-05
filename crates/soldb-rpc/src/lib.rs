@@ -530,6 +530,12 @@ pub fn storage_at(rpc_url: &str, address: &str, slot: &str, block: &str) -> Sold
     client.request::<String>("eth_getStorageAt", json!([address, slot, block]))
 }
 
+/// The deployed code of an account as the node has it at `block`, as hex.
+pub fn code_at(rpc_url: &str, address: &str, block: &str) -> SoldbResult<String> {
+    let client = HttpJsonRpcClient::new(rpc_url)?;
+    client.request::<String>("eth_getCode", json!([address, block]))
+}
+
 /// The block a transaction was mined in, as a hex number, and its index within it.
 pub fn transaction_block(rpc_url: &str, tx_hash: &str) -> SoldbResult<(String, u64)> {
     let client = HttpJsonRpcClient::new(rpc_url)?;
