@@ -53,10 +53,52 @@ pub trait ChainStorage {
     /// Where these words come from, as a user-facing phrase such as
     /// `the chain at block 21000000`.
     fn label(&self) -> &str;
+
+    /// The deployed code of `address`, which holds the values of its immutables, or
+    /// `None` when it could not be read. A chain that only answers storage has none.
+    fn code(&self, _address: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// The reading a frontend supplies: one storage word of one account, or nothing.
 pub type ChainRead = Box<dyn Fn(&str, &Word) -> Option<Word>>;
+
+/// The reading a frontend supplies for code: the deployed code of one account, or nothing.
+pub type CodeRead = Box<dyn Fn(&str) -> Option<Vec<u8>>>;
+
+/// Deployed code a frontend has without asking a chain, such as what a local deployment
+/// returned, by address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KnownCode(HashMap<String, Vec<u8>>);
+
+impl KnownCode {
+    /// Adds the deployed `code` of `address`.
+    #[must_use]
+    pub fn with(mut self, address: &str, code: Vec<u8>) -> Self {
+        self.0.insert(address.to_ascii_lowercase(), code);
+        self
+    }
+
+    /// The deployed code of `address`, when known.
+    #[must_use]
+    pub fn get(&self, address: &str) -> Option<&[u8]> {
+        self.0.get(&address.to_ascii_lowercase()).map(Vec::as_slice)
+    }
+}
+
+/// Bytes from the `0x`-prefixed hex a node or a trace gives code as.
+#[must_use]
+pub fn code_from_hex(text: &str) -> Option<Vec<u8>> {
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..digits.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(digits.get(index..index + 2)?, 16).ok())
+        .collect()
+}
 
 /// A [`ChainStorage`] that reads each slot once, through a function the frontend gives.
 ///
@@ -67,6 +109,8 @@ pub struct CachedChain<F> {
     read: F,
     label: String,
     words: RefCell<HashMap<(String, Word), Option<Word>>>,
+    read_code: Option<CodeRead>,
+    codes: RefCell<HashMap<String, Option<Vec<u8>>>>,
 }
 
 impl<F> std::fmt::Debug for CachedChain<F> {
@@ -90,7 +134,16 @@ where
             read,
             label: label.into(),
             words: RefCell::new(HashMap::new()),
+            read_code: None,
+            codes: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Reads the deployed code of an account through `read_code`, once per account.
+    #[must_use]
+    pub fn with_code(mut self, read_code: CodeRead) -> Self {
+        self.read_code = Some(read_code);
+        self
     }
 }
 
@@ -111,6 +164,17 @@ where
     fn label(&self) -> &str {
         &self.label
     }
+
+    fn code(&self, address: &str) -> Option<Vec<u8>> {
+        let read_code = self.read_code.as_ref()?;
+        let key = address.to_ascii_lowercase();
+        if let Some(cached) = self.codes.borrow().get(&key) {
+            return cached.clone();
+        }
+        let code = read_code(&key);
+        self.codes.borrow_mut().insert(key, code.clone());
+        code
+    }
 }
 
 /// One state variable, or one place inside one, with its value at a step.
@@ -120,10 +184,14 @@ pub struct StateVariable {
     pub name: String,
     /// The Solidity type as the layout labels it.
     pub ty: String,
-    /// The slot, as `0x`-prefixed hex without leading zeros.
+    /// The slot, as `0x`-prefixed hex without leading zeros. For a value in the code,
+    /// the offset of its bytes in the code.
     pub slot: String,
     /// The byte offset within the slot.
     pub offset: u64,
+    /// Whether the value is in the deployed code, as an immutable's is, rather than in
+    /// storage.
+    pub in_code: bool,
     pub value: DebugValue,
     /// Whether the value came from the recording or from the chain.
     pub source: StateSource,
@@ -237,6 +305,7 @@ impl StorageTape {
             context,
             address: None,
             chain: None,
+            known_code: None,
         }
     }
 
@@ -250,6 +319,7 @@ impl StorageTape {
             context: map.storage_context_index(step),
             address: map.storage_address(step),
             chain: None,
+            known_code: None,
         }
     }
 
@@ -275,6 +345,8 @@ pub struct StorageWords<'a> {
     /// The account whose storage this is, for reading from a chain.
     address: Option<&'a str>,
     chain: Option<&'a dyn ChainStorage>,
+    /// Deployed code the frontend has without a chain.
+    known_code: Option<&'a KnownCode>,
 }
 
 impl<'a> StorageWords<'a> {
@@ -283,6 +355,24 @@ impl<'a> StorageWords<'a> {
     pub fn with_chain(mut self, chain: Option<&'a dyn ChainStorage>) -> Self {
         self.chain = chain;
         self
+    }
+
+    /// Takes deployed code from `known_code` before asking the chain.
+    #[must_use]
+    pub fn with_known_code(mut self, known_code: Option<&'a KnownCode>) -> Self {
+        self.known_code = known_code;
+        self
+    }
+
+    /// The deployed code of `address`, or of the account whose storage this is: from the
+    /// code the frontend has, otherwise from the chain.
+    #[must_use]
+    pub fn code(&self, address: Option<&str>) -> Option<Vec<u8>> {
+        let address = address.or(self.address)?;
+        if let Some(code) = self.known_code.and_then(|known| known.get(address)) {
+            return Some(code.to_vec());
+        }
+        self.chain?.code(address)
     }
 
     /// The word at `slot`, when the trace recorded one that still holds.
@@ -394,8 +484,9 @@ pub fn state_variables(layout: &StorageLayout, words: &StorageWords<'_>) -> Vec<
 /// by its length, and a mapping, which has no value of its own, as needing a key. A path
 /// such as `balances[0xabc]` still goes through the layout. When the contract has a
 /// layout, its spelling of a variable's type is used, which qualifies a user-defined type
-/// by the contract defining it. An immutable lives in the code, which this view does not
-/// have, and is reported as unavailable.
+/// by the contract defining it. An immutable is read from the deployed code, which the
+/// frontend supplies through [`StorageWords::with_known_code`] or its chain; without it,
+/// the immutable is reported as unavailable.
 #[must_use]
 pub fn context_state_variables(
     contract: &ContractDebugInfo,
@@ -406,18 +497,41 @@ pub fn context_state_variables(
         return None;
     }
     let from_chain = Cell::new(false);
+    // The first slot a variable needed and nobody knew, which says why it is unknown the
+    // same way the storage layout's view does.
+    let missing = Cell::new(None);
     let read_storage = |slot: &Word| {
         if let Some(word) = words.get(slot) {
             return Some(word);
         }
-        let word = words.chain_word(slot)?;
+        let Some(word) = words.chain_word(slot) else {
+            if missing.get().is_none() {
+                missing.set(Some(*slot));
+            }
+            return None;
+        };
         from_chain.set(true);
         Some(word)
+    };
+    // Immutables live in the deployed code of the contract running, which is only asked
+    // for when there are any.
+    let in_code = contract.info.state_variables.iter().any(|variable| {
+        variable
+            .pointer
+            .as_ref()
+            .and_then(|pointer| pointer.get("location"))
+            .and_then(serde_json::Value::as_str)
+            == Some("code")
+    });
+    let code = if in_code {
+        words.code(contract.address.as_deref())
+    } else {
+        None
     };
     let machine = StorageMachine {
         storage: &read_storage,
         transient: None,
-        code: None,
+        code: code.as_deref(),
     };
     let variables = contract
         .info
@@ -425,6 +539,7 @@ pub fn context_state_variables(
         .iter()
         .map(|variable| {
             from_chain.set(false);
+            missing.set(None);
             let name = variable.name();
             let ty = variable.type_reference().ok().flatten();
             let pointer = variable.parsed_pointer().ok().flatten();
@@ -445,15 +560,17 @@ pub fn context_state_variables(
                     .into_iter()
                     .next()
             });
-            let (slot, offset) = first_region
+            let (slot, offset, in_code) = first_region
                 .as_ref()
-                .map_or_else(|| ("-".to_owned(), 0), place);
+                .map_or_else(|| ("-".to_owned(), 0, false), place);
             let value = match (ty, pointer) {
                 (Some(ty), Some(pointer)) => match resources.read_variable(&ty, &pointer, &machine)
                 {
                     Ok(values) => composed(&values, resources.resolve(&ty).ok()),
                     Err(error) => DebugValue {
-                        display: format!("<{error}>"),
+                        display: missing
+                            .get()
+                            .map_or_else(|| format!("<{error}>"), |slot| words.unavailable(&slot)),
                         raw: None,
                         status: DebugValueStatus::Unavailable,
                     },
@@ -464,11 +581,20 @@ pub fn context_state_variables(
                     status: DebugValueStatus::Unavailable,
                 },
             };
+            // A value no word could be found for says why, as the storage layout's view does.
+            let value = match missing.get() {
+                Some(slot) if value.status == DebugValueStatus::Unavailable => DebugValue {
+                    display: words.unavailable(&slot),
+                    ..value
+                },
+                _ => value,
+            };
             StateVariable {
                 name,
                 ty: label,
                 slot,
                 offset,
+                in_code,
                 value,
                 source: if from_chain.get() {
                     StateSource::Chain
@@ -484,7 +610,7 @@ pub fn context_state_variables(
 /// Where a region starts, as the storage layout says it: the slot, and the offset from
 /// the least significant byte, while a region counts it from the most significant one. A
 /// region of the code is placed by its offset in the code.
-fn place(region: &Region) -> (String, u64) {
+fn place(region: &Region) -> (String, u64, bool) {
     match (region.location, region.slot) {
         (Location::Storage | Location::Transient, Some(slot)) => {
             let layout_offset = if region.length < 32 {
@@ -494,12 +620,13 @@ fn place(region: &Region) -> (String, u64) {
             };
             let slot = short_hex(&slot);
             if region.location == Location::Transient {
-                (format!("{slot} (transient)"), layout_offset)
+                (format!("{slot} (transient)"), layout_offset, false)
             } else {
-                (slot, layout_offset)
+                (slot, layout_offset, false)
             }
         }
-        (location, _) => (format!("{location} {:#x}", region.offset), 0),
+        (Location::Code, _) => (format!("{:#x}", region.offset), 0, true),
+        (location, _) => (format!("{location} {:#x}", region.offset), 0, false),
     }
 }
 
@@ -665,6 +792,7 @@ fn read(layout: &StorageLayout, words: &StorageWords<'_>, reference: &StorageRef
         ty,
         slot: short_hex(&reference.slot),
         offset: reference.offset,
+        in_code: false,
         value,
         source: if from_chain.get() {
             StateSource::Chain
@@ -711,7 +839,8 @@ mod tests {
     use soldb_ethdebug::{EthdebugInfo, Resources};
 
     use super::{
-        context_state_variables, short_hex, state_value, state_variables, StorageTape, Word,
+        code_from_hex, context_state_variables, short_hex, state_value, state_variables, KnownCode,
+        StorageTape, Word,
     };
     use crate::stepping::{ContractDebugInfo, StepMap};
     use crate::DebugValueStatus;
@@ -898,6 +1027,48 @@ mod tests {
         let without_tables =
             ContractDebugInfo::new(None, "Resources", contract.info.clone(), BTreeMap::new());
         assert!(context_state_variables(&without_tables, &words).is_none());
+
+        // With the deployed code of the account running, the immutable is read from the
+        // copy of its value the code holds.
+        let pointer = contract
+            .info
+            .state_variables
+            .iter()
+            .find(|variable| variable.identifier.as_deref() == Some("createdAt"))
+            .and_then(|variable| variable.pointer.clone())
+            .expect("createdAt pointer");
+        let offset = usize::from_str_radix(
+            pointer["offset"]
+                .as_str()
+                .expect("offset")
+                .trim_start_matches("0x"),
+            16,
+        )
+        .expect("offset");
+        let mut code = vec![0_u8; offset + 64];
+        code[offset + 30] = 0x04;
+        code[offset + 31] = 0xd2;
+        let known = KnownCode::default().with("0xAAaa000000000000000000000000000000000001", code);
+        let words = words.with_known_code(Some(&known));
+        let variables = context_state_variables(&contract, &words).expect("context");
+        let created_at = variables
+            .iter()
+            .find(|variable| variable.name == "createdAt")
+            .expect("createdAt");
+        assert_eq!(created_at.value.display, "1234");
+        assert!(created_at.in_code);
+        assert_eq!(created_at.slot, format!("{offset:#x}"));
+    }
+
+    #[test]
+    fn code_is_read_from_hex() {
+        assert_eq!(
+            code_from_hex("0x60016000"),
+            Some(vec![0x60, 0x01, 0x60, 0x00])
+        );
+        assert_eq!(code_from_hex("0x"), Some(Vec::new()));
+        assert_eq!(code_from_hex("0x6"), None);
+        assert_eq!(code_from_hex("0xzz"), None);
     }
 
     #[test]
@@ -1139,6 +1310,32 @@ mod tests {
         let missing = [0_u8; 32];
         assert!(super::ChainStorage::word(&chain, "0xaa", &missing).is_none());
         assert!(super::ChainStorage::word(&chain, "0xaa", &missing).is_none());
+        assert_eq!(reads.get(), 2);
+        // Without a code reader the chain has no code.
+        assert!(super::ChainStorage::code(&chain, "0xaa").is_none());
+    }
+
+    #[test]
+    fn a_cached_chain_reads_each_account_code_once() {
+        use std::rc::Rc;
+
+        let reads = Rc::new(std::cell::Cell::new(0_u32));
+        let counted = Rc::clone(&reads);
+        let chain = super::CachedChain::new("the chain at block 7", |_: &str, _: &Word| None)
+            .with_code(Box::new(move |address: &str| {
+                counted.set(counted.get() + 1);
+                (address == "0xaa").then(|| vec![0x60, 0x00])
+            }));
+        assert_eq!(
+            super::ChainStorage::code(&chain, "0xAA"),
+            Some(vec![0x60, 0x00])
+        );
+        assert_eq!(
+            super::ChainStorage::code(&chain, "0xaa"),
+            Some(vec![0x60, 0x00])
+        );
+        assert!(super::ChainStorage::code(&chain, "0xbb").is_none());
+        assert!(super::ChainStorage::code(&chain, "0xbb").is_none());
         assert_eq!(reads.get(), 2);
     }
 

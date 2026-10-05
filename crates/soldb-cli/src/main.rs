@@ -26,7 +26,8 @@ use serde::Serialize;
 use serde_json::json;
 use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace, Word as StackWord};
 use soldb_debugger::{
-    CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam,
+    code_from_hex, CachedChain, ChainRead, ChainStorage, CodeRead, ContractDebugInfo, KnownCode,
+    SourceFunction, SourceParam,
 };
 use soldb_ethdebug::{
     encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
@@ -494,6 +495,9 @@ struct SimulationView {
     /// its end state is exactly what the call started from. `None` when the call ran at a
     /// position inside a block, where neither that block nor its parent is that state.
     chain_block: Option<Option<u64>>,
+    /// The deployed code of a local run's contract, which holds its immutables: there is
+    /// no chain to read it from.
+    known_code: Option<KnownCode>,
 }
 
 impl SimulationView {
@@ -507,6 +511,7 @@ impl SimulationView {
                 .tx_index
                 .is_none_or(|index| index == 0)
                 .then_some(args.block),
+            known_code: None,
             contract_address: contract_address.to_owned(),
             function_signature: args.function_signature.clone(),
             function_args: args.function_args.clone(),
@@ -528,6 +533,7 @@ impl SimulationView {
             rpc_url: None,
             replayed_from: None,
             chain_block: None,
+            known_code: None,
             contract_address: contract_address.to_owned(),
             function_signature: args.function_signature.clone(),
             function_args: args.function_args.clone(),
@@ -560,6 +566,7 @@ impl SimulationView {
             rpc_url: None,
             replayed_from: Some(file.to_path_buf()),
             chain_block: None,
+            known_code: None,
             contract_address: request.to_addr.clone(),
             function_signature: None,
             function_args: Vec::new(),
@@ -1120,7 +1127,13 @@ fn present_trace(view: &TraceView, trace: TransactionTrace) -> SoldbResult<()> {
     save_trace(view.save_trace.as_deref(), &trace)?;
     if view.session.wanted(view.interactive) {
         let source_indexes = interactive_trace_source_indexes(view, &trace);
-        run_debugger_session(trace, source_indexes, view.chain_storage(), &view.session)?;
+        run_debugger_session(
+            trace,
+            source_indexes,
+            view.chain_storage(),
+            None,
+            &view.session,
+        )?;
     } else if view.json {
         return Err(json_needs_session());
     } else if view.raw {
@@ -1252,7 +1265,13 @@ fn present_simulation(
             );
         }
         let source_indexes = interactive_simulation_source_indexes(view, contract_address);
-        run_debugger_session(trace, source_indexes, view.chain_storage(), &view.session)?;
+        run_debugger_session(
+            trace,
+            source_indexes,
+            view.chain_storage(),
+            view.known_code.clone(),
+            &view.session,
+        )?;
     } else if view.json {
         return Err(json_needs_session());
     } else if view.raw {
@@ -1317,6 +1336,13 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         chain = chain.with_storage(&contract_address, slot.trim(), value.trim())?;
     }
 
+    // The deployed code holds the values of the immutables: the bytes installed as they
+    // are, or what the constructor returned.
+    let mut deployed_code = if args.runtime {
+        code_from_hex(&bytecode)
+    } else {
+        None
+    };
     // Before saying the contract is there: a constructor that reverted leaves no code,
     // and the call would run against an empty account. The constructor runs again as the
     // call's prefix, which for a local run costs less than reporting a deployment that
@@ -1324,6 +1350,7 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
     if !args.runtime && !args.deploy {
         if let Some(deployment) = prefix.first() {
             let deployed = chain.deploy(deployment)?;
+            deployed_code = code_from_hex(&deployed.output);
             if !deployed.success {
                 let reason = deployed
                     .error
@@ -1343,7 +1370,8 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         }
     }
 
-    let view = SimulationView::for_run(args, &contract_address);
+    let mut view = SimulationView::for_run(args, &contract_address);
+    view.known_code = deployed_code.map(|code| KnownCode::default().with(&contract_address, code));
     let contract_name = simulate_contract_name(&view);
     if !args.json {
         let what = if args.runtime {
@@ -1650,6 +1678,17 @@ impl NodeStorage {
     }
 
     fn reader(rpc_url: &str, block: String, label: String) -> ChainReader {
+        // Immutables live in the deployed code, read at the same block as the storage.
+        let read_code: CodeRead = {
+            let rpc_url = rpc_url.to_owned();
+            let block = block.clone();
+            Box::new(move |address: &str| {
+                soldb_rpc::code_at(&rpc_url, address, &block)
+                    .ok()
+                    .as_deref()
+                    .and_then(code_from_hex)
+            })
+        };
         let rpc_url = rpc_url.to_owned();
         let read: ChainRead = Box::new(move |address: &str, slot: &[u8; 32]| {
             match soldb_rpc::storage_at(&rpc_url, address, &soldb_ethdebug::word_hex(slot), &block)
@@ -1665,7 +1704,7 @@ impl NodeStorage {
                 }
             }
         });
-        CachedChain::new(label, read)
+        CachedChain::new(label, read).with_code(read_code)
     }
 }
 
@@ -1728,6 +1767,7 @@ fn run_debugger_session(
     trace: TransactionTrace,
     source_indexes: Vec<TraceSourceIndex>,
     chain: Option<ChainReader>,
+    known_code: Option<KnownCode>,
     options: &SessionOptions,
 ) -> SoldbResult<()> {
     let mut state = DebuggerState::new();
@@ -1738,8 +1778,9 @@ fn run_debugger_session(
             .map(|index| index.debug.clone())
             .collect(),
     );
-    let mut session =
-        Session::new(state).with_chain(chain.map(|chain| Box::new(chain) as Box<dyn ChainStorage>));
+    let mut session = Session::new(state)
+        .with_chain(chain.map(|chain| Box::new(chain) as Box<dyn ChainStorage>))
+        .with_known_code(known_code);
     let renderer = Renderer::new(colors_enabled());
     let json = options.json;
     let terminal = io::stdin().is_terminal();
