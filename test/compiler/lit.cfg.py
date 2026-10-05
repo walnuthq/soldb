@@ -29,11 +29,13 @@ config.test_exec_root = str(
 )
 config.environment["NO_COLOR"] = "1"
 
-# Tests that need a compiler release gate on it with `REQUIRES: solc-at-least-<version>`;
-# every version listed here becomes such a feature when the selected solc is at least
-# that new. A development build such as `0.8.38-develop.2026.9.17` counts as its
-# leading `major.minor.patch`.
-SOLC_VERSION_GATES = ("0.8.38",)
+# What a compiler emits for ETHDebug is probed rather than read off its version: a
+# development build carries the version of the next release long before the features
+# that release will have, so `0.8.38-develop` on `develop` says nothing about whether the
+# type and pointer tables are there yet.
+PROBE_SOURCE = (
+    "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\ncontract Probe { uint256 x; }\n"
+)
 
 
 def require_tool(name, value):
@@ -52,30 +54,53 @@ def solc_version(path):
     return tuple(int(part) for part in match.groups())
 
 
-def solc_emits_program_context(path):
-    """Whether the compiler lists the state variables in the program-level context of a
-    program, which a version alone does not say: it arrives on develop after the type and
-    pointer tables do. Tests that read it gate on `solc-ethdebug-program-context`."""
+def probe(path, flags, artifact):
+    """The JSON `artifact` the compiler writes for a contract with one `uint256` state
+    variable `x` when given `flags`, or `None` when it writes none."""
     with tempfile.TemporaryDirectory() as directory:
         source = Path(directory) / "Probe.sol"
-        source.write_text(
-            "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\ncontract Probe { uint256 x; }\n"
-        )
+        source.write_text(PROBE_SOURCE)
         result = subprocess.run(
-            [
-                path, "--evm-version=cancun", "--via-ir", "--debug-info", "ethdebug,ast-id",
-                "--experimental", "--ethdebug-program-runtime", "-o", directory, str(source),
-            ],
+            [path, "--evm-version=cancun", *flags, "-o", directory, str(source)],
             capture_output=True, text=True, check=False, cwd=directory,
         )
-        program = Path(directory) / "Probe_ethdebug-runtime.json"
-        if result.returncode != 0 or not program.is_file():
-            return False
+        output = Path(directory) / artifact
+        if result.returncode != 0 or not output.is_file():
+            return None
         try:
-            variables = json.loads(program.read_text())["context"]["variables"]
-        except (ValueError, KeyError, TypeError):
-            return False
-        return any(variable.get("identifier") == "x" for variable in variables)
+            return json.loads(output.read_text())
+        except ValueError:
+            return None
+
+
+def solc_emits_resource_tables(path):
+    """Whether the compiler fills the type and pointer tables of the resources, which
+    argotorg/solidity#16990 adds. Tests that read them gate on
+    `solc-ethdebug-resource-tables`."""
+    resources = probe(path, ["--experimental", "--ethdebug-resources"], "ethdebug_resources.json")
+    try:
+        return "t_uint256" in resources["types"]
+    except (KeyError, TypeError):
+        return False
+
+
+def solc_emits_program_context(path):
+    """Whether the compiler lists the state variables in the program-level context of a
+    program, which arrives after the type and pointer tables do. Tests that read it gate
+    on `solc-ethdebug-program-context`."""
+    program = probe(
+        path,
+        [
+            "--via-ir", "--debug-info", "ethdebug,ast-id", "--experimental",
+            "--ethdebug-program-runtime",
+        ],
+        "Probe_ethdebug-runtime.json",
+    )
+    try:
+        variables = program["context"]["variables"]
+    except (KeyError, TypeError):
+        return False
+    return any(variable.get("identifier") == "x" for variable in variables)
 
 
 # Unlike the live-node suite, missing prerequisites must fail configuration.
@@ -117,9 +142,9 @@ if compiler in ("solc", "both"):
     config.available_features.add("compiler-solc")
     version = solc_version(solc)
     lit_config.note(f"solc {'.'.join(str(part) for part in version)} at {solc}")
-    for gate in SOLC_VERSION_GATES:
-        if version >= tuple(int(part) for part in gate.split(".")):
-            config.available_features.add(f"solc-at-least-{gate}")
+    if solc_emits_resource_tables(solc):
+        config.available_features.add("solc-ethdebug-resource-tables")
+        lit_config.note("solc fills the type and pointer tables of the resources")
     if solc_emits_program_context(solc):
         config.available_features.add("solc-ethdebug-program-context")
         lit_config.note("solc lists the state variables in the program-level context")

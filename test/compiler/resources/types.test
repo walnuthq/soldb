@@ -2,7 +2,7 @@
 # keyed by the identifier the storage layout uses for it, with composed types referencing
 # their parts by identifier. solc emits the tables from 0.8.38 and refuses ETHDebug output
 # with the optimizer, so this needs a new enough compiler and no optimization.
-# REQUIRES: soldb, compiler-solc, solc-at-least-0.8.38, optimization-none
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-resource-tables, optimization-none
 # RUN: rm -rf %t
 # RUN: mkdir -p %t
 # RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-resources --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr

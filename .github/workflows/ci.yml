@@ -384,7 +384,7 @@ jobs:
             echo "ETHDebug variable locations: not emitted by this build yet"
           fi
           # The type and pointer tables of the resources are what `test/compiler/resources/`
-          # pins; they are empty before solc 0.8.38.
+          # checks. Report whether the compiler fills both tables.
           resources="$out/ethdebug_resources.json"
           if [ -f "$resources" ] && jq -e '(.types | length) > 0 and (.pointers | length) > 0' "$resources" > /dev/null 2>&1; then
             echo "ETHDebug type and pointer tables: PRESENT"
