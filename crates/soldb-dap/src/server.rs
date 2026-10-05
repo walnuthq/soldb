@@ -686,18 +686,29 @@ impl DapServer {
     }
 
     /// Every state variable of the contract executing at the current step, read through
-    /// its storage layout.
+    /// the pointers of its program-level context when the compiler gives one, and through
+    /// its storage layout otherwise.
     fn state_variables(&self) -> Vec<Value> {
-        let Some(layout) = self.debugger.storage_layout() else {
-            return Vec::new();
-        };
         let Some(words) = self
             .debugger
             .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
         else {
             return Vec::new();
         };
-        soldb_debugger::state_variables(layout, &words)
+        let variables = match self
+            .debugger
+            .current_contract()
+            .and_then(|contract| soldb_debugger::context_state_variables(contract, &words))
+        {
+            Some(variables) => variables,
+            None => {
+                let Some(layout) = self.debugger.storage_layout() else {
+                    return Vec::new();
+                };
+                soldb_debugger::state_variables(layout, &words)
+            }
+        };
+        variables
             .into_iter()
             .map(|variable| {
                 json!({
@@ -986,11 +997,14 @@ impl LoadedSource {
             })?;
         let name = program.info.contract_name.clone();
         let code_generator = program.code_generator();
+        // Tables a debugger cannot read leave the state to the storage layout.
+        let resources = program.resources_tables().ok();
         Ok(Self {
             root: root.to_path_buf(),
             contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
-                .with_storage_layout(program.storage_layout),
+                .with_storage_layout(program.storage_layout)
+                .with_resources(resources),
         })
     }
 }

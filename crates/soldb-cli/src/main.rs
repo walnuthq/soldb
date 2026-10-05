@@ -2253,6 +2253,8 @@ impl TraceSourceIndex {
             );
         }
         let code_generator = program.code_generator();
+        // Tables a debugger cannot read leave the state to the storage layout.
+        let resources_tables = program.resources_tables().ok();
         let debug = ContractDebugInfo::new(
             spec.address.as_deref(),
             &spec.name,
@@ -2260,7 +2262,8 @@ impl TraceSourceIndex {
             program.source_contents,
         )
         .with_code_generator(Some(code_generator))
-        .with_storage_layout(program.storage_layout);
+        .with_storage_layout(program.storage_layout)
+        .with_resources(resources_tables);
         Ok(Some(Self {
             spec: spec.clone(),
             resources: program.resources,

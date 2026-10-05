@@ -38,8 +38,8 @@ pub use debug_diff::{
 };
 pub use soldb_ethdebug::{CodeGenerator, StorageLayout};
 pub use state::{
-    short_hex, state_value, state_variables, CachedChain, ChainRead, ChainStorage, StateSource,
-    StateVariable, StorageTape, StorageWords,
+    context_state_variables, short_hex, state_value, state_variables, CachedChain, ChainRead,
+    ChainStorage, StateSource, StateVariable, StorageTape, StorageWords,
 };
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,

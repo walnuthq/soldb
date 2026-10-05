@@ -24,9 +24,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use soldb_core::TransactionTrace;
-use soldb_ethdebug::{parse_word, word_hex, StorageLayout, StorageRef, Word};
+use soldb_ethdebug::{
+    dereference_pointer, parse_word, word_hex, Location, Region, StateValue, StorageLayout,
+    StorageMachine, StorageRef, TypeDocument, Word,
+};
 
-use crate::stepping::StepMap;
+use crate::stepping::{ContractDebugInfo, StepMap};
 use crate::{DebugValue, DebugValueStatus};
 
 /// Where a value came from.
@@ -380,6 +383,245 @@ pub fn state_variables(layout: &StorageLayout, words: &StorageWords<'_>) -> Vec<
         .collect()
 }
 
+/// Every state variable the program-level context of `contract`'s program lists, read
+/// through the pointer the compiler gave it instead of through the storage layout, in the
+/// compiler's order. `None` when the program lists none or the contract has no resource
+/// tables, for a compiler that does not emit them yet: the frontend then falls back to the
+/// storage layout.
+///
+/// Values are shown the way [`state_variables`] shows them: a struct with its members and
+/// a static array with its elements, from the regions the pointer names, a dynamic array
+/// by its length, and a mapping, which has no value of its own, as needing a key. A path
+/// such as `balances[0xabc]` still goes through the layout. When the contract has a
+/// layout, its spelling of a variable's type is used, which qualifies a user-defined type
+/// by the contract defining it. An immutable lives in the code, which this view does not
+/// have, and is reported as unavailable.
+#[must_use]
+pub fn context_state_variables(
+    contract: &ContractDebugInfo,
+    words: &StorageWords<'_>,
+) -> Option<Vec<StateVariable>> {
+    let resources = contract.resources.as_ref()?;
+    if contract.info.state_variables.is_empty() {
+        return None;
+    }
+    let from_chain = Cell::new(false);
+    let read_storage = |slot: &Word| {
+        if let Some(word) = words.get(slot) {
+            return Some(word);
+        }
+        let word = words.chain_word(slot)?;
+        from_chain.set(true);
+        Some(word)
+    };
+    let machine = StorageMachine {
+        storage: &read_storage,
+        transient: None,
+        code: None,
+    };
+    let variables = contract
+        .info
+        .state_variables
+        .iter()
+        .map(|variable| {
+            from_chain.set(false);
+            let name = variable.name();
+            let ty = variable.type_reference().ok().flatten();
+            let pointer = variable.parsed_pointer().ok().flatten();
+            let layout_label = contract.storage_layout.as_ref().and_then(|layout| {
+                let variable = layout
+                    .variables
+                    .iter()
+                    .find(|variable| variable.label == name)?;
+                Some(layout.type_of(&variable.type_id)?.label.clone())
+            });
+            let label = layout_label.unwrap_or_else(|| {
+                ty.as_ref()
+                    .map_or_else(|| "<unknown type>".to_owned(), |ty| resources.label(ty))
+            });
+            let first_region = pointer.as_ref().and_then(|pointer| {
+                dereference_pointer(pointer, &resources.pointers, &machine)
+                    .ok()?
+                    .into_iter()
+                    .next()
+            });
+            let (slot, offset) = first_region
+                .as_ref()
+                .map_or_else(|| ("-".to_owned(), 0), place);
+            let value = match (ty, pointer) {
+                (Some(ty), Some(pointer)) => match resources.read_variable(&ty, &pointer, &machine)
+                {
+                    Ok(values) => composed(&values, resources.resolve(&ty).ok()),
+                    Err(error) => DebugValue {
+                        display: format!("<{error}>"),
+                        raw: None,
+                        status: DebugValueStatus::Unavailable,
+                    },
+                },
+                _ => DebugValue {
+                    display: "<the compiler gave no type or pointer for it>".to_owned(),
+                    raw: None,
+                    status: DebugValueStatus::Unavailable,
+                },
+            };
+            StateVariable {
+                name,
+                ty: label,
+                slot,
+                offset,
+                value,
+                source: if from_chain.get() {
+                    StateSource::Chain
+                } else {
+                    StateSource::Trace
+                },
+            }
+        })
+        .collect();
+    Some(variables)
+}
+
+/// Where a region starts, as the storage layout says it: the slot, and the offset from
+/// the least significant byte, while a region counts it from the most significant one. A
+/// region of the code is placed by its offset in the code.
+fn place(region: &Region) -> (String, u64) {
+    match (region.location, region.slot) {
+        (Location::Storage | Location::Transient, Some(slot)) => {
+            let layout_offset = if region.length < 32 {
+                32_u64.saturating_sub(region.offset + region.length)
+            } else {
+                0
+            };
+            let slot = short_hex(&slot);
+            if region.location == Location::Transient {
+                (format!("{slot} (transient)"), layout_offset)
+            } else {
+                (slot, layout_offset)
+            }
+        }
+        (location, _) => (format!("{location} {:#x}", region.offset), 0),
+    }
+}
+
+/// A part of a value under construction from the regions of its pointer.
+enum Part {
+    Value(String),
+    Members(Vec<(String, Part)>),
+    Elements(Vec<Part>),
+}
+
+impl Part {
+    /// Whether the part already holds a value at `path`, so that the next value for that
+    /// path belongs to a new array element.
+    fn holds(&self, path: &[&str]) -> bool {
+        match (self, path.split_first()) {
+            (_, None) => true,
+            (Self::Members(members), Some((member, rest))) => members
+                .iter()
+                .find(|(name, _)| name == member)
+                .is_some_and(|(_, part)| part.holds(rest)),
+            (Self::Elements(elements), Some((&"item", rest))) => {
+                elements.last().is_some_and(|element| element.holds(rest))
+            }
+            _ => false,
+        }
+    }
+
+    fn insert(&mut self, path: &[&str], display: String) {
+        let Some((first, rest)) = path.split_first() else {
+            *self = Self::Value(display);
+            return;
+        };
+        if *first == "item" {
+            if !matches!(self, Self::Elements(_)) {
+                *self = Self::Elements(Vec::new());
+            }
+            let Self::Elements(elements) = self else {
+                unreachable!()
+            };
+            if elements.last().is_none_or(|element| element.holds(rest)) {
+                elements.push(Self::Members(Vec::new()));
+            }
+            if let Some(element) = elements.last_mut() {
+                element.insert(rest, display);
+            }
+            return;
+        }
+        if !matches!(self, Self::Members(_)) {
+            *self = Self::Members(Vec::new());
+        }
+        let Self::Members(members) = self else {
+            unreachable!()
+        };
+        if let Some((_, part)) = members.iter_mut().find(|(name, _)| name == first) {
+            part.insert(rest, display);
+        } else {
+            let mut part = Self::Members(Vec::new());
+            part.insert(rest, display);
+            members.push(((*first).to_owned(), part));
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Value(display) => display.clone(),
+            Self::Members(members) => format!(
+                "{{ {} }}",
+                members
+                    .iter()
+                    .map(|(name, part)| format!("{name}: {}", part.render()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Elements(elements) => format!(
+                "[{}]",
+                elements
+                    .iter()
+                    .map(Self::render)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+/// One value from the regions a variable's pointer names, which `read_variable` names
+/// relative to the variable: `x` is a struct member, `item` an array element and
+/// `from-x` a member of a member. `document` is the variable's type: a dynamic array is
+/// shown by its length rather than its elements.
+fn composed(values: &[StateValue], document: Option<&TypeDocument>) -> DebugValue {
+    let mut root = Part::Members(Vec::new());
+    for value in values {
+        let path = value
+            .name
+            .split('-')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        root.insert(&path, value.display.clone());
+    }
+    let dynamic_array = matches!(document, Some(TypeDocument::Array { count: None, .. }));
+    let available = dynamic_array || values.iter().any(|value| value.available);
+    let display = match (&root, dynamic_array) {
+        (Part::Elements(elements), true) => {
+            format!("<{} element(s); index it with [i]>", elements.len())
+        }
+        (Part::Members(members), true) if members.is_empty() => {
+            "<0 element(s); index it with [i]>".to_owned()
+        }
+        (Part::Members(members), false) if members.is_empty() => "<no regions>".to_owned(),
+        _ => root.render(),
+    };
+    DebugValue {
+        display,
+        raw: None,
+        status: if available {
+            DebugValueStatus::Decoded
+        } else {
+            DebugValueStatus::Unavailable
+        },
+    }
+}
+
 /// The value at a storage path such as `owner`, `balances[0xabc]`, `items[2]`, or
 /// `config.limit`. `Err` says why the path does not name a place in storage.
 pub fn state_value(
@@ -466,9 +708,29 @@ mod tests {
     use soldb_core::{StepSnapshot, StorageChange, TraceCapabilities, TraceStep, TransactionTrace};
     use soldb_ethdebug::StorageLayout;
 
-    use super::{short_hex, state_value, state_variables, StorageTape, Word};
-    use crate::stepping::StepMap;
+    use soldb_ethdebug::{EthdebugInfo, Resources};
+
+    use super::{
+        context_state_variables, short_hex, state_value, state_variables, StorageTape, Word,
+    };
+    use crate::stepping::{ContractDebugInfo, StepMap};
     use crate::DebugValueStatus;
+
+    const RESOURCES: &str =
+        include_str!("../../../test/fixtures/ethdebug-resources/ethdebug_resources.json");
+    const PROGRAM: &str =
+        include_str!("../../../test/fixtures/ethdebug-resources/Resources_ethdebug-runtime.json");
+
+    /// The fixture's `Resources` contract, with the program-level context solc gives it and
+    /// the tables of its resources.
+    fn context_contract() -> ContractDebugInfo {
+        let resources: serde_json::Value = serde_json::from_str(RESOURCES).expect("resources");
+        let program: serde_json::Value = serde_json::from_str(PROGRAM).expect("program");
+        let info =
+            EthdebugInfo::from_artifacts("Resources", "call", &resources, &program).expect("info");
+        ContractDebugInfo::new(None, "Resources", info, BTreeMap::new())
+            .with_resources(Some(Resources::parse(&resources).expect("tables")))
+    }
 
     /// The slot of `balances[0xf39f…]`, as the layout resolves it.
     fn mapping_entry_slot() -> Word {
@@ -564,6 +826,78 @@ mod tests {
             .expect(path)
             .value
             .display
+    }
+
+    #[test]
+    fn state_is_read_through_the_program_context() {
+        // Where solc puts the fixture's variables: `total` at slot 1, `small` and `flag`
+        // packed into slot 2 from its least significant byte, `origin` at slot 5 and the
+        // length of `values` at slot 7.
+        let trace = trace(
+            vec![
+                step("SLOAD", 1, &[], &[("0x1", "0x7")]),
+                step("SLOAD", 1, &[], &[("0x2", "0x0109")]),
+                step("SLOAD", 1, &[], &[("0x5", "0x0201")]),
+                step("SLOAD", 1, &[], &[("0x7", "0x2")]),
+                step("STOP", 1, &[], &[]),
+            ],
+            true,
+        );
+        let map = StepMap::new(&trace, Vec::new());
+        let tape = StorageTape::new(&trace, &map);
+        let words = tape.at_step(&map, 4);
+        let contract = context_contract();
+        let variables = context_state_variables(&contract, &words).expect("context");
+        let variable = |name: &str| {
+            variables
+                .iter()
+                .find(|variable| variable.name == name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        assert_eq!(
+            (
+                variable("total").value.display.as_str(),
+                variable("total").ty.as_str()
+            ),
+            ("7", "uint256")
+        );
+        let small = variable("small");
+        assert_eq!(
+            (
+                small.value.display.as_str(),
+                small.slot.as_str(),
+                small.offset
+            ),
+            ("9", "0x2", 0)
+        );
+        let flag = variable("flag");
+        assert_eq!((flag.value.display.as_str(), flag.offset), ("true", 1));
+        // Shown the way the storage layout shows them.
+        assert_eq!(variable("origin").value.display, "{ x: 1, y: 2 }");
+        assert_eq!(
+            variable("values").value.display,
+            "<2 element(s); index it with [i]>"
+        );
+        assert_eq!(
+            variable("balances").value.display,
+            "<mapping; index it with [key]>"
+        );
+        // A mapping needs a key, a slot the trace never touched is unknown rather than
+        // zero, and an immutable lives in the code, which this view does not have.
+        for (name, reason) in [
+            ("balances", "key"),
+            ("inherited", "slot"),
+            ("createdAt", "code"),
+        ] {
+            let value = &variable(name).value;
+            assert_eq!(value.status, DebugValueStatus::Unavailable, "{name}");
+            assert!(value.display.contains(reason), "{name}: {}", value.display);
+        }
+
+        // Without resource tables, the frontend falls back to the storage layout.
+        let without_tables =
+            ContractDebugInfo::new(None, "Resources", contract.info.clone(), BTreeMap::new());
+        assert!(context_state_variables(&without_tables, &words).is_none());
     }
 
     #[test]

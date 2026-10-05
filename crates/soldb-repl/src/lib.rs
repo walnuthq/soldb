@@ -311,11 +311,13 @@ impl DebuggerState {
     /// compiled with one.
     #[must_use]
     pub fn storage_layout(&self) -> Option<&StorageLayout> {
-        self.step_map
-            .as_ref()?
-            .contract_at_step(self.current_step)?
-            .storage_layout
-            .as_ref()
+        self.current_contract()?.storage_layout.as_ref()
+    }
+
+    /// The debug info of the contract executing at the current step.
+    #[must_use]
+    pub fn current_contract(&self) -> Option<&ContractDebugInfo> {
+        self.step_map.as_ref()?.contract_at_step(self.current_step)
     }
 
     pub fn trace(&self) -> Option<&TransactionTrace> {

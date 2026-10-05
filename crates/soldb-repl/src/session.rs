@@ -7,8 +7,8 @@
 //! here, so it is said once whichever frontend asks first.
 
 use soldb_debugger::{
-    state_value, state_variables, ChainStorage, DebugValueStatus, DebugVariable, StateSource,
-    StateVariable, StorageWords, INFERRED_LOCALS_WARNING,
+    context_state_variables, state_value, state_variables, ChainStorage, DebugValueStatus,
+    DebugVariable, StateSource, StateVariable, StorageWords, INFERRED_LOCALS_WARNING,
 };
 
 use crate::command::{command_spec, CommandGroup, COMMANDS};
@@ -589,16 +589,28 @@ impl Session {
             };
         }
 
-        let state = match (layout, words.as_ref()) {
-            (Some(layout), _) if layout.variables.is_empty() => StateInfo::None,
-            (Some(layout), Some(words)) => StateInfo::Variables {
+        // The compiler's own description of the state, when it gives one; the storage
+        // layout otherwise.
+        let context_state = words
+            .as_ref()
+            .zip(self.state.current_contract())
+            .and_then(|(words, contract)| context_state_variables(contract, words));
+        let state = match (context_state, layout, words.as_ref()) {
+            (Some(variables), _, _) => StateInfo::Variables {
+                variables: variables
+                    .iter()
+                    .map(|variable| state_info(variable, chain_label))
+                    .collect(),
+            },
+            (None, Some(layout), _) if layout.variables.is_empty() => StateInfo::None,
+            (None, Some(layout), Some(words)) => StateInfo::Variables {
                 variables: state_variables(layout, words)
                     .iter()
                     .map(|variable| state_info(variable, chain_label))
                     .collect(),
             },
-            (Some(_), None) => StateInfo::NoStorage,
-            (None, _) => StateInfo::NoLayout,
+            (None, Some(_), None) => StateInfo::NoStorage,
+            (None, None, _) => StateInfo::NoLayout,
         };
         Output::Variables {
             warning,
