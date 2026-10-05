@@ -93,6 +93,8 @@ throw a JavaScript `Error` whose message is the debugger's own error text.
 | `trace.hasEthdebug()` | whether steps carry source spans and variables |
 | `trace.stepCount()` | number of opcode steps |
 | `trace.step(index)` | one step as JSON, or `undefined` past the end |
+| `trace.provideCode(address, code)` | the deployed code of `address` as `eth_getCode` returns it, which holds the contract's immutables |
+| `trace.state(index)` | the attached contract's state variables at a step as JSON, or `undefined` past the end; see below |
 | `trace.summary()` | header as JSON: hash, parties, gas, status, backend, capabilities, step count, attached debug info |
 | `trace.toJson()` | the trace as JSON, the input `fromJson` accepts and the native CLI's `--save-trace` writes |
 | `trace.free()` | release the trace; it lives outside the JavaScript heap |
@@ -128,6 +130,33 @@ its steps carry source spans and variables:
 `name`, `metadata`, and `program` are required. `sources` maps ETHDebug source ids to
 file contents; any id it leaves out falls back to the source the compilation metadata
 embeds, when the compiler inlined it. `abi` is accepted but not required for stepping.
+`address` is where the contract is deployed, whose code holds its immutables; without it,
+the account whose storage a step runs in is used. `storageLayout` is the parsed
+`<Contract>_storage.json`, for compilers that do not list the state variables in the
+program-level context.
+
+### State
+
+`state(index)` gives the attached contract's state variables at a step, the way the
+CLI's `vars` lists them:
+
+```json
+{
+  "origin": "ethdebug",
+  "variables": [
+    {"name": "total", "type": "uint256", "slot": "0x1", "offset": 0, "inCode": false,
+     "value": "7", "status": "decoded", "source": "trace"}
+  ]
+}
+```
+
+With a compiler that lists the state variables in the program-level context of the
+program, `origin` is `ethdebug` and every variable is read through the pointer the
+compiler gave it: no storage layout is needed. Otherwise it is `storageLayout`, read
+through the attached `storageLayout`, or `null` when neither is there. Storage is what
+the trace recorded, so a slot the transaction never touched is reported as unknown
+rather than zero. Immutables live in the deployed code: fetch it with `eth_getCode` and
+pass it to `provideCode` first, otherwise they are reported as unavailable.
 
 ### Example
 
