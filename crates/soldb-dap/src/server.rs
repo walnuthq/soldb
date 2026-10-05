@@ -813,20 +813,34 @@ impl DapServer {
     }
 
     /// Every state variable of the contract executing at the current step, read through
-    /// its storage layout, followed by its `transient` ones.
+    /// its program context or storage layout, followed by its `transient` ones.
     fn state_variables(&self) -> Vec<Value> {
         let mut variables = Vec::new();
         let words = self
             .debugger
             .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage));
-        if let (Some(layout), Some(words)) = (self.debugger.storage_layout(), words) {
-            variables.extend(soldb_debugger::state_variables(layout, &words));
+        if let Some(words) = words {
+            if let Some(context_variables) = self
+                .debugger
+                .current_contract()
+                .and_then(|contract| soldb_debugger::context_state_variables(contract, &words))
+            {
+                variables.extend(context_variables);
+            } else if let Some(layout) = self.debugger.storage_layout() {
+                variables.extend(soldb_debugger::state_variables(layout, &words));
+            }
         }
         if let (Some(layout), Some(words)) = (
             self.debugger.transient_storage_layout(),
             self.debugger.transient_words(),
         ) {
-            variables.extend(soldb_debugger::state_variables(layout, &words));
+            for variable in soldb_debugger::state_variables(layout, &words) {
+                if let Some(existing) = variables.iter_mut().find(|existing| existing.name == variable.name) {
+                    *existing = variable;
+                } else {
+                    variables.push(variable);
+                }
+            }
         }
         variables
             .into_iter()
@@ -1125,13 +1139,16 @@ impl LoadedSource {
             })?;
         let name = program.info.contract_name.clone();
         let code_generator = program.code_generator();
+        // Tables a debugger cannot read leave the state to the storage layout.
+        let resources = program.resources_tables().ok();
         Ok(Self {
             root: root.to_path_buf(),
             source_files: program.source_files,
             contract: ContractDebugInfo::new(address, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
                 .with_storage_layout(program.storage_layout)
-                .with_transient_storage_layout(program.transient_storage_layout),
+                .with_transient_storage_layout(program.transient_storage_layout)
+                .with_resources(resources),
         })
     }
 }
