@@ -1,0 +1,22 @@
+# The debugger shows the state of a contract through the program-level context alone:
+# compiled without `--storage-layout`, a storage variable is read through its pointer
+# against the recorded storage, and the immutables through theirs against the deployed
+# code, which a local run takes from what the constructor returned. solc refuses ETHDebug
+# output with the optimizer, so this needs no optimization.
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-program-context, optimization-none
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: cd %S/.. && %solc Immutables.sol --via-ir --debug-info ethdebug,ast-id --experimental --bin --ethdebug-program --ethdebug-program-runtime --ethdebug-resources -o %t > %t/compile.stdout 2> %t/compile.stderr
+# RUN: printf 'vars\ncontinue\nvars\nquit\n' | %soldb run %t/Immutables.bin "bump()" --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Immutables:%t -i 2>&1 | FileCheck %s
+
+# Before the call reads it, the counter is unknown, not zero; the immutables are already
+# there, the address and the integer in the low-order bytes of their copies and the
+# `bytes4` in the high-order ones.
+# CHECK: State:
+# CHECK-NEXT: uint256 counter = <unknown: slot 0x0 has not been read or written yet> [slot 0x0]
+# CHECK-NEXT: uint256 step = 7 [code 0x{{[0-9a-f]+}}]
+# CHECK-NEXT: address owner = 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266 [code 0x{{[0-9a-f]+}}]
+# CHECK-NEXT: bytes4 tag = 0xdeadbeef [code 0x{{[0-9a-f]+}}]
+# After it, the counter holds what the call wrote.
+# CHECK: State:
+# CHECK-NEXT: uint256 counter = 7 [slot 0x0]
