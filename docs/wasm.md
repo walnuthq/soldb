@@ -406,6 +406,13 @@ Where the bytes go, from a build with symbol names kept:
 - The replay-capable package adds REVM: the interpreter, the precompiles with their
   elliptic-curve and hashing code, and the state journal. That is what the second budget
   pays for.
+- `state()` added about 230 KB to both packages, which is why both budgets were raised
+  with it: about 100 KB for the step map and the storage tape, which follow the storage
+  account of every frame across calls, delegate calls and reverts; about 65 KB for
+  parsing the type and pointer tables of the resources and the storage layout; and about
+  65 KB for reading a variable through its pointer and decoding its value. The step map
+  is the same one the CLI steps with, so the state the browser shows follows the same
+  rules; a lighter tracker of storage accounts alone could recover part of its share.
 - Gating REVM behind the `replay` feature did not shrink the lean package by itself,
   because the linker had already been discarding unreachable replay code; it saved
   compile time and dependencies. The size-oriented build profile is what brought the
