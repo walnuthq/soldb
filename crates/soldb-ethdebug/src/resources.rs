@@ -534,7 +534,7 @@ impl Resources {
             if let TypeDocument::Mapping { .. } = document {
                 values.push(StateValue {
                     name,
-                    display: "<mapping; index it with a key>".to_owned(),
+                    display: "<mapping; index it with [key]>".to_owned(),
                     available: false,
                 });
                 continue;
