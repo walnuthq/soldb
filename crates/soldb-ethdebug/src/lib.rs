@@ -48,8 +48,8 @@ pub use metadata::{
 };
 pub use source_map::{
     build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program,
-    load_source_map_program_with_sources, parse_srcmap, SourceMapEntry, SourceMapEnvironment,
-    SourceMapInfo, SourceMapProgram,
+    load_source_map_program_with_sources, parse_srcmap, LegacySource, SourceMapEntry,
+    SourceMapEnvironment, SourceMapInfo, SourceMapProgram,
 };
 pub use storage_layout::{
     add_word, decode_value, element_place, mapping_slot, parse_path, parse_word, word_hex,

@@ -10,7 +10,7 @@
 //! Nothing here decides anything about the trace: every pane shows what the session
 //! answers, so the view and the REPL cannot disagree.
 
-use std::io::{self, IsTerminal, Stdout};
+use std::io::{self, BufRead, IsTerminal, Stdout, Write};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -117,6 +117,92 @@ pub fn run(session: &mut Session) -> io::Result<Exit> {
     };
     drop(terminal);
     Ok(exit)
+}
+
+/// Runs `session` for a host that embeds the debugger: the view first when there is a
+/// terminal, then a prompt reading commands until `quit` or the end of input.
+///
+/// # Errors
+///
+/// When reading the input, writing the output, or drawing the view fails.
+pub fn run_interactive(session: &mut Session) -> io::Result<()> {
+    let terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let renderer = Renderer::new(terminal && std::env::var_os("NO_COLOR").is_none());
+    let input = io::stdin().lock();
+    let output = io::stdout().lock();
+    run_with_io(session, input, output, &renderer, terminal)
+}
+
+/// What the answers to a command ask for next.
+enum Next {
+    Prompt,
+    View,
+    Quit,
+}
+
+fn run_with_io(
+    session: &mut Session,
+    mut input: impl BufRead,
+    mut output: impl Write,
+    renderer: &Renderer,
+    terminal: bool,
+) -> io::Result<()> {
+    write_outputs(&mut output, renderer, vec![session.loaded()])?;
+    write_outputs(&mut output, renderer, session.initial_stop())?;
+    if terminal && open_view(session, &mut output)? == Exit::Quit {
+        return Ok(());
+    }
+
+    let mut line = String::new();
+    loop {
+        if terminal {
+            write!(output, "soldb> ")?;
+            output.flush()?;
+        }
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let outputs = session.execute(DebuggerCommand::parse(&line));
+        match write_outputs(&mut output, renderer, outputs)? {
+            Next::Prompt => {}
+            Next::Quit => return Ok(()),
+            Next::View => {
+                if open_view(session, &mut output)? == Exit::Quit {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn write_outputs(
+    output: &mut impl Write,
+    renderer: &Renderer,
+    outputs: Vec<Output>,
+) -> io::Result<Next> {
+    let mut next = Next::Prompt;
+    for answer in outputs {
+        match answer {
+            Output::Quit => next = Next::Quit,
+            Output::Tui => next = Next::View,
+            _ => {}
+        }
+        write!(output, "{}", renderer.render(&answer))?;
+    }
+    output.flush()?;
+    Ok(next)
+}
+
+/// Opens the view; without a terminal, says so and stays at the prompt.
+fn open_view(session: &mut Session, output: &mut impl Write) -> io::Result<Exit> {
+    match run(session) {
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            writeln!(output, "Cannot open the full-screen view: {error}")?;
+            Ok(Exit::Repl)
+        }
+        result => result,
+    }
 }
 
 /// The raw-mode alternate screen, restored however the view ends.
@@ -714,4 +800,39 @@ fn variable_line(ty: &str, name: &str, value: &str, place: Option<&str>) -> Line
 /// An answer as plain lines, for a pane that shows text.
 fn text_lines(renderer: &Renderer, output: &Output) -> Vec<Line<'static>> {
     renderer.lines(output).into_iter().map(Line::from).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use soldb_repl::{DebuggerState, Renderer, Session};
+
+    use super::run_with_io;
+
+    fn transcript(input: &str) -> String {
+        let mut session = Session::new(DebuggerState::new());
+        let mut output = Vec::new();
+        run_with_io(
+            &mut session,
+            input.as_bytes(),
+            &mut output,
+            &Renderer::new(false),
+            false,
+        )
+        .expect("session");
+        String::from_utf8(output).expect("utf-8 output")
+    }
+
+    #[test]
+    fn prompt_stops_reading_at_quit() {
+        let output = transcript("help\nquit\nhelp\n");
+        assert!(output.ends_with("Exiting debugger.\n"));
+        assert_eq!(output, transcript("help\nquit\n"));
+    }
+
+    #[test]
+    fn prompt_ends_with_its_input() {
+        let output = transcript("help\n");
+        assert!(output.contains("reverse-next"));
+        assert!(!output.contains("Exiting debugger."));
+    }
 }

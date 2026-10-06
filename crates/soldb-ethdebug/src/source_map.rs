@@ -46,6 +46,13 @@ pub struct SourceMapProgram {
     pub storage_layout: Option<StorageLayout>,
 }
 
+/// One source a legacy map can point at: its path and, when it could be read, its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySource {
+    pub path: String,
+    pub contents: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceMapEntry {
     pub offset: i64,
@@ -210,7 +217,7 @@ fn source_map_program_from_combined(
     let Some((contract_key, contract)) = find_contract(contracts, contract_name)? else {
         return Ok(None);
     };
-    let (source_map_field, bytecode_field, environment_name) = environment.fields();
+    let (source_map_field, bytecode_field, _) = environment.fields();
     let Some(source_map) = contract.get(source_map_field).and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -225,7 +232,6 @@ fn source_map_program_from_combined(
             ))
         })?;
     let bytecode = decode_bytecode(bytecode, artifact_path, contract_key, bytecode_field)?;
-    let source_map = parse_srcmap(source_map)?;
     let source_list = combined
         .get("sourceList")
         .and_then(Value::as_array)
@@ -237,8 +243,6 @@ fn source_map_program_from_combined(
         })?;
 
     let mut sources = BTreeMap::new();
-    let mut source_contents = BTreeMap::new();
-    let mut compilation_sources = Vec::with_capacity(source_list.len());
     for (source_id, source) in source_list.iter().enumerate() {
         let source_path = source.as_str().ok_or_else(|| {
             SoldbError::Message(format!(
@@ -248,83 +252,25 @@ fn source_map_program_from_combined(
         })?;
         let source_id = u64::try_from(source_id)
             .map_err(|_| SoldbError::Message("source index does not fit in `u64`".to_owned()))?;
-        sources.insert(source_id, source_path.to_owned());
-
-        let contents = read_source(root, source_roots, source_path)?;
-        if let Some(contents) = &contents {
-            source_contents.insert(source_id, contents.clone());
-        }
-        let mut source = json!({
-            "id": source_id,
-            "path": source_path,
-            "language": "Solidity",
-        });
-        if let Some(contents) = contents {
-            source["contents"] = Value::String(contents);
-        }
-        compilation_sources.push(source);
+        sources.insert(
+            source_id,
+            LegacySource {
+                path: source_path.to_owned(),
+                contents: read_source(root, source_roots, source_path)?,
+            },
+        );
     }
 
-    let pc_to_instruction_index = build_pc_to_instruction_map(&bytecode);
-    if source_map.len() > pc_to_instruction_index.len() {
-        return Err(SoldbError::Message(format!(
-            "legacy source map for `{contract_key}` has {} entries but `{bytecode_field}` has \
-             only {} instructions",
-            source_map.len(),
-            pc_to_instruction_index.len()
-        )));
-    }
-
-    let mut instructions = Vec::with_capacity(source_map.len());
-    for (pc, instruction_index) in pc_to_instruction_index {
-        let Some(entry) = source_map.get(instruction_index) else {
-            break;
-        };
-        instructions.push(Instruction {
-            offset: u64::try_from(pc).map_err(|_| {
-                SoldbError::Message("program counter does not fit in `u64`".to_owned())
-            })?,
-            operation: opcode_operation(bytecode[pc]),
-            context: source_context(
-                entry,
-                sources.len(),
-                &source_contents,
-                instruction_index,
-                contract_key,
-            )?,
-        });
-    }
-
-    let compiler_version = combined
-        .get("version")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let compilation = json!({
-        "id": format!("legacy-{compiler_version}"),
-        "compiler": {
-            "name": "Solidity compiler",
-            "version": compiler_version,
-        },
-        "sources": compilation_sources,
-    });
-    let resources = json!({
-        "compilation": compilation,
-        "types": {},
-        "pointers": {},
-    });
-    let resolved_contract_name = contract_key
-        .rsplit_once(':')
-        .map_or(contract_key, |(_, name)| name);
-    let info = EthdebugInfo {
-        compilation,
-        contract_name: resolved_contract_name.to_owned(),
-        environment: environment_name.to_owned(),
-        instructions,
+    let compiler_version = combined.get("version").and_then(Value::as_str);
+    let mut program = SourceMapProgram::from_parts(
+        contract_key,
+        environment,
+        source_map,
+        &bytecode,
         sources,
-        variable_locations: BTreeMap::new(),
-    };
-
-    let storage_layout = contract
+        compiler_version,
+    )?;
+    program.storage_layout = contract
         .get("storage-layout")
         .map(StorageLayout::parse)
         .transpose()
@@ -334,13 +280,107 @@ fn source_map_program_from_combined(
                 artifact_path.display()
             ))
         })?;
+    Ok(Some(program))
+}
 
-    Ok(Some(SourceMapProgram {
-        info,
-        resources,
-        source_contents,
-        storage_layout,
-    }))
+impl SourceMapProgram {
+    /// Builds a program from a legacy source map and the code it describes, with no file
+    /// access, for a host that already holds a compiler's output in memory.
+    ///
+    /// `contract_name` may be a `path:Name` key; the program is named after the part
+    /// after the last `:`. `bytecode` must be the linked code that ran; code that differs
+    /// from what executed maps to the wrong lines. A source id the map uses but `sources` lacks is code without a user source, which
+    /// is how solc marks the Yul it generates. `storage_layout` is left empty for the
+    /// caller to fill.
+    pub fn from_parts(
+        contract_name: &str,
+        environment: SourceMapEnvironment,
+        source_map: &str,
+        bytecode: &[u8],
+        sources: BTreeMap<u64, LegacySource>,
+        compiler_version: Option<&str>,
+    ) -> SoldbResult<Self> {
+        let source_map = parse_srcmap(source_map)?;
+        let pc_to_instruction_index = build_pc_to_instruction_map(bytecode);
+        if source_map.len() > pc_to_instruction_index.len() {
+            return Err(SoldbError::Message(format!(
+                "legacy source map for `{contract_name}` has {} entries but its bytecode has \
+                 only {} instructions",
+                source_map.len(),
+                pc_to_instruction_index.len()
+            )));
+        }
+
+        let mut source_paths = BTreeMap::new();
+        let mut source_contents = BTreeMap::new();
+        let mut compilation_sources = Vec::with_capacity(sources.len());
+        for (source_id, source) in sources {
+            let mut entry = json!({
+                "id": source_id,
+                "path": source.path,
+                "language": "Solidity",
+            });
+            if let Some(contents) = source.contents {
+                entry["contents"] = Value::String(contents.clone());
+                source_contents.insert(source_id, contents);
+            }
+            source_paths.insert(source_id, source.path);
+            compilation_sources.push(entry);
+        }
+
+        let mut instructions = Vec::with_capacity(source_map.len());
+        for (pc, instruction_index) in pc_to_instruction_index {
+            let Some(entry) = source_map.get(instruction_index) else {
+                break;
+            };
+            instructions.push(Instruction {
+                offset: u64::try_from(pc).map_err(|_| {
+                    SoldbError::Message("program counter does not fit in `u64`".to_owned())
+                })?,
+                operation: opcode_operation(bytecode[pc]),
+                context: source_context(
+                    entry,
+                    &source_paths,
+                    &source_contents,
+                    instruction_index,
+                    contract_name,
+                )?,
+            });
+        }
+
+        let compiler_version = compiler_version.unwrap_or("unknown");
+        let compilation = json!({
+            "id": format!("legacy-{compiler_version}"),
+            "compiler": {
+                "name": "Solidity compiler",
+                "version": compiler_version,
+            },
+            "sources": compilation_sources,
+        });
+        let resources = json!({
+            "compilation": compilation,
+            "types": {},
+            "pointers": {},
+        });
+        let resolved_contract_name = contract_name
+            .rsplit_once(':')
+            .map_or(contract_name, |(_, name)| name);
+        let info = EthdebugInfo {
+            compilation,
+            contract_name: resolved_contract_name.to_owned(),
+            environment: environment.fields().2.to_owned(),
+            instructions,
+            sources: source_paths,
+            variable_locations: BTreeMap::new(),
+        };
+
+        Ok(Self {
+            info,
+            resources,
+            source_contents,
+            storage_layout: None,
+        })
+    }
 }
 
 fn find_contract<'a>(
@@ -429,7 +469,7 @@ fn opcode_operation(opcode: u8) -> Value {
 /// may still jump.
 fn source_context(
     entry: &SourceMapEntry,
-    source_count: usize,
+    source_paths: &BTreeMap<u64, String>,
     source_contents: &BTreeMap<u64, String>,
     instruction_index: usize,
     contract_name: &str,
@@ -438,7 +478,7 @@ fn source_context(
     context.insert("modifierDepth".to_owned(), json!(entry.modifier_depth));
     if let Some(code) = source_code(
         entry,
-        source_count,
+        source_paths,
         source_contents,
         instruction_index,
         contract_name,
@@ -460,7 +500,7 @@ fn source_context(
 /// The `code` part of an entry's context: the source range it maps to, if any.
 fn source_code(
     entry: &SourceMapEntry,
-    source_count: usize,
+    source_paths: &BTreeMap<u64, String>,
     source_contents: &BTreeMap<u64, String>,
     instruction_index: usize,
     contract_name: &str,
@@ -485,7 +525,7 @@ fn source_code(
     // source is never in the artifact. Such an instruction has no user source, the same
     // as an entry with index -1; treating it as an error would reject every map a modern
     // legacy-format compiler emits.
-    if usize::try_from(source_id).map_or(true, |source_id| source_id >= source_count) {
+    if !source_paths.contains_key(&source_id) {
         return Ok(None);
     }
     let offset = u64::try_from(entry.offset).map_err(|_| {
@@ -598,6 +638,7 @@ fn parse_inherited_string(field: Option<&str>, previous: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::metadata::FunctionExit;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -608,7 +649,7 @@ mod tests {
 
     use super::{
         build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, opcode_operation,
-        parse_srcmap, SourceMapEnvironment, SourceMapInfo,
+        parse_srcmap, LegacySource, SourceMapEnvironment, SourceMapInfo, SourceMapProgram,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -882,5 +923,95 @@ mod tests {
             .expect_err("missing bytecode");
         assert!(error.to_string().contains("`bin-runtime`"));
         assert!(error.to_string().contains("bytecode output"));
+    }
+
+    #[test]
+    fn builds_a_program_from_parts_in_memory() {
+        // A Forge build numbers sources across the whole compilation, so a contract's
+        // map can name id 21 with nothing at 0..20 handed over, and the generated Yul
+        // sits at an id the compiler never lists.
+        let source = "contract Vault { function add() external {} }";
+        let sources = BTreeMap::from([(
+            21,
+            LegacySource {
+                path: "src/Vault.sol".to_owned(),
+                contents: Some(source.to_owned()),
+            },
+        )]);
+        let program = SourceMapProgram::from_parts(
+            "src/Vault.sol:Vault",
+            SourceMapEnvironment::Runtime,
+            "0:8:21:i:0;9:3:21:o;0:5:23:-",
+            &[0x60, 0x01, 0x60, 0x01, 0x00],
+            sources,
+            Some("0.8.29+commit.ab55807c"),
+        )
+        .expect("program");
+
+        assert_eq!(program.info.contract_name, "Vault");
+        assert_eq!(program.info.environment, "call");
+        assert_eq!(program.info.source_info(0), Some(("src/Vault.sol", 0, 8)));
+        assert_eq!(program.info.source_info(2), Some(("src/Vault.sol", 9, 3)));
+        assert_eq!(program.info.source_info(4), None);
+        let at = |pc: u64| program.info.instruction_at_pc(pc).expect("instruction");
+        assert_eq!(at(0).function_invocations().len(), 1);
+        assert_eq!(at(2).function_exit(), Some(FunctionExit::Return));
+        assert_eq!(
+            program.source_contents.get(&21).map(String::as_str),
+            Some(source)
+        );
+        assert_eq!(
+            program.resources["compilation"]["sources"][0]["path"],
+            "src/Vault.sol"
+        );
+        assert_eq!(
+            program.resources["compilation"]["compiler"]["version"],
+            "0.8.29+commit.ab55807c"
+        );
+        assert!(program.storage_layout.is_none());
+    }
+
+    #[test]
+    fn maps_a_source_whose_text_is_missing() {
+        // The path alone still names the line's file; only range checks need the text.
+        let sources = BTreeMap::from([(
+            0,
+            LegacySource {
+                path: "Missing.sol".to_owned(),
+                contents: None,
+            },
+        )]);
+        let program = SourceMapProgram::from_parts(
+            "Missing",
+            SourceMapEnvironment::Creation,
+            "0:1:0",
+            &[0x00],
+            sources,
+            None,
+        )
+        .expect("program");
+
+        assert_eq!(program.info.environment, "create");
+        assert_eq!(program.info.source_info(0), Some(("Missing.sol", 0, 1)));
+        assert!(program.source_contents.is_empty());
+        assert_eq!(
+            program.resources["compilation"]["compiler"]["version"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn rejects_a_map_longer_than_its_bytecode() {
+        let error = SourceMapProgram::from_parts(
+            "Counter",
+            SourceMapEnvironment::Runtime,
+            "0:1:0;1:1:0;2:1:0",
+            &[0x60, 0x01, 0x00],
+            BTreeMap::new(),
+            None,
+        )
+        .expect_err("map longer than code");
+        assert!(error.to_string().contains("3 entries"));
+        assert!(error.to_string().contains("only 2 instructions"));
     }
 }
