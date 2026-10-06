@@ -4365,7 +4365,7 @@ contract Counter {
         assert_eq!(display_json_value(&json!({"a": 1})), "{\"a\":1}");
         assert_eq!(shorten_hex("0x1234567890"), "0x1234...");
         assert_eq!(shorten_hex("0x1234"), "0x1234");
-        assert_eq!(format_stack(&[]), "[empty]");
+        assert_eq!(format_stack(&[]), dim("[empty]"));
         assert!(
             format_stack(&["0x01".into(), "0x02".into(), "0x03".into(), "0x04".into()])
                 .contains("... +1 more")
