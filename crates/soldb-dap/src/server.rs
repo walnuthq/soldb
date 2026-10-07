@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
 use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo, StepLocation};
-use soldb_ethdebug::{load_debug_program, SourceMapEnvironment};
+use soldb_ethdebug::{load_contract_mapping, load_debug_program, SourceMapEnvironment};
 use soldb_repl::{
     BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
 };
@@ -42,7 +42,8 @@ pub struct DapServer {
     config: DapServerConfig,
     thread_id: u64,
     debugger: DebuggerState,
-    source: Option<LoadedSource>,
+    /// One entry per contract with debug info, in the order given to the step map.
+    sources: Vec<LoadedSource>,
     /// Line breakpoints by source file, as the editor last sent them. They are applied
     /// once a trace and its debug info are loaded, and re-applied after each launch.
     pending_breakpoints: BTreeMap<String, Vec<SourceBreakpoint>>,
@@ -110,7 +111,7 @@ impl Default for DapServer {
             config: DapServerConfig::default(),
             thread_id: 1,
             debugger: DebuggerState::new(),
-            source: None,
+            sources: Vec::new(),
             pending_breakpoints: BTreeMap::new(),
             pending_function_breakpoints: Vec::new(),
             line_breakpoint_ids: BTreeMap::new(),
@@ -217,13 +218,32 @@ impl DapServer {
 
     fn load_launch_arguments(&mut self, arguments: Option<&Value>) -> SoldbResult<Option<String>> {
         let args = arguments.cloned().unwrap_or_else(|| json!({}));
-        if let Some(ethdebug_dir) = string_arg(&args, &["ethdebugDir", "ethdebugPath", "debugDir"])
-        {
-            let contract_name = string_arg(&args, &["contractName", "contract"]);
-            self.source = Some(LoadedSource::load(
-                Path::new(&ethdebug_dir),
-                contract_name.as_deref().unwrap_or_default(),
-            )?);
+        let contracts_file = string_arg(&args, &["contracts"]);
+        let ethdebug_dir = string_arg(&args, &["ethdebugDir", "ethdebugPath", "debugDir"]);
+        match (contracts_file, ethdebug_dir) {
+            (Some(_), Some(_)) => {
+                return Err(SoldbError::Message(
+                    "pass either `contracts` or `ethdebugDir`, not both".to_owned(),
+                ));
+            }
+            (Some(contracts_file), None) => {
+                self.sources = load_mapped_sources(Path::new(&contracts_file))?;
+            }
+            (None, Some(ethdebug_dir)) => {
+                if Path::new(&ethdebug_dir).is_file() {
+                    return Err(SoldbError::Message(format!(
+                        "`ethdebugDir` points to the file `{ethdebug_dir}`; pass a mapping file as `contracts`"
+                    )));
+                }
+                let contract_name = string_arg(&args, &["contractName", "contract"]);
+                let source = LoadedSource::load(
+                    Path::new(&ethdebug_dir),
+                    contract_name.as_deref().unwrap_or_default(),
+                    None,
+                )?;
+                self.sources = vec![source];
+            }
+            (None, None) => self.sources = Vec::new(),
         }
 
         let trace = if let Some(trace_file) = string_arg(&args, &["traceFile", "tracePath"]) {
@@ -265,9 +285,12 @@ impl DapServer {
             .clone()
             .unwrap_or_else(|| "simulation".to_owned());
         self.debugger.load_trace(trace);
-        if let Some(source) = &self.source {
-            self.debugger
-                .attach_debug_info(vec![source.contract.clone()]);
+        if !self.sources.is_empty() {
+            let mut contracts = Vec::new();
+            for source in &self.sources {
+                contracts.push(source.contract.clone());
+            }
+            self.debugger.attach_debug_info(contracts);
         }
         self.register_pending_breakpoints();
         Ok(Some(format!(
@@ -277,7 +300,7 @@ impl DapServer {
 
     /// Whether breakpoints can be resolved now: a trace with debug info is loaded.
     fn can_resolve_breakpoints(&self) -> bool {
-        self.debugger.trace().is_some() && self.source.is_some()
+        self.debugger.trace().is_some() && !self.sources.is_empty()
     }
 
     fn set_breakpoints(&mut self, request: &DapMessage) -> DapMessage {
@@ -657,7 +680,7 @@ impl DapServer {
     }
 
     fn display_source_path(&self, location: &StepLocation) -> String {
-        let Some(source) = &self.source else {
+        let Some(source) = self.sources.get(location.key.contract) else {
             return location.path.clone();
         };
         if let Some(file) = source.source_files.get(&location.key.source_id) {
@@ -980,10 +1003,29 @@ fn frame_error(error: DapFrameError) -> SoldbError {
     SoldbError::Message(format!("Invalid DAP frame: {error:?}"))
 }
 
+/// Loads every contract a mapping file names, as `soldb trace --contracts` does.
+fn load_mapped_sources(path: &Path) -> SoldbResult<Vec<LoadedSource>> {
+    let mut sources = Vec::new();
+    for contract in load_contract_mapping(path)? {
+        let source =
+            LoadedSource::load(&contract.debug_dir, &contract.name, Some(&contract.address))?;
+        sources.push(source);
+    }
+    if sources.is_empty() {
+        return Err(SoldbError::Message(format!(
+            "no contracts found in `{}`; expected `{{\"contracts\": [{{\"address\", \"name\", \"debug_dir\"}}]}}`",
+            path.display()
+        )));
+    }
+    Ok(sources)
+}
+
 impl LoadedSource {
     /// Loads the contract's debug program from `root`: ETHDebug artifacts, or the legacy
-    /// source map. An empty name loads the only program in the directory.
-    fn load(root: &Path, contract_name: &str) -> SoldbResult<Self> {
+    /// source map. An empty name loads the only program in the directory. The address
+    /// matches the info to the frames running that code; a single loaded contract is
+    /// also used for the root frame whatever its address.
+    fn load(root: &Path, contract_name: &str, address: Option<&str>) -> SoldbResult<Self> {
         let program = load_debug_program(root, contract_name, SourceMapEnvironment::Runtime)?
             .ok_or_else(|| {
                 SoldbError::Message(format!(
@@ -996,7 +1038,7 @@ impl LoadedSource {
         Ok(Self {
             root: root.to_path_buf(),
             source_files: program.source_files,
-            contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents)
+            contract: ContractDebugInfo::new(address, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
                 .with_storage_layout(program.storage_layout),
         })
@@ -1297,6 +1339,170 @@ mod tests {
             messages[0].body.as_ref().expect("body")["variables"][0]["value"],
             "42"
         );
+    }
+
+    #[test]
+    fn launches_with_a_contract_mapping_and_stops_in_the_callee() {
+        let temp = temp_dir("soldb-dap-mapping");
+        let caller = "0xaaaa000000000000000000000000000000000001";
+        let callee = "0xbbbb000000000000000000000000000000000002";
+        write_contract(
+            &temp.join("caller"),
+            "Caller",
+            "contract Caller {\n  function run() public {\n    callee.go();\n  }\n}\n",
+            "callee.go();",
+            "CALL",
+        );
+        write_contract(
+            &temp.join("callee"),
+            "Callee",
+            "contract Callee {\n  function go() public {\n    value = 1;\n  }\n}\n",
+            "value = 1;",
+            "SSTORE",
+        );
+        let mapping = temp.join("contracts.json");
+        std::fs::write(
+            &mapping,
+            json!({"contracts": [
+                {"address": caller, "name": "Caller", "debug_dir": "caller"},
+                {"address": callee, "name": "Callee", "debug_dir": "callee"}
+            ]})
+            .to_string(),
+        )
+        .expect("write mapping");
+
+        let callee_word = format!("0x{:0>64}", callee.trim_start_matches("0x"));
+        let call_stack = [
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            callee_word.as_str(),
+            "0x0",
+        ];
+        let mut trace = sample_trace();
+        trace.to_addr = Some(caller.to_owned());
+        trace.steps = vec![
+            trace_step(0, 1, "PUSH1", &[]),
+            trace_step(2, 1, "CALL", &call_stack),
+            trace_step(0, 2, "PUSH1", &[]),
+            trace_step(2, 2, "SSTORE", &[]),
+            trace_step(3, 1, "STOP", &[]),
+        ];
+
+        let mut server = DapServer::new();
+        let both = DapMessage::request(
+            1,
+            "launch",
+            Some(json!({
+                "trace": trace,
+                "contracts": mapping.display().to_string(),
+                "ethdebugDir": temp.join("caller").display().to_string()
+            })),
+        );
+        assert_eq!(server.handle_message(&both)[0].success, Some(false));
+
+        let mapping_as_dir = DapMessage::request(
+            1,
+            "launch",
+            Some(json!({"trace": trace, "ethdebugDir": mapping.display().to_string()})),
+        );
+        let response = &server.handle_message(&mapping_as_dir)[0];
+        assert_eq!(response.success, Some(false));
+        assert!(response
+            .message
+            .as_deref()
+            .expect("message")
+            .contains("pass a mapping file as `contracts`"));
+
+        let launch = DapMessage::request(
+            2,
+            "launch",
+            Some(json!({"trace": trace, "contracts": mapping.display().to_string()})),
+        );
+        assert_eq!(server.handle_message(&launch)[0].success, Some(true));
+
+        let set_breakpoints = DapMessage::request(
+            3,
+            "setBreakpoints",
+            Some(json!({
+                "source": {"path": "Callee.sol"},
+                "breakpoints": [{"line": 3}]
+            })),
+        );
+        let body = server.handle_message(&set_breakpoints)[0]
+            .body
+            .clone()
+            .expect("body");
+        assert_eq!(body["breakpoints"][0]["verified"], true, "{body}");
+
+        let messages = server.handle_message(&DapMessage::request(4, "continue", None));
+        assert_eq!(
+            messages[1].body.as_ref().expect("body")["reason"],
+            "breakpoint"
+        );
+
+        let messages = server.handle_message(&DapMessage::request(5, "stackTrace", None));
+        let frames = &messages[0].body.as_ref().expect("body")["stackFrames"];
+        let top = &frames[0];
+        assert_eq!(top["line"], 3);
+        assert_eq!(
+            top["source"]["path"],
+            temp.join("callee").join("Callee.sol").display().to_string()
+        );
+        let last = frames
+            .as_array()
+            .expect("frames")
+            .last()
+            .expect("caller frame");
+        assert_eq!(
+            last["source"]["path"],
+            temp.join("caller").join("Caller.sol").display().to_string()
+        );
+    }
+
+    /// One contract's source and ETHDebug artifacts in `dir`: two instructions, both
+    /// mapped to `statement`, the second of them `op`.
+    fn write_contract(dir: &std::path::Path, name: &str, source: &str, statement: &str, op: &str) {
+        std::fs::create_dir_all(dir).expect("create contract dir");
+        std::fs::write(dir.join(format!("{name}.sol")), source).expect("write source");
+        std::fs::write(
+            dir.join("ethdebug.json"),
+            json!({"compilation": {"sources": [{"id": 0, "path": format!("{name}.sol")}]}})
+                .to_string(),
+        )
+        .expect("write metadata");
+        let offset = source.find(statement).expect("statement in source");
+        let context = json!({"code": {"source": {"id": 0}, "range": {"offset": offset, "length": statement.len()}}});
+        let program = json!({"instructions": [
+            {"offset": 0, "operation": {"mnemonic": "PUSH1"}, "context": context},
+            {"offset": 2, "operation": {"mnemonic": op}, "context": context}
+        ]});
+        std::fs::write(
+            dir.join(format!("{name}_ethdebug-runtime.json")),
+            program.to_string(),
+        )
+        .expect("write runtime");
+    }
+
+    fn trace_step(pc: u64, depth: u64, op: &str, stack: &[&str]) -> TraceStep {
+        let mut words = Vec::new();
+        for word in stack {
+            words.push((*word).into());
+        }
+        TraceStep {
+            pc,
+            op: op.into(),
+            gas: 100,
+            gas_cost: 1,
+            depth,
+            stack: words,
+            memory: None,
+            storage: None,
+            error: None,
+            snapshot: Default::default(),
+        }
     }
 
     #[test]

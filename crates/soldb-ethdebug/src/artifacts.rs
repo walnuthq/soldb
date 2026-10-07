@@ -350,6 +350,61 @@ pub fn load_storage_layout(root: &Path, contract_name: &str) -> SoldbResult<Opti
         .map_err(|error| SoldbError::Message(format!("{}: {error}", path.display())))
 }
 
+/// One entry of a contract mapping file: a deployed address and the directory holding
+/// the artifacts that describe its code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractMapping {
+    pub address: String,
+    pub name: String,
+    pub debug_dir: PathBuf,
+}
+
+/// Reads a contract mapping file, `{"contracts": [{"address", "name", "debug_dir"}]}`.
+pub fn load_contract_mapping(path: &Path) -> SoldbResult<Vec<ContractMapping>> {
+    let value = read_json_file(path)?;
+    parse_contract_mapping(path, &value)
+}
+
+/// The entries of a parsed mapping file. A relative `debug_dir` is relative to the file.
+pub fn parse_contract_mapping(path: &Path, value: &Value) -> SoldbResult<Vec<ContractMapping>> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let contracts = value
+        .get("contracts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            SoldbError::Message(format!(
+                "contract mapping `{}` must contain a `contracts` array",
+                path.display()
+            ))
+        })?;
+
+    Ok(contracts
+        .iter()
+        .filter_map(|contract| {
+            let address = contract.get("address")?.as_str()?.to_owned();
+            let name = contract
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_owned();
+            let debug_dir = contract
+                .get("debug_dir")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)?;
+            let debug_dir = if debug_dir.is_absolute() {
+                debug_dir
+            } else {
+                base_dir.join(debug_dir)
+            };
+            Some(ContractMapping {
+                address,
+                name,
+                debug_dir,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
