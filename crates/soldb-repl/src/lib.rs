@@ -311,11 +311,13 @@ impl DebuggerState {
     /// compiled with one.
     #[must_use]
     pub fn storage_layout(&self) -> Option<&StorageLayout> {
-        self.step_map
-            .as_ref()?
-            .contract_at_step(self.current_step)?
-            .storage_layout
-            .as_ref()
+        self.current_contract()?.storage_layout.as_ref()
+    }
+
+    /// The debug info of the contract executing at the current step.
+    #[must_use]
+    pub fn current_contract(&self) -> Option<&ContractDebugInfo> {
+        self.step_map.as_ref()?.contract_at_step(self.current_step)
     }
 
     pub fn trace(&self) -> Option<&TransactionTrace> {
@@ -1748,6 +1750,7 @@ contract C {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
@@ -1918,6 +1921,7 @@ contract C {
                 ],
                 sources: BTreeMap::from([(0, "C.sol".to_owned())]),
                 variable_locations: BTreeMap::new(),
+                state_variables: Vec::new(),
             };
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]))
                 .with_code_generator(code_generator)
@@ -2059,6 +2063,7 @@ contract C {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]))

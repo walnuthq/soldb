@@ -1,8 +1,12 @@
 """Shared compiler-backed tests using the ordinary node-free lit shell format."""
 
+import json
 import os
+import re
 import shlex
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import lit.formats
@@ -25,12 +29,78 @@ config.test_exec_root = str(
 )
 config.environment["NO_COLOR"] = "1"
 
+# What a compiler emits for ETHDebug is probed rather than read off its version: a
+# development build carries the version of the next release long before the features
+# that release will have, so `0.8.38-develop` on `develop` says nothing about whether the
+# type and pointer tables are there yet.
+PROBE_SOURCE = (
+    "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\ncontract Probe { uint256 x; }\n"
+)
+
 
 def require_tool(name, value):
     path = shutil.which(str(value))
     if path is None:
         lit_config.fatal(f"{name} is required; could not find {value}")
-    return shlex.quote(path)
+    return path
+
+
+def solc_version(path):
+    """The leading `major.minor.patch` of `solc --version`, ignoring a prerelease suffix."""
+    output = subprocess.run([path, "--version"], capture_output=True, text=True, check=False)
+    match = re.search(r"Version: (\d+)\.(\d+)\.(\d+)", output.stdout)
+    if match is None:
+        lit_config.fatal(f"could not read the solc version from {path}")
+    return tuple(int(part) for part in match.groups())
+
+
+def probe(path, flags, artifact):
+    """The JSON `artifact` the compiler writes for a contract with one `uint256` state
+    variable `x` when given `flags`, or `None` when it writes none."""
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "Probe.sol"
+        source.write_text(PROBE_SOURCE)
+        result = subprocess.run(
+            [path, "--evm-version=cancun", *flags, "-o", directory, str(source)],
+            capture_output=True, text=True, check=False, cwd=directory,
+        )
+        output = Path(directory) / artifact
+        if result.returncode != 0 or not output.is_file():
+            return None
+        try:
+            return json.loads(output.read_text())
+        except ValueError:
+            return None
+
+
+def solc_emits_resource_tables(path):
+    """Whether the compiler fills the type and pointer tables of the resources, which
+    argotorg/solidity#16990 adds. Tests that read them gate on
+    `solc-ethdebug-resource-tables`."""
+    resources = probe(path, ["--experimental", "--ethdebug-resources"], "ethdebug_resources.json")
+    try:
+        return "t_uint256" in resources["types"]
+    except (KeyError, TypeError):
+        return False
+
+
+def solc_emits_program_context(path):
+    """Whether the compiler lists the state variables in the program-level context of a
+    program, which arrives after the type and pointer tables do. Tests that read it gate
+    on `solc-ethdebug-program-context`."""
+    program = probe(
+        path,
+        [
+            "--via-ir", "--debug-info", "ethdebug,ast-id", "--experimental",
+            "--ethdebug-program-runtime",
+        ],
+        "Probe_ethdebug-runtime.json",
+    )
+    try:
+        variables = program["context"]["variables"]
+    except (KeyError, TypeError):
+        return False
+    return any(variable.get("identifier") == "x" for variable in variables)
 
 
 # Unlike the live-node suite, missing prerequisites must fail configuration.
@@ -42,7 +112,7 @@ solc_optimization = {
     "gas": "--optimize --optimize-runs 200",
     "size": "--optimize --optimize-runs 1",
 }[optimization]
-config.substitutions = [("%soldb", soldb), ("FileCheck", filecheck)]
+config.substitutions = [("%soldb", shlex.quote(soldb)), ("FileCheck", shlex.quote(filecheck))]
 
 # `verdict.jq` judges a debug-diff or profile report: debugger invariants fail
 # the test, attribution the optimizer dropped is reported. solc 0.8.36 is the
@@ -60,12 +130,24 @@ config.substitutions.extend(
 )
 if compiler in ("solar", "both"):
     solar = require_tool("Solar (set SOLAR)", os.environ.get("SOLAR", "solar"))
-    config.substitutions.append(("%solar", f"{solar} --evm-version=cancun -O{optimization}"))
+    config.substitutions.append(
+        ("%solar", f"{shlex.quote(solar)} --evm-version=cancun -O{optimization}")
+    )
     config.available_features.add("compiler-solar")
 if compiler in ("solc", "both"):
     solc = require_tool("solc (set SOLC_PATH)", os.environ.get("SOLC_PATH", "solc"))
-    config.substitutions.append(("%solc", f"{solc} --evm-version=cancun {solc_optimization}"))
+    config.substitutions.append(
+        ("%solc", f"{shlex.quote(solc)} --evm-version=cancun {solc_optimization}")
+    )
     config.available_features.add("compiler-solc")
+    version = solc_version(solc)
+    lit_config.note(f"solc {'.'.join(str(part) for part in version)} at {solc}")
+    if solc_emits_resource_tables(solc):
+        config.available_features.add("solc-ethdebug-resource-tables")
+        lit_config.note("solc fills the type and pointer tables of the resources")
+    if solc_emits_program_context(solc):
+        config.available_features.add("solc-ethdebug-program-context")
+        lit_config.note("solc lists the state variables in the program-level context")
 if compiler == "both":
     config.available_features.add("compiler-diff")
 config.available_features.add("soldb")

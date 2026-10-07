@@ -1,0 +1,73 @@
+# The program-level context of a contract's programs lists its state variables: the
+# identifier, the declaration, the type by identifier into the type table and the pointer,
+# a region for a value type and for a mapping's base slot, a reference to the template of
+# the type with the slot bound for any other type. It is the first ETHDebug output that
+# tells the debugger where the state lives without the storage layout. The runtime
+# program lists the immutables its code reads as well, as regions of the code. solc refuses
+# ETHDebug output with the optimizer, so this needs no optimization.
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-program-context, optimization-none
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr
+
+# Every variable of the storage layout is listed, in order, with the type identifier the
+# layout uses for it; the transient storage variable follows, then the immutable.
+# RUN: jq -r '.context.variables[] | "\(.identifier) \(.type.id)"' %t/Resources_ethdebug-runtime.json | FileCheck %s --check-prefix=VARIABLES
+# VARIABLES: inherited t_uint256
+# VARIABLES-NEXT: total t_uint256
+# VARIABLES-NEXT: small t_uint8
+# VARIABLES-NEXT: flag t_bool
+# VARIABLES-NEXT: owner t_address
+# VARIABLES-NEXT: hash t_bytes32
+# VARIABLES-NEXT: color t_enum$_Color_${{[0-9]+}}
+# VARIABLES-NEXT: price t_userDefinedValueType$_Price_${{[0-9]+}}
+# VARIABLES-NEXT: origin t_struct$_Point_${{[0-9]+}}_storage
+# VARIABLES-NEXT: packed t_array$_t_uint16_$4_storage
+# VARIABLES-NEXT: values t_array$_t_uint256_$dyn_storage
+# VARIABLES-NEXT: blob t_bytes_storage
+# VARIABLES-NEXT: text t_string_storage
+# VARIABLES-NEXT: balances t_mapping$_t_address_$_t_uint256_$
+# VARIABLES-NEXT: nested t_mapping$_t_address_$_t_mapping$_t_uint256_$_t_bool_$_$
+# VARIABLES-NEXT: scratch t_uint256
+# VARIABLES-NEXT: createdAt t_uint256
+
+# The types resolve in the type table, and every declaration points into the source.
+# RUN: jq -c --slurpfile resources %t/ethdebug_resources.json '[.context.variables[] | .type.id] | [length, all(. as $id | $resources[0].types | has($id))]' %t/Resources_ethdebug-runtime.json | FileCheck %s --check-prefix=TYPES
+# TYPES: [17,true]
+# RUN: jq -c '[.context.variables[] | .declaration | [.source.id, (.range | has("offset") and has("length"))]] | unique[]' %t/Resources_ethdebug-runtime.json | FileCheck %s --check-prefix=DECLARED
+# DECLARED: [0,true]
+
+# Every pointer locates the variable where the storage layout puts it; `context.jq` fails
+# on one that disagrees. A packed value's offset counts from the most significant byte
+# of the slot, so the `uint8` the layout puts at its least significant byte is at 0x1f.
+# An immutable is not in the layout: it is the word of the code holding a copy of it.
+# RUN: jq -r --slurpfile layout %t/Resources_storage.json --slurpfile resources %t/ethdebug_resources.json -f %S/context.jq %t/Resources_ethdebug-runtime.json > %t/context.txt
+# RUN: FileCheck %s --check-prefix=POINTERS < %t/context.txt
+# POINTERS: inherited: region at slot 0x00
+# POINTERS-NEXT: total: region at slot 0x01
+# POINTERS-NEXT: small: region at slot 0x02 offset 0x1f length 0x01
+# POINTERS-NEXT: flag: region at slot 0x02 offset 0x1e length 0x01
+# POINTERS-NEXT: owner: region at slot 0x02 offset 0x0a length 0x14
+# POINTERS-NEXT: hash: region at slot 0x03
+# POINTERS-NEXT: color: region at slot 0x04 offset 0x1f length 0x01
+# POINTERS-NEXT: price: region at slot 0x04 offset 0x0f length 0x10
+# POINTERS-NEXT: origin: template t_struct$_Point_${{[0-9]+}}_storage at slot 0x05
+# POINTERS-NEXT: packed: template t_array$_t_uint16_$4_storage at slot 0x06
+# POINTERS-NEXT: values: template t_array$_t_uint256_$dyn_storage at slot 0x07
+# POINTERS-NEXT: blob: template t_bytes_storage at slot 0x08
+# POINTERS-NEXT: text: template t_string_storage at slot 0x09
+# POINTERS-NEXT: balances: mapping base slot 0x0a
+# POINTERS-NEXT: nested: mapping base slot 0x0b
+# POINTERS-NEXT: scratch: transient region at slot 0x00
+# POINTERS-NEXT: createdAt: code region offset 0x{{[0-9a-f]+}} length 0x20
+
+# The creation program lists the same variables except the immutable, of which the
+# creation code holds no copy; a base contract lists its own only; a contract without
+# state variables has no program-level context.
+# RUN: jq -c '[.context.variables[].identifier]' %t/Resources_ethdebug.json > %t/creation.json
+# RUN: jq -c '[.context.variables[] | select(.pointer.location != "code") | .identifier]' %t/Resources_ethdebug-runtime.json > %t/runtime.json
+# RUN: cmp %t/creation.json %t/runtime.json
+# RUN: jq -c '[.context.variables[].identifier]' %t/Base_ethdebug-runtime.json | FileCheck %s --check-prefix=BASE
+# BASE: ["inherited"]
+# RUN: jq -c '.context' %t/Stateless_ethdebug-runtime.json | FileCheck %s --check-prefix=STATELESS
+# STATELESS: null

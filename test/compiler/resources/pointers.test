@@ -1,0 +1,71 @@
+# The pointer table of the ETHDebug resources: one template per struct, array and mapping
+# type a state variable has or is composed of, keyed by the type identifier, describing a
+# value of the type from a base slot the template expects as `slot`; a mapping's expects
+# `key` too. Value types have no template. solc emits the tables from 0.8.38 and refuses
+# ETHDebug output with the optimizer, so this needs a new enough compiler and no
+# optimization.
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-resource-tables, optimization-none
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime --ethdebug-resources --storage-layout --bin --abi -o %t > %t/compile.stdout 2> %t/compile.stderr
+
+# Templates are keyed like the type documents.
+# RUN: jq -c '. as $r | [.pointers | keys[] | . as $id | $r.types | has($id)] | [length, all]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=NAMES
+# NAMES: [8,true]
+
+# Every composed type of the storage layout has a template and no value type does;
+# `pointers.jq` fails otherwise.
+# RUN: jq -r --slurpfile layout %t/Resources_storage.json -f %S/pointers.jq %t/ethdebug_resources.json > %t/pointers.txt
+# RUN: FileCheck %s --check-prefix=LAYOUT < %t/pointers.txt
+# LAYOUT: inherited: value type, no template
+# LAYOUT-NEXT: total: value type, no template
+# LAYOUT-NEXT: small: value type, no template
+# LAYOUT-NEXT: flag: value type, no template
+# LAYOUT-NEXT: owner: value type, no template
+# LAYOUT-NEXT: hash: value type, no template
+# LAYOUT-NEXT: color: value type, no template
+# LAYOUT-NEXT: price: value type, no template
+# LAYOUT-NEXT: origin: struct template expects slot, regions x y
+# LAYOUT-NEXT: packed: array template expects slot, regions item
+# LAYOUT-NEXT: values: array template expects slot, regions item length
+# LAYOUT-NEXT: blob: bytes template expects slot, regions data length-flag long-length
+# LAYOUT-NEXT: text: string template expects slot, regions data length-flag long-length
+# LAYOUT-NEXT: balances: mapping template expects slot key, regions value
+# LAYOUT-NEXT: nested: mapping template expects slot key, regions value
+
+# A struct's members sit at the base slot and at the offsets the layout packs them at,
+# counted from the most significant byte of the slot: the `uint8` the layout puts at the
+# least significant byte is at offset 31.
+# RUN: jq -c '.pointers[] | select(.expect == ["slot"]) | .for.group? // empty | .[] | select(has("location")) | [.name, .slot, .offset, .length]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=STRUCT
+# STRUCT: ["x","slot","0x1f","0x01"]
+# STRUCT-NEXT: ["y","slot","0x1e","0x01"]
+
+# A mapping's entry lives at keccak256 of the key and of the slot, both as words; the
+# value of a nested mapping is the base slot of the inner one, a whole slot, which the
+# inner mapping's template takes as its own `slot` with the next key.
+# RUN: jq -c '.pointers | to_entries[] | select(.value.expect == ["slot","key"]) | [.key, .value.for.slot, .value.for.offset, .value.for.length]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=MAPPING
+# MAPPING: ["t_mapping$_t_address_$_t_mapping$_t_uint256_$_t_bool_$_$",{"$keccak256":[{"$wordsized":"key"},{"$wordsized":"slot"}]},null,null]
+# MAPPING-NEXT: ["t_mapping$_t_address_$_t_uint256_$",{"$keccak256":[{"$wordsized":"key"},{"$wordsized":"slot"}]},null,null]
+# MAPPING-NEXT: ["t_mapping$_t_uint256_$_t_bool_$",{"$keccak256":[{"$wordsized":"key"},{"$wordsized":"slot"}]},"0x1f","0x01"]
+
+# A dynamic array keeps its length in the slot and its elements at keccak256 of the slot,
+# one per index of the list; bytes and strings choose between the short and the long
+# encoding by the length flag in the slot.
+# RUN: jq -c '.pointers["t_array$_t_uint256_$dyn_storage"].for.group[1] | [.define, .in.list.count, .in.list.each, .in.list.is.slot]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=ARRAY
+# ARRAY: [{"data":{"$keccak256":[{"$wordsized":"slot"}]}},{"$read":"length"},"index",{"$sum":["data","index"]}]
+# RUN: jq -c '.pointers["t_string_storage"].for.group | [.[0].name, .[0].offset, .[0].length, (.[1] | keys)]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=STRING
+# STRING: ["length-flag",{"$difference":["$wordsize","0x01"]},"0x01",["else","if","then"]]
+
+# Transient storage holds value types only, so it adds no template; neither do constants
+# and immutables, which occupy no storage.
+# RUN: jq -c '[(.pointers | has("t_uint256")), ([.pointers[] | .. | objects | select(.location? == "transient")] | length)]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=TRANSIENT
+# TRANSIENT: [false,0]
+
+# The debugger loads what this compiler wrote: the resources next to the runtime program,
+# and the state variables through the storage layout.
+# RUN: %soldb run %t/Resources.bin "read()" --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Resources:%t --json -x "info resources --json" -x "vars" --batch > %t/session.json
+# RUN: jq -c 'select(.kind == "resources") | .contracts[] | [.name, .environment, .sources]' %t/session.json | FileCheck %s --check-prefix=LOADED
+# LOADED: ["Resources","call",["Resources.sol"]]
+# RUN: jq -r 'select(.kind == "variables") | .state.variables[] | "\(.name) \(.ty) \(.place)"' %t/session.json | FileCheck %s --check-prefix=STATE
+# STATE: inherited uint256 slot 0x0
+# STATE-NEXT: total uint256 slot 0x1

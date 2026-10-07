@@ -24,9 +24,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use soldb_core::TransactionTrace;
-use soldb_ethdebug::{parse_word, word_hex, StorageLayout, StorageRef, Word};
+use soldb_ethdebug::{
+    dereference_pointer, parse_word, word_hex, Location, Region, StateValue, StorageLayout,
+    StorageMachine, StorageRef, TypeDocument, Word,
+};
 
-use crate::stepping::StepMap;
+use crate::stepping::{ContractDebugInfo, StepMap};
 use crate::{DebugValue, DebugValueStatus};
 
 /// Where a value came from.
@@ -50,10 +53,52 @@ pub trait ChainStorage {
     /// Where these words come from, as a user-facing phrase such as
     /// `the chain at block 21000000`.
     fn label(&self) -> &str;
+
+    /// The deployed code of `address`, which holds the values of its immutables, or
+    /// `None` when it could not be read. A chain that only answers storage has none.
+    fn code(&self, _address: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// The reading a frontend supplies: one storage word of one account, or nothing.
 pub type ChainRead = Box<dyn Fn(&str, &Word) -> Option<Word>>;
+
+/// The reading a frontend supplies for code: the deployed code of one account, or nothing.
+pub type CodeRead = Box<dyn Fn(&str) -> Option<Vec<u8>>>;
+
+/// Deployed code a frontend has without asking a chain, such as what a local deployment
+/// returned, by address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KnownCode(HashMap<String, Vec<u8>>);
+
+impl KnownCode {
+    /// Adds the deployed `code` of `address`.
+    #[must_use]
+    pub fn with(mut self, address: &str, code: Vec<u8>) -> Self {
+        self.0.insert(address.to_ascii_lowercase(), code);
+        self
+    }
+
+    /// The deployed code of `address`, when known.
+    #[must_use]
+    pub fn get(&self, address: &str) -> Option<&[u8]> {
+        self.0.get(&address.to_ascii_lowercase()).map(Vec::as_slice)
+    }
+}
+
+/// Bytes from the `0x`-prefixed hex a node or a trace gives code as.
+#[must_use]
+pub fn code_from_hex(text: &str) -> Option<Vec<u8>> {
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..digits.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(digits.get(index..index + 2)?, 16).ok())
+        .collect()
+}
 
 /// A [`ChainStorage`] that reads each slot once, through a function the frontend gives.
 ///
@@ -64,6 +109,8 @@ pub struct CachedChain<F> {
     read: F,
     label: String,
     words: RefCell<HashMap<(String, Word), Option<Word>>>,
+    read_code: Option<CodeRead>,
+    codes: RefCell<HashMap<String, Option<Vec<u8>>>>,
 }
 
 impl<F> std::fmt::Debug for CachedChain<F> {
@@ -87,7 +134,16 @@ where
             read,
             label: label.into(),
             words: RefCell::new(HashMap::new()),
+            read_code: None,
+            codes: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Reads the deployed code of an account through `read_code`, once per account.
+    #[must_use]
+    pub fn with_code(mut self, read_code: CodeRead) -> Self {
+        self.read_code = Some(read_code);
+        self
     }
 }
 
@@ -108,6 +164,17 @@ where
     fn label(&self) -> &str {
         &self.label
     }
+
+    fn code(&self, address: &str) -> Option<Vec<u8>> {
+        let read_code = self.read_code.as_ref()?;
+        let key = address.to_ascii_lowercase();
+        if let Some(cached) = self.codes.borrow().get(&key) {
+            return cached.clone();
+        }
+        let code = read_code(&key);
+        self.codes.borrow_mut().insert(key, code.clone());
+        code
+    }
 }
 
 /// One state variable, or one place inside one, with its value at a step.
@@ -117,10 +184,14 @@ pub struct StateVariable {
     pub name: String,
     /// The Solidity type as the layout labels it.
     pub ty: String,
-    /// The slot, as `0x`-prefixed hex without leading zeros.
+    /// The slot, as `0x`-prefixed hex without leading zeros. For a value in the code,
+    /// the offset of its bytes in the code.
     pub slot: String,
     /// The byte offset within the slot.
     pub offset: u64,
+    /// Whether the value is in the deployed code, as an immutable's is, rather than in
+    /// storage.
+    pub in_code: bool,
     pub value: DebugValue,
     /// Whether the value came from the recording or from the chain.
     pub source: StateSource,
@@ -234,6 +305,7 @@ impl StorageTape {
             context,
             address: None,
             chain: None,
+            known_code: None,
         }
     }
 
@@ -247,6 +319,7 @@ impl StorageTape {
             context: map.storage_context_index(step),
             address: map.storage_address(step),
             chain: None,
+            known_code: None,
         }
     }
 
@@ -272,6 +345,8 @@ pub struct StorageWords<'a> {
     /// The account whose storage this is, for reading from a chain.
     address: Option<&'a str>,
     chain: Option<&'a dyn ChainStorage>,
+    /// Deployed code the frontend has without a chain.
+    known_code: Option<&'a KnownCode>,
 }
 
 impl<'a> StorageWords<'a> {
@@ -280,6 +355,24 @@ impl<'a> StorageWords<'a> {
     pub fn with_chain(mut self, chain: Option<&'a dyn ChainStorage>) -> Self {
         self.chain = chain;
         self
+    }
+
+    /// Takes deployed code from `known_code` before asking the chain.
+    #[must_use]
+    pub fn with_known_code(mut self, known_code: Option<&'a KnownCode>) -> Self {
+        self.known_code = known_code;
+        self
+    }
+
+    /// The deployed code of `address`, or of the account whose storage this is: from the
+    /// code the frontend has, otherwise from the chain.
+    #[must_use]
+    pub fn code(&self, address: Option<&str>) -> Option<Vec<u8>> {
+        let address = address.or(self.address)?;
+        if let Some(code) = self.known_code.and_then(|known| known.get(address)) {
+            return Some(code.to_vec());
+        }
+        self.chain?.code(address)
     }
 
     /// The word at `slot`, when the trace recorded one that still holds.
@@ -380,6 +473,282 @@ pub fn state_variables(layout: &StorageLayout, words: &StorageWords<'_>) -> Vec<
         .collect()
 }
 
+/// Every state variable the program-level context of `contract`'s program lists, read
+/// through the pointer the compiler gave it instead of through the storage layout, in the
+/// compiler's order. `None` when the program lists none or the contract has no resource
+/// tables, for a compiler that does not emit them yet: the frontend then falls back to the
+/// storage layout.
+///
+/// Values are shown the way [`state_variables`] shows them: a struct with its members and
+/// a static array with its elements, from the regions the pointer names, a dynamic array
+/// by its length, and a mapping, which has no value of its own, as needing a key. A path
+/// such as `balances[0xabc]` still goes through the layout. When the contract has a
+/// layout, its spelling of a variable's type is used, which qualifies a user-defined type
+/// by the contract defining it. An immutable is read from the deployed code, which the
+/// frontend supplies through [`StorageWords::with_known_code`] or its chain; without it,
+/// the immutable is reported as unavailable.
+#[must_use]
+pub fn context_state_variables(
+    contract: &ContractDebugInfo,
+    words: &StorageWords<'_>,
+) -> Option<Vec<StateVariable>> {
+    let resources = contract.resources.as_ref()?;
+    if contract.info.state_variables.is_empty() {
+        return None;
+    }
+    let from_chain = Cell::new(false);
+    // The first slot a variable needed and nobody knew, which says why it is unknown the
+    // same way the storage layout's view does.
+    let missing = Cell::new(None);
+    let read_storage = |slot: &Word| {
+        if let Some(word) = words.get(slot) {
+            return Some(word);
+        }
+        let Some(word) = words.chain_word(slot) else {
+            if missing.get().is_none() {
+                missing.set(Some(*slot));
+            }
+            return None;
+        };
+        from_chain.set(true);
+        Some(word)
+    };
+    // Immutables live in the deployed code of the contract running, which is only asked
+    // for when there are any.
+    let in_code = contract.info.state_variables.iter().any(|variable| {
+        variable
+            .pointer
+            .as_ref()
+            .and_then(|pointer| pointer.get("location"))
+            .and_then(serde_json::Value::as_str)
+            == Some("code")
+    });
+    let code = if in_code {
+        words.code(contract.address.as_deref())
+    } else {
+        None
+    };
+    let machine = StorageMachine {
+        storage: &read_storage,
+        transient: None,
+        code: code.as_deref(),
+    };
+    let variables = contract
+        .info
+        .state_variables
+        .iter()
+        .map(|variable| {
+            from_chain.set(false);
+            missing.set(None);
+            let name = variable.name();
+            let ty = variable.type_reference().ok().flatten();
+            let pointer = variable.parsed_pointer().ok().flatten();
+            let layout_label = contract.storage_layout.as_ref().and_then(|layout| {
+                let variable = layout
+                    .variables
+                    .iter()
+                    .find(|variable| variable.label == name)?;
+                Some(layout.type_of(&variable.type_id)?.label.clone())
+            });
+            let label = layout_label.unwrap_or_else(|| {
+                ty.as_ref()
+                    .map_or_else(|| "<unknown type>".to_owned(), |ty| resources.label(ty))
+            });
+            let first_region = pointer.as_ref().and_then(|pointer| {
+                dereference_pointer(pointer, &resources.pointers, &machine)
+                    .ok()?
+                    .into_iter()
+                    .next()
+            });
+            let (slot, offset, in_code) = first_region
+                .as_ref()
+                .map_or_else(|| ("-".to_owned(), 0, false), place);
+            let value = match (ty, pointer) {
+                (Some(ty), Some(pointer)) => match resources.read_variable(&ty, &pointer, &machine)
+                {
+                    Ok(values) => composed(&values, resources.resolve(&ty).ok()),
+                    Err(error) => DebugValue {
+                        display: missing
+                            .get()
+                            .map_or_else(|| format!("<{error}>"), |slot| words.unavailable(&slot)),
+                        raw: None,
+                        status: DebugValueStatus::Unavailable,
+                    },
+                },
+                _ => DebugValue {
+                    display: "<the compiler gave no type or pointer for it>".to_owned(),
+                    raw: None,
+                    status: DebugValueStatus::Unavailable,
+                },
+            };
+            // A value no word could be found for says why, as the storage layout's view does.
+            let value = match missing.get() {
+                Some(slot) if value.status == DebugValueStatus::Unavailable => DebugValue {
+                    display: words.unavailable(&slot),
+                    ..value
+                },
+                _ => value,
+            };
+            StateVariable {
+                name,
+                ty: label,
+                slot,
+                offset,
+                in_code,
+                value,
+                source: if from_chain.get() {
+                    StateSource::Chain
+                } else {
+                    StateSource::Trace
+                },
+            }
+        })
+        .collect();
+    Some(variables)
+}
+
+/// Where a region starts, as the storage layout says it: the slot, and the offset from
+/// the least significant byte, while a region counts it from the most significant one. A
+/// region of the code is placed by its offset in the code.
+fn place(region: &Region) -> (String, u64, bool) {
+    match (region.location, region.slot) {
+        (Location::Storage | Location::Transient, Some(slot)) => {
+            let layout_offset = if region.length < 32 {
+                32_u64.saturating_sub(region.offset + region.length)
+            } else {
+                0
+            };
+            let slot = short_hex(&slot);
+            if region.location == Location::Transient {
+                (format!("{slot} (transient)"), layout_offset, false)
+            } else {
+                (slot, layout_offset, false)
+            }
+        }
+        (Location::Code, _) => (format!("{:#x}", region.offset), 0, true),
+        (location, _) => (format!("{location} {:#x}", region.offset), 0, false),
+    }
+}
+
+/// A part of a value under construction from the regions of its pointer.
+enum Part {
+    Value(String),
+    Members(Vec<(String, Part)>),
+    Elements(Vec<Part>),
+}
+
+impl Part {
+    /// Whether the part already holds a value at `path`, so that the next value for that
+    /// path belongs to a new array element.
+    fn holds(&self, path: &[&str]) -> bool {
+        match (self, path.split_first()) {
+            (_, None) => true,
+            (Self::Members(members), Some((member, rest))) => members
+                .iter()
+                .find(|(name, _)| name == member)
+                .is_some_and(|(_, part)| part.holds(rest)),
+            (Self::Elements(elements), Some((&"item", rest))) => {
+                elements.last().is_some_and(|element| element.holds(rest))
+            }
+            _ => false,
+        }
+    }
+
+    fn insert(&mut self, path: &[&str], display: String) {
+        let Some((first, rest)) = path.split_first() else {
+            *self = Self::Value(display);
+            return;
+        };
+        if *first == "item" {
+            if !matches!(self, Self::Elements(_)) {
+                *self = Self::Elements(Vec::new());
+            }
+            let Self::Elements(elements) = self else {
+                unreachable!()
+            };
+            if elements.last().is_none_or(|element| element.holds(rest)) {
+                elements.push(Self::Members(Vec::new()));
+            }
+            if let Some(element) = elements.last_mut() {
+                element.insert(rest, display);
+            }
+            return;
+        }
+        if !matches!(self, Self::Members(_)) {
+            *self = Self::Members(Vec::new());
+        }
+        let Self::Members(members) = self else {
+            unreachable!()
+        };
+        if let Some((_, part)) = members.iter_mut().find(|(name, _)| name == first) {
+            part.insert(rest, display);
+        } else {
+            let mut part = Self::Members(Vec::new());
+            part.insert(rest, display);
+            members.push(((*first).to_owned(), part));
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Value(display) => display.clone(),
+            Self::Members(members) => format!(
+                "{{ {} }}",
+                members
+                    .iter()
+                    .map(|(name, part)| format!("{name}: {}", part.render()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Elements(elements) => format!(
+                "[{}]",
+                elements
+                    .iter()
+                    .map(Self::render)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+/// One value from the regions a variable's pointer names, which `read_variable` names
+/// relative to the variable: `x` is a struct member, `item` an array element and
+/// `from-x` a member of a member. `document` is the variable's type: a dynamic array is
+/// shown by its length rather than its elements.
+fn composed(values: &[StateValue], document: Option<&TypeDocument>) -> DebugValue {
+    let mut root = Part::Members(Vec::new());
+    for value in values {
+        let path = value
+            .name
+            .split('-')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        root.insert(&path, value.display.clone());
+    }
+    let dynamic_array = matches!(document, Some(TypeDocument::Array { count: None, .. }));
+    let available = dynamic_array || values.iter().any(|value| value.available);
+    let display = match (&root, dynamic_array) {
+        (Part::Elements(elements), true) => {
+            format!("<{} element(s); index it with [i]>", elements.len())
+        }
+        (Part::Members(members), true) if members.is_empty() => {
+            "<0 element(s); index it with [i]>".to_owned()
+        }
+        (Part::Members(members), false) if members.is_empty() => "<no regions>".to_owned(),
+        _ => root.render(),
+    };
+    DebugValue {
+        display,
+        raw: None,
+        status: if available {
+            DebugValueStatus::Decoded
+        } else {
+            DebugValueStatus::Unavailable
+        },
+    }
+}
+
 /// The value at a storage path such as `owner`, `balances[0xabc]`, `items[2]`, or
 /// `config.limit`. `Err` says why the path does not name a place in storage.
 pub fn state_value(
@@ -423,6 +792,7 @@ fn read(layout: &StorageLayout, words: &StorageWords<'_>, reference: &StorageRef
         ty,
         slot: short_hex(&reference.slot),
         offset: reference.offset,
+        in_code: false,
         value,
         source: if from_chain.get() {
             StateSource::Chain
@@ -466,9 +836,30 @@ mod tests {
     use soldb_core::{StepSnapshot, StorageChange, TraceCapabilities, TraceStep, TransactionTrace};
     use soldb_ethdebug::StorageLayout;
 
-    use super::{short_hex, state_value, state_variables, StorageTape, Word};
-    use crate::stepping::StepMap;
+    use soldb_ethdebug::{EthdebugInfo, Resources};
+
+    use super::{
+        code_from_hex, context_state_variables, short_hex, state_value, state_variables, KnownCode,
+        StorageTape, Word,
+    };
+    use crate::stepping::{ContractDebugInfo, StepMap};
     use crate::DebugValueStatus;
+
+    const RESOURCES: &str =
+        include_str!("../../../test/fixtures/ethdebug-resources/ethdebug_resources.json");
+    const PROGRAM: &str =
+        include_str!("../../../test/fixtures/ethdebug-resources/Resources_ethdebug-runtime.json");
+
+    /// The fixture's `Resources` contract, with the program-level context solc gives it and
+    /// the tables of its resources.
+    fn context_contract() -> ContractDebugInfo {
+        let resources: serde_json::Value = serde_json::from_str(RESOURCES).expect("resources");
+        let program: serde_json::Value = serde_json::from_str(PROGRAM).expect("program");
+        let info =
+            EthdebugInfo::from_artifacts("Resources", "call", &resources, &program).expect("info");
+        ContractDebugInfo::new(None, "Resources", info, BTreeMap::new())
+            .with_resources(Some(Resources::parse(&resources).expect("tables")))
+    }
 
     /// The slot of `balances[0xf39f…]`, as the layout resolves it.
     fn mapping_entry_slot() -> Word {
@@ -564,6 +955,120 @@ mod tests {
             .expect(path)
             .value
             .display
+    }
+
+    #[test]
+    fn state_is_read_through_the_program_context() {
+        // Where solc puts the fixture's variables: `total` at slot 1, `small` and `flag`
+        // packed into slot 2 from its least significant byte, `origin` at slot 5 and the
+        // length of `values` at slot 7.
+        let trace = trace(
+            vec![
+                step("SLOAD", 1, &[], &[("0x1", "0x7")]),
+                step("SLOAD", 1, &[], &[("0x2", "0x0109")]),
+                step("SLOAD", 1, &[], &[("0x5", "0x0201")]),
+                step("SLOAD", 1, &[], &[("0x7", "0x2")]),
+                step("STOP", 1, &[], &[]),
+            ],
+            true,
+        );
+        let map = StepMap::new(&trace, Vec::new());
+        let tape = StorageTape::new(&trace, &map);
+        let words = tape.at_step(&map, 4);
+        let contract = context_contract();
+        let variables = context_state_variables(&contract, &words).expect("context");
+        let variable = |name: &str| {
+            variables
+                .iter()
+                .find(|variable| variable.name == name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        assert_eq!(
+            (
+                variable("total").value.display.as_str(),
+                variable("total").ty.as_str()
+            ),
+            ("7", "uint256")
+        );
+        let small = variable("small");
+        assert_eq!(
+            (
+                small.value.display.as_str(),
+                small.slot.as_str(),
+                small.offset
+            ),
+            ("9", "0x2", 0)
+        );
+        let flag = variable("flag");
+        assert_eq!((flag.value.display.as_str(), flag.offset), ("true", 1));
+        // Shown the way the storage layout shows them.
+        assert_eq!(variable("origin").value.display, "{ x: 1, y: 2 }");
+        assert_eq!(
+            variable("values").value.display,
+            "<2 element(s); index it with [i]>"
+        );
+        assert_eq!(
+            variable("balances").value.display,
+            "<mapping; index it with [key]>"
+        );
+        // A mapping needs a key, a slot the trace never touched is unknown rather than
+        // zero, and an immutable lives in the code, which this view does not have.
+        for (name, reason) in [
+            ("balances", "key"),
+            ("inherited", "slot"),
+            ("createdAt", "code"),
+        ] {
+            let value = &variable(name).value;
+            assert_eq!(value.status, DebugValueStatus::Unavailable, "{name}");
+            assert!(value.display.contains(reason), "{name}: {}", value.display);
+        }
+
+        // Without resource tables, the frontend falls back to the storage layout.
+        let without_tables =
+            ContractDebugInfo::new(None, "Resources", contract.info.clone(), BTreeMap::new());
+        assert!(context_state_variables(&without_tables, &words).is_none());
+
+        // With the deployed code of the account running, the immutable is read from the
+        // copy of its value the code holds.
+        let pointer = contract
+            .info
+            .state_variables
+            .iter()
+            .find(|variable| variable.identifier.as_deref() == Some("createdAt"))
+            .and_then(|variable| variable.pointer.clone())
+            .expect("createdAt pointer");
+        let offset = usize::from_str_radix(
+            pointer["offset"]
+                .as_str()
+                .expect("offset")
+                .trim_start_matches("0x"),
+            16,
+        )
+        .expect("offset");
+        let mut code = vec![0_u8; offset + 64];
+        code[offset + 30] = 0x04;
+        code[offset + 31] = 0xd2;
+        let known = KnownCode::default().with("0xAAaa000000000000000000000000000000000001", code);
+        let words = words.with_known_code(Some(&known));
+        let variables = context_state_variables(&contract, &words).expect("context");
+        let created_at = variables
+            .iter()
+            .find(|variable| variable.name == "createdAt")
+            .expect("createdAt");
+        assert_eq!(created_at.value.display, "1234");
+        assert!(created_at.in_code);
+        assert_eq!(created_at.slot, format!("{offset:#x}"));
+    }
+
+    #[test]
+    fn code_is_read_from_hex() {
+        assert_eq!(
+            code_from_hex("0x60016000"),
+            Some(vec![0x60, 0x01, 0x60, 0x00])
+        );
+        assert_eq!(code_from_hex("0x"), Some(Vec::new()));
+        assert_eq!(code_from_hex("0x6"), None);
+        assert_eq!(code_from_hex("0xzz"), None);
     }
 
     #[test]
@@ -805,6 +1310,32 @@ mod tests {
         let missing = [0_u8; 32];
         assert!(super::ChainStorage::word(&chain, "0xaa", &missing).is_none());
         assert!(super::ChainStorage::word(&chain, "0xaa", &missing).is_none());
+        assert_eq!(reads.get(), 2);
+        // Without a code reader the chain has no code.
+        assert!(super::ChainStorage::code(&chain, "0xaa").is_none());
+    }
+
+    #[test]
+    fn a_cached_chain_reads_each_account_code_once() {
+        use std::rc::Rc;
+
+        let reads = Rc::new(std::cell::Cell::new(0_u32));
+        let counted = Rc::clone(&reads);
+        let chain = super::CachedChain::new("the chain at block 7", |_: &str, _: &Word| None)
+            .with_code(Box::new(move |address: &str| {
+                counted.set(counted.get() + 1);
+                (address == "0xaa").then(|| vec![0x60, 0x00])
+            }));
+        assert_eq!(
+            super::ChainStorage::code(&chain, "0xAA"),
+            Some(vec![0x60, 0x00])
+        );
+        assert_eq!(
+            super::ChainStorage::code(&chain, "0xaa"),
+            Some(vec![0x60, 0x00])
+        );
+        assert!(super::ChainStorage::code(&chain, "0xbb").is_none());
+        assert!(super::ChainStorage::code(&chain, "0xbb").is_none());
         assert_eq!(reads.get(), 2);
     }
 

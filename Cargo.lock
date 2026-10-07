@@ -3268,6 +3268,7 @@ dependencies = [
 name = "soldb-ethdebug"
 version = "0.4.0"
 dependencies = [
+ "ruint",
  "serde",
  "serde_json",
  "soldb-core",

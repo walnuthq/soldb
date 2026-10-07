@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
-use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo};
+use soldb_debugger::{CachedChain, ChainRead, ChainStorage, CodeRead, ContractDebugInfo};
 use soldb_ethdebug::{load_debug_program, SourceMapEnvironment};
 use soldb_repl::{
     BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
@@ -73,6 +73,17 @@ fn chain_before_transaction(rpc_url: &str, tx_hash: &str) -> Option<ChainReader>
     let number = u64::from_str_radix(block.trim_start_matches("0x"), 16).ok()?;
     let parent = number.checked_sub(1)?;
     let block = format!("0x{parent:x}");
+    // Immutables live in the deployed code, read at the same block as the storage.
+    let read_code: CodeRead = {
+        let rpc_url = rpc_url.to_owned();
+        let block = block.clone();
+        Box::new(move |address: &str| {
+            soldb_rpc::code_at(&rpc_url, address, &block)
+                .ok()
+                .as_deref()
+                .and_then(soldb_debugger::code_from_hex)
+        })
+    };
     let rpc_url = rpc_url.to_owned();
     let read: ChainRead = Box::new(move |address: &str, slot: &[u8; 32]| {
         let value =
@@ -80,10 +91,13 @@ fn chain_before_transaction(rpc_url: &str, tx_hash: &str) -> Option<ChainReader>
                 .ok()?;
         soldb_ethdebug::parse_word(&value).ok()
     });
-    Some(CachedChain::new(
-        format!("the chain at block {parent}, before this transaction's block"),
-        read,
-    ))
+    Some(
+        CachedChain::new(
+            format!("the chain at block {parent}, before this transaction's block"),
+            read,
+        )
+        .with_code(read_code),
+    )
 }
 
 /// A source breakpoint as the editor sent it.
@@ -686,18 +700,29 @@ impl DapServer {
     }
 
     /// Every state variable of the contract executing at the current step, read through
-    /// its storage layout.
+    /// the pointers of its program-level context when the compiler gives one, and through
+    /// its storage layout otherwise.
     fn state_variables(&self) -> Vec<Value> {
-        let Some(layout) = self.debugger.storage_layout() else {
-            return Vec::new();
-        };
         let Some(words) = self
             .debugger
             .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
         else {
             return Vec::new();
         };
-        soldb_debugger::state_variables(layout, &words)
+        let variables = match self
+            .debugger
+            .current_contract()
+            .and_then(|contract| soldb_debugger::context_state_variables(contract, &words))
+        {
+            Some(variables) => variables,
+            None => {
+                let Some(layout) = self.debugger.storage_layout() else {
+                    return Vec::new();
+                };
+                soldb_debugger::state_variables(layout, &words)
+            }
+        };
+        variables
             .into_iter()
             .map(|variable| {
                 json!({
@@ -986,11 +1011,14 @@ impl LoadedSource {
             })?;
         let name = program.info.contract_name.clone();
         let code_generator = program.code_generator();
+        // Tables a debugger cannot read leave the state to the storage layout.
+        let resources = program.resources_tables().ok();
         Ok(Self {
             root: root.to_path_buf(),
             contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
-                .with_storage_layout(program.storage_layout),
+                .with_storage_layout(program.storage_layout)
+                .with_resources(resources),
         })
     }
 }
