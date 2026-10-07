@@ -42,6 +42,8 @@ pub struct SourceMapProgram {
     pub info: EthdebugInfo,
     pub resources: Value,
     pub source_contents: BTreeMap<u64, String>,
+    /// The file each source was read from, which may be above the artifact directory.
+    pub source_files: BTreeMap<u64, PathBuf>,
     /// The contract's `storage-layout` entry, when the artifact was compiled with it.
     pub storage_layout: Option<StorageLayout>,
 }
@@ -238,6 +240,7 @@ fn source_map_program_from_combined(
 
     let mut sources = BTreeMap::new();
     let mut source_contents = BTreeMap::new();
+    let mut source_files = BTreeMap::new();
     let mut compilation_sources = Vec::with_capacity(source_list.len());
     for (source_id, source) in source_list.iter().enumerate() {
         let source_path = source.as_str().ok_or_else(|| {
@@ -250,16 +253,14 @@ fn source_map_program_from_combined(
             .map_err(|_| SoldbError::Message("source index does not fit in `u64`".to_owned()))?;
         sources.insert(source_id, source_path.to_owned());
 
-        let contents = read_source(root, source_roots, source_path)?;
-        if let Some(contents) = &contents {
-            source_contents.insert(source_id, contents.clone());
-        }
         let mut source = json!({
             "id": source_id,
             "path": source_path,
             "language": "Solidity",
         });
-        if let Some(contents) = contents {
+        if let Some((file, contents)) = read_source(root, source_roots, source_path)? {
+            source_contents.insert(source_id, contents.clone());
+            source_files.insert(source_id, file);
             source["contents"] = Value::String(contents);
         }
         compilation_sources.push(source);
@@ -339,6 +340,7 @@ fn source_map_program_from_combined(
         info,
         resources,
         source_contents,
+        source_files,
         storage_layout,
     }))
 }
@@ -530,20 +532,22 @@ fn read_source(
     root: &Path,
     source_roots: &[PathBuf],
     source_path: &str,
-) -> SoldbResult<Option<String>> {
+) -> SoldbResult<Option<(PathBuf, String)>> {
     let candidates = source_roots
         .iter()
         .flat_map(|extra| crate::artifacts::source_candidates(extra, source_path))
         .chain(crate::artifacts::source_candidates(root, source_path));
     for candidate in candidates {
-        if candidate.exists() {
-            return fs::read_to_string(&candidate).map(Some).map_err(|error| {
-                SoldbError::Message(format!(
-                    "failed to read source `{}`: {error}",
-                    candidate.display()
-                ))
-            });
+        if !candidate.exists() {
+            continue;
         }
+        let contents = fs::read_to_string(&candidate).map_err(|error| {
+            SoldbError::Message(format!(
+                "failed to read source `{}`: {error}",
+                candidate.display()
+            ))
+        })?;
+        return Ok(Some((candidate, contents)));
     }
     Ok(None)
 }
