@@ -43,6 +43,8 @@ pub struct DebugProgram {
     pub resources: Value,
     /// Source text by source id, for every source that could be read.
     pub source_contents: BTreeMap<u64, String>,
+    /// The file each source was read from; a source taken from the compilation record has none.
+    pub source_files: BTreeMap<u64, PathBuf>,
     /// True when the program came from a legacy `srcmap` rather than ETHDebug.
     pub legacy: bool,
     /// The contract's storage layout, when it was compiled with `--storage-layout`.
@@ -62,6 +64,27 @@ impl DebugProgram {
             CodeGenerator::Legacy
         } else {
             CodeGenerator::ViaIr
+        }
+    }
+
+    /// Fills in the source text for every source the program names, from the compilation
+    /// record first and from disk next to the artifacts otherwise.
+    fn read_sources(&mut self, root: &Path, source_roots: &[PathBuf]) {
+        for (source_id, source_path) in &self.info.sources {
+            if self.source_contents.contains_key(source_id) {
+                continue;
+            }
+            if let Some(source) = read_compilation_source(&self.info.compilation, *source_id) {
+                self.source_contents.insert(*source_id, source);
+                continue;
+            }
+            match read_debug_source_file(root, source_roots, source_path) {
+                Some((file, source)) => {
+                    self.source_contents.insert(*source_id, source);
+                    self.source_files.insert(*source_id, file);
+                }
+                None => self.missing_sources.push(source_path.clone()),
+            }
         }
     }
 }
@@ -148,21 +171,28 @@ pub fn contract_name_from_program_path(
 /// directory, to that directory's parent, and as given.
 #[must_use]
 pub fn read_debug_source(root: &Path, source_path: &str) -> Option<String> {
-    read_debug_source_from(root, &[], source_path)
+    let (_, contents) = read_debug_source_file(root, &[], source_path)?;
+    Some(contents)
 }
 
-/// The same, looking in `extra_roots` first: directories the user named because the
-/// sources are not where the artifact's paths reach.
-pub fn read_debug_source_from(
+/// The same, looking in `extra_roots` first, which are directories the user named because
+/// the sources are not where the artifact's paths reach, and returning the file it read.
+fn read_debug_source_file(
     root: &Path,
     extra_roots: &[PathBuf],
     source_path: &str,
-) -> Option<String> {
-    extra_roots
+) -> Option<(PathBuf, String)> {
+    let candidates = extra_roots
         .iter()
         .flat_map(|extra| source_candidates(extra, source_path))
-        .chain(source_candidates(root, source_path))
-        .find_map(|candidate| fs::read_to_string(candidate).ok())
+        .chain(source_candidates(root, source_path));
+    for candidate in candidates {
+        // A candidate that cannot be read is skipped; the next one may be the file.
+        if let Ok(contents) = fs::read_to_string(&candidate) {
+            return Some((candidate, contents));
+        }
+    }
+    None
 }
 
 /// Where a source path recorded in an artifact might be on disk.
@@ -269,17 +299,18 @@ pub fn load_debug_program_with_sources(
         };
         let info = EthdebugInfo::from_artifacts(&name, environment_name, &metadata, &program)
             .map_err(|error| SoldbError::Message(format!("{}: {error}", program_path.display())))?;
-        let (source_contents, missing_sources) =
-            read_sources(root, source_roots, &info, BTreeMap::new());
         let storage_layout = load_storage_layout(root, &info.contract_name)?;
-        return Ok(Some(DebugProgram {
+        let mut program = DebugProgram {
             info,
             resources,
-            source_contents,
+            source_contents: BTreeMap::new(),
+            source_files: BTreeMap::new(),
             legacy: false,
             storage_layout,
-            missing_sources,
-        }));
+            missing_sources: Vec::new(),
+        };
+        program.read_sources(root, source_roots);
+        return Ok(Some(program));
     }
 
     let Some(program) =
@@ -287,20 +318,21 @@ pub fn load_debug_program_with_sources(
     else {
         return Ok(None);
     };
-    let (source_contents, missing_sources) =
-        read_sources(root, source_roots, &program.info, program.source_contents);
     let storage_layout = match program.storage_layout {
         Some(layout) => Some(layout),
         None => load_storage_layout(root, &program.info.contract_name)?,
     };
-    Ok(Some(DebugProgram {
+    let mut program = DebugProgram {
         info: program.info,
         resources: program.resources,
-        source_contents,
+        source_contents: program.source_contents,
+        source_files: program.source_files,
         legacy: true,
         storage_layout,
-        missing_sources,
-    }))
+        missing_sources: Vec::new(),
+    };
+    program.read_sources(root, source_roots);
+    Ok(Some(program))
 }
 
 /// The `<Contract>_storage.json` that `solc --storage-layout -o <root>` writes, when it
@@ -316,31 +348,6 @@ pub fn load_storage_layout(root: &Path, contract_name: &str) -> SoldbResult<Opti
     StorageLayout::parse(&value)
         .map(Some)
         .map_err(|error| SoldbError::Message(format!("{}: {error}", path.display())))
-}
-
-/// Fills in the source text for every source the program names, from the compilation
-/// record first and from disk next to the artifacts otherwise.
-fn read_sources(
-    root: &Path,
-    source_roots: &[PathBuf],
-    info: &EthdebugInfo,
-    mut source_contents: BTreeMap<u64, String>,
-) -> (BTreeMap<u64, String>, Vec<String>) {
-    let mut missing = Vec::new();
-    for (source_id, source_path) in &info.sources {
-        if source_contents.contains_key(source_id) {
-            continue;
-        }
-        match read_compilation_source(&info.compilation, *source_id)
-            .or_else(|| read_debug_source_from(root, source_roots, source_path))
-        {
-            Some(source) => {
-                source_contents.insert(*source_id, source);
-            }
-            None => missing.push(source_path.clone()),
-        }
-    }
-    (source_contents, missing)
 }
 
 #[cfg(test)]
@@ -401,6 +408,7 @@ mod tests {
             program.source_contents.get(&0).map(String::as_str),
             Some(source)
         );
+        assert_eq!(program.source_files.get(&0), Some(&dir.join("Counter.sol")));
         assert!(program.resources.get("compilation").is_some());
         // No `Counter_storage.json` yet: the layout is optional debug information.
         assert!(program.storage_layout.is_none());
@@ -524,6 +532,7 @@ mod tests {
             program.source_contents.get(&0).map(String::as_str),
             Some(source)
         );
+        assert_eq!(program.source_files.get(&0), Some(&dir.join("Counter.sol")));
         assert!(program.info.instruction_at_pc(2).is_some());
 
         let empty = temp_dir("empty");

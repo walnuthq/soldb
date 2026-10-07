@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
-use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo};
+use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo, StepLocation};
 use soldb_ethdebug::{load_debug_program, SourceMapEnvironment};
 use soldb_repl::{
     BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
@@ -94,11 +94,12 @@ struct SourceBreakpoint {
     condition: Option<String>,
 }
 
-/// The contract's debug info and the directory it came from, which the paths reported to
-/// the editor are built against.
+/// The contract's debug info, the directory it came from, and the file each source was
+/// read from, which is the path reported to the editor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadedSource {
     root: PathBuf,
+    source_files: BTreeMap<u64, PathBuf>,
     contract: ContractDebugInfo,
 }
 
@@ -637,7 +638,7 @@ impl DapServer {
                     Some(location) => (
                         Some(Source {
                             name: normalize_source_key(&location.path),
-                            path: self.display_source_path(&location.path),
+                            path: self.display_source_path(location),
                         }),
                         location.line,
                         location.column.max(1),
@@ -655,12 +656,18 @@ impl DapServer {
             .collect()
     }
 
-    fn display_source_path(&self, source_path: &str) -> String {
-        let path = Path::new(source_path);
-        match &self.source {
-            Some(source) if !path.is_absolute() => source.root.join(path).display().to_string(),
-            _ => source_path.to_owned(),
+    fn display_source_path(&self, location: &StepLocation) -> String {
+        let Some(source) = &self.source else {
+            return location.path.clone();
+        };
+        if let Some(file) = source.source_files.get(&location.key.source_id) {
+            return file.display().to_string();
         }
+        let path = Path::new(&location.path);
+        if path.is_absolute() {
+            return location.path.clone();
+        }
+        source.root.join(path).display().to_string()
     }
 
     /// The locals at the current step, and whether they were inferred from the stack
@@ -988,6 +995,7 @@ impl LoadedSource {
         let code_generator = program.code_generator();
         Ok(Self {
             root: root.to_path_buf(),
+            source_files: program.source_files,
             contract: ContractDebugInfo::new(None, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
                 .with_storage_layout(program.storage_layout),
@@ -1340,6 +1348,62 @@ mod tests {
         let frame = &messages[0].body.as_ref().expect("body")["stackFrames"][0];
         assert_eq!(frame["source"]["name"], "Counter.sol");
         assert_eq!(frame["line"], 3);
+    }
+
+    #[test]
+    fn reports_the_source_file_found_above_the_artifact_directory() {
+        // `solc --combined-json -o out src/Counter.sol` run from the project root.
+        let project = temp_dir("soldb-dap-ancestor-source");
+        let artifacts = project.join("out");
+        std::fs::create_dir_all(&artifacts).expect("create artifact dir");
+        std::fs::create_dir_all(project.join("src")).expect("create source dir");
+        let source =
+            "contract Counter {\n  function set(uint256 x) public {\n    value = x;\n  }\n}\n";
+        let statement_offset = source.find("value = x").expect("statement offset");
+        let source_file = project.join("src").join("Counter.sol");
+        std::fs::write(&source_file, source).expect("write source");
+        std::fs::write(
+            artifacts.join("combined.json"),
+            json!({
+                "sourceList": ["src/Counter.sol"],
+                "contracts": {
+                    "src/Counter.sol:Counter": {
+                        "bin-runtime": "60010000",
+                        "srcmap-runtime": format!("{statement_offset}:9:0:-:0")
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write combined JSON");
+        let trace_file = project.join("trace.json");
+        std::fs::write(
+            &trace_file,
+            serde_json::to_string(&sample_trace()).expect("trace JSON"),
+        )
+        .expect("write trace");
+
+        let mut server = DapServer::new();
+        let launch = DapMessage::request(
+            1,
+            "launch",
+            Some(json!({
+                "traceFile": trace_file.display().to_string(),
+                "ethdebugDir": artifacts.display().to_string(),
+                "contractName": "Counter"
+            })),
+        );
+        assert_eq!(server.handle_message(&launch)[0].success, Some(true));
+
+        let stack_trace = DapMessage::request(2, "stackTrace", None);
+        let messages = server.handle_message(&stack_trace);
+        let frame = &messages[0].body.as_ref().expect("body")["stackFrames"][0];
+        assert_eq!(frame["line"], 3);
+        assert_eq!(
+            frame["source"]["path"],
+            source_file.display().to_string(),
+            "{frame}"
+        );
     }
 
     #[test]
