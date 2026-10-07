@@ -100,11 +100,19 @@ Start a node that can trace, for example Anvil:
 anvil --steps-tracing
 ```
 
-Compile with ETHDebug (Solidity 0.8.29+):
+Compile with ETHDebug. Solidity 0.8.32 and later:
+
+```bash
+solc --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --bin --abi --overwrite -o out examples/Counter.sol
+```
+
+Solidity 0.8.29 to 0.8.31 (later versions reject `--ethdebug` as an unrecognised option):
 
 ```bash
 solc --via-ir --debug-info ethdebug,ast-id --ethdebug --ethdebug-runtime --bin --abi --overwrite -o out examples/Counter.sol
 ```
+
+Add `--storage-layout` to either command to read state variables.
 
 Or let SolDB drive solc, which also requests the storage layout used to read state variables:
 
@@ -138,6 +146,24 @@ Call Stack:
     #2 increment2 [internal] gas: 6322 @ TestContract.sol:39
       #3 increment3 [internal] gas: 5172 @ TestContract.sol:54
 ```
+
+When the transaction calls other contracts, give each one its debug info, either with
+one `--ethdebug-dir <address>:<name>:<dir>` per contract or with a mapping file:
+
+```bash
+soldb trace <tx_hash> --contracts contracts.json --rpc http://localhost:8545
+```
+
+```json
+{
+  "contracts": [
+    {"address": "0x2279…", "name": "Router", "debug_dir": "./out"},
+    {"address": "0xa513…", "name": "Pool", "debug_dir": "./out"}
+  ]
+}
+```
+
+A relative `debug_dir` is relative to the mapping file.
 
 Add `--interactive` (or `-i`) to step through it:
 
@@ -275,7 +301,7 @@ parsing, CLI presentation, and interactive debugging can evolve independently.
 
 ```mermaid
 flowchart TD
-    contracts["Solidity contracts"] --> solc["solc<br/>--debug-info ethdebug,ast-id<br/>--ethdebug --ethdebug-runtime"]
+    contracts["Solidity contracts"] --> solc["solc<br/>--debug-info ethdebug,ast-id<br/>--ethdebug-program --ethdebug-program-runtime"]
     solc --> artifacts["ETHDebug + ABI artifacts"]
 
     cli["soldb trace / simulate / profile"] --> metadata["soldb-ethdebug<br/>metadata + ABI loader"]

@@ -30,8 +30,9 @@ use soldb_debugger::{
 };
 use soldb_ethdebug::{
     encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-    function_selector, load_debug_program_with_sources, parse_ethdebug_spec, parse_event_abis,
-    parse_signature, DecodedEvent, EventRegistry, SourceMapEnvironment,
+    function_selector, load_debug_program_with_sources, parse_contract_mapping,
+    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, EventRegistry,
+    SourceMapEnvironment,
 };
 use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
 use soldb_rpc::{RpcLog, TraceBackend};
@@ -3240,43 +3241,16 @@ fn parse_contract_mapping_array(
     path: &Path,
     value: &serde_json::Value,
 ) -> SoldbResult<Vec<ResolvedContractSpec>> {
-    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let contracts = value
-        .get("contracts")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            soldb_core::SoldbError::Message(format!(
-                "Contracts mapping {} must contain a contracts array",
-                path.display()
-            ))
-        })?;
-
-    Ok(contracts
-        .iter()
-        .filter_map(|contract| {
-            let address = contract.get("address")?.as_str()?.to_owned();
-            let name = contract
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Unknown")
-                .to_owned();
-            let debug_dir = contract
-                .get("debug_dir")
-                .and_then(serde_json::Value::as_str)
-                .map(PathBuf::from)?;
-            let debug_dir = if debug_dir.is_absolute() {
-                debug_dir
-            } else {
-                base_dir.join(debug_dir)
-            };
-            Some(ResolvedContractSpec {
-                address: Some(address),
-                name,
-                debug_dir,
-                source_paths: Vec::new(),
-            })
-        })
-        .collect())
+    let mut specs = Vec::new();
+    for contract in parse_contract_mapping(path, value)? {
+        specs.push(ResolvedContractSpec {
+            address: Some(contract.address),
+            name: contract.name,
+            debug_dir: contract.debug_dir,
+            source_paths: Vec::new(),
+        });
+    }
+    Ok(specs)
 }
 
 fn parse_deployment_value(
