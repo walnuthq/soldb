@@ -115,6 +115,7 @@ impl TraceStep {
                 memory: self.snapshot.memory.as_deref(),
                 storage: &self.snapshot.storage,
                 storage_diff: &self.snapshot.storage_diff,
+                transient_storage: &self.snapshot.transient_storage,
             };
         }
         StepSnapshotRef {
@@ -122,6 +123,7 @@ impl TraceStep {
             memory: self.memory.as_deref(),
             storage: self.storage.as_ref().unwrap_or(&EMPTY_STORAGE),
             storage_diff: &EMPTY_STORAGE_DIFF,
+            transient_storage: &EMPTY_STORAGE,
         }
     }
 
@@ -143,6 +145,7 @@ impl TraceStep {
                 memory: self.memory.take().map(Arc::from),
                 storage: Arc::new(self.storage.take().unwrap_or_default()),
                 storage_diff: BTreeMap::new(),
+                transient_storage: BTreeMap::new(),
             };
         } else {
             self.stack = Vec::new();
@@ -290,6 +293,12 @@ pub struct StepSnapshotRef<'a> {
     pub memory: Option<&'a str>,
     pub storage: &'a BTreeMap<String, String>,
     pub storage_diff: &'a BTreeMap<String, StorageChange>,
+    #[serde(skip_serializing_if = "is_empty_ref")]
+    pub transient_storage: &'a BTreeMap<String, String>,
+}
+
+fn is_empty_ref(map: &&BTreeMap<String, String>) -> bool {
+    map.is_empty()
 }
 
 impl StepSnapshotRef<'_> {
@@ -301,6 +310,7 @@ impl StepSnapshotRef<'_> {
             memory: self.memory.map(Arc::from),
             storage: Arc::new(self.storage.clone()),
             storage_diff: self.storage_diff.clone(),
+            transient_storage: self.transient_storage.clone(),
         }
     }
 }
@@ -319,6 +329,8 @@ pub struct StepSnapshot {
     pub memory: Option<Arc<str>>,
     pub storage: Arc<BTreeMap<String, String>>,
     pub storage_diff: BTreeMap<String, StorageChange>,
+    /// The transient slots this step read or wrote, with their value after it.
+    pub transient_storage: BTreeMap<String, String>,
 }
 
 impl StepSnapshot {
@@ -335,7 +347,15 @@ impl StepSnapshot {
             memory: memory.map(Arc::from),
             storage: Arc::new(storage),
             storage_diff,
+            transient_storage: BTreeMap::new(),
         }
+    }
+
+    /// The same snapshot with `transient_storage` set.
+    #[must_use]
+    pub fn with_transient_storage(mut self, transient_storage: BTreeMap<String, String>) -> Self {
+        self.transient_storage = transient_storage;
+        self
     }
 
     #[must_use]
@@ -344,16 +364,23 @@ impl StepSnapshot {
             && self.memory.is_none()
             && self.storage.is_empty()
             && self.storage_diff.is_empty()
+            && self.transient_storage.is_empty()
     }
 }
 
 impl Serialize for StepSnapshot {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StepSnapshot", 4)?;
+        let mut state = serializer.serialize_struct("StepSnapshot", 5)?;
         state.serialize_field("stack", &self.stack)?;
         state.serialize_field("memory", &self.memory.as_deref())?;
         state.serialize_field("storage", &*self.storage)?;
         state.serialize_field("storage_diff", &self.storage_diff)?;
+        // Only where a step touched it, so files without it are unchanged.
+        if self.transient_storage.is_empty() {
+            state.skip_field("transient_storage")?;
+        } else {
+            state.serialize_field("transient_storage", &self.transient_storage)?;
+        }
         state.end()
     }
 }
@@ -368,11 +395,14 @@ struct StepSnapshotRepr {
     storage: BTreeMap<String, String>,
     #[serde(default)]
     storage_diff: BTreeMap<String, StorageChange>,
+    #[serde(default)]
+    transient_storage: BTreeMap<String, String>,
 }
 
 impl From<StepSnapshotRepr> for StepSnapshot {
     fn from(repr: StepSnapshotRepr) -> Self {
         Self::new(repr.stack, repr.memory, repr.storage, repr.storage_diff)
+            .with_transient_storage(repr.transient_storage)
     }
 }
 
@@ -541,6 +571,9 @@ pub struct TraceCapabilities {
     pub gas_details: bool,
     #[serde(default)]
     pub account_changes: bool,
+    /// Every `TLOAD`/`TSTORE` since the transaction began carries `transient_storage`.
+    #[serde(default)]
+    pub transient_storage: bool,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -835,6 +868,7 @@ mod tests {
                 memory: step.snapshot.memory.clone(),
                 storage: Arc::clone(&step.snapshot.storage),
                 storage_diff: BTreeMap::new(),
+                transient_storage: BTreeMap::new(),
             },
         );
         assert!(Arc::ptr_eq(
@@ -842,6 +876,57 @@ mod tests {
             &step.snapshot.storage
         ));
         assert_eq!(shared.snapshot_ref().memory, Some("aabb"));
+    }
+
+    #[test]
+    fn transient_storage_is_written_only_where_a_step_touched_it() {
+        let plain = TraceStep::new(
+            0,
+            Arc::from("ADD"),
+            1,
+            1,
+            1,
+            None,
+            StepSnapshot::new(
+                vec![Arc::from("0x1")],
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+        );
+        let json = serde_json::to_value(&plain).expect("json");
+        assert!(json["snapshot"].get("transient_storage").is_none());
+
+        let touched = TraceStep::new(
+            1,
+            Arc::from("TSTORE"),
+            1,
+            100,
+            1,
+            None,
+            StepSnapshot::new(
+                vec![Arc::from("0x1")],
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .with_transient_storage(BTreeMap::from([("0x0".to_owned(), "0x2".to_owned())])),
+        );
+        let json = serde_json::to_value(&touched).expect("json");
+        assert_eq!(json["snapshot"]["transient_storage"]["0x0"], "0x2");
+        assert_eq!(
+            serde_json::to_value(touched.snapshot_ref()).expect("borrowed"),
+            json["snapshot"]
+        );
+        let restored: TraceStep = serde_json::from_value(json).expect("step");
+        assert_eq!(restored, touched);
+        assert_eq!(restored.snapshot_ref().transient_storage["0x0"], "0x2");
+
+        // A file written before the field existed reads with none, and so does its
+        // capability.
+        let capabilities: TraceCapabilities =
+            serde_json::from_str(r#"{"stack":true}"#).expect("capabilities");
+        assert!(!capabilities.transient_storage);
     }
 
     fn step_with_legacy_fields() -> TraceStep {

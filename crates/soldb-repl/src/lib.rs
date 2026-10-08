@@ -238,6 +238,7 @@ pub struct DebuggerState {
     trace: Option<TransactionTrace>,
     step_map: Option<StepMap>,
     storage_tape: Option<StorageTape>,
+    transient_tape: Option<StorageTape>,
     /// Something the frontend should tell the user, kept until it does: a breakpoint that
     /// cannot be hit, or a condition that could not be evaluated. Both are silent traps
     /// otherwise.
@@ -254,6 +255,7 @@ impl Default for DebuggerState {
             trace: None,
             step_map: None,
             storage_tape: None,
+            transient_tape: None,
             note: RefCell::new(None),
         }
     }
@@ -269,6 +271,7 @@ impl DebuggerState {
     pub fn load_trace(&mut self, trace: TransactionTrace) {
         let map = StepMap::new(&trace, Vec::new());
         self.storage_tape = Some(StorageTape::new(&trace, &map));
+        self.transient_tape = Some(StorageTape::transient(&trace, &map));
         self.step_map = Some(map);
         self.trace = Some(trace);
         self.current_step = 0;
@@ -280,6 +283,7 @@ impl DebuggerState {
         if let Some(trace) = &self.trace {
             let map = StepMap::new(trace, contracts);
             self.storage_tape = Some(StorageTape::new(trace, &map));
+            self.transient_tape = Some(StorageTape::transient(trace, &map));
             self.step_map = Some(map);
         }
     }
@@ -289,6 +293,17 @@ impl DebuggerState {
     pub fn storage_words(&self) -> Option<StorageWords<'_>> {
         let map = self.step_map.as_ref()?;
         Some(self.storage_tape.as_ref()?.at_step(map, self.current_step))
+    }
+
+    /// The transient storage words known at the current step, in the context it runs in.
+    #[must_use]
+    pub fn transient_words(&self) -> Option<StorageWords<'_>> {
+        let map = self.step_map.as_ref()?;
+        Some(
+            self.transient_tape
+                .as_ref()?
+                .at_step(map, self.current_step),
+        )
     }
 
     /// The same words, with a chain the frontend can read slots the transaction never
@@ -315,6 +330,17 @@ impl DebuggerState {
             .as_ref()?
             .contract_at_step(self.current_step)?
             .storage_layout
+            .as_ref()
+    }
+
+    /// The layout of the `transient` state variables of the contract executing at the
+    /// current step, when it was compiled with one.
+    #[must_use]
+    pub fn transient_storage_layout(&self) -> Option<&StorageLayout> {
+        self.step_map
+            .as_ref()?
+            .contract_at_step(self.current_step)?
+            .transient_storage_layout
             .as_ref()
     }
 
@@ -1760,6 +1786,100 @@ contract C {
         state.load_trace(trace);
         state.attach_debug_info(vec![contract]);
         state
+    }
+
+    #[test]
+    fn transient_storage_shows_by_slot_and_by_name() {
+        use crate::response::{Output, StateInfo};
+        use crate::Session;
+
+        assert_eq!(
+            DebuggerCommand::parse("transient"),
+            DebuggerCommand::Info(DebuggerInfoCommand::TransientStorage)
+        );
+        assert_eq!(
+            DebuggerCommand::parse("info transient"),
+            DebuggerCommand::Info(DebuggerInfoCommand::TransientStorage)
+        );
+
+        let layout = soldb_ethdebug::StorageLayout::parse(&json!({
+            "storage": [
+                {"astId": 1, "contract": "C.sol:C", "label": "count", "offset": 0, "slot": "0", "type": "t_uint256"},
+                {"astId": 2, "contract": "C.sol:C", "label": "locked", "offset": 0, "slot": "1", "type": "t_bool"}
+            ],
+            "types": {
+                "t_uint256": {"encoding": "inplace", "label": "uint256", "numberOfBytes": "32"},
+                "t_bool": {"encoding": "inplace", "label": "bool", "numberOfBytes": "1"}
+            }
+        }))
+        .expect("layout");
+        let mut state = source_state();
+        let mut trace = state.trace().expect("trace").clone();
+        trace.capabilities.transient_storage = true;
+        trace.steps[3].op = "TSTORE".into();
+        trace.steps[3].snapshot.transient_storage =
+            BTreeMap::from([("0x0".to_owned(), "0x7".to_owned())]);
+        let contracts = state.step_map().expect("map").contracts().to_vec();
+        state.load_trace(trace);
+        state.attach_debug_info(
+            contracts
+                .into_iter()
+                .map(|contract| contract.with_transient_storage_layout(Some(layout.clone())))
+                .collect(),
+        );
+        let mut session = Session::new(state);
+
+        session.execute(DebuggerCommand::Goto(3));
+        assert_eq!(
+            session.execute(DebuggerCommand::Info(DebuggerInfoCommand::TransientStorage)),
+            [Output::TransientStorage {
+                address: Some("0x2".to_owned()),
+                slots: Vec::new(),
+            }]
+        );
+        session.execute(DebuggerCommand::Goto(4));
+        let [Output::TransientStorage { slots, .. }] =
+            &session.execute(DebuggerCommand::Info(DebuggerInfoCommand::TransientStorage))[..]
+        else {
+            panic!("transient storage");
+        };
+        assert_eq!(
+            (slots[0].slot.as_str(), slots[0].value.as_str()),
+            ("0x0", "0x7")
+        );
+
+        let [Output::Variable { variable, .. }] =
+            &session.execute(DebuggerCommand::Print("count".to_owned()))[..]
+        else {
+            panic!("count");
+        };
+        assert_eq!(variable.value, "7");
+        assert_eq!(variable.place.as_deref(), Some("transient slot 0x0"));
+
+        // No storage layout here: `vars` still says so, and lists the transient variables
+        // beside it; the untouched one is zero.
+        let [Output::Variables {
+            state, transient, ..
+        }] = &session.execute(DebuggerCommand::Vars)[..]
+        else {
+            panic!("vars");
+        };
+        assert_eq!(*state, StateInfo::NoLayout);
+        let shown = transient
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(shown, [("count", "7"), ("locked", "false")]);
+
+        // A trace recorded without it says so.
+        let mut state = DebuggerState::new();
+        state.load_trace(sample_trace());
+        let [Output::Message { text, .. }] = &Session::new(state)
+            .execute(DebuggerCommand::Info(DebuggerInfoCommand::TransientStorage))[..]
+        else {
+            panic!("message");
+        };
+        assert!(text.contains("not in this trace"), "{text}");
     }
 
     #[test]

@@ -228,6 +228,7 @@ impl View {
                 locals,
                 unavailable,
                 state,
+                transient,
                 ..
             } => {
                 let mut lines = Vec::new();
@@ -257,9 +258,18 @@ impl View {
                             ));
                         }
                     }
+                    StateInfo::None if !transient.is_empty() => {}
                     StateInfo::None => lines.push(dim("  no state variables declared".to_owned())),
                     StateInfo::NoLayout => lines.push(dim("  no storage layout loaded".to_owned())),
                     StateInfo::NoStorage => lines.push(dim("  no storage recorded".to_owned())),
+                }
+                for variable in &transient {
+                    lines.push(variable_line(
+                        &variable.ty,
+                        &variable.name,
+                        &variable.value,
+                        variable.place.as_deref(),
+                    ));
                 }
                 lines
             }

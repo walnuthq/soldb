@@ -799,18 +799,22 @@ impl DapServer {
     }
 
     /// Every state variable of the contract executing at the current step, read through
-    /// its storage layout.
+    /// its storage layout, followed by its `transient` ones.
     fn state_variables(&self) -> Vec<Value> {
-        let Some(layout) = self.debugger.storage_layout() else {
-            return Vec::new();
-        };
-        let Some(words) = self
+        let mut variables = Vec::new();
+        let words = self
             .debugger
-            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
-        else {
-            return Vec::new();
-        };
-        soldb_debugger::state_variables(layout, &words)
+            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage));
+        if let (Some(layout), Some(words)) = (self.debugger.storage_layout(), words) {
+            variables.extend(soldb_debugger::state_variables(layout, &words));
+        }
+        if let (Some(layout), Some(words)) = (
+            self.debugger.transient_storage_layout(),
+            self.debugger.transient_words(),
+        ) {
+            variables.extend(soldb_debugger::state_variables(layout, &words));
+        }
+        variables
             .into_iter()
             .map(|variable| {
                 json!({
@@ -950,8 +954,16 @@ impl DapServer {
     }
 
     /// A storage path such as `counter` or `balances[0xabc]`, read through the storage
-    /// layout when one is loaded.
+    /// layout when one is loaded, or a `transient` state variable by name.
     fn evaluate_state(&self, expression: &str) -> String {
+        if let (Some(layout), Some(words)) = (
+            self.debugger.transient_storage_layout(),
+            self.debugger.transient_words(),
+        ) {
+            if let Ok(variable) = soldb_debugger::state_value(layout, &words, expression) {
+                return variable.value.display;
+            }
+        }
         let Some(layout) = self.debugger.storage_layout() else {
             return "<unsupported expression>".to_owned();
         };
@@ -1088,7 +1100,8 @@ impl LoadedSource {
             source_files: program.source_files,
             contract: ContractDebugInfo::new(address, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
-                .with_storage_layout(program.storage_layout),
+                .with_storage_layout(program.storage_layout)
+                .with_transient_storage_layout(program.transient_storage_layout),
         })
     }
 }

@@ -76,6 +76,8 @@ pub struct ContractDebugInfo {
     /// Where the contract's state variables live, when it was compiled with
     /// `--storage-layout`.
     pub storage_layout: Option<StorageLayout>,
+    /// Where its `transient` state variables live, from `--transient-storage-layout`.
+    pub transient_storage_layout: Option<StorageLayout>,
     /// Which code generator produced the program, when the artifact or the host says.
     /// Decides whether local variables can be inferred from the stack; see
     /// [`StepMap::locals_at`].
@@ -162,6 +164,7 @@ impl ContractDebugInfo {
             functions,
             types,
             storage_layout: None,
+            transient_storage_layout: None,
             code_generator: None,
             line_starts,
             pc_index,
@@ -177,15 +180,25 @@ impl ContractDebugInfo {
     }
 
     /// Attaches the contract's storage layout, so state variables can be read by name.
-    /// The sources' enum declarations are handed to it, so an enum in storage shows by
-    /// its variant's name.
     #[must_use]
     pub fn with_storage_layout(mut self, storage_layout: Option<StorageLayout>) -> Self {
-        self.storage_layout = storage_layout.map(|mut layout| {
+        self.storage_layout = self.with_enum_variants(storage_layout);
+        self
+    }
+
+    /// Attaches the layout of the contract's `transient` state variables.
+    #[must_use]
+    pub fn with_transient_storage_layout(mut self, layout: Option<StorageLayout>) -> Self {
+        self.transient_storage_layout = self.with_enum_variants(layout);
+        self
+    }
+
+    /// Hands the sources' enum declarations to a layout, so an enum shows by variant name.
+    fn with_enum_variants(&self, layout: Option<StorageLayout>) -> Option<StorageLayout> {
+        layout.map(|mut layout| {
             layout.enum_variants = self.types.enum_variants_by_name();
             layout
-        });
-        self
+        })
     }
 
     /// The program this info describes, when the artifact says: ETHDebug programs and legacy

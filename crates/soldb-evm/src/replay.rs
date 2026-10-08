@@ -52,9 +52,9 @@ use soldb_core::{
 
 use crate::{
     build_transaction_trace, bytes_to_hex, decode_revert_reason, format_quantity,
-    format_u256_quantity, hex_to_bytes, normalize_hex_output, parse_quantity, parse_u256_quantity,
-    parse_value_quantity, quantity_is_one, DebugTraceResult, RpcReceipt, RpcTransaction,
-    SimulateCallRequest, StructLog, TraceBackend, TraceEnvelope,
+    format_u256_quantity, hex_to_bytes, normalize_hex_output, normalize_storage_key,
+    parse_quantity, parse_u256_quantity, parse_value_quantity, quantity_is_one, DebugTraceResult,
+    RpcReceipt, RpcTransaction, SimulateCallRequest, StructLog, TraceBackend, TraceEnvelope,
 };
 
 /// The header fields of an `eth_getBlockByNumber` response that replay reads.
@@ -112,6 +112,7 @@ fn replay_capabilities(chain_id: u64) -> TraceCapabilities {
         revert_data: true,
         gas_details: true,
         account_changes: true,
+        transient_storage: true,
         notes: replay_chain_support(chain_id).unwrap_or_default(),
     }
 }
@@ -1962,16 +1963,6 @@ fn record_replay_storage_touch(log: &mut StructLog, interp: &Interpreter) {
                 .insert(normalize_storage_key(&slot), normalize_hex_output(&value));
         }
         _ => {}
-    }
-}
-
-fn normalize_storage_key(value: &str) -> String {
-    let value = normalize_hex_output(value);
-    let trimmed = value.trim_start_matches("0x").trim_start_matches('0');
-    if trimmed.is_empty() {
-        "0x0".to_owned()
-    } else {
-        format!("0x{}", trimmed.to_ascii_lowercase())
     }
 }
 

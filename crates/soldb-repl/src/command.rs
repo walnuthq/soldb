@@ -70,6 +70,7 @@ pub enum DebuggerInfoCommand {
     Resources { json: bool },
     Breakpoints,
     Storage,
+    TransientStorage,
 }
 
 /// What a command is for, which is how `help` groups them.
@@ -268,11 +269,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "info",
         aliases: &["i"],
-        usage: "info breakpoints|storage|resources [--json]",
-        summary: "the breakpoints, the storage known here, or the loaded debug resources",
+        usage: "info breakpoints|storage|transient|resources [--json]",
+        summary: "the breakpoints, the storage or transient storage known here, or the loaded debug resources",
         details: &[
             "info breakpoints (i b)  every breakpoint with its number",
             "info storage            every storage slot known at this step",
+            "info transient          every transient storage slot known at this step",
             "info resources          the contracts whose sources are loaded, as text or JSON",
         ],
         group: CommandGroup::Breakpoints,
@@ -322,6 +324,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "storage",
         summary: "every storage slot known at the current step",
         details: &["The same as `info storage`."],
+        group: CommandGroup::Inspection,
+    },
+    CommandSpec {
+        name: "transient",
+        aliases: &[],
+        usage: "transient",
+        summary: "every transient storage slot known at the current step",
+        details: &[
+            "The slots `TLOAD` and `TSTORE` touched so far in this frame's account, read",
+            "from the trace. A slot not listed is zero: transient storage starts empty in",
+            "every transaction. The same as `info transient`.",
+        ],
         group: CommandGroup::Inspection,
     },
     CommandSpec {
@@ -441,6 +455,7 @@ impl DebuggerCommand {
                 }
             }
             "storage" => Self::Info(DebuggerInfoCommand::Storage),
+            "transient" => Self::Info(DebuggerInfoCommand::TransientStorage),
             "info" => parse_info_command(&rest).map_or_else(unknown, Self::Info),
             "mode" => Self::Mode(
                 (!rest.is_empty())
@@ -476,6 +491,7 @@ fn parse_info_command(input: &str) -> Option<DebuggerInfoCommand> {
         }
         "breakpoints" | "break" | "b" => Some(DebuggerInfoCommand::Breakpoints),
         "storage" => Some(DebuggerInfoCommand::Storage),
+        "transient" => Some(DebuggerInfoCommand::TransientStorage),
         _ => None,
     }
 }

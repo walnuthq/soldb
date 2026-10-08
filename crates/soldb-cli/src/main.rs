@@ -2261,7 +2261,8 @@ impl TraceSourceIndex {
             program.source_contents,
         )
         .with_code_generator(Some(code_generator))
-        .with_storage_layout(program.storage_layout);
+        .with_storage_layout(program.storage_layout)
+        .with_transient_storage_layout(program.transient_storage_layout);
         Ok(Some(Self {
             spec: spec.clone(),
             resources: program.resources,

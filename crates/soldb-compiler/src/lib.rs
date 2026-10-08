@@ -224,6 +224,8 @@ impl Default for CompilerConfig {
                 "--bin".to_owned(),
                 "--abi".to_owned(),
                 "--storage-layout".to_owned(),
+                // Dropped by `run_solc_dropping_unsupported` where solc does not know it.
+                TRANSIENT_STORAGE_LAYOUT_FLAG.to_owned(),
                 "--overwrite".to_owned(),
             ],
             production_flags: vec![
@@ -283,7 +285,7 @@ impl CompilerConfig {
         // installs, and fall back to the modern flag names only if solc specifically rejects
         // the legacy ones - this keeps a single code path working across solc versions without
         // needing to parse and hardcode a version cutoff.
-        match run_solc(
+        match run_solc_dropping_unsupported(
             &self.solc_path,
             &self.ethdebug_flags,
             &self.project,
@@ -298,7 +300,7 @@ impl CompilerConfig {
                 if is_unrecognised_ethdebug_option(&legacy_error) =>
             {
                 let modern_flags = modern_ethdebug_flags(&self.ethdebug_flags);
-                run_solc(
+                run_solc_dropping_unsupported(
                     &self.solc_path,
                     &modern_flags,
                     &self.project,
@@ -569,6 +571,32 @@ pub fn auto_deploy(config: &AutoDeployConfig) -> SoldbResult<AutoDeployResult> {
     })
 }
 
+/// The flag that asks solc for `<Contract>_transient_storage.json`.
+const TRANSIENT_STORAGE_LAYOUT_FLAG: &str = "--transient-storage-layout";
+
+/// Runs solc, retrying without `--transient-storage-layout` when solc does not know it.
+fn run_solc_dropping_unsupported(
+    solc_path: &str,
+    flags: &[String],
+    project: &ProjectLayout,
+    contract_file: &Path,
+    output_dir: &Path,
+) -> SoldbResult<CompilationResult> {
+    match run_solc(solc_path, flags, project, contract_file, output_dir) {
+        Err(SoldbError::Message(error))
+            if is_unrecognised_option(&error, TRANSIENT_STORAGE_LAYOUT_FLAG) =>
+        {
+            let supported = flags
+                .iter()
+                .filter(|flag| *flag != TRANSIENT_STORAGE_LAYOUT_FLAG)
+                .cloned()
+                .collect::<Vec<_>>();
+            run_solc(solc_path, &supported, project, contract_file, output_dir)
+        }
+        other => other,
+    }
+}
+
 fn run_solc(
     solc_path: &str,
     flags: &[String],
@@ -658,7 +686,11 @@ fn modern_ethdebug_flags(flags: &[String]) -> Vec<String> {
 }
 
 fn is_unrecognised_ethdebug_option(error_message: &str) -> bool {
-    error_message.contains("unrecognised option") && error_message.contains("--ethdebug")
+    is_unrecognised_option(error_message, "--ethdebug")
+}
+
+fn is_unrecognised_option(error_message: &str, flag: &str) -> bool {
+    error_message.contains("unrecognised option") && error_message.contains(flag)
 }
 
 fn discover_output_files(output_dir: &Path) -> SoldbResult<CompilerOutputFiles> {
@@ -994,6 +1026,33 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn asks_for_the_transient_layout_and_compiles_without_it_where_unknown() {
+        for (version, asked) in [("0.8.31", true), ("0.8.26", false)] {
+            let temp = temp_dir(&format!("transient-{version}"));
+            let contract = temp.join("Counter.sol");
+            std::fs::write(&contract, "contract Counter {}").expect("write contract");
+            let out = temp.join("out");
+            let cfg = CompilerConfig::with_paths(
+                fake_solc(version, false).to_string_lossy(),
+                &out,
+                temp.join("build"),
+            );
+
+            cfg.compile_with_ethdebug(&contract, None)
+                .expect("a compiler without the layout output still compiles");
+
+            let args = std::fs::read_to_string(out.join("solc-args.txt")).expect("args");
+            assert_eq!(
+                args.contains("--transient-storage-layout"),
+                asked,
+                "{version}"
+            );
+            assert!(args.contains("--storage-layout"), "{version}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn verifies_solc_ethdebug_version_floor() {
         let new_solc = fake_solc("0.8.31", false);
         let old_solc = fake_solc("0.8.28", false);
@@ -1095,7 +1154,8 @@ mod tests {
 
     #[cfg(unix)]
     /// Every fake compiler a test runs, as (version, has a constructor).
-    const FAKE_SOLCS: [(&str, bool); 4] = [
+    const FAKE_SOLCS: [(&str, bool); 5] = [
+        ("0.8.26", false),
         ("0.8.28", false),
         ("0.8.31", false),
         ("0.8.31", true),
@@ -1134,6 +1194,9 @@ mod tests {
         } else {
             ""
         };
+        // 0.8.26 stands for a release from before transient storage, which rejects the
+        // flag asking for its layout.
+        let rejects_transient = if version == "0.8.26" { "true" } else { "false" };
         let script = format!(
             r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -1147,9 +1210,14 @@ for arg in "$@"; do
   if [ "$prev" = "-o" ]; then
     out="$arg"
   fi
+  if [ "$arg" = "--transient-storage-layout" ] && {rejects_transient}; then
+    echo "unrecognised option '--transient-storage-layout'" >&2
+    exit 1
+  fi
   prev="$arg"
 done
 mkdir -p "$out"
+echo "$@" > "$out/solc-args.txt"
 cat > "$out/ethdebug.json" <<'EOF'
 {{"version":1}}
 EOF

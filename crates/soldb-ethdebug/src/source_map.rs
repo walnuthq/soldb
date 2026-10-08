@@ -46,6 +46,8 @@ pub struct SourceMapProgram {
     pub source_files: BTreeMap<u64, PathBuf>,
     /// The contract's `storage-layout` entry, when the artifact was compiled with it.
     pub storage_layout: Option<StorageLayout>,
+    /// The contract's `transient-storage-layout` entry, when compiled with it.
+    pub transient_storage_layout: Option<StorageLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,16 +327,13 @@ fn source_map_program_from_combined(
         variable_locations: BTreeMap::new(),
     };
 
-    let storage_layout = contract
-        .get("storage-layout")
-        .map(StorageLayout::parse)
-        .transpose()
-        .map_err(|error| {
-            SoldbError::Message(format!(
-                "legacy artifact `{}` has an invalid `storage-layout` for `{contract_key}`: {error}",
-                artifact_path.display()
-            ))
-        })?;
+    let storage_layout = combined_layout(contract, "storage-layout", artifact_path, contract_key)?;
+    let transient_storage_layout = combined_layout(
+        contract,
+        "transient-storage-layout",
+        artifact_path,
+        contract_key,
+    )?;
 
     Ok(Some(SourceMapProgram {
         info,
@@ -342,7 +341,27 @@ fn source_map_program_from_combined(
         source_contents,
         source_files,
         storage_layout,
+        transient_storage_layout,
     }))
+}
+
+/// A contract's layout entry `key` in a `combined.json`, when it was compiled with it.
+fn combined_layout(
+    contract: &Value,
+    key: &str,
+    artifact_path: &Path,
+    contract_key: &str,
+) -> SoldbResult<Option<StorageLayout>> {
+    contract
+        .get(key)
+        .map(StorageLayout::parse)
+        .transpose()
+        .map_err(|error| {
+            SoldbError::Message(format!(
+                "legacy artifact `{}` has an invalid `{key}` for `{contract_key}`: {error}",
+                artifact_path.display()
+            ))
+        })
 }
 
 fn find_contract<'a>(
@@ -724,6 +743,23 @@ mod tests {
                                     "numberOfBytes": "32"
                                 }
                             }
+                        },
+                        "transient-storage-layout": {
+                            "storage": [{
+                                "astId": 2,
+                                "contract": "Counter.sol:Counter",
+                                "label": "locked",
+                                "offset": 0,
+                                "slot": "0",
+                                "type": "t_bool"
+                            }],
+                            "types": {
+                                "t_bool": {
+                                    "encoding": "inplace",
+                                    "label": "bool",
+                                    "numberOfBytes": "1"
+                                }
+                            }
                         }
                     }
                 }
@@ -745,6 +781,13 @@ mod tests {
             layout.resolve("value").expect("resolve").type_id,
             "t_uint256"
         );
+        // `transient-storage-layout` is the same shape, for the `transient` variables.
+        let transient = program
+            .transient_storage_layout
+            .as_ref()
+            .expect("transient layout");
+        assert!(transient.variable("locked").is_some());
+        assert!(transient.variable("value").is_none());
 
         assert_eq!(program.info.contract_name, "Counter");
         assert_eq!(program.info.environment, "call");

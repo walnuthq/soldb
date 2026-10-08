@@ -170,6 +170,7 @@ impl StructLog {
                 memory,
                 storage: self.shared_storage(previous.map(|(_, step)| step)),
                 storage_diff,
+                transient_storage: BTreeMap::new(),
             },
         )
     }
@@ -201,6 +202,7 @@ impl StructLog {
                 memory,
                 storage,
                 storage_diff,
+                transient_storage: BTreeMap::new(),
             },
         )
     }
@@ -351,6 +353,51 @@ fn share_unchanged(previous: &StructLog, log: &mut StructLog) {
     }
 }
 
+/// Fills `transient_storage` on each `TLOAD` and `TSTORE` from the stack, for every backend.
+fn record_transient_storage(steps: &mut [TraceStep]) {
+    for index in 0..steps.len() {
+        let step = &steps[index];
+        if step.error.is_some() {
+            continue;
+        }
+        let stack = step.snapshot_ref().stack;
+        let Some(slot) = stack.last() else {
+            continue;
+        };
+        // A `TLOAD`'s value is what it leaves on top: the next step's stack in its frame.
+        let value = match &*step.op {
+            "TSTORE" => stack
+                .len()
+                .checked_sub(2)
+                .and_then(|below| stack.get(below)),
+            "TLOAD" => steps
+                .get(index + 1)
+                .filter(|next| next.depth == step.depth)
+                .and_then(|next| next.snapshot_ref().stack.last()),
+            _ => continue,
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        let touched = BTreeMap::from([(normalize_storage_key(slot), normalize_storage_key(value))]);
+        steps[index].snapshot.transient_storage = touched;
+    }
+}
+
+/// A slot or word as `0x`-prefixed lowercase hex without leading zeros.
+pub(crate) fn normalize_storage_key(value: &str) -> String {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0x0".to_owned()
+    } else {
+        format!("0x{}", trimmed.to_ascii_lowercase())
+    }
+}
+
 impl DebugTraceResult {
     /// Builds every step, borrowing the logs. Prefer [`DebugTraceResult::into_steps`]
     /// when the result is not needed afterwards: it frees each log as its step is built.
@@ -368,6 +415,7 @@ impl DebugTraceResult {
             previous_storage = &log.storage;
             previous_memory = Some(&log.memory);
         }
+        record_transient_storage(&mut steps);
         steps
     }
 
@@ -398,6 +446,7 @@ impl DebugTraceResult {
             steps.push(step);
             previous = Some((memory, storage));
         }
+        record_transient_storage(&mut steps);
         steps
     }
 
@@ -606,6 +655,7 @@ pub(crate) fn simulation_trace(
 
 fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
     let has_steps = !result.struct_logs.is_empty();
+    let has_stack = result.struct_logs.iter().any(|log| !log.stack.is_empty());
     let has_storage = result
         .struct_logs
         .iter()
@@ -642,6 +692,8 @@ fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
         revert_data: result.failed && !result.return_value.is_empty(),
         gas_details: result.gas.is_some(),
         account_changes: false,
+        // Read off the stack, so only as complete as the stacks the node returned.
+        transient_storage: has_stack,
         notes,
     }
 }
@@ -1009,6 +1061,53 @@ mod tests {
         assert!(!trace.success);
         assert!(trace.error.is_some(), "failure must be reported");
         assert_eq!(trace.gas_used, 0);
+    }
+
+    #[test]
+    fn transient_storage_is_read_off_the_stack_for_both_ways_of_building_steps() {
+        // A `TSTORE` holds its slot on top and its value below; a `TLOAD`'s value is the
+        // top of the next step in the same frame. Padded and unpadded words record alike,
+        // and a failed or frame-ending step records nothing.
+        let debug_result: DebugTraceResult = serde_json::from_value(json!({
+            "structLogs": [
+                {"pc": 0, "op": "TSTORE", "gas": 100, "gasCost": 100, "depth": 1,
+                 "stack": ["0x0000000000000000000000000000000000000000000000000000000000000007", "0x1"]},
+                {"pc": 1, "op": "TLOAD", "gas": 0, "gasCost": 100, "depth": 1, "stack": ["0x1"]},
+                {"pc": 2, "op": "POP", "gas": 0, "gasCost": 2, "depth": 1, "stack": ["0x0A"]},
+                {"pc": 3, "op": "TSTORE", "gas": 0, "gasCost": 0, "depth": 1, "stack": ["0x5", "0x2"], "error": "out of gas"},
+                {"pc": 4, "op": "TLOAD", "gas": 0, "gasCost": 0, "depth": 1, "stack": ["0x2"]},
+                {"pc": 0, "op": "STOP", "gas": 0, "gasCost": 0, "depth": 2, "stack": ["0x3"]}
+            ]
+        }))
+        .expect("debug result");
+
+        for steps in [debug_result.steps(), debug_result.clone().into_steps()] {
+            let touched = steps
+                .iter()
+                .map(|step| step.snapshot.transient_storage.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                touched[0],
+                BTreeMap::from([("0x1".to_owned(), "0x7".to_owned())])
+            );
+            assert_eq!(
+                touched[1],
+                BTreeMap::from([("0x1".to_owned(), "0xa".to_owned())])
+            );
+            assert!(touched[2].is_empty());
+            assert!(touched[3].is_empty(), "a failed TSTORE wrote nothing");
+            assert!(touched[4].is_empty(), "the next step is in another frame");
+        }
+        assert!(debug_rpc_capabilities(&debug_result).transient_storage);
+
+        // Without stacks nothing could be read, so unrecorded slots are not claimed zero.
+        let stackless: DebugTraceResult = serde_json::from_value(json!({
+            "structLogs": [{"pc": 0, "op": "TSTORE", "gas": 0, "gasCost": 0, "depth": 1}]
+        }))
+        .expect("debug result");
+        assert!(!debug_rpc_capabilities(&stackless).transient_storage);
+        assert_eq!(super::normalize_storage_key("0X001A"), "0x1a");
+        assert_eq!(super::normalize_storage_key("0"), "0x0");
     }
 
     #[test]

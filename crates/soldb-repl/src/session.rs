@@ -135,6 +135,9 @@ impl Session {
             }
             DebuggerCommand::Info(DebuggerInfoCommand::Breakpoints) => vec![self.breakpoints()],
             DebuggerCommand::Info(DebuggerInfoCommand::Storage) => vec![self.storage()],
+            DebuggerCommand::Info(DebuggerInfoCommand::TransientStorage) => {
+                vec![self.transient_storage()]
+            }
             DebuggerCommand::Vars => vec![self.variables(None)],
             DebuggerCommand::Print(name) => {
                 let name = name.trim();
@@ -468,6 +471,45 @@ impl Session {
         }
     }
 
+    /// Every transient storage slot whose value is known at the current step.
+    #[must_use]
+    pub fn transient_storage(&self) -> Output {
+        if self.state.current_step_data().is_none() {
+            return message(Level::Warning, "No trace loaded.");
+        }
+        let captured = self
+            .state
+            .trace()
+            .is_some_and(|trace| trace.capabilities.transient_storage);
+        if !captured {
+            return message(
+                Level::Warning,
+                "Transient storage is not in this trace; it was recorded without `TLOAD` and `TSTORE` values.",
+            );
+        }
+        let (Some(words), Some(address)) =
+            (self.state.transient_words(), self.state.storage_address())
+        else {
+            return message(
+                Level::Warning,
+                "Transient storage unavailable: this frame's storage belongs to no known account.",
+            );
+        };
+        let slots = words
+            .known()
+            .into_iter()
+            .map(|(slot, value)| SlotInfo {
+                slot: soldb_debugger::short_hex(&slot),
+                value: soldb_debugger::short_hex(&value),
+                was: None,
+            })
+            .collect();
+        Output::TransientStorage {
+            address: Some(address.to_owned()),
+            slots,
+        }
+    }
+
     #[must_use]
     pub fn calldata(&self) -> Output {
         if self.state.trace().is_none() {
@@ -541,6 +583,8 @@ impl Session {
         let words = self.storage_words();
         let layout = self.state.storage_layout();
         let chain_label = words.as_ref().and_then(StorageWords::chain_label);
+        let transient_words = self.state.transient_words();
+        let transient_layout = self.state.transient_storage_layout();
 
         if let Some(name) = filter {
             if let Some(variable) = locals.iter().find(|variable| variable.name == name) {
@@ -561,6 +605,17 @@ impl Session {
                     return message(Level::Warning, format!("Cannot read variable: {reason}"))
                 }
                 None => {}
+            }
+            // Names are unique across both spaces, so a transient variable is found by name.
+            if let (Some(transient_layout), Some(transient_words)) =
+                (transient_layout, transient_words.as_ref())
+            {
+                if let Ok(variable) = state_value(transient_layout, transient_words, name) {
+                    return Output::Variable {
+                        warning,
+                        variable: transient_info(&variable),
+                    };
+                }
             }
             let (Some(layout), Some(words)) = (layout, words.as_ref()) else {
                 return message(
@@ -600,12 +655,20 @@ impl Session {
             (Some(_), None) => StateInfo::NoStorage,
             (None, _) => StateInfo::NoLayout,
         };
+        let transient = match (transient_layout, transient_words.as_ref()) {
+            (Some(layout), Some(words)) => state_variables(layout, words)
+                .iter()
+                .map(transient_info)
+                .collect(),
+            _ => Vec::new(),
+        };
         Output::Variables {
             warning,
             pc,
             locals: locals.iter().map(local_info).collect(),
             unavailable,
             state,
+            transient,
         }
     }
 
@@ -715,6 +778,19 @@ fn state_info(variable: &StateVariable, chain_label: Option<&str>) -> VariableIn
         raw: variable.value.raw.clone(),
         status: status(variable.value.status),
         place: Some(place),
+    }
+}
+
+/// A `transient` state variable, its place marked so it is not read as a storage slot.
+fn transient_info(variable: &StateVariable) -> VariableInfo {
+    let place = if variable.offset == 0 {
+        format!("transient slot {}", variable.slot)
+    } else {
+        format!("transient slot {} + {}", variable.slot, variable.offset)
+    };
+    VariableInfo {
+        place: Some(place),
+        ..state_info(variable, None)
     }
 }
 

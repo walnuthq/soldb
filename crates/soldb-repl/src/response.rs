@@ -62,6 +62,12 @@ pub enum Output {
         address: Option<String>,
         slots: Vec<SlotInfo>,
     },
+    /// The transient storage slots known at a step; every other slot is zero.
+    TransientStorage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+        slots: Vec<SlotInfo>,
+    },
     Calldata {
         bytes: usize,
         data: String,
@@ -76,6 +82,9 @@ pub enum Output {
         #[serde(skip_serializing_if = "Option::is_none")]
         unavailable: Option<String>,
         state: StateInfo,
+        /// The `transient` state variables, when the contract has a transient layout.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        transient: Vec<VariableInfo>,
     },
     /// One variable, from `print`.
     Variable {

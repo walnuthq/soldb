@@ -1,0 +1,36 @@
+# Transient state variables, read by name through `--transient-storage-layout` and by
+# slot with `transient`. No node: the contract is compiled here and run on a local chain.
+# REQUIRES: soldb
+# RUN: %soldb compile %S/../examples/TransientCounter.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: %soldb run %t.out/TransientCounter.bin "incrementTransient()" --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:TransientCounter:%t.out -x 'break TransientCounter.sol:18' -x continue -x vars -x transient -x next -x 'print transientCount' -x 'info transient' --batch 2>&1 | FileCheck %s
+
+# After the first `+= 1`. A transient variable nothing wrote is zero, not unknown: the
+# space starts empty in every transaction.
+# CHECK: TransientCounter.sol:18 in incrementTransient
+# CHECK: State:
+# CHECK-NEXT: uint256 storedCount = {{.*}} [slot 0x0]
+# CHECK-NEXT: uint256 transientCount = 1 [transient slot 0x0]
+# CHECK-NEXT: bool locked = false [transient slot 0x1]
+# CHECK: Transient storage: of 0x5fbdb2315678afecb367f032d93f642f64180aa3
+# CHECK-NEXT: 0x0 = 0x1
+# CHECK: TransientCounter.sol:19 in incrementTransient
+# CHECK: uint256 transientCount = 2 [transient slot 0x0]
+# CHECK: Transient storage:
+# CHECK-NEXT: 0x0 = 0x2
+
+# A write made by a frame that reverted is undone with it.
+# RUN: %soldb run %t.out/TransientCounter.bin "writeSurvivesRevert(uint256,uint256)" 1 2 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:TransientCounter:%t.out -x 'break TransientCounter.sol:32' -x continue -x 'print transientCount' -x 'break TransientCounter.sol:39' -x continue -x 'print transientCount' --batch 2>&1 | FileCheck --check-prefix=REVERT %s
+
+# REVERT: TransientCounter.sol:32 in setAndRevert
+# REVERT: uint256 transientCount = 2 [transient slot 0x0]
+# REVERT: TransientCounter.sol:39 in writeSurvivesRevert
+# REVERT: uint256 transientCount = 1 [transient slot 0x0]
+
+# The saved trace carries the slot and value of every `TSTORE` (and `TLOAD`).
+# RUN: %soldb run %t.out/TransientCounter.bin "incrementTransient()" --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:TransientCounter:%t.out --save-trace %t.trace.json > /dev/null 2>&1
+# RUN: jq -r '.capabilities.transient_storage, (.steps[] | select(.op == "TSTORE") | .snapshot.transient_storage | tojson)' %t.trace.json | FileCheck --check-prefix=SAVED %s
+
+# SAVED: true
+# SAVED-NEXT: {"0x0":"0x1"}
+# SAVED-NEXT: {"0x0":"0x2"}
+# SAVED-NOT: 0x

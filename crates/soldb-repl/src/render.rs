@@ -216,6 +216,25 @@ impl Renderer {
                 }
                 lines
             }
+            Output::TransientStorage { address, slots } => {
+                if slots.is_empty() {
+                    return vec![self.dim(
+                        "Transient storage: nothing read or written yet; every slot is zero.",
+                    )];
+                }
+                let mut lines = vec![match address {
+                    Some(address) => format!(
+                        "{} {}",
+                        self.info("Transient storage:"),
+                        self.dim(format!("of {address}"))
+                    ),
+                    None => self.info("Transient storage:"),
+                }];
+                for slot in slots {
+                    lines.push(format!("  {} = {}", slot.slot, slot.value));
+                }
+                lines
+            }
             Output::Calldata { bytes, data } => vec![
                 format!("{} {} bytes", self.info("Calldata:"), self.number(bytes)),
                 data.clone(),
@@ -226,6 +245,7 @@ impl Renderer {
                 locals,
                 unavailable,
                 state,
+                transient,
             } => {
                 let mut lines = Vec::new();
                 if let Some(warning) = warning {
@@ -256,6 +276,8 @@ impl Renderer {
                             lines.push(self.variable(variable));
                         }
                     }
+                    // Transient variables are state variables too; they follow under `State:`.
+                    StateInfo::None if !transient.is_empty() => lines.push(self.dim("State:")),
                     StateInfo::None => {
                         lines.push(self.dim("State: this contract declares no state variables"));
                     }
@@ -266,6 +288,9 @@ impl Renderer {
                     StateInfo::NoStorage => {
                         lines.push(self.dim("State: no storage was recorded for this step"));
                     }
+                }
+                for variable in transient {
+                    lines.push(self.variable(variable));
                 }
                 lines
             }
@@ -504,7 +529,69 @@ pub fn shorten_hex(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{shorten_hex, Renderer};
-    use crate::response::{Level, Output, Stop, StopLocation, StopReason};
+    use crate::response::{
+        Level, Output, SlotInfo, StateInfo, Stop, StopLocation, StopReason, ValueStatus,
+        VariableInfo,
+    };
+
+    #[test]
+    fn transient_storage_lists_its_slots_or_says_every_one_is_zero() {
+        let renderer = Renderer::new(false);
+        assert_eq!(
+            renderer.render(&Output::TransientStorage {
+                address: Some("0xabc".to_owned()),
+                slots: vec![SlotInfo {
+                    slot: "0x0".to_owned(),
+                    value: "0x2".to_owned(),
+                    was: None,
+                }],
+            }),
+            "Transient storage: of 0xabc\n  0x0 = 0x2\n"
+        );
+        assert_eq!(
+            renderer.render(&Output::TransientStorage {
+                address: None,
+                slots: Vec::new(),
+            }),
+            "Transient storage: nothing read or written yet; every slot is zero.\n"
+        );
+    }
+
+    #[test]
+    fn transient_variables_follow_the_state_and_keep_its_reason() {
+        let renderer = Renderer::new(false);
+        let variables = |state| Output::Variables {
+            warning: None,
+            pc: 7,
+            locals: vec![VariableInfo {
+                name: "a".to_owned(),
+                ty: "uint256".to_owned(),
+                value: "1".to_owned(),
+                raw: None,
+                status: ValueStatus::Decoded,
+                place: Some("stack+1".to_owned()),
+            }],
+            unavailable: None,
+            state,
+            transient: vec![VariableInfo {
+                name: "locked".to_owned(),
+                ty: "bool".to_owned(),
+                value: "true".to_owned(),
+                raw: None,
+                status: ValueStatus::Decoded,
+                place: Some("transient slot 0x0".to_owned()),
+            }],
+        };
+        // A layout with no storage variables does not say the contract has none.
+        assert_eq!(
+            renderer.render(&variables(StateInfo::None)),
+            "uint256 a = 1 [stack+1]\nState:\nbool locked = true [transient slot 0x0]\n"
+        );
+        // A missing storage layout is still reported.
+        assert!(renderer
+            .render(&variables(StateInfo::NoLayout))
+            .contains("no storage layout loaded"));
+    }
 
     #[test]
     fn a_stop_is_one_location_line_and_the_source_line() {
