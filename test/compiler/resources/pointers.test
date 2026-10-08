@@ -40,21 +40,24 @@
 # STRUCT: ["x","slot","0x1f","0x01"]
 # STRUCT-NEXT: ["y","slot","0x1e","0x01"]
 
+# The format's terms are spelled `~sum`, `~read` and so on since ethdebug/format
+# 0.1.0-draft.2 and `$sum`, `$read` before; either is accepted below.
+#
 # A mapping's entry lives at keccak256 of the key and of the slot, both as words; the
 # value of a nested mapping is the base slot of the inner one, a whole slot, which the
 # inner mapping's template takes as its own `slot` with the next key.
 # RUN: jq -c '.pointers | to_entries[] | select(.value.expect == ["slot","key"]) | [.key, .value.for.slot, .value.for.offset, .value.for.length]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=MAPPING
-# MAPPING: ["t_mapping$_t_address_$_t_mapping$_t_uint256_$_t_bool_$_$",{"$keccak256":[{"$wordsized":"key"},{"$wordsized":"slot"}]},null,null]
-# MAPPING-NEXT: ["t_mapping$_t_address_$_t_uint256_$",{"$keccak256":[{"$wordsized":"key"},{"$wordsized":"slot"}]},null,null]
-# MAPPING-NEXT: ["t_mapping$_t_uint256_$_t_bool_$",{"$keccak256":[{"$wordsized":"key"},{"$wordsized":"slot"}]},"0x1f","0x01"]
+# MAPPING: ["t_mapping$_t_address_$_t_mapping$_t_uint256_$_t_bool_$_$",{"{{[$~]}}keccak256":[{"{{[$~]}}wordsized":"key"},{"{{[$~]}}wordsized":"slot"}]},null,null]
+# MAPPING-NEXT: ["t_mapping$_t_address_$_t_uint256_$",{"{{[$~]}}keccak256":[{"{{[$~]}}wordsized":"key"},{"{{[$~]}}wordsized":"slot"}]},null,null]
+# MAPPING-NEXT: ["t_mapping$_t_uint256_$_t_bool_$",{"{{[$~]}}keccak256":[{"{{[$~]}}wordsized":"key"},{"{{[$~]}}wordsized":"slot"}]},"0x1f","0x01"]
 
 # A dynamic array keeps its length in the slot and its elements at keccak256 of the slot,
 # one per index of the list; bytes and strings choose between the short and the long
 # encoding by the length flag in the slot.
 # RUN: jq -c '.pointers["t_array$_t_uint256_$dyn_storage"].for.group[1] | [.define, .in.list.count, .in.list.each, .in.list.is.slot]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=ARRAY
-# ARRAY: [{"data":{"$keccak256":[{"$wordsized":"slot"}]}},{"$read":"length"},"index",{"$sum":["data","index"]}]
+# ARRAY: [{"data":{"{{[$~]}}keccak256":[{"{{[$~]}}wordsized":"slot"}]}},{"{{[$~]}}read":"length"},"index",{"{{[$~]}}sum":["data","index"]}]
 # RUN: jq -c '.pointers["t_string_storage"].for.group | [.[0].name, .[0].offset, .[0].length, (.[1] | keys)]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=STRING
-# STRING: ["length-flag",{"$difference":["$wordsize","0x01"]},"0x01",["else","if","then"]]
+# STRING: ["length-flag",{"{{[$~]}}difference":["{{[$~]}}wordsize","0x01"]},"0x01",["else","if","then"]]
 
 # Transient storage holds value types only, so it adds no template; neither do constants
 # and immutables, which occupy no storage.

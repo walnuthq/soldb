@@ -109,15 +109,15 @@ pub enum Expression {
     Literal(Vec<u8>),
     /// A variable bound by a template parameter, a scope definition, or a list index.
     Variable(String),
-    /// `$wordsize`, 32.
+    /// `~wordsize`, 32.
     WordSize,
     /// `{ ".slot" | ".offset" | ".length": <region> }`, a property of a named region or of
-    /// `$this`, the region the expression is part of.
+    /// `~this`, the region the expression is part of.
     Lookup {
         property: Property,
         region: String,
     },
-    /// `{ "$read": <region> }`, the bytes in a named region or in `$this`.
+    /// `{ "~read": <region> }`, the bytes in a named region or in `~this`.
     Read(String),
     Sum(Vec<Expression>),
     /// `a - b`, zero when `b` exceeds `a`.
@@ -129,7 +129,7 @@ pub enum Expression {
     Keccak256(Vec<Expression>),
     /// The operands' bytes, concatenated at their own widths.
     Concat(Vec<Expression>),
-    /// `{ "$sized<N>": e }` or, with `size` unset, `{ "$wordsized": e }`: `e` left-padded
+    /// `{ "~sized<N>": e }` or, with `size` unset, `{ "~wordsized": e }`: `e` left-padded
     /// with zeros or with its most significant bytes dropped to the width.
     Resize {
         size: Option<u64>,
@@ -659,9 +659,9 @@ impl Dereferencer<'_> {
     }
 
     fn lookup<'r>(&'r self, region: &str, this: Option<&'r Region>) -> SoldbResult<&'r Region> {
-        if region == "$this" {
+        if region == THIS {
             return this.ok_or_else(|| {
-                SoldbError::Message("`$this` is used outside of a region".to_owned())
+                SoldbError::Message("`~this` is used outside of a region".to_owned())
             });
         }
         self.named.get(region).ok_or_else(|| {
@@ -956,7 +956,7 @@ fn parse_expression(value: &Value, depth: usize) -> SoldbResult<Expression> {
             Ok(Expression::Literal(number_bytes(number)))
         }
         Value::String(string) => {
-            if string == "$wordsize" {
+            if format_term(string) == Some("wordsize") {
                 Ok(Expression::WordSize)
             } else if let Some(bytes) = hex_bytes(string) {
                 Ok(Expression::Literal(bytes))
@@ -964,7 +964,7 @@ fn parse_expression(value: &Value, depth: usize) -> SoldbResult<Expression> {
                 Ok(Expression::Variable(string.clone()))
             } else {
                 Err(SoldbError::Message(format!(
-                    "`{string}` is neither a hex literal, `$wordsize`, nor a variable"
+                    "`{string}` is neither a hex literal, `~wordsize`, nor a variable"
                 )))
             }
         }
@@ -998,42 +998,44 @@ fn parse_expression(value: &Value, depth: usize) -> SoldbResult<Expression> {
                 Ok((Box::new(first), Box::new(second)))
             };
             let region = || region_reference(operand);
-            match key.as_str() {
-                ".slot" => Ok(Expression::Lookup {
+            // A format term without its sigil; a key with neither is a lookup or nothing.
+            let term = format_term(key);
+            match (key.as_str(), term) {
+                (".slot", _) => Ok(Expression::Lookup {
                     property: Property::Slot,
                     region: region()?,
                 }),
-                ".offset" => Ok(Expression::Lookup {
+                (".offset", _) => Ok(Expression::Lookup {
                     property: Property::Offset,
                     region: region()?,
                 }),
-                ".length" => Ok(Expression::Lookup {
+                (".length", _) => Ok(Expression::Lookup {
                     property: Property::Length,
                     region: region()?,
                 }),
-                "$read" => Ok(Expression::Read(region()?)),
-                "$sum" => Ok(Expression::Sum(operands("$sum")?)),
-                "$product" => Ok(Expression::Product(operands("$product")?)),
-                "$difference" => {
-                    let (first, second) = pair("$difference")?;
+                (_, Some("read")) => Ok(Expression::Read(region()?)),
+                (_, Some("sum")) => Ok(Expression::Sum(operands(key)?)),
+                (_, Some("product")) => Ok(Expression::Product(operands(key)?)),
+                (_, Some("difference")) => {
+                    let (first, second) = pair(key)?;
                     Ok(Expression::Difference(first, second))
                 }
-                "$quotient" => {
-                    let (first, second) = pair("$quotient")?;
+                (_, Some("quotient")) => {
+                    let (first, second) = pair(key)?;
                     Ok(Expression::Quotient(first, second))
                 }
-                "$remainder" => {
-                    let (first, second) = pair("$remainder")?;
+                (_, Some("remainder")) => {
+                    let (first, second) = pair(key)?;
                     Ok(Expression::Remainder(first, second))
                 }
-                "$keccak256" => Ok(Expression::Keccak256(operands("$keccak256")?)),
-                "$concat" => Ok(Expression::Concat(operands("$concat")?)),
-                "$wordsized" => Ok(Expression::Resize {
+                (_, Some("keccak256")) => Ok(Expression::Keccak256(operands(key)?)),
+                (_, Some("concat")) => Ok(Expression::Concat(operands(key)?)),
+                (_, Some("wordsized")) => Ok(Expression::Resize {
                     size: None,
                     operand: Box::new(parse_expression(operand, depth + 1)?),
                 }),
-                key if key.starts_with("$sized") => {
-                    let digits = &key["$sized".len()..];
+                (_, Some(term)) if term.starts_with("sized") => {
+                    let digits = &term["sized".len()..];
                     let size = match digits.parse::<u64>() {
                         Ok(size) if size > 0 && !digits.starts_with('0') => size,
                         _ => {
@@ -1062,7 +1064,9 @@ fn region_reference(value: &Value) -> SoldbResult<String> {
     let name = value
         .as_str()
         .ok_or_else(|| SoldbError::Message("a region reference is not a string".to_owned()))?;
-    if name == "$this" || is_identifier(name) {
+    if format_term(name) == Some("this") {
+        Ok(THIS.to_owned())
+    } else if is_identifier(name) {
         Ok(name.to_owned())
     } else {
         Err(SoldbError::Message(format!(
@@ -1071,14 +1075,25 @@ fn region_reference(value: &Value) -> SoldbResult<String> {
     }
 }
 
+/// `~this`, the region an expression is part of, as region references are kept.
+const THIS: &str = "~this";
+
+/// The format's own term `text` spells, without its sigil: `~` since ethdebug/format
+/// 0.1.0-draft.2, and `$` before it, which solc 0.8.x writes. A `$` term is read as one
+/// only where a name cannot be meant: as an expression key, or as `$wordsize` and `$this`,
+/// which no compiler names a variable or a region.
+fn format_term(text: &str) -> Option<&str> {
+    text.strip_prefix('~').or_else(|| text.strip_prefix('$'))
+}
+
 /// The identifier grammar of ethdebug/format/pointer/identifier:
-/// `^[a-zA-Z_\-]+[a-zA-Z0-9$_\-]*$`.
+/// `^[a-zA-Z$_\-]+[a-zA-Z0-9$_\-]*$`, which admits every Solidity identifier.
 #[must_use]
 pub fn is_identifier(text: &str) -> bool {
     let mut chars = text.chars();
-    let starts = |c: char| c.is_ascii_alphabetic() || c == '_' || c == '-';
+    let starts = |c: char| c.is_ascii_alphabetic() || c == '_' || c == '-' || c == '$';
     match chars.next() {
-        Some(first) if starts(first) => chars.all(|c| starts(c) || c.is_ascii_digit() || c == '$'),
+        Some(first) if starts(first) => chars.all(|c| starts(c) || c.is_ascii_digit()),
         _ => false,
     }
 }
@@ -1229,7 +1244,9 @@ mod tests {
         assert!(is_identifier("balances"));
         assert!(is_identifier("_$items-data"));
         assert!(is_identifier("key1"));
-        assert!(!is_identifier("$this"));
+        // Solidity names may start with `$`; the format's own terms start with `~`.
+        assert!(is_identifier("$items"));
+        assert!(!is_identifier("~this"));
         assert!(!is_identifier("1abc"));
         assert!(!is_identifier(""));
     }
@@ -1249,7 +1266,7 @@ mod tests {
             Expression::Literal(vec![0x0a, 0x0b])
         );
         assert_eq!(
-            Expression::parse(&json!("$wordsize")).expect("wordsize"),
+            Expression::parse(&json!("~wordsize")).expect("wordsize"),
             Expression::WordSize
         );
         assert_eq!(
@@ -1257,21 +1274,36 @@ mod tests {
             Expression::Variable("key".to_owned())
         );
         assert_eq!(
-            Expression::parse(&json!({"$sized2": {"$read": "$this"}})).expect("resize"),
+            Expression::parse(&json!({"~sized2": {"~read": "~this"}})).expect("resize"),
             Expression::Resize {
                 size: Some(2),
-                operand: Box::new(Expression::Read("$this".to_owned())),
+                operand: Box::new(Expression::Read("~this".to_owned())),
             }
+        );
+        // solc 0.8.x spells the terms with `$`, as the format did before 0.1.0-draft.2.
+        assert_eq!(
+            Expression::parse(&json!({"$sized2": {"$read": "$this"}})).expect("legacy"),
+            Expression::parse(&json!({"~sized2": {"~read": "~this"}})).expect("resize")
+        );
+        assert_eq!(
+            Expression::parse(&json!({"$sum": ["$wordsize", "slot"]})).expect("legacy"),
+            Expression::parse(&json!({"~sum": ["~wordsize", "slot"]})).expect("sum")
+        );
+        // A name may start with `$` now, and a region of that name is read as one.
+        assert_eq!(
+            Expression::parse(&json!({"~read": "$member"})).expect("dollar name"),
+            Expression::Read("$member".to_owned())
         );
         for bad in [
             json!("0x0"),
             json!(-1),
-            json!({"$sum": 1}),
-            json!({"$difference": [1]}),
-            json!({"$sized0": 1}),
-            json!({"$sized01": 1}),
-            json!({"$nope": []}),
-            json!({"$read": "$that"}),
+            json!({"~sum": 1}),
+            json!({"~difference": [1]}),
+            json!({"~sized0": 1}),
+            json!({"~sized01": 1}),
+            json!({"~nope": []}),
+            json!({"~read": "~that"}),
+            json!({"$$yulLocal": "x"}),
         ] {
             assert!(Expression::parse(&bad).is_err(), "{bad} should not parse");
         }
@@ -1290,7 +1322,7 @@ mod tests {
             json!({"if": 1}),
             json!({"define": {}, "in": {"location": "storage", "slot": 1}}),
             json!({"define": {"1x": 1}, "in": {"location": "storage", "slot": 1}}),
-            json!({"template": "t", "yields": {"a": "$this"}}),
+            json!({"template": "t", "yields": {"a": "~this"}}),
             json!({"templates": {}}),
             json!({"unknown": 1}),
             json!([]),
@@ -1348,7 +1380,7 @@ mod tests {
             "for": {
                 "name": "balances",
                 "location": "storage",
-                "slot": {"$keccak256": [{"$wordsized": "key"}, {"$wordsized": "0x0a"}]}
+                "slot": {"~keccak256": [{"~wordsized": "key"}, {"~wordsized": "0x0a"}]}
             }
         }));
         let key = vec![0xab; 20];
@@ -1370,11 +1402,11 @@ mod tests {
             "expect": [],
             "for": {"group": [
                 {"name": "values-length", "location": "storage", "slot": "0x07"},
-                {"define": {"values-data": {"$keccak256": [{"$wordsized": "0x07"}]}},
+                {"define": {"values-data": {"~keccak256": [{"~wordsized": "0x07"}]}},
                  "in": {"list": {
-                    "count": {"$read": "values-length"},
+                    "count": {"~read": "values-length"},
                     "each": "values-index",
-                    "is": {"name": "values-item", "location": "storage", "slot": {"$sum": ["values-data", "values-index"]}}
+                    "is": {"name": "values-item", "location": "storage", "slot": {"~sum": ["values-data", "values-index"]}}
                  }}}
             ]}
         }));
@@ -1416,14 +1448,14 @@ mod tests {
             "expect": [],
             "for": {"group": [
                 {"name": "text-length-flag", "location": "storage", "slot": "0x09",
-                 "offset": {"$difference": ["$wordsize", "0x01"]}, "length": "0x01"},
-                {"if": {"$remainder": [{"$sum": [{"$read": "text-length-flag"}, "0x01"]}, "0x02"]},
-                 "then": {"define": {"text-length": {"$quotient": [{"$read": "text-length-flag"}, "0x02"]}},
+                 "offset": {"~difference": ["~wordsize", "0x01"]}, "length": "0x01"},
+                {"if": {"~remainder": [{"~sum": [{"~read": "text-length-flag"}, "0x01"]}, "0x02"]},
+                 "then": {"define": {"text-length": {"~quotient": [{"~read": "text-length-flag"}, "0x02"]}},
                           "in": {"name": "text", "location": "storage", "slot": "0x09", "length": "text-length"}},
                  "else": {"group": [
                     {"name": "text-long-length", "location": "storage", "slot": "0x09"},
-                    {"define": {"text-length": {"$quotient": [{"$difference": [{"$read": "text-long-length"}, "0x01"]}, "0x02"]}},
-                     "in": {"define": {"text-data": {"$keccak256": [{"$wordsized": "0x09"}]}},
+                    {"define": {"text-length": {"~quotient": [{"~difference": [{"~read": "text-long-length"}, "0x01"]}, "0x02"]}},
+                     "in": {"define": {"text-data": {"~keccak256": [{"~wordsized": "0x09"}]}},
                             "in": {"name": "text", "location": "storage", "slot": "text-data", "length": "text-length"}}}
                  ]}}
             ]}
@@ -1478,8 +1510,8 @@ mod tests {
             "expect": [],
             "for": {"list": {"count": "0x03", "each": "i", "is": {
                 "name": "item", "location": "storage",
-                "slot": {"$sum": ["0x06", {"$quotient": ["i", "0x10"]}]},
-                "offset": {"$difference": ["$wordsize", {"$product": [{"$sum": [{"$remainder": ["i", "0x10"]}, "0x01"]}, "0x02"]}]},
+                "slot": {"~sum": ["0x06", {"~quotient": ["i", "0x10"]}]},
+                "offset": {"~difference": ["~wordsize", {"~product": [{"~sum": [{"~remainder": ["i", "0x10"]}, "0x01"]}, "0x02"]}]},
                 "length": "0x02"
             }}}
         }));
@@ -1507,7 +1539,7 @@ mod tests {
             "expect": ["n"],
             "for": {"group": [
                 {"template": "slot-of", "yields": {"value": "first"}},
-                {"templates": {"local": {"expect": [], "for": {"name": "value", "location": "storage", "slot": {"$sum": [{".slot": "first"}, 1]}}}},
+                {"templates": {"local": {"expect": [], "for": {"name": "value", "location": "storage", "slot": {"~sum": [{".slot": "first"}, 1]}}}},
                  "in": {"template": "local"}}
             ]}
         }));
@@ -1622,7 +1654,7 @@ mod tests {
             "for": {"list": {"count": "0x02", "each": "i", "is": {
                 "name": "tree-children-item",
                 "location": "storage",
-                "slot": {"$sum": ["0x10", {"$product": ["i", "0x03"]}]},
+                "slot": {"~sum": ["0x10", {"~product": ["i", "0x03"]}]},
                 "length": "0x60"
             }}}
         }));
@@ -1665,22 +1697,22 @@ mod tests {
                 .slot
                 .expect("slot")
         };
-        assert_eq!(evaluate(json!({"$sum": [1, 2, 3]})), word(6));
-        assert_eq!(evaluate(json!({"$difference": [3, 5]})), word(0));
-        assert_eq!(evaluate(json!({"$product": [4, 5]})), word(20));
-        assert_eq!(evaluate(json!({"$quotient": [7, 2]})), word(3));
-        assert_eq!(evaluate(json!({"$remainder": [7, 2]})), word(1));
-        assert_eq!(evaluate(json!({"$sized1": "0xffff"})), word(0xff));
-        assert_eq!(evaluate(json!({"$concat": ["0x01", "0x02"]})), word(0x0102));
+        assert_eq!(evaluate(json!({"~sum": [1, 2, 3]})), word(6));
+        assert_eq!(evaluate(json!({"~difference": [3, 5]})), word(0));
+        assert_eq!(evaluate(json!({"~product": [4, 5]})), word(20));
+        assert_eq!(evaluate(json!({"~quotient": [7, 2]})), word(3));
+        assert_eq!(evaluate(json!({"~remainder": [7, 2]})), word(1));
+        assert_eq!(evaluate(json!({"~sized1": "0xffff"})), word(0xff));
+        assert_eq!(evaluate(json!({"~concat": ["0x01", "0x02"]})), word(0x0102));
         assert_eq!(number_bytes(0), vec![0]);
         assert_eq!(number_bytes(256), vec![1, 0]);
 
         let division = parse_template(
-            json!({"expect": [], "for": {"location": "storage", "slot": {"$quotient": [1, 0]}}}),
+            json!({"expect": [], "for": {"location": "storage", "slot": {"~quotient": [1, 0]}}}),
         );
         assert!(dereference(&division, &[], &BTreeMap::new(), &storage).is_err());
         let overflow = parse_template(
-            json!({"expect": [], "for": {"location": "storage", "slot": {"$product": [
+            json!({"expect": [], "for": {"location": "storage", "slot": {"~product": [
             "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 2]}}}),
         );
         assert!(dereference(&overflow, &[], &BTreeMap::new(), &storage).is_err());
