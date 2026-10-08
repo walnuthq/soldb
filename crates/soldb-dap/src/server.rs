@@ -1,7 +1,8 @@
 //! The Debug Adapter Protocol server.
 //!
 //! [`DapServer`] holds one debug session and maps DAP requests onto it: launching from a
-//! trace file, an inline trace, or a transaction hash plus RPC URL; setting line and
+//! trace file, an inline trace, a transaction hash plus RPC URL, or a session the host
+//! prepared in memory ([`DapServer::with_session`]); setting line and
 //! function breakpoints; reporting stack frames, scopes, and variables; and stepping by
 //! source line or by instruction, forward and backward.
 //!
@@ -59,6 +60,9 @@ pub struct DapServer {
     /// The chain to read state variables the transaction never touched from, when the
     /// session was launched against a node.
     chain: Option<ChainReader>,
+    /// Whether the host gave the session to [`DapServer::with_session`]; `launch` then
+    /// serves it and ignores its arguments.
+    prepared: bool,
     terminated: bool,
 }
 
@@ -119,6 +123,7 @@ impl Default for DapServer {
             reported_frame_arguments: false,
             reported_inferred_locals: false,
             chain: None,
+            prepared: false,
             terminated: false,
         }
     }
@@ -128,6 +133,78 @@ impl DapServer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A server whose session is a trace and contract debug info the host built in
+    /// memory, as `forge test --debug` does. `launch` serves it whatever its arguments.
+    /// Relative source paths are reported to the editor under `root`.
+    #[must_use]
+    pub fn with_session(
+        trace: TransactionTrace,
+        contracts: Vec<ContractDebugInfo>,
+        root: &Path,
+    ) -> Self {
+        let mut server = Self::default();
+        for contract in &contracts {
+            server.sources.push(LoadedSource {
+                root: root.to_path_buf(),
+                source_files: BTreeMap::new(),
+                contract: contract.clone(),
+            });
+        }
+        server.debugger.load_trace(trace);
+        server.debugger.attach_debug_info(contracts);
+        server.prepared = true;
+        server
+    }
+
+    /// Answers DAP requests read from `reader` on `writer` until the client disconnects
+    /// or the input ends.
+    pub fn serve<R: Read, W: Write>(&mut self, mut reader: R, mut writer: W) -> SoldbResult<()> {
+        let mut buffer = Vec::<u8>::new();
+        let mut chunk = [0_u8; 8192];
+
+        loop {
+            let bytes_read = reader.read(&mut chunk).map_err(|error| {
+                SoldbError::Message(format!("failed to read DAP input: {error}"))
+            })?;
+            if bytes_read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..bytes_read]);
+
+            loop {
+                match decode_dap_frame(&buffer) {
+                    Ok((message, consumed)) => {
+                        buffer.drain(..consumed);
+                        for response in self.handle_message(&message) {
+                            let frame = encode_dap_frame(&response).map_err(|error| {
+                                SoldbError::Message(format!(
+                                    "failed to encode DAP response: {error}"
+                                ))
+                            })?;
+                            writer.write_all(&frame).map_err(|error| {
+                                SoldbError::Message(format!(
+                                    "failed to write DAP response: {error}"
+                                ))
+                            })?;
+                        }
+                        writer.flush().map_err(|error| {
+                            SoldbError::Message(format!("failed to flush DAP response: {error}"))
+                        })?;
+                        if self.is_terminated() {
+                            return Ok(());
+                        }
+                    }
+                    Err(DapFrameError::MissingHeaderEnd | DapFrameError::IncompleteBody { .. }) => {
+                        break;
+                    }
+                    Err(error) => return Err(frame_error(error)),
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[must_use]
@@ -205,6 +282,15 @@ impl DapServer {
                         "output",
                         Some(json!({"category": "stdout", "output": format!("{summary}\n")})),
                     ));
+                    if self.prepared {
+                        messages.push(self.event(
+                            "output",
+                            Some(json!({
+                                "category": "console",
+                                "output": "soldb: the host prepared this session; launch arguments are not read\n",
+                            })),
+                        ));
+                    }
                     messages.push(self.event(
                         "stopped",
                         Some(json!({"reason": "entry", "threadId": self.thread_id})),
@@ -217,6 +303,9 @@ impl DapServer {
     }
 
     fn load_launch_arguments(&mut self, arguments: Option<&Value>) -> SoldbResult<Option<String>> {
+        if self.prepared {
+            return Ok(self.debugger.trace().map(loaded_summary));
+        }
         let args = arguments.cloned().unwrap_or_else(|| json!({}));
         let contracts_file = string_arg(&args, &["contracts"]);
         let ethdebug_dir = string_arg(&args, &["ethdebugDir", "ethdebugPath", "debugDir"]);
@@ -279,11 +368,7 @@ impl DapServer {
             return Ok(None);
         };
 
-        let step_count = trace.steps.len();
-        let tx_hash = trace
-            .tx_hash
-            .clone()
-            .unwrap_or_else(|| "simulation".to_owned());
+        let summary = loaded_summary(&trace);
         self.debugger.load_trace(trace);
         if !self.sources.is_empty() {
             let mut contracts = Vec::new();
@@ -293,9 +378,7 @@ impl DapServer {
             self.debugger.attach_debug_info(contracts);
         }
         self.register_pending_breakpoints();
-        Ok(Some(format!(
-            "Loaded {tx_hash} with {step_count} EVM steps"
-        )))
+        Ok(Some(summary))
     }
 
     /// Whether breakpoints can be resolved now: a trace with debug info is loaded.
@@ -921,48 +1004,13 @@ impl DapServer {
     }
 }
 
-pub fn run_stdio_server<R: Read, W: Write>(mut reader: R, mut writer: W) -> SoldbResult<()> {
-    let mut server = DapServer::new();
-    let mut buffer = Vec::<u8>::new();
-    let mut chunk = [0_u8; 8192];
+pub fn run_stdio_server<R: Read, W: Write>(reader: R, writer: W) -> SoldbResult<()> {
+    DapServer::new().serve(reader, writer)
+}
 
-    loop {
-        let bytes_read = reader
-            .read(&mut chunk)
-            .map_err(|error| SoldbError::Message(format!("Failed to read DAP input: {error}")))?;
-        if bytes_read == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..bytes_read]);
-
-        loop {
-            match decode_dap_frame(&buffer) {
-                Ok((message, consumed)) => {
-                    buffer.drain(..consumed);
-                    for response in server.handle_message(&message) {
-                        let frame = encode_dap_frame(&response).map_err(|error| {
-                            SoldbError::Message(format!("Failed to encode DAP response: {error}"))
-                        })?;
-                        writer.write_all(&frame).map_err(|error| {
-                            SoldbError::Message(format!("Failed to write DAP response: {error}"))
-                        })?;
-                    }
-                    writer.flush().map_err(|error| {
-                        SoldbError::Message(format!("Failed to flush DAP response: {error}"))
-                    })?;
-                    if server.is_terminated() {
-                        return Ok(());
-                    }
-                }
-                Err(DapFrameError::MissingHeaderEnd | DapFrameError::IncompleteBody { .. }) => {
-                    break;
-                }
-                Err(error) => return Err(frame_error(error)),
-            }
-        }
-    }
-
-    Ok(())
+fn loaded_summary(trace: &TransactionTrace) -> String {
+    let tx_hash = trace.tx_hash.as_deref().unwrap_or("simulation");
+    format!("Loaded {tx_hash} with {} EVM steps", trace.steps.len())
 }
 
 fn instruction_granularity(request: &DapMessage) -> bool {
@@ -1000,7 +1048,7 @@ fn normalize_source_key(input: &str) -> String {
 }
 
 fn frame_error(error: DapFrameError) -> SoldbError {
-    SoldbError::Message(format!("Invalid DAP frame: {error:?}"))
+    SoldbError::Message(format!("invalid DAP frame: {error:?}"))
 }
 
 /// Loads every contract a mapping file names, as `soldb trace --contracts` does.
@@ -1056,7 +1104,7 @@ mod tests {
 
     use crate::{decode_dap_frame, encode_dap_frame, DapMessage};
 
-    use super::{run_stdio_server, DapServer, MEMORY_REF, STACK_REF, STORAGE_REF};
+    use super::{run_stdio_server, DapServer, LoadedSource, MEMORY_REF, STACK_REF, STORAGE_REF};
 
     #[test]
     fn handles_initialize_and_threads() {
@@ -1459,6 +1507,97 @@ mod tests {
         assert_eq!(
             last["source"]["path"],
             temp.join("caller").join("Caller.sol").display().to_string()
+        );
+    }
+
+    #[test]
+    fn serves_a_session_prepared_in_memory() {
+        let temp = temp_dir("soldb-dap-prepared");
+        let caller = "0xaaaa000000000000000000000000000000000001";
+        let callee = "0xbbbb000000000000000000000000000000000002";
+        write_contract(
+            &temp.join("caller"),
+            "Caller",
+            "contract Caller {\n  function run() public {\n    callee.go();\n  }\n}\n",
+            "callee.go();",
+            "CALL",
+        );
+        write_contract(
+            &temp.join("callee"),
+            "Callee",
+            "contract Callee {\n  function go() public {\n    value = 1;\n  }\n}\n",
+            "value = 1;",
+            "SSTORE",
+        );
+        let caller_source =
+            LoadedSource::load(&temp.join("caller"), "Caller", Some(caller)).expect("load caller");
+        let callee_source =
+            LoadedSource::load(&temp.join("callee"), "Callee", Some(callee)).expect("load callee");
+        let contracts = vec![caller_source.contract, callee_source.contract];
+
+        let callee_word = format!("0x{:0>64}", callee.trim_start_matches("0x"));
+        let call_stack = [
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            "0x0",
+            callee_word.as_str(),
+            "0x0",
+        ];
+        let mut trace = sample_trace();
+        trace.to_addr = Some(caller.to_owned());
+        trace.steps = vec![
+            trace_step(0, 1, "PUSH1", &[]),
+            trace_step(2, 1, "CALL", &call_stack),
+            trace_step(0, 2, "PUSH1", &[]),
+            trace_step(2, 2, "SSTORE", &[]),
+            trace_step(3, 1, "STOP", &[]),
+        ];
+
+        let root = temp.join("project");
+        let mut server = DapServer::with_session(trace, contracts, &root);
+
+        let set_breakpoints = DapMessage::request(
+            1,
+            "setBreakpoints",
+            Some(json!({
+                "source": {"path": "Callee.sol"},
+                "breakpoints": [{"line": 3}]
+            })),
+        );
+        let body = server.handle_message(&set_breakpoints)[0]
+            .body
+            .clone()
+            .expect("body");
+        assert_eq!(body["breakpoints"][0]["verified"], true, "{body}");
+
+        // The host's session wins over whatever the editor's launch configuration names.
+        let launch = DapMessage::request(
+            2,
+            "launch",
+            Some(json!({"transactionHash": null, "ethdebugDir": "/nonexistent"})),
+        );
+        let messages = server.handle_message(&launch);
+        assert_eq!(messages[0].success, Some(true));
+        assert_eq!(
+            messages[2].body.as_ref().expect("body")["output"],
+            "soldb: the host prepared this session; launch arguments are not read\n"
+        );
+        assert_eq!(messages[3].body.as_ref().expect("body")["reason"], "entry");
+
+        let messages = server.handle_message(&DapMessage::request(3, "continue", None));
+        assert_eq!(
+            messages[1].body.as_ref().expect("body")["reason"],
+            "breakpoint"
+        );
+
+        let messages = server.handle_message(&DapMessage::request(4, "stackTrace", None));
+        let top = &messages[0].body.as_ref().expect("body")["stackFrames"][0];
+        assert_eq!(top["line"], 3);
+        assert_eq!(
+            top["source"]["path"],
+            root.join("Callee.sol").display().to_string()
         );
     }
 

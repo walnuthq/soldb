@@ -240,10 +240,10 @@ DAP | JSON answers | WASM`.
   or removing one is a breaking change (see JSON Output Contract).
 - The crates listed in `WASM_CRATES` in the `Makefile` must keep building for
   `wasm32-unknown-unknown` and do no I/O of their own: no sockets, no processes, no files.
-  The `wasm` CI job lints them on that target, checks `soldb-evm`/`soldb-rpc`/`soldb-wasm`
-  without their `replay` feature, and builds and tests both `soldb-wasm` packages; a
-  frontend that runs where I/O is unavailable — the browser bindings today, a
-  DAP-over-HTTP server next — depends on this. `std::net`/`std::process`/`std::fs` compile
+  The `wasm` CI job lints them on that target, checks `soldb-evm`/`soldb-rpc`/
+  `soldb-dap`/`soldb-wasm` without their `replay` feature, and builds and tests both
+  `soldb-wasm` packages; a frontend that runs where I/O is unavailable — the browser
+  bindings today, a DAP-over-HTTP server next — depends on this. `std::net`/`std::process`/`std::fs` compile
   there but fail at runtime, so a host does the I/O and hands results over as strings;
   nothing reachable from a `soldb-wasm` export may open a socket, spawn a process, or read
   a file. `make wasm` builds both packages and fails when either exceeds its budget

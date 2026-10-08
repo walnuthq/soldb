@@ -74,8 +74,8 @@ lit-test:
 wasm-check:
 	cargo clippy --target $(WASM_TARGET) $(addprefix -p ,$(WASM_CRATES)) -- -D warnings
 	cargo clippy --target $(WASM_TARGET) -p soldb-evm -p soldb-wasm --no-default-features -- -D warnings
-	cargo clippy -p soldb-evm -p soldb-rpc -p soldb-wasm --no-default-features --all-targets -- -D warnings
-	cargo test -p soldb-evm -p soldb-rpc -p soldb-wasm --no-default-features
+	cargo clippy -p soldb-evm -p soldb-rpc -p soldb-dap -p soldb-wasm --no-default-features --all-targets -- -D warnings
+	cargo test -p soldb-evm -p soldb-rpc -p soldb-dap -p soldb-wasm --no-default-features
 
 wasm: wasm-lean wasm-replay
 

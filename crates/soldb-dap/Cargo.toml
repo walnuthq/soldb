@@ -13,6 +13,12 @@ categories = ["development-tools::debugging", "command-line-utilities"]
 [lib]
 doctest = false
 
+[features]
+default = ["replay"]
+# Lets a `transactionHash` launch replay the transaction in REVM when the node has no
+# `debug_traceTransaction`. A host that brings its own trace turns it off and links no REVM.
+replay = ["soldb-rpc/replay"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
