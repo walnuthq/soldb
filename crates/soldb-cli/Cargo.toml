@@ -29,7 +29,7 @@ soldb-debugger.workspace = true
 soldb-ethdebug.workspace = true
 soldb-profiler.workspace = true
 soldb-repl.workspace = true
-soldb-rpc.workspace = true
+soldb-rpc = { workspace = true, features = ["replay"] }
 soldb-tui.workspace = true
 
 [lints]

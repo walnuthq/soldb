@@ -5,7 +5,9 @@
 //! SolDB debug session: breakpoints, stack frames, scopes, variables, and stepping.
 //!
 //! A session is launched from a trace file, an inline trace, or a transaction hash plus
-//! an RPC URL. Source mapping and variable decoding come from `soldb-ethdebug` and
+//! an RPC URL, or a host that already holds the trace and its contracts' debug info
+//! starts one in memory with [`DapServer::with_session`] and serves it with
+//! [`DapServer::serve`]. Source mapping and variable decoding come from `soldb-ethdebug` and
 //! `soldb-debugger`, the same path the terminal debugger uses, so an editor and the CLI
 //! report the same values.
 
