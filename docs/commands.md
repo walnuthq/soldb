@@ -39,9 +39,9 @@ soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir 0x5fbd…:Counte
 
 With `--json`, every answer is one JSON object per line, tagged by `kind` (`stop`,
 `variables`, `variable`, `backtrace`, `stack`, `memory`, `storage`, `transient_storage`,
-`breakpoint`, `message`, …), with the same fields the text shows and the raw words
-alongside the decoded values, so a tool or an agent reads the session instead of scraping
-it:
+`return_data`, `breakpoint`, `message`, …), with the same fields the text shows and the
+raw words alongside the decoded values, so a tool or an agent reads the session instead
+of scraping it:
 
 ```console
 soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir … -x 'break Counter.sol:12' -x continue -x vars --batch --json
@@ -486,6 +486,24 @@ when the trace carries no transient storage.
 
 Print the calldata of the current frame: the transaction input at the root, or the
 recorded call's input in a nested frame when the backend recorded calls.
+
+### `returndata`
+
+Print the return data buffer at the current step: what the frame's last call or create
+returned or reverted with, which `RETURNDATASIZE` and `RETURNDATACOPY` read.
+
+```text
+soldb> returndata
+Return data: 32 bytes
+0x000000000000000000000000000000000000000000000000000000000000002a
+```
+
+The buffer is empty until the frame makes a call, and each call replaces it; after a
+reverted call it holds the revert data, such as an `Error(string)`. The debug-rpc backend
+asks the node for it with `enableReturnData`, and the replay backend reads it from the
+interpreter. Says so when the trace carries no return data; a trace with no call at all
+has an empty buffer throughout. The full-screen view shows it under the memory, and the
+DAP server as a `Return Data` scope.
 
 ## Variables
 

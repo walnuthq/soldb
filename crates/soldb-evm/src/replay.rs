@@ -34,7 +34,7 @@ use revm::database::{Cache, CacheDB, WrapDatabaseRef};
 use revm::database_interface::DBErrorMarker;
 use revm::inspector::inspectors::GasInspector;
 use revm::inspector::JournalExt;
-use revm::interpreter::interpreter_types::{Jumps, LoopControl, MemoryTr};
+use revm::interpreter::interpreter_types::{Jumps, LoopControl, MemoryTr, ReturnData};
 use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Interpreter,
 };
@@ -113,6 +113,7 @@ fn replay_capabilities(chain_id: u64) -> TraceCapabilities {
         gas_details: true,
         account_changes: true,
         transient_storage: true,
+        return_data: true,
         notes: replay_chain_support(chain_id).unwrap_or_default(),
     }
 }
@@ -1596,11 +1597,25 @@ struct ReplayStepInspector {
     words: WordInterner,
     /// The storage every log starts from; a log that touches a slot gets its own map.
     empty_storage: Arc<BTreeMap<String, String>>,
+    /// The return data buffer as of the last step that saw it change, shared like memory.
+    last_return_data: Option<(Bytes, Arc<str>)>,
 }
 
 impl ReplayStepInspector {
     fn into_parts(self) -> (Vec<StructLog>, TraceArtifacts) {
         (self.struct_logs, self.artifacts)
+    }
+
+    /// `buffer` as hex, the same `Arc` as the last step's while it is unchanged.
+    fn return_data_hex(&mut self, buffer: &Bytes) -> Arc<str> {
+        if let Some((last, hex)) = &self.last_return_data {
+            if last == buffer {
+                return Arc::clone(hex);
+            }
+        }
+        let hex = Arc::<str>::from(bytes_to_hex(buffer));
+        self.last_return_data = Some((buffer.clone(), Arc::clone(&hex)));
+        hex
     }
 }
 
@@ -1642,6 +1657,7 @@ where
                 });
             }
         }
+        let return_data = self.return_data_hex(interp.return_data.buffer());
         self.pending = Some(StructLog {
             pc: interp.bytecode.pc() as u64,
             op,
@@ -1652,6 +1668,7 @@ where
             memory: Arc::clone(&self.last_memory_words),
             storage: Arc::clone(&self.empty_storage),
             error: None,
+            return_data: Some(return_data),
         });
     }
 

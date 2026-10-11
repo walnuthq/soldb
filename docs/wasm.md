@@ -151,7 +151,7 @@ const file = async (path) => (await fetch(path)).text();
 
 const txHash = "0x…";
 const trace = Trace.fromTransaction(
-  await text("debug_traceTransaction", [txHash, { enableMemory: true, disableStorage: false }]),
+  await text("debug_traceTransaction", [txHash, { enableMemory: true, enableReturnData: true, disableStorage: false }]),
   await text("eth_getTransactionByHash", [txHash]),
   await text("eth_getTransactionReceipt", [txHash]),
 );

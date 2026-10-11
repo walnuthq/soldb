@@ -239,6 +239,11 @@ impl Renderer {
                 format!("{} {} bytes", self.info("Calldata:"), self.number(bytes)),
                 data.clone(),
             ],
+            Output::ReturnData { bytes: 0, .. } => vec![self.dim("Return data: empty.")],
+            Output::ReturnData { bytes, data } => vec![
+                format!("{} {} bytes", self.info("Return data:"), self.number(bytes)),
+                data.clone(),
+            ],
             Output::Variables {
                 warning,
                 pc,
@@ -554,6 +559,25 @@ mod tests {
                 slots: Vec::new(),
             }),
             "Transient storage: nothing read or written yet; every slot is zero.\n"
+        );
+    }
+
+    #[test]
+    fn return_data_is_its_size_and_hex_or_says_it_is_empty() {
+        let renderer = Renderer::new(false);
+        assert_eq!(
+            renderer.render(&Output::ReturnData {
+                bytes: 1,
+                data: "0x2a".to_owned()
+            }),
+            "Return data: 1 bytes\n0x2a\n"
+        );
+        assert_eq!(
+            renderer.render(&Output::ReturnData {
+                bytes: 0,
+                data: "0x".to_owned()
+            }),
+            "Return data: empty.\n"
         );
     }
 

@@ -99,6 +99,13 @@ pub struct StructLog {
     pub storage: Arc<BTreeMap<String, String>>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The return data buffer before this step; `None` when the node did not report it.
+    #[serde(
+        rename = "returnData",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub return_data: Option<Arc<str>>,
 }
 
 /// Joins a `structLogs` memory array into one unprefixed hex string.
@@ -171,6 +178,7 @@ impl StructLog {
                 storage: self.shared_storage(previous.map(|(_, step)| step)),
                 storage_diff,
                 transient_storage: BTreeMap::new(),
+                return_data: self.shared_return_data(previous.map(|(_, step)| step)),
             },
         )
     }
@@ -185,6 +193,7 @@ impl StructLog {
     ) -> TraceStep {
         let memory = self.shared_memory(previous);
         let storage = self.shared_storage(previous.map(|(_, step)| step));
+        let return_data = self.shared_return_data(previous.map(|(_, step)| step));
         let storage_diff = if self.storage.is_empty() {
             BTreeMap::new()
         } else {
@@ -203,6 +212,7 @@ impl StructLog {
                 storage,
                 storage_diff,
                 transient_storage: BTreeMap::new(),
+                return_data,
             },
         )
     }
@@ -216,6 +226,25 @@ impl StructLog {
             }
             _ => Arc::clone(&self.storage),
         }
+    }
+
+    /// This log's return data as unprefixed lowercase hex, shared with the previous step's
+    /// when equal; `None` when empty.
+    fn shared_return_data(&self, previous: Option<&TraceStep>) -> Option<Arc<str>> {
+        let reported = self.return_data.as_deref()?;
+        let digits = reported
+            .strip_prefix("0x")
+            .or_else(|| reported.strip_prefix("0X"))
+            .unwrap_or(reported);
+        if digits.is_empty() {
+            return None;
+        }
+        if let Some(shared) = previous.and_then(|step| step.snapshot.return_data.as_ref()) {
+            if shared.eq_ignore_ascii_case(digits) {
+                return Some(Arc::clone(shared));
+            }
+        }
+        Some(Arc::from(digits.to_ascii_lowercase()))
     }
 
     #[must_use]
@@ -351,6 +380,11 @@ fn share_unchanged(previous: &StructLog, log: &mut StructLog) {
     if !Arc::ptr_eq(&previous.storage, &log.storage) && *previous.storage == *log.storage {
         log.storage = Arc::clone(&previous.storage);
     }
+    if let (Some(previous_data), Some(data)) = (&previous.return_data, &log.return_data) {
+        if !Arc::ptr_eq(previous_data, data) && **previous_data == **data {
+            log.return_data = Some(Arc::clone(previous_data));
+        }
+    }
 }
 
 /// Fills `transient_storage` on each `TLOAD` and `TSTORE` from the stack, for every backend.
@@ -382,6 +416,14 @@ fn record_transient_storage(steps: &mut [TraceStep]) {
         let touched = BTreeMap::from([(normalize_storage_key(slot), normalize_storage_key(value))]);
         steps[index].snapshot.transient_storage = touched;
     }
+}
+
+/// Whether an opcode can leave data in its frame's return data buffer.
+fn fills_return_data(op: &str) -> bool {
+    matches!(
+        op,
+        "CALL" | "CALLCODE" | "DELEGATECALL" | "STATICCALL" | "CREATE" | "CREATE2"
+    )
 }
 
 /// A slot or word as `0x`-prefixed lowercase hex without leading zeros.
@@ -656,6 +698,15 @@ pub(crate) fn simulation_trace(
 fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
     let has_steps = !result.struct_logs.is_empty();
     let has_stack = result.struct_logs.iter().any(|log| !log.stack.is_empty());
+    // Without a call or a create the buffer is empty throughout, reported or not.
+    let has_return_data = result
+        .struct_logs
+        .iter()
+        .any(|log| log.return_data.is_some())
+        || !result
+            .struct_logs
+            .iter()
+            .any(|log| fills_return_data(&log.op));
     let has_storage = result
         .struct_logs
         .iter()
@@ -694,6 +745,7 @@ fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
         account_changes: false,
         // Read off the stack, so only as complete as the stacks the node returned.
         transient_storage: has_stack,
+        return_data: has_steps && has_return_data,
         notes,
     }
 }
@@ -1111,6 +1163,41 @@ mod tests {
     }
 
     #[test]
+    fn return_data_comes_from_the_node_and_is_claimed_only_when_reported() {
+        let debug_result: DebugTraceResult = serde_json::from_value(json!({
+            "structLogs": [
+                {"pc": 0, "op": "STATICCALL", "gas": 0, "gasCost": 0, "depth": 1, "returnData": "0x"},
+                {"pc": 0, "op": "STOP", "gas": 0, "gasCost": 0, "depth": 2, "returnData": "0x"},
+                {"pc": 1, "op": "RETURNDATASIZE", "gas": 0, "gasCost": 2, "depth": 1, "returnData": "0x002A"},
+                {"pc": 2, "op": "POP", "gas": 0, "gasCost": 2, "depth": 1, "returnData": "0x002A"}
+            ]
+        }))
+        .expect("debug result");
+
+        for steps in [debug_result.steps(), debug_result.clone().into_steps()] {
+            assert_eq!(
+                steps[0].snapshot.return_data, None,
+                "an empty buffer is None"
+            );
+            assert_eq!(steps[2].snapshot_ref().return_data, Some("002a"));
+            let shared = |index: usize| steps[index].snapshot.return_data.as_ref().expect("data");
+            assert!(Arc::ptr_eq(shared(2), shared(3)));
+        }
+        assert!(debug_rpc_capabilities(&debug_result).return_data);
+
+        // A call the node said nothing about leaves the buffer unknown; with no call at
+        // all it is empty throughout.
+        let unreported = |op: &str| -> DebugTraceResult {
+            serde_json::from_value(json!({
+                "structLogs": [{"pc": 0, "op": op, "gas": 0, "gasCost": 0, "depth": 1}]
+            }))
+            .expect("debug result")
+        };
+        assert!(!debug_rpc_capabilities(&unreported("CALL")).return_data);
+        assert!(debug_rpc_capabilities(&unreported("ADD")).return_data);
+    }
+
+    #[test]
     fn storage_diff_capability_matches_the_materialized_steps() {
         // `debug_rpc_capabilities` reads the storage-diff flag off the raw logs instead of
         // building every step. Pin it against the definition it replaces.
@@ -1129,6 +1216,7 @@ mod tests {
                     .collect(),
             ),
             error: None,
+            return_data: None,
         };
 
         let cases = [
@@ -1187,6 +1275,7 @@ mod tests {
             memory: Arc::new(memory.iter().map(|word| (*word).to_owned()).collect()),
             storage: Arc::new(BTreeMap::from([("0x0".to_owned(), slot_value.to_owned())])),
             error: None,
+            return_data: None,
         };
         let result = DebugTraceResult {
             struct_logs: vec![

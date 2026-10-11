@@ -47,6 +47,8 @@ pub enum DebuggerCommand {
     },
     /// The calldata of the current call frame.
     Calldata,
+    /// The return data buffer at the current step.
+    ReturnData,
     /// The stack at the current step, all of it or the top `limit` words.
     Stack {
         limit: Option<usize>,
@@ -347,6 +349,17 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: CommandGroup::Inspection,
     },
     CommandSpec {
+        name: "returndata",
+        aliases: &[],
+        usage: "returndata",
+        summary: "the return data buffer at the current step",
+        details: &[
+            "What the frame's last call or create returned or reverted with, which",
+            "`RETURNDATASIZE` and `RETURNDATACOPY` read. Empty until the frame makes a call.",
+        ],
+        group: CommandGroup::Inspection,
+    },
+    CommandSpec {
         name: "vars",
         aliases: &["locals"],
         usage: "vars",
@@ -446,6 +459,7 @@ impl DebuggerCommand {
             "list" => Self::List,
             "memory" => parse_memory_command(&rest).unwrap_or_else(unknown),
             "calldata" => Self::Calldata,
+            "returndata" => Self::ReturnData,
             "stack" => {
                 if rest.is_empty() {
                     Self::Stack { limit: None }

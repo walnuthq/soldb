@@ -314,6 +314,11 @@ impl View {
                 .collect(),
             other => text_lines(&renderer, &other),
         };
+        if let Output::ReturnData { bytes, data } = session.return_data() {
+            if bytes > 0 {
+                self.memory.extend(return_data_lines(bytes, &data));
+            }
+        }
         self.backtrace = text_lines(&renderer, &session.backtrace());
         self.refresh_opcodes(session);
         if self.follow {
@@ -700,6 +705,22 @@ fn pane_index(pane: Pane) -> usize {
 
 fn dim(text: String) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+}
+
+/// The return data buffer under the memory, in 32-byte words like memory.
+fn return_data_lines(bytes: usize, data: &str) -> Vec<Line<'static>> {
+    let digits = data.trim_start_matches("0x").chars().collect::<Vec<_>>();
+    let mut lines = vec![dim(format!("return data, {bytes} bytes:"))];
+    for (index, word) in digits.chunks(64).enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("0x{:04x}: ", index * 32),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(word.iter().collect::<String>()),
+        ]));
+    }
+    lines
 }
 
 fn variable_line(ty: &str, name: &str, value: &str, place: Option<&str>) -> Line<'static> {

@@ -116,6 +116,7 @@ impl TraceStep {
                 storage: &self.snapshot.storage,
                 storage_diff: &self.snapshot.storage_diff,
                 transient_storage: &self.snapshot.transient_storage,
+                return_data: self.snapshot.return_data.as_deref(),
             };
         }
         StepSnapshotRef {
@@ -124,6 +125,7 @@ impl TraceStep {
             storage: self.storage.as_ref().unwrap_or(&EMPTY_STORAGE),
             storage_diff: &EMPTY_STORAGE_DIFF,
             transient_storage: &EMPTY_STORAGE,
+            return_data: None,
         }
     }
 
@@ -146,6 +148,7 @@ impl TraceStep {
                 storage: Arc::new(self.storage.take().unwrap_or_default()),
                 storage_diff: BTreeMap::new(),
                 transient_storage: BTreeMap::new(),
+                return_data: None,
             };
         } else {
             self.stack = Vec::new();
@@ -295,6 +298,8 @@ pub struct StepSnapshotRef<'a> {
     pub storage_diff: &'a BTreeMap<String, StorageChange>,
     #[serde(skip_serializing_if = "is_empty_ref")]
     pub transient_storage: &'a BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_data: Option<&'a str>,
 }
 
 fn is_empty_ref(map: &&BTreeMap<String, String>) -> bool {
@@ -311,6 +316,7 @@ impl StepSnapshotRef<'_> {
             storage: Arc::new(self.storage.clone()),
             storage_diff: self.storage_diff.clone(),
             transient_storage: self.transient_storage.clone(),
+            return_data: self.return_data.map(Arc::from),
         }
     }
 }
@@ -331,6 +337,8 @@ pub struct StepSnapshot {
     pub storage_diff: BTreeMap<String, StorageChange>,
     /// The transient slots this step read or wrote, with their value after it.
     pub transient_storage: BTreeMap<String, String>,
+    /// The return data buffer before this step, as unprefixed hex; `None` when empty.
+    pub return_data: Option<Arc<str>>,
 }
 
 impl StepSnapshot {
@@ -348,6 +356,7 @@ impl StepSnapshot {
             storage: Arc::new(storage),
             storage_diff,
             transient_storage: BTreeMap::new(),
+            return_data: None,
         }
     }
 
@@ -358,6 +367,13 @@ impl StepSnapshot {
         self
     }
 
+    /// The same snapshot with `return_data` set; empty data is stored as `None`.
+    #[must_use]
+    pub fn with_return_data(mut self, return_data: Option<String>) -> Self {
+        self.return_data = return_data.filter(|data| !data.is_empty()).map(Arc::from);
+        self
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
@@ -365,12 +381,13 @@ impl StepSnapshot {
             && self.storage.is_empty()
             && self.storage_diff.is_empty()
             && self.transient_storage.is_empty()
+            && self.return_data.is_none()
     }
 }
 
 impl Serialize for StepSnapshot {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("StepSnapshot", 5)?;
+        let mut state = serializer.serialize_struct("StepSnapshot", 6)?;
         state.serialize_field("stack", &self.stack)?;
         state.serialize_field("memory", &self.memory.as_deref())?;
         state.serialize_field("storage", &*self.storage)?;
@@ -380,6 +397,11 @@ impl Serialize for StepSnapshot {
             state.skip_field("transient_storage")?;
         } else {
             state.serialize_field("transient_storage", &self.transient_storage)?;
+        }
+        if self.return_data.is_none() {
+            state.skip_field("return_data")?;
+        } else {
+            state.serialize_field("return_data", &self.return_data.as_deref())?;
         }
         state.end()
     }
@@ -397,12 +419,15 @@ struct StepSnapshotRepr {
     storage_diff: BTreeMap<String, StorageChange>,
     #[serde(default)]
     transient_storage: BTreeMap<String, String>,
+    #[serde(default)]
+    return_data: Option<String>,
 }
 
 impl From<StepSnapshotRepr> for StepSnapshot {
     fn from(repr: StepSnapshotRepr) -> Self {
         Self::new(repr.stack, repr.memory, repr.storage, repr.storage_diff)
             .with_transient_storage(repr.transient_storage)
+            .with_return_data(repr.return_data)
     }
 }
 
@@ -511,7 +536,7 @@ fn deserialize_shared_steps<'de, D: Deserializer<'de>>(
     deserializer.deserialize_seq(SharedSteps)
 }
 
-/// Points `step`'s memory and storage at `previous`'s when the values are equal.
+/// Points `step`'s memory, storage, and return data at `previous`'s when they are equal.
 fn share_snapshot(previous: &TraceStep, step: &mut TraceStep) {
     let previous = &previous.snapshot;
     let current = &mut step.snapshot;
@@ -522,6 +547,12 @@ fn share_snapshot(previous: &TraceStep, step: &mut TraceStep) {
     }
     if !Arc::ptr_eq(&previous.storage, &current.storage) && *previous.storage == *current.storage {
         current.storage = Arc::clone(&previous.storage);
+    }
+    if let (Some(previous_data), Some(current_data)) = (&previous.return_data, &current.return_data)
+    {
+        if !Arc::ptr_eq(previous_data, current_data) && **previous_data == **current_data {
+            current.return_data = Some(Arc::clone(previous_data));
+        }
     }
 }
 
@@ -574,6 +605,9 @@ pub struct TraceCapabilities {
     /// Every `TLOAD`/`TSTORE` since the transaction began carries `transient_storage`.
     #[serde(default)]
     pub transient_storage: bool,
+    /// Every step carries the return data buffer it starts with.
+    #[serde(default)]
+    pub return_data: bool,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -869,6 +903,7 @@ mod tests {
                 storage: Arc::clone(&step.snapshot.storage),
                 storage_diff: BTreeMap::new(),
                 transient_storage: BTreeMap::new(),
+                return_data: None,
             },
         );
         assert!(Arc::ptr_eq(
@@ -927,6 +962,78 @@ mod tests {
         let capabilities: TraceCapabilities =
             serde_json::from_str(r#"{"stack":true}"#).expect("capabilities");
         assert!(!capabilities.transient_storage);
+    }
+
+    #[test]
+    fn return_data_is_written_only_where_the_buffer_holds_some() {
+        let snapshot = || {
+            StepSnapshot::new(
+                vec![Arc::from("0x1")],
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+        let empty = TraceStep::new(
+            0,
+            Arc::from("CALL"),
+            1,
+            1,
+            1,
+            None,
+            snapshot().with_return_data(Some(String::new())),
+        );
+        assert!(empty.snapshot.return_data.is_none());
+        let json = serde_json::to_value(&empty).expect("json");
+        assert!(json["snapshot"].get("return_data").is_none());
+
+        let filled = TraceStep::new(
+            1,
+            Arc::from("RETURNDATASIZE"),
+            1,
+            2,
+            1,
+            None,
+            snapshot().with_return_data(Some("2a".to_owned())),
+        );
+        let json = serde_json::to_value(&filled).expect("json");
+        assert_eq!(json["snapshot"]["return_data"], "2a");
+        assert_eq!(
+            serde_json::to_value(filled.snapshot_ref()).expect("borrowed"),
+            json["snapshot"]
+        );
+        let restored: TraceStep = serde_json::from_value(json).expect("step");
+        assert_eq!(restored, filled);
+        assert_eq!(restored.snapshot_ref().return_data, Some("2a"));
+
+        // Consecutive steps read back from a file share one copy of the buffer.
+        let mut trace = TransactionTrace {
+            tx_hash: None,
+            from_addr: "0x1".to_owned(),
+            to_addr: None,
+            value: "0x0".to_owned(),
+            input_data: "0x".to_owned(),
+            gas_used: 0,
+            output: "0x".to_owned(),
+            success: true,
+            error: None,
+            debug_trace_available: true,
+            contract_address: None,
+            backend: None,
+            capabilities: TraceCapabilities::default(),
+            artifacts: TraceArtifacts::default(),
+            steps: vec![filled.clone(), filled],
+        };
+        trace = serde_json::from_str(&serde_json::to_string(&trace).expect("json")).expect("trace");
+        let data = |index: usize| {
+            trace.steps[index]
+                .snapshot
+                .return_data
+                .as_ref()
+                .expect("data")
+        };
+        assert!(Arc::ptr_eq(data(0), data(1)));
+        assert!(!trace.capabilities.return_data);
     }
 
     fn step_with_legacy_fields() -> TraceStep {

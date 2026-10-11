@@ -72,6 +72,11 @@ pub enum Output {
         bytes: usize,
         data: String,
     },
+    /// The return data buffer at a step, `0x`-prefixed.
+    ReturnData {
+        bytes: usize,
+        data: String,
+    },
     /// The variables in scope, and the state variables.
     Variables {
         #[serde(skip_serializing_if = "Option::is_none")]

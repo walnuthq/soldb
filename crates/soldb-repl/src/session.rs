@@ -151,6 +151,7 @@ impl Session {
             DebuggerCommand::List => vec![self.listing(LISTING_RADIUS)],
             DebuggerCommand::Memory { offset, length } => vec![self.memory(offset, length)],
             DebuggerCommand::Calldata => vec![self.calldata()],
+            DebuggerCommand::ReturnData => vec![self.return_data()],
             DebuggerCommand::Stack { limit } => vec![self.stack(limit)],
             DebuggerCommand::Unknown(text) => vec![message(
                 Level::Warning,
@@ -507,6 +508,29 @@ impl Session {
         Output::TransientStorage {
             address: Some(address.to_owned()),
             slots,
+        }
+    }
+
+    /// The return data buffer at the current step.
+    #[must_use]
+    pub fn return_data(&self) -> Output {
+        let Some(step) = self.state.current_step_data() else {
+            return message(Level::Warning, "No trace loaded.");
+        };
+        let captured = self
+            .state
+            .trace()
+            .is_some_and(|trace| trace.capabilities.return_data);
+        if !captured {
+            return message(
+                Level::Warning,
+                "Return data is not in this trace; the backend did not record it per step.",
+            );
+        }
+        let data = step.snapshot_ref().return_data.unwrap_or_default();
+        Output::ReturnData {
+            bytes: data.len() / 2,
+            data: format!("0x{data}"),
         }
     }
 

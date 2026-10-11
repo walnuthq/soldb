@@ -1029,6 +1029,7 @@ impl DebuggerState {
             | DebuggerCommand::List
             | DebuggerCommand::Memory { .. }
             | DebuggerCommand::Calldata
+            | DebuggerCommand::ReturnData
             | DebuggerCommand::Stack { .. }
             | DebuggerCommand::Mode(None)
             | DebuggerCommand::Print(_)
@@ -1880,6 +1881,48 @@ contract C {
             panic!("message");
         };
         assert!(text.contains("not in this trace"), "{text}");
+    }
+
+    #[test]
+    fn return_data_shows_the_buffer_or_says_it_was_not_recorded() {
+        use crate::response::Output;
+        use crate::Session;
+
+        assert_eq!(
+            DebuggerCommand::parse("returndata"),
+            DebuggerCommand::ReturnData
+        );
+
+        let mut trace = sample_trace();
+        trace.steps[2].snapshot = trace.steps[2]
+            .normalized_snapshot()
+            .with_return_data(Some("2a".to_owned()));
+        let mut state = DebuggerState::new();
+        state.load_trace(trace.clone());
+        assert!(matches!(
+            &Session::new(state).execute(DebuggerCommand::ReturnData)[..],
+            [Output::Message { text, .. }] if text.contains("not in this trace")
+        ));
+
+        trace.capabilities.return_data = true;
+        let mut state = DebuggerState::new();
+        state.load_trace(trace);
+        let mut session = Session::new(state);
+        assert_eq!(
+            session.execute(DebuggerCommand::ReturnData),
+            [Output::ReturnData {
+                bytes: 0,
+                data: "0x".to_owned()
+            }]
+        );
+        session.execute(DebuggerCommand::Goto(2));
+        assert_eq!(
+            session.execute(DebuggerCommand::ReturnData),
+            [Output::ReturnData {
+                bytes: 1,
+                data: "0x2a".to_owned()
+            }]
+        );
     }
 
     #[test]

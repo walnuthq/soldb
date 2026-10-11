@@ -578,6 +578,8 @@ pub fn trace_transaction_with_client(
                 "disableStorage": false,
                 "disableMemory": false,
                 "enableMemory": true,
+                // Verified on anvil only; a node that rejects it fails the whole trace.
+                "enableReturnData": true,
             }
         ]),
     )?;
@@ -603,6 +605,8 @@ pub fn simulate_call_with_client(
         "disableStorage": false,
         "disableMemory": false,
         "enableMemory": true,
+        // Verified on anvil only; a node that rejects it fails the whole call trace.
+        "enableReturnData": true,
     });
     if let Some(tx_index) = request.tx_index {
         trace_config["txIndex"] = Value::String(format_quantity(tx_index));
