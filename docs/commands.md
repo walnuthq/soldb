@@ -20,7 +20,8 @@ everything else works on the bare trace. ETHDebug artifacts and the legacy `comb
 source maps of pre-ETHDebug compilers both serve: lines, functions, and frames come from
 the map and the source text either way. Only *local* variables need ETHDebug, because
 their locations exist nowhere else; state variables are read from the storage layout
-`solc --storage-layout` writes, which pre-ETHDebug compilers emit as well.
+`solc --storage-layout` writes, which pre-ETHDebug compilers emit as well, and `transient`
+ones from the layout `solc --transient-storage-layout` writes.
 
 The prompt is `soldb> `, printed only when stdin is a terminal: a session fed from a
 pipe or a script prints the answers alone.
@@ -37,9 +38,10 @@ soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir 0x5fbd…:Counte
 ```
 
 With `--json`, every answer is one JSON object per line, tagged by `kind` (`stop`,
-`variables`, `variable`, `backtrace`, `stack`, `memory`, `storage`, `breakpoint`,
-`message`, …), with the same fields the text shows and the raw words alongside the
-decoded values, so a tool or an agent reads the session instead of scraping it:
+`variables`, `variable`, `backtrace`, `stack`, `memory`, `storage`, `transient_storage`,
+`return_data`, `breakpoint`, `message`, …), with the same fields the text shows and the
+raw words alongside the decoded values, so a tool or an agent reads the session instead
+of scraping it:
 
 ```console
 soldb run out/Counter.bin "increment(uint256)" 4 --ethdebug-dir … -x 'break Counter.sol:12' -x continue -x vars --batch --json
@@ -460,10 +462,48 @@ chain state and does not ask a node for slots the trace never mentioned. Slots w
 this step are marked with their previous value. Says so when the backend captured no
 storage at all.
 
+### `transient`
+
+Aliases: `info transient`
+
+Print every transient storage slot (`TLOAD`/`TSTORE`, EIP-1153) the transaction has read or
+written so far, for the same account as `storage`.
+
+```text
+soldb> transient
+Transient storage: of 0x5fbdb2315678afecb367f032d93f642f64180aa3
+  0x0 = 0x1
+```
+
+No node reports transient storage, so SolDB reads it off the stack: a `TSTORE` holds its
+slot and value, and a `TLOAD`'s value is what it leaves on top. Both backends do this the
+same way, and a trace another tool hands over can carry it in each step's
+`transient_storage`. Transient storage is empty when a transaction starts, so a slot that
+is not listed is zero, and a write made by a frame that reverted is undone with it. Says so
+when the trace carries no transient storage.
+
 ### `calldata`
 
 Print the calldata of the current frame: the transaction input at the root, or the
 recorded call's input in a nested frame when the backend recorded calls.
+
+### `returndata`
+
+Print the return data buffer at the current step: what the frame's last call or create
+returned or reverted with, which `RETURNDATASIZE` and `RETURNDATACOPY` read.
+
+```text
+soldb> returndata
+Return data: 32 bytes
+0x000000000000000000000000000000000000000000000000000000000000002a
+```
+
+The buffer is empty until the frame makes a call, and each call replaces it; after a
+reverted call it holds the revert data, such as an `Error(string)`. The debug-rpc backend
+asks the node for it with `enableReturnData`, and the replay backend reads it from the
+interpreter. Says so when the trace carries no return data; a trace with no call at all
+has an empty buffer throughout. The full-screen view shows it under the memory, and the
+DAP server as a `Return Data` scope.
 
 ## Variables
 
@@ -588,6 +628,19 @@ live.
 SolDB says so instead of guessing where a variable lives. The slot arithmetic behind
 mappings, arrays, and structs is Solidity's own rule, so the values are read, never
 inferred.
+
+*Transient* state variables (`uint256 transient locked;`) live in a separate space whose
+slots also start at zero, so they come from their own layout,
+`<Contract>_transient_storage.json` (or `transient-storage-layout` in a `combined.json`),
+which `solc --transient-storage-layout` writes. `soldb compile` and the test harness pass
+it, and leave it out for a compiler that predates transient storage. They are listed after
+the state variables, marked `transient slot`, and since the space starts empty in every
+transaction, one nothing has written yet is zero rather than unknown:
+
+```text
+uint256 transientCount = 1 [transient slot 0x0]
+bool locked = false [transient slot 0x1]
+```
 
 ### `vars`
 

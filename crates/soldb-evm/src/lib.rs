@@ -99,6 +99,13 @@ pub struct StructLog {
     pub storage: Arc<BTreeMap<String, String>>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The return data buffer before this step; `None` when the node did not report it.
+    #[serde(
+        rename = "returnData",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub return_data: Option<Arc<str>>,
 }
 
 /// Joins a `structLogs` memory array into one unprefixed hex string.
@@ -170,6 +177,8 @@ impl StructLog {
                 memory,
                 storage: self.shared_storage(previous.map(|(_, step)| step)),
                 storage_diff,
+                transient_storage: BTreeMap::new(),
+                return_data: self.shared_return_data(previous.map(|(_, step)| step)),
             },
         )
     }
@@ -184,6 +193,7 @@ impl StructLog {
     ) -> TraceStep {
         let memory = self.shared_memory(previous);
         let storage = self.shared_storage(previous.map(|(_, step)| step));
+        let return_data = self.shared_return_data(previous.map(|(_, step)| step));
         let storage_diff = if self.storage.is_empty() {
             BTreeMap::new()
         } else {
@@ -201,6 +211,8 @@ impl StructLog {
                 memory,
                 storage,
                 storage_diff,
+                transient_storage: BTreeMap::new(),
+                return_data,
             },
         )
     }
@@ -214,6 +226,25 @@ impl StructLog {
             }
             _ => Arc::clone(&self.storage),
         }
+    }
+
+    /// This log's return data as unprefixed lowercase hex, shared with the previous step's
+    /// when equal; `None` when empty.
+    fn shared_return_data(&self, previous: Option<&TraceStep>) -> Option<Arc<str>> {
+        let reported = self.return_data.as_deref()?;
+        let digits = reported
+            .strip_prefix("0x")
+            .or_else(|| reported.strip_prefix("0X"))
+            .unwrap_or(reported);
+        if digits.is_empty() {
+            return None;
+        }
+        if let Some(shared) = previous.and_then(|step| step.snapshot.return_data.as_ref()) {
+            if shared.eq_ignore_ascii_case(digits) {
+                return Some(Arc::clone(shared));
+            }
+        }
+        Some(Arc::from(digits.to_ascii_lowercase()))
     }
 
     #[must_use]
@@ -349,6 +380,64 @@ fn share_unchanged(previous: &StructLog, log: &mut StructLog) {
     if !Arc::ptr_eq(&previous.storage, &log.storage) && *previous.storage == *log.storage {
         log.storage = Arc::clone(&previous.storage);
     }
+    if let (Some(previous_data), Some(data)) = (&previous.return_data, &log.return_data) {
+        if !Arc::ptr_eq(previous_data, data) && **previous_data == **data {
+            log.return_data = Some(Arc::clone(previous_data));
+        }
+    }
+}
+
+/// Fills `transient_storage` on each `TLOAD` and `TSTORE` from the stack, for every backend.
+fn record_transient_storage(steps: &mut [TraceStep]) {
+    for index in 0..steps.len() {
+        let step = &steps[index];
+        if step.error.is_some() {
+            continue;
+        }
+        let stack = step.snapshot_ref().stack;
+        let Some(slot) = stack.last() else {
+            continue;
+        };
+        // A `TLOAD`'s value is what it leaves on top: the next step's stack in its frame.
+        let value = match &*step.op {
+            "TSTORE" => stack
+                .len()
+                .checked_sub(2)
+                .and_then(|below| stack.get(below)),
+            "TLOAD" => steps
+                .get(index + 1)
+                .filter(|next| next.depth == step.depth)
+                .and_then(|next| next.snapshot_ref().stack.last()),
+            _ => continue,
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        let touched = BTreeMap::from([(normalize_storage_key(slot), normalize_storage_key(value))]);
+        steps[index].snapshot.transient_storage = touched;
+    }
+}
+
+/// Whether an opcode can leave data in its frame's return data buffer.
+fn fills_return_data(op: &str) -> bool {
+    matches!(
+        op,
+        "CALL" | "CALLCODE" | "DELEGATECALL" | "STATICCALL" | "CREATE" | "CREATE2"
+    )
+}
+
+/// A slot or word as `0x`-prefixed lowercase hex without leading zeros.
+pub(crate) fn normalize_storage_key(value: &str) -> String {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0x0".to_owned()
+    } else {
+        format!("0x{}", trimmed.to_ascii_lowercase())
+    }
 }
 
 impl DebugTraceResult {
@@ -368,6 +457,7 @@ impl DebugTraceResult {
             previous_storage = &log.storage;
             previous_memory = Some(&log.memory);
         }
+        record_transient_storage(&mut steps);
         steps
     }
 
@@ -398,6 +488,7 @@ impl DebugTraceResult {
             steps.push(step);
             previous = Some((memory, storage));
         }
+        record_transient_storage(&mut steps);
         steps
     }
 
@@ -606,6 +697,16 @@ pub(crate) fn simulation_trace(
 
 fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
     let has_steps = !result.struct_logs.is_empty();
+    let has_stack = result.struct_logs.iter().any(|log| !log.stack.is_empty());
+    // Without a call or a create the buffer is empty throughout, reported or not.
+    let has_return_data = result
+        .struct_logs
+        .iter()
+        .any(|log| log.return_data.is_some())
+        || !result
+            .struct_logs
+            .iter()
+            .any(|log| fills_return_data(&log.op));
     let has_storage = result
         .struct_logs
         .iter()
@@ -642,6 +743,9 @@ fn debug_rpc_capabilities(result: &DebugTraceResult) -> TraceCapabilities {
         revert_data: result.failed && !result.return_value.is_empty(),
         gas_details: result.gas.is_some(),
         account_changes: false,
+        // Read off the stack, so only as complete as the stacks the node returned.
+        transient_storage: has_stack,
+        return_data: has_steps && has_return_data,
         notes,
     }
 }
@@ -1012,6 +1116,88 @@ mod tests {
     }
 
     #[test]
+    fn transient_storage_is_read_off_the_stack_for_both_ways_of_building_steps() {
+        // A `TSTORE` holds its slot on top and its value below; a `TLOAD`'s value is the
+        // top of the next step in the same frame. Padded and unpadded words record alike,
+        // and a failed or frame-ending step records nothing.
+        let debug_result: DebugTraceResult = serde_json::from_value(json!({
+            "structLogs": [
+                {"pc": 0, "op": "TSTORE", "gas": 100, "gasCost": 100, "depth": 1,
+                 "stack": ["0x0000000000000000000000000000000000000000000000000000000000000007", "0x1"]},
+                {"pc": 1, "op": "TLOAD", "gas": 0, "gasCost": 100, "depth": 1, "stack": ["0x1"]},
+                {"pc": 2, "op": "POP", "gas": 0, "gasCost": 2, "depth": 1, "stack": ["0x0A"]},
+                {"pc": 3, "op": "TSTORE", "gas": 0, "gasCost": 0, "depth": 1, "stack": ["0x5", "0x2"], "error": "out of gas"},
+                {"pc": 4, "op": "TLOAD", "gas": 0, "gasCost": 0, "depth": 1, "stack": ["0x2"]},
+                {"pc": 0, "op": "STOP", "gas": 0, "gasCost": 0, "depth": 2, "stack": ["0x3"]}
+            ]
+        }))
+        .expect("debug result");
+
+        for steps in [debug_result.steps(), debug_result.clone().into_steps()] {
+            let touched = steps
+                .iter()
+                .map(|step| step.snapshot.transient_storage.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                touched[0],
+                BTreeMap::from([("0x1".to_owned(), "0x7".to_owned())])
+            );
+            assert_eq!(
+                touched[1],
+                BTreeMap::from([("0x1".to_owned(), "0xa".to_owned())])
+            );
+            assert!(touched[2].is_empty());
+            assert!(touched[3].is_empty(), "a failed TSTORE wrote nothing");
+            assert!(touched[4].is_empty(), "the next step is in another frame");
+        }
+        assert!(debug_rpc_capabilities(&debug_result).transient_storage);
+
+        // Without stacks nothing could be read, so unrecorded slots are not claimed zero.
+        let stackless: DebugTraceResult = serde_json::from_value(json!({
+            "structLogs": [{"pc": 0, "op": "TSTORE", "gas": 0, "gasCost": 0, "depth": 1}]
+        }))
+        .expect("debug result");
+        assert!(!debug_rpc_capabilities(&stackless).transient_storage);
+        assert_eq!(super::normalize_storage_key("0X001A"), "0x1a");
+        assert_eq!(super::normalize_storage_key("0"), "0x0");
+    }
+
+    #[test]
+    fn return_data_comes_from_the_node_and_is_claimed_only_when_reported() {
+        let debug_result: DebugTraceResult = serde_json::from_value(json!({
+            "structLogs": [
+                {"pc": 0, "op": "STATICCALL", "gas": 0, "gasCost": 0, "depth": 1, "returnData": "0x"},
+                {"pc": 0, "op": "STOP", "gas": 0, "gasCost": 0, "depth": 2, "returnData": "0x"},
+                {"pc": 1, "op": "RETURNDATASIZE", "gas": 0, "gasCost": 2, "depth": 1, "returnData": "0x002A"},
+                {"pc": 2, "op": "POP", "gas": 0, "gasCost": 2, "depth": 1, "returnData": "0x002A"}
+            ]
+        }))
+        .expect("debug result");
+
+        for steps in [debug_result.steps(), debug_result.clone().into_steps()] {
+            assert_eq!(
+                steps[0].snapshot.return_data, None,
+                "an empty buffer is None"
+            );
+            assert_eq!(steps[2].snapshot_ref().return_data, Some("002a"));
+            let shared = |index: usize| steps[index].snapshot.return_data.as_ref().expect("data");
+            assert!(Arc::ptr_eq(shared(2), shared(3)));
+        }
+        assert!(debug_rpc_capabilities(&debug_result).return_data);
+
+        // A call the node said nothing about leaves the buffer unknown; with no call at
+        // all it is empty throughout.
+        let unreported = |op: &str| -> DebugTraceResult {
+            serde_json::from_value(json!({
+                "structLogs": [{"pc": 0, "op": op, "gas": 0, "gasCost": 0, "depth": 1}]
+            }))
+            .expect("debug result")
+        };
+        assert!(!debug_rpc_capabilities(&unreported("CALL")).return_data);
+        assert!(debug_rpc_capabilities(&unreported("ADD")).return_data);
+    }
+
+    #[test]
     fn storage_diff_capability_matches_the_materialized_steps() {
         // `debug_rpc_capabilities` reads the storage-diff flag off the raw logs instead of
         // building every step. Pin it against the definition it replaces.
@@ -1030,6 +1216,7 @@ mod tests {
                     .collect(),
             ),
             error: None,
+            return_data: None,
         };
 
         let cases = [
@@ -1088,6 +1275,7 @@ mod tests {
             memory: Arc::new(memory.iter().map(|word| (*word).to_owned()).collect()),
             storage: Arc::new(BTreeMap::from([("0x0".to_owned(), slot_value.to_owned())])),
             error: None,
+            return_data: None,
         };
         let result = DebugTraceResult {
             struct_logs: vec![

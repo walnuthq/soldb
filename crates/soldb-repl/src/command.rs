@@ -47,6 +47,8 @@ pub enum DebuggerCommand {
     },
     /// The calldata of the current call frame.
     Calldata,
+    /// The return data buffer at the current step.
+    ReturnData,
     /// The stack at the current step, all of it or the top `limit` words.
     Stack {
         limit: Option<usize>,
@@ -70,6 +72,7 @@ pub enum DebuggerInfoCommand {
     Resources { json: bool },
     Breakpoints,
     Storage,
+    TransientStorage,
 }
 
 /// What a command is for, which is how `help` groups them.
@@ -268,11 +271,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "info",
         aliases: &["i"],
-        usage: "info breakpoints|storage|resources [--json]",
-        summary: "the breakpoints, the storage known here, or the loaded debug resources",
+        usage: "info breakpoints|storage|transient|resources [--json]",
+        summary: "the breakpoints, the storage or transient storage known here, or the loaded debug resources",
         details: &[
             "info breakpoints (i b)  every breakpoint with its number",
             "info storage            every storage slot known at this step",
+            "info transient          every transient storage slot known at this step",
             "info resources          the contracts whose sources are loaded, as text or JSON",
         ],
         group: CommandGroup::Breakpoints,
@@ -325,11 +329,34 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: CommandGroup::Inspection,
     },
     CommandSpec {
+        name: "transient",
+        aliases: &[],
+        usage: "transient",
+        summary: "every transient storage slot known at the current step",
+        details: &[
+            "The slots `TLOAD` and `TSTORE` touched so far in this frame's account, read",
+            "from the trace. A slot not listed is zero: transient storage starts empty in",
+            "every transaction. The same as `info transient`.",
+        ],
+        group: CommandGroup::Inspection,
+    },
+    CommandSpec {
         name: "calldata",
         aliases: &[],
         usage: "calldata",
         summary: "the calldata of the current frame",
         details: &[],
+        group: CommandGroup::Inspection,
+    },
+    CommandSpec {
+        name: "returndata",
+        aliases: &[],
+        usage: "returndata",
+        summary: "the return data buffer at the current step",
+        details: &[
+            "What the frame's last call or create returned or reverted with, which",
+            "`RETURNDATASIZE` and `RETURNDATACOPY` read. Empty until the frame makes a call.",
+        ],
         group: CommandGroup::Inspection,
     },
     CommandSpec {
@@ -432,6 +459,7 @@ impl DebuggerCommand {
             "list" => Self::List,
             "memory" => parse_memory_command(&rest).unwrap_or_else(unknown),
             "calldata" => Self::Calldata,
+            "returndata" => Self::ReturnData,
             "stack" => {
                 if rest.is_empty() {
                     Self::Stack { limit: None }
@@ -441,6 +469,7 @@ impl DebuggerCommand {
                 }
             }
             "storage" => Self::Info(DebuggerInfoCommand::Storage),
+            "transient" => Self::Info(DebuggerInfoCommand::TransientStorage),
             "info" => parse_info_command(&rest).map_or_else(unknown, Self::Info),
             "mode" => Self::Mode(
                 (!rest.is_empty())
@@ -476,6 +505,7 @@ fn parse_info_command(input: &str) -> Option<DebuggerInfoCommand> {
         }
         "breakpoints" | "break" | "b" => Some(DebuggerInfoCommand::Breakpoints),
         "storage" => Some(DebuggerInfoCommand::Storage),
+        "transient" => Some(DebuggerInfoCommand::TransientStorage),
         _ => None,
     }
 }

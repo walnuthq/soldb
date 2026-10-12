@@ -19,6 +19,9 @@
 //! only for slots the trace never recorded, and the value is then marked as coming from
 //! the chain rather than from the recording. Without one, unknown is reported as unknown
 //! and never as zero: this crate has no chain to ask, and it does not pretend to.
+//!
+//! Transient storage is a second tape, [`StorageTape::transient`], where a slot with no
+//! record is zero: the space starts empty in every transaction.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -132,7 +135,17 @@ pub struct StorageTape {
     records: HashMap<(usize, Word), Vec<Record>>,
     /// Whether the backend recorded per-step storage at all.
     captured: bool,
+    space: Space,
 }
+
+/// Which storage a tape holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Space {
+    Persistent,
+    Transient,
+}
+
+const ZERO_WORD: Word = [0_u8; 32];
 
 /// A value a slot holds from a step on. `None` when a reverted frame undid a write and
 /// the value before it was never recorded.
@@ -160,37 +173,46 @@ impl StorageTape {
     /// computed for the step that recorded it.
     #[must_use]
     pub fn new(trace: &TransactionTrace, map: &StepMap) -> Self {
+        Self::index(trace, map, Space::Persistent)
+    }
+
+    /// Indexes every transient storage word `trace` recorded, the same way.
+    #[must_use]
+    pub fn transient(trace: &TransactionTrace, map: &StepMap) -> Self {
+        Self::index(trace, map, Space::Transient)
+    }
+
+    fn index(trace: &TransactionTrace, map: &StepMap, space: Space) -> Self {
+        let (write, captured) = match space {
+            Space::Persistent => ("SSTORE", trace.capabilities.storage),
+            Space::Transient => ("TSTORE", trace.capabilities.transient_storage),
+        };
         let mut records = HashMap::<(usize, Word), Vec<Record>>::new();
-        for (index, step) in trace.steps.iter().enumerate() {
+        // A trace without transient storage has nothing to index, so skip the walk.
+        let steps = if space == Space::Transient && !captured {
+            &[][..]
+        } else {
+            &trace.steps[..]
+        };
+        for (index, step) in steps.iter().enumerate() {
             let snapshot = step.snapshot_ref();
-            if snapshot.storage_diff.is_empty() {
-                continue;
-            }
+            let words = match space {
+                Space::Persistent if snapshot.storage_diff.is_empty() => continue,
+                Space::Transient if snapshot.transient_storage.is_empty() => continue,
+                Space::Persistent => snapshot
+                    .storage_diff
+                    .iter()
+                    .filter_map(|(slot, change)| Some((slot, change.after.as_ref()?)))
+                    .collect::<Vec<_>>(),
+                Space::Transient => snapshot.transient_storage.iter().collect(),
+            };
             let Some(context) = map.storage_context_index(index) else {
                 continue;
             };
             // A write takes effect after its step; a read reports what is there at it.
-            let from = if &*step.op == "SSTORE" {
-                index + 1
-            } else {
-                index
-            };
-            for (slot, change) in snapshot.storage_diff {
-                let Some(after) = change.after.as_deref() else {
-                    continue;
-                };
-                let (Some(slot), Some(value)) = (parse_slot(slot), parse_slot(after)) else {
-                    continue;
-                };
-                let entries = records.entry((context, slot)).or_default();
-                if entries.last().is_some_and(|last| last.value == Some(value)) {
-                    continue;
-                }
-                entries.push(Record {
-                    from,
-                    value: Some(value),
-                    rollback: false,
-                });
+            let from = if &*step.op == write { index + 1 } else { index };
+            for (slot, value) in words {
+                push_record(&mut records, context, from, slot, value);
             }
         }
 
@@ -221,7 +243,8 @@ impl StorageTape {
         }
         Self {
             records,
-            captured: trace.capabilities.storage,
+            captured,
+            space,
         }
     }
 
@@ -251,6 +274,16 @@ impl StorageTape {
     }
 
     fn lookup(&self, context: usize, slot: &Word, step: usize) -> Lookup {
+        match self.recorded(context, slot, step) {
+            Lookup::Untouched | Lookup::Reverted if self.starts_at_zero() => {
+                Lookup::Known(ZERO_WORD)
+            }
+            found => found,
+        }
+    }
+
+    /// What the recording itself says, without the zero an untouched transient slot holds.
+    fn recorded(&self, context: usize, slot: &Word, step: usize) -> Lookup {
         let Some(entries) = self.records.get(&(context, *slot)) else {
             return Lookup::Untouched;
         };
@@ -261,6 +294,33 @@ impl StorageTape {
             None => Lookup::Untouched,
         }
     }
+
+    /// Whether a slot with no surviving write is zero, as transient storage is at the start.
+    fn starts_at_zero(&self) -> bool {
+        self.space == Space::Transient && self.captured
+    }
+}
+
+/// Records that `slot` of `context` holds `value` from step `from`, unless it already did.
+fn push_record(
+    records: &mut HashMap<(usize, Word), Vec<Record>>,
+    context: usize,
+    from: usize,
+    slot: &str,
+    value: &str,
+) {
+    let (Some(slot), Some(value)) = (parse_slot(slot), parse_slot(value)) else {
+        return;
+    };
+    let entries = records.entry((context, slot)).or_default();
+    if entries.last().is_some_and(|last| last.value == Some(value)) {
+        return;
+    }
+    entries.push(Record {
+        from,
+        value: Some(value),
+        rollback: false,
+    });
 }
 
 /// The storage words known at one step, in one storage context.
@@ -315,7 +375,7 @@ impl<'a> StorageWords<'a> {
             .keys()
             .filter(|(candidate, _)| *candidate == context)
             .filter_map(
-                |(_, slot)| match self.tape.lookup(context, slot, self.step) {
+                |(_, slot)| match self.tape.recorded(context, slot, self.step) {
                     Lookup::Known(value) => Some((*slot, value)),
                     Lookup::Untouched | Lookup::Reverted => None,
                 },
@@ -345,7 +405,11 @@ impl<'a> StorageWords<'a> {
             )
         };
         if !self.tape.captured {
-            return "<unavailable: this backend recorded no storage>".to_owned();
+            return match self.tape.space {
+                Space::Persistent => "<unavailable: this backend recorded no storage>",
+                Space::Transient => "<unavailable: this trace carries no transient storage>",
+            }
+            .to_owned();
         }
         let Some(context) = self.context else {
             return "<unavailable: the storage of this frame belongs to no known account>"
@@ -564,6 +628,110 @@ mod tests {
             .expect(path)
             .value
             .display
+    }
+
+    /// One step recording the transient slots it touched.
+    fn transient_step(op: &str, depth: u64, touched: &[(&str, &str)]) -> TraceStep {
+        let mut step = step(op, depth, &["0x0"], &[]);
+        step.snapshot.transient_storage = touched
+            .iter()
+            .map(|(slot, value)| ((*slot).to_owned(), (*value).to_owned()))
+            .collect();
+        step
+    }
+
+    fn transient_layout() -> StorageLayout {
+        StorageLayout::parse(&json!({
+            "storage": [
+                {"astId": 1, "contract": "T.sol:T", "label": "count", "offset": 0, "slot": "0", "type": "t_uint256"},
+                {"astId": 2, "contract": "T.sol:T", "label": "locked", "offset": 0, "slot": "1", "type": "t_bool"}
+            ],
+            "types": {
+                "t_uint256": {"encoding": "inplace", "label": "uint256", "numberOfBytes": "32"},
+                "t_bool": {"encoding": "inplace", "label": "bool", "numberOfBytes": "1"}
+            }
+        }))
+        .expect("layout")
+    }
+
+    fn show_transient(trace: &TransactionTrace, at: usize, path: &str) -> String {
+        let map = StepMap::new(trace, Vec::new());
+        let tape = StorageTape::transient(trace, &map);
+        state_value(&transient_layout(), &tape.at_step(&map, at), path)
+            .expect(path)
+            .value
+            .display
+    }
+
+    #[test]
+    fn transient_slots_start_at_zero_and_follow_their_writes() {
+        let mut trace = trace(
+            vec![
+                transient_step("PUSH1", 1, &[]),
+                transient_step("TSTORE", 1, &[("0x0", "0x5")]),
+                transient_step("POP", 1, &[]),
+                transient_step("TLOAD", 1, &[("0x0", "0x5")]),
+                transient_step("STOP", 1, &[]),
+            ],
+            true,
+        );
+        trace.capabilities.transient_storage = true;
+        // Nothing has written yet, and transient storage starts empty in a transaction.
+        assert_eq!(show_transient(&trace, 0, "count"), "0");
+        assert_eq!(show_transient(&trace, 0, "locked"), "false");
+        // A write takes effect after its step.
+        assert_eq!(show_transient(&trace, 1, "count"), "0");
+        assert_eq!(show_transient(&trace, 2, "count"), "5");
+        assert_eq!(show_transient(&trace, 4, "count"), "5");
+        // Persistent storage is a separate space: the same slot number is untouched there.
+        let map = StepMap::new(&trace, Vec::new());
+        let tape = StorageTape::new(&trace, &map);
+        assert!(tape.at_step(&map, 4).known().is_empty());
+    }
+
+    #[test]
+    fn a_reverted_frame_undoes_its_transient_writes() {
+        // The contract calls itself, so both frames share one transient storage.
+        let own = "0xaaaa000000000000000000000000000000000001";
+        let mut call = transient_step("CALL", 1, &[]);
+        call.snapshot.stack = ["0x0", "0x0", "0x0", "0x0", "0x0", own, "0x0"]
+            .into_iter()
+            .map(soldb_core::Word::from)
+            .collect();
+        let mut trace = trace(
+            vec![
+                transient_step("TSTORE", 1, &[("0x0", "0x1")]),
+                call,
+                transient_step("TSTORE", 2, &[("0x0", "0x2")]),
+                transient_step("TSTORE", 2, &[("0x1", "0x1")]),
+                transient_step("REVERT", 2, &[]),
+                transient_step("POP", 1, &[]),
+                transient_step("STOP", 1, &[]),
+            ],
+            true,
+        );
+        trace.capabilities.transient_storage = true;
+        let map = StepMap::new(&trace, Vec::new());
+        assert_eq!(map.reverted_spans(), [(2, 4)]);
+        assert_eq!(map.storage_context_index(2), map.storage_context_index(0));
+
+        assert_eq!(show_transient(&trace, 4, "count"), "2");
+        assert_eq!(show_transient(&trace, 4, "locked"), "true");
+        // After the revert: the caller's write again, and zero for a slot only the
+        // reverted frame wrote.
+        assert_eq!(show_transient(&trace, 5, "count"), "1");
+        assert_eq!(show_transient(&trace, 5, "locked"), "false");
+        // Only the caller's write survives to be listed; the undone one is not a record.
+        let tape = StorageTape::transient(&trace, &map);
+        let known = tape.at_step(&map, 5).known();
+        assert_eq!(known.len(), 1);
+        assert_eq!(short_hex(&known[0].1), "0x1");
+    }
+
+    #[test]
+    fn transient_storage_without_the_capability_is_unknown_not_zero() {
+        let trace = trace(vec![transient_step("STOP", 1, &[])], true);
+        assert!(show_transient(&trace, 0, "count").contains("carries no transient storage"));
     }
 
     #[test]

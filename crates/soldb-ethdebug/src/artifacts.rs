@@ -49,6 +49,8 @@ pub struct DebugProgram {
     pub legacy: bool,
     /// The contract's storage layout, when it was compiled with `--storage-layout`.
     pub storage_layout: Option<StorageLayout>,
+    /// Where its `transient` state variables live, from `--transient-storage-layout`.
+    pub transient_storage_layout: Option<StorageLayout>,
     /// Sources the artifact names that could not be read, so a frontend can say why its
     /// lines are missing instead of degrading to an opcode view without a word.
     pub missing_sources: Vec<String>,
@@ -300,6 +302,7 @@ pub fn load_debug_program_with_sources(
         let info = EthdebugInfo::from_artifacts(&name, environment_name, &metadata, &program)
             .map_err(|error| SoldbError::Message(format!("{}: {error}", program_path.display())))?;
         let storage_layout = load_storage_layout(root, &info.contract_name)?;
+        let transient_storage_layout = load_transient_storage_layout(root, &info.contract_name)?;
         let mut program = DebugProgram {
             info,
             resources,
@@ -307,6 +310,7 @@ pub fn load_debug_program_with_sources(
             source_files: BTreeMap::new(),
             legacy: false,
             storage_layout,
+            transient_storage_layout,
             missing_sources: Vec::new(),
         };
         program.read_sources(root, source_roots);
@@ -322,6 +326,10 @@ pub fn load_debug_program_with_sources(
         Some(layout) => Some(layout),
         None => load_storage_layout(root, &program.info.contract_name)?,
     };
+    let transient_storage_layout = match program.transient_storage_layout {
+        Some(layout) => Some(layout),
+        None => load_transient_storage_layout(root, &program.info.contract_name)?,
+    };
     let mut program = DebugProgram {
         info: program.info,
         resources: program.resources,
@@ -329,6 +337,7 @@ pub fn load_debug_program_with_sources(
         source_files: program.source_files,
         legacy: true,
         storage_layout,
+        transient_storage_layout,
         missing_sources: Vec::new(),
     };
     program.read_sources(root, source_roots);
@@ -340,11 +349,22 @@ pub fn load_debug_program_with_sources(
 /// An unreadable one is, because the user compiled with it and would otherwise get a
 /// silent "no storage layout" that looks identical to never having asked for it.
 pub fn load_storage_layout(root: &Path, contract_name: &str) -> SoldbResult<Option<StorageLayout>> {
-    let path = root.join(format!("{contract_name}_storage.json"));
+    load_layout_file(&root.join(format!("{contract_name}_storage.json")))
+}
+
+/// `<Contract>_transient_storage.json`, under the same rules as [`load_storage_layout`].
+pub fn load_transient_storage_layout(
+    root: &Path,
+    contract_name: &str,
+) -> SoldbResult<Option<StorageLayout>> {
+    load_layout_file(&root.join(format!("{contract_name}_transient_storage.json")))
+}
+
+fn load_layout_file(path: &Path) -> SoldbResult<Option<StorageLayout>> {
     if !path.exists() {
         return Ok(None);
     }
-    let value = read_json_file(&path)?;
+    let value = read_json_file(path)?;
     StorageLayout::parse(&value)
         .map(Some)
         .map_err(|error| SoldbError::Message(format!("{}: {error}", path.display())))
@@ -415,8 +435,8 @@ mod tests {
 
     use super::{
         contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-        find_program_ethdebug, load_debug_program, load_storage_layout, read_debug_source,
-        read_json_file,
+        find_program_ethdebug, load_debug_program, load_storage_layout,
+        load_transient_storage_layout, read_debug_source, read_json_file,
     };
     use crate::source_map::SourceMapEnvironment;
 
@@ -530,6 +550,43 @@ mod tests {
         let layout = program.storage_layout.as_ref().expect("storage layout");
         assert_eq!(layout.variable("value").expect("value").slot[31], 1);
         assert!(load_storage_layout(&dir, "Missing")
+            .expect("absent")
+            .is_none());
+        // Not compiled with `--transient-storage-layout`: no transient layout.
+        assert!(program.transient_storage_layout.is_none());
+
+        // `--transient-storage-layout` writes a second file of the same shape, for the
+        // `transient` variables, whose slots number from zero in their own space.
+        fs::write(
+            dir.join("Counter_transient_storage.json"),
+            json!({
+                "storage": [{
+                    "astId": 2,
+                    "contract": "Counter.sol:Counter",
+                    "label": "locked",
+                    "offset": 0,
+                    "slot": "0",
+                    "type": "t_bool"
+                }],
+                "types": {"t_bool": {
+                    "encoding": "inplace",
+                    "label": "bool",
+                    "numberOfBytes": "1"
+                }}
+            })
+            .to_string(),
+        )
+        .expect("transient layout");
+        let program = load_debug_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect("load")
+            .expect("present");
+        let transient = program
+            .transient_storage_layout
+            .as_ref()
+            .expect("transient layout");
+        assert_eq!(transient.variable("locked").expect("locked").slot, [0; 32]);
+        assert!(transient.variable("value").is_none());
+        assert!(load_transient_storage_layout(&dir, "Missing")
             .expect("absent")
             .is_none());
         fs::write(dir.join("Counter_storage.json"), "{}").expect("layout");

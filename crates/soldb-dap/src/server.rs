@@ -36,6 +36,7 @@ const STEP_REF: u64 = 1002;
 const MEMORY_REF: u64 = 1003;
 const STORAGE_REF: u64 = 1004;
 const STATE_REF: u64 = 1005;
+const RETURN_DATA_REF: u64 = 1006;
 
 #[derive(Debug)]
 pub struct DapServer {
@@ -580,6 +581,7 @@ impl DapServer {
                     {"name": "Stack", "variablesReference": STACK_REF, "expensive": false},
                     {"name": "Memory", "variablesReference": MEMORY_REF, "expensive": false},
                     {"name": "Storage", "variablesReference": STORAGE_REF, "expensive": false},
+                    {"name": "Return Data", "variablesReference": RETURN_DATA_REF, "expensive": false},
                     {"name": "Step", "variablesReference": STEP_REF, "expensive": false}
                 ]
             })),
@@ -619,6 +621,7 @@ impl DapServer {
             MEMORY_REF => self.memory_variables(),
             STORAGE_REF => self.storage_variables(),
             STATE_REF => self.state_variables(),
+            RETURN_DATA_REF => self.return_data_variables(),
             STEP_REF => self.step_variables(),
             _ => Vec::new(),
         };
@@ -799,18 +802,22 @@ impl DapServer {
     }
 
     /// Every state variable of the contract executing at the current step, read through
-    /// its storage layout.
+    /// its storage layout, followed by its `transient` ones.
     fn state_variables(&self) -> Vec<Value> {
-        let Some(layout) = self.debugger.storage_layout() else {
-            return Vec::new();
-        };
-        let Some(words) = self
+        let mut variables = Vec::new();
+        let words = self
             .debugger
-            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
-        else {
-            return Vec::new();
-        };
-        soldb_debugger::state_variables(layout, &words)
+            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage));
+        if let (Some(layout), Some(words)) = (self.debugger.storage_layout(), words) {
+            variables.extend(soldb_debugger::state_variables(layout, &words));
+        }
+        if let (Some(layout), Some(words)) = (
+            self.debugger.transient_storage_layout(),
+            self.debugger.transient_words(),
+        ) {
+            variables.extend(soldb_debugger::state_variables(layout, &words));
+        }
+        variables
             .into_iter()
             .map(|variable| {
                 json!({
@@ -856,6 +863,28 @@ impl DapServer {
                 json!({
                     "name": format!("memory[0x{:x}]", index * 32),
                     "value": std::str::from_utf8(chunk).unwrap_or_default(),
+                    "variablesReference": 0
+                })
+            })
+            .collect()
+    }
+
+    /// The return data buffer at the current step, in 32-byte words.
+    fn return_data_variables(&self) -> Vec<Value> {
+        let Some(step) = self.debugger.current_step_data() else {
+            return Vec::new();
+        };
+        let Some(data) = step.snapshot_ref().return_data else {
+            return Vec::new();
+        };
+        let digits = data.chars().collect::<Vec<_>>();
+        digits
+            .chunks(64)
+            .enumerate()
+            .map(|(index, word)| {
+                json!({
+                    "name": format!("returndata[0x{:x}]", index * 32),
+                    "value": word.iter().collect::<String>(),
                     "variablesReference": 0
                 })
             })
@@ -950,8 +979,16 @@ impl DapServer {
     }
 
     /// A storage path such as `counter` or `balances[0xabc]`, read through the storage
-    /// layout when one is loaded.
+    /// layout when one is loaded, or a `transient` state variable by name.
     fn evaluate_state(&self, expression: &str) -> String {
+        if let (Some(layout), Some(words)) = (
+            self.debugger.transient_storage_layout(),
+            self.debugger.transient_words(),
+        ) {
+            if let Ok(variable) = soldb_debugger::state_value(layout, &words, expression) {
+                return variable.value.display;
+            }
+        }
         let Some(layout) = self.debugger.storage_layout() else {
             return "<unsupported expression>".to_owned();
         };
@@ -1088,7 +1125,8 @@ impl LoadedSource {
             source_files: program.source_files,
             contract: ContractDebugInfo::new(address, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
-                .with_storage_layout(program.storage_layout),
+                .with_storage_layout(program.storage_layout)
+                .with_transient_storage_layout(program.transient_storage_layout),
         })
     }
 }
@@ -1104,7 +1142,10 @@ mod tests {
 
     use crate::{decode_dap_frame, encode_dap_frame, DapMessage};
 
-    use super::{run_stdio_server, DapServer, LoadedSource, MEMORY_REF, STACK_REF, STORAGE_REF};
+    use super::{
+        run_stdio_server, DapServer, LoadedSource, MEMORY_REF, RETURN_DATA_REF, STACK_REF,
+        STORAGE_REF,
+    };
 
     #[test]
     fn handles_initialize_and_threads() {
@@ -1177,6 +1218,45 @@ mod tests {
         let messages = server.handle_message(&DapMessage::request(10, "stepBack", None));
         assert_eq!(messages[1].body.as_ref().expect("body")["reason"], "entry");
         assert!(frame_name(&mut server, 11).starts_with("step 0:"));
+    }
+
+    #[test]
+    fn the_return_data_scope_lists_the_buffer_in_words() {
+        let mut trace = sample_trace();
+        let data = format!("{:0>64}{:0>64}", "2a", "1");
+        trace.steps[0] = TraceStep::new(
+            0,
+            "RETURNDATASIZE".into(),
+            100,
+            2,
+            1,
+            None,
+            soldb_core::StepSnapshot::new(
+                vec!["0x1".into()],
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .with_return_data(Some(data)),
+        );
+        let mut server = DapServer::with_session(trace, Vec::new(), &std::env::temp_dir());
+        server.handle_message(&DapMessage::request(1, "launch", None));
+
+        let scopes = server.handle_message(&DapMessage::request(2, "scopes", None));
+        assert!(scopes[0].body.as_ref().expect("body")["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .any(|scope| scope["variablesReference"] == RETURN_DATA_REF));
+        let words = server.handle_message(&DapMessage::request(
+            3,
+            "variables",
+            Some(json!({"variablesReference": RETURN_DATA_REF})),
+        ));
+        let variables = &words[0].body.as_ref().expect("body")["variables"];
+        assert_eq!(variables[0]["name"], "returndata[0x0]");
+        assert_eq!(variables[0]["value"], format!("{:0>64}", "2a"));
+        assert_eq!(variables[1]["name"], "returndata[0x20]");
     }
 
     #[test]

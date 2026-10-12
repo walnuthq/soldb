@@ -148,7 +148,7 @@ async function main() {
 
   // Backend parity: the node's debug_traceTransaction, through the same module, must
   // agree on program counters and opcodes.
-  const debugTrace = await rpc("debug_traceTransaction", [callHash, { enableMemory: true, disableStorage: false }]);
+  const debugTrace = await rpc("debug_traceTransaction", [callHash, { enableMemory: true, enableReturnData: true, disableStorage: false }]);
   const traced = Trace.fromTransaction(JSON.stringify(debugTrace), JSON.stringify(transaction), JSON.stringify(receipt));
   assert(traced.stepCount() === replayed.stepCount(), `step count ${traced.stepCount()} vs ${replayed.stepCount()}`);
   for (let index = 0; index < traced.stepCount(); index += 1) {
@@ -201,7 +201,7 @@ async function main() {
   const nodeCall = await rpc("debug_traceCall", [
     { from: SENDER, to: contract, data: "0x" },
     "latest",
-    { enableMemory: true, disableStorage: false },
+    { enableMemory: true, enableReturnData: true, disableStorage: false },
   ]);
   const nodeSimulated = Trace.fromSimulation(SENDER, contract, "0x", "0", JSON.stringify(nodeCall));
   assert(nodeSimulated.stepCount() === simulated.stepCount(), `call step count ${nodeSimulated.stepCount()} vs ${simulated.stepCount()}`);

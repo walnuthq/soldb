@@ -145,6 +145,7 @@ if [ "$USE_ETHDEBUG" = true ]; then
         --bin
         --abi
         --storage-layout
+        --transient-storage-layout
         --overwrite
         -o "$DEBUG_DIR"
     )
@@ -186,9 +187,26 @@ if [ "$USE_ETHDEBUG" = true ] && [ $COMPILE_EXIT_CODE -ne 0 ] && grep -q "unreco
         --bin
         --abi
         --storage-layout
+        --transient-storage-layout
         --overwrite
         -o "$DEBUG_DIR"
     )
+    echo -e "${BLUE}Running: $SOLC_PATH ${COMPILE_FLAGS[*]} $CONTRACT_FILE${NC}"
+    "$SOLC_PATH" "${COMPILE_FLAGS[@]}" "$CONTRACT_FILE" 2>&1 | tee "$DEBUG_DIR/compile.log"
+    COMPILE_EXIT_CODE=${PIPESTATUS[0]}
+fi
+
+# Releases before transient storage do not know `--transient-storage-layout`; the layout
+# is optional debug information, so compile without it rather than fail.
+if [ "$USE_ETHDEBUG" = true ] && [ $COMPILE_EXIT_CODE -ne 0 ] && grep -q -- "unrecognised option '--transient-storage-layout'" "$DEBUG_DIR/compile.log"; then
+    echo -e "${YELLOW}This solc has no transient storage layout output; retrying without it...${NC}"
+    SUPPORTED_FLAGS=()
+    for flag in "${COMPILE_FLAGS[@]}"; do
+        if [ "$flag" != "--transient-storage-layout" ]; then
+            SUPPORTED_FLAGS+=("$flag")
+        fi
+    done
+    COMPILE_FLAGS=("${SUPPORTED_FLAGS[@]}")
     echo -e "${BLUE}Running: $SOLC_PATH ${COMPILE_FLAGS[*]} $CONTRACT_FILE${NC}"
     "$SOLC_PATH" "${COMPILE_FLAGS[@]}" "$CONTRACT_FILE" 2>&1 | tee "$DEBUG_DIR/compile.log"
     COMPILE_EXIT_CODE=${PIPESTATUS[0]}
