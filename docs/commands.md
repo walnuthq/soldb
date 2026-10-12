@@ -91,6 +91,11 @@ the source line, each word with its index from the bottom of the stack.
 A trace is a complete recording, so every command below is a search over it. Nothing is
 re-executed, and a breakpoint anywhere in the code a command runs through stops it early.
 
+A trace can hold several top-level calls one after another, as Foundry records a test's
+`setUp` and the test itself. Each is a root frame with its own contract and calldata, and
+stepping past the end of one continues into the next. When the trace names what each call
+is, such as `setup` or `execution`, `backtrace` shows it on the root frame.
+
 ### `next`
 
 Aliases: `n`
@@ -127,8 +132,8 @@ Advance one EVM instruction.
 Aliases: `fin`
 
 Run until the current frame returns to its caller: the end of the current internal
-function, or of the current external call. At the root, `finish` runs to the end of the
-trace.
+function, or of the current external call. At the root, `finish` runs to where the next
+top-level call starts, or to the end of the trace from the last one.
 
 ### `continue`
 
@@ -146,7 +151,7 @@ step, including the middle of a transaction.
 | `reverse-next` | `rnext`, `rn` | the start of the previous line in this frame or a caller, skipping calls it made; from the middle of a line, the start of that line |
 | `reverse-step` | `rstep`, `rs` | the start of the previous line anywhere, entering calls |
 | `reverse-nexti` | `rnexti`, `rni`, `reverse-stepi`, `rsi`, `back` | the previous EVM instruction |
-| `reverse-finish` | `rfinish`, `rfin` | the step in the caller that entered the current frame |
+| `reverse-finish` | `rfinish`, `rfin` | the step in the caller that entered the current frame; at the root, where its top-level call starts |
 | `reverse-continue` | `rcontinue`, `rc` | the nearest earlier breakpoint, or the first step |
 
 ```text
@@ -354,7 +359,8 @@ Aliases: `bt`, `where`
 Print the call frames at the current step, innermost first. A frame is an external call or
 an internal Solidity function; each shows its function (or, without source, the contract or
 address executing), where it is, and the step and program counter it sits at. Frames above
-the innermost one show the call site.
+the innermost one show the call site. A root frame whose top-level call has a kind recorded
+in the trace shows it in brackets, as `[setup]`.
 
 ```text
 soldb> bt
@@ -484,8 +490,8 @@ when the trace carries no transient storage.
 
 ### `calldata`
 
-Print the calldata of the current frame: the transaction input at the root, or the
-recorded call's input in a nested frame when the backend recorded calls.
+Print the calldata of the current frame: the input of its top-level call at the root, or
+the recorded call's input in a nested frame when the backend recorded calls.
 
 ### `returndata`
 

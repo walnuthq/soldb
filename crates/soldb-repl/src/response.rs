@@ -212,6 +212,9 @@ pub struct FrameInfo {
     pub address: Option<String>,
     pub step: usize,
     pub pc: u64,
+    /// For a root frame, what its top-level call is, when the trace says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

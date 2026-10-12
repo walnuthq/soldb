@@ -138,13 +138,13 @@ impl DapServer {
 
     /// A server whose session is a trace and contract debug info the host built in
     /// memory, as `forge test --debug` does. `launch` serves it whatever its arguments.
-    /// Relative source paths are reported to the editor under `root`.
-    #[must_use]
+    /// Relative source paths are reported to the editor under `root`. Fails on a trace
+    /// whose top-level calls no execution produces.
     pub fn with_session(
         trace: TransactionTrace,
         contracts: Vec<ContractDebugInfo>,
         root: &Path,
-    ) -> Self {
+    ) -> SoldbResult<Self> {
         let mut server = Self::default();
         for contract in &contracts {
             server.sources.push(LoadedSource {
@@ -153,10 +153,10 @@ impl DapServer {
                 contract: contract.clone(),
             });
         }
-        server.debugger.load_trace(trace);
+        server.debugger.load_trace(trace)?;
         server.debugger.attach_debug_info(contracts);
         server.prepared = true;
-        server
+        Ok(server)
     }
 
     /// Answers DAP requests read from `reader` on `writer` until the client disconnects
@@ -370,7 +370,7 @@ impl DapServer {
         };
 
         let summary = loaded_summary(&trace);
-        self.debugger.load_trace(trace);
+        self.debugger.load_trace(trace)?;
         if !self.sources.is_empty() {
             let mut contracts = Vec::new();
             for source in &self.sources {
@@ -742,6 +742,10 @@ impl DapServer {
                     (Some(function), _) => format!("{function}{arguments} ({step_name})"),
                     (None, Some(contract)) => format!("{contract} ({step_name})"),
                     (None, None) => step_name,
+                };
+                let name = match &frame.kind {
+                    Some(kind) => format!("[{kind}] {name}"),
+                    None => name,
                 };
                 let (source, line, column) = match &frame.location {
                     Some(location) => (
@@ -1239,7 +1243,8 @@ mod tests {
             )
             .with_return_data(Some(data)),
         );
-        let mut server = DapServer::with_session(trace, Vec::new(), &std::env::temp_dir());
+        let mut server = DapServer::with_session(trace, Vec::new(), &std::env::temp_dir())
+            .expect("a valid trace");
         server.handle_message(&DapMessage::request(1, "launch", None));
 
         let scopes = server.handle_message(&DapMessage::request(2, "scopes", None));
@@ -1636,7 +1641,7 @@ mod tests {
         ];
 
         let root = temp.join("project");
-        let mut server = DapServer::with_session(trace, contracts, &root);
+        let mut server = DapServer::with_session(trace, contracts, &root).expect("a valid trace");
 
         let set_breakpoints = DapMessage::request(
             1,

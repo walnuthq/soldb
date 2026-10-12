@@ -79,14 +79,16 @@ lit test/trace/basic-trace.test -v
 lit test/simulate/ -v
 ```
 
-Scope a full run with `--trace-only`, `--simulate-only`, `--run-only`, `--events-only`, or
-`--cli-only`.
+Scope a full run with `--trace-only`, `--simulate-only`, `--run-only`, `--events-only`,
+`--cli-only`, or `--dap-only`.
 Tests run with `-j1` on purpose: they share one node, one contract deployment, and the
 `examples/out` artifact directory.
 
 Some tests are opt-in and silently skip without their prerequisites, so a green run does
 not mean full coverage:
 
+- `test/dap/*.test` need `soldb-dap-server` next to `soldb` or on `PATH`; they gate on
+  the `soldb-dap` lit feature, and `run-tests.sh` warns when it is missing.
 - `test/events/sepolia-*.test`, `test/trace/multi-contract-*sepolia.test` need
   `--sepolia-key=KEY` or `SEPOLIA_KEY_ENV`; they gate on the `sepolia-rpc` lit feature.
 - `test/trace/stylus-interop.test` needs a nitro testnode, `cargo-stylus-beta`, and the

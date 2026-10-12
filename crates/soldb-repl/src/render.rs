@@ -111,7 +111,11 @@ impl Renderer {
                     lines.push(format!("{} {note}", self.dim("note:")));
                 }
                 for frame in frames {
-                    let mut line = format!("#{:<2} {}", frame.index, self.name(&frame.name));
+                    let mut line = format!("#{:<2} ", frame.index);
+                    if let Some(kind) = &frame.kind {
+                        let _ = write!(line, "[{kind}] ");
+                    }
+                    line.push_str(&self.name(&frame.name));
                     if !frame.arguments.is_empty() {
                         let arguments = frame
                             .arguments

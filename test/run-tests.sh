@@ -21,6 +21,7 @@ RUN_SIMULATE_TESTS=true
 RUN_RUN_TESTS=true
 RUN_EVENTS_TESTS=true
 RUN_CLI_TESTS=true
+RUN_DAP_TESTS=true
 VERBOSE=false
 SEPOLIA_KEY=""
 
@@ -42,6 +43,7 @@ for arg in "$@"; do
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
             RUN_RUN_TESTS=false
+            RUN_DAP_TESTS=false
             shift
             ;;
         --profile-only)
@@ -51,6 +53,7 @@ for arg in "$@"; do
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
             RUN_RUN_TESTS=false
+            RUN_DAP_TESTS=false
             shift
             ;;
         --debug-diff-only)
@@ -60,6 +63,7 @@ for arg in "$@"; do
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
             RUN_RUN_TESTS=false
+            RUN_DAP_TESTS=false
             shift
             ;;
         --simulate-only)
@@ -69,6 +73,7 @@ for arg in "$@"; do
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
             RUN_RUN_TESTS=false
+            RUN_DAP_TESTS=false
             shift
             ;;
         --events-only)
@@ -78,6 +83,7 @@ for arg in "$@"; do
             RUN_SIMULATE_TESTS=false
             RUN_CLI_TESTS=false
             RUN_RUN_TESTS=false
+            RUN_DAP_TESTS=false
             shift
             ;;
         --run-only)
@@ -87,6 +93,7 @@ for arg in "$@"; do
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
             RUN_CLI_TESTS=false
+            RUN_DAP_TESTS=false
             shift
             ;;
         --cli-only)
@@ -95,6 +102,17 @@ for arg in "$@"; do
             RUN_DEBUG_DIFF_TESTS=false
             RUN_SIMULATE_TESTS=false
             RUN_EVENTS_TESTS=false
+            RUN_RUN_TESTS=false
+            RUN_DAP_TESTS=false
+            shift
+            ;;
+        --dap-only)
+            RUN_TRACE_TESTS=false
+            RUN_PROFILE_TESTS=false
+            RUN_DEBUG_DIFF_TESTS=false
+            RUN_SIMULATE_TESTS=false
+            RUN_EVENTS_TESTS=false
+            RUN_CLI_TESTS=false
             RUN_RUN_TESTS=false
             shift
             ;;
@@ -118,6 +136,7 @@ for arg in "$@"; do
             echo "  --run-only         Run only run tests (from test/run/)"
             echo "  --events-only      Run only events tests (from test/events/)"
             echo "  --cli-only         Run only CLI tests (from test/cli/)"
+            echo "  --dap-only         Run only DAP server tests (from test/dap/)"
             echo "  --solc=PATH        Compiler for both deployment and the tests themselves"
             echo "  --sepolia-key=KEY  Set Optimism Sepolia API key for remote tests"
             echo "  --coverage         Accepted for compatibility; use cargo llvm-cov for coverage"
@@ -132,6 +151,7 @@ for arg in "$@"; do
             echo "  test/run/          Contains run command tests (no node needed)"
             echo "  test/events/       Contains list-events command tests"
             echo "  test/cli/          Contains CLI command and error tests"
+            echo "  test/dap/          Contains soldb-dap-server tests (no node needed)"
             echo ""
             echo "Environment variables:"
             echo "  RPC_URL            RPC endpoint (default: http://localhost:8545)"
@@ -616,6 +636,23 @@ if [ "$RUN_CLI_TESTS" = true ]; then
         "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/cli"
     else
         echo -e "${YELLOW}Warning: cli directory not found${NC}"
+    fi
+fi
+
+# Run DAP server tests: they replay trace fixtures, no node
+if [ "$RUN_DAP_TESTS" = true ]; then
+    echo -e "${YELLOW}Running DAP tests...${NC}"
+    # lit.cfg.py looks for the server next to soldb, then on PATH; without it the tests
+    # are unsupported, which a green run would not show.
+    SOLDB_DAP_CMD="$(dirname "$(command -v "$SOLDB_CMD")")/soldb-dap-server"
+    if [ ! -x "$SOLDB_DAP_CMD" ] && ! command -v soldb-dap-server &> /dev/null; then
+        echo -e "${YELLOW}Warning: soldb-dap-server not found; DAP tests will be skipped${NC}"
+        echo "Build it with: cargo build --bin soldb-dap-server"
+    fi
+    if [ -d "${SCRIPT_DIR}/dap" ]; then
+        "$LIT_CMD" $LIT_OPTS "${SCRIPT_DIR}/dap"
+    else
+        echo -e "${YELLOW}Warning: dap directory not found${NC}"
     fi
 fi
 

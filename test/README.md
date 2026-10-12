@@ -11,6 +11,7 @@ test/
 ├── simulate/        # Simulate command tests (lit + FileCheck)
 ├── events/          # Events command tests (lit + FileCheck)
 ├── cli/             # CLI command and validation tests (lit + FileCheck)
+├── dap/             # soldb-dap-server tests over stdio (lit + FileCheck)
 ├── stylus/          # Stylus interop test contracts and scripts
 ├── run-tests.sh     # Main test runner script
 ├── lit.cfg.py       # Test framework configuration
@@ -68,6 +69,14 @@ Tests for command-line parsing and shared command behavior:
 - **list-contracts-basic.test**: Contract listing for a local transaction
 - **bridge-invalid-host.test**: Bridge command startup error handling
 
+### DAP Tests (`test/dap/`)
+
+Tests for `soldb-dap-server`, driven over stdio by `dap-session.py`:
+
+- **foundry-multi-root.test**: A Foundry test's deployment, `setUp`, and test call as one
+  trace with three top-level calls: each root frame's kind, stepping from one call into the
+  next, and a breakpoint in the last call. No node needed.
+
 ### Stylus Interop Tests (`test/stylus/`)
 
 Tests for Solidity <> Stylus cross-environment tracing:
@@ -102,6 +111,9 @@ cd test
 
 # Run only CLI tests
 ./run-tests.sh --cli-only
+
+# Run only DAP server tests
+./run-tests.sh --dap-only
 ```
 
 ### Run with Verbose Output

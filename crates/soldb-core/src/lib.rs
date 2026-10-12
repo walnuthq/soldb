@@ -626,6 +626,17 @@ pub struct TraceArtifacts {
     pub gas: Option<GasSummary>,
     #[serde(default)]
     pub revert_data: Option<String>,
+    /// What each top-level call is, for a trace with several, such as Foundry's
+    /// `deployment`, `setup` and `execution`. Display only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub root_kinds: Vec<RootKind>,
+}
+
+/// The kind of the top-level call that starts at `entry_step`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootKind {
+    pub entry_step: usize,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
