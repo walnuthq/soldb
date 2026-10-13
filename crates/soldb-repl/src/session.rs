@@ -332,6 +332,7 @@ impl Session {
                     .flatten(),
                 step: frame.step,
                 pc: frame.pc,
+                kind: frame.kind.clone(),
             })
             .collect();
         Output::Backtrace {

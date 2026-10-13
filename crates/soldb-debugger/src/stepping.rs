@@ -39,6 +39,7 @@ use soldb_ethdebug::{
 
 use crate::condition::Value;
 use crate::decode::{Place, ValueReader};
+use crate::roots::{root_calls, root_index, RootCall};
 use crate::state::StorageWords;
 use crate::types::SourceTypes;
 use crate::{
@@ -479,6 +480,8 @@ pub struct Frame {
     /// entry point and the contract's argument order is known. Filled in by
     /// [`StepMap::frame_arguments`]; empty otherwise.
     pub arguments: Vec<FrameArgument>,
+    /// For a root frame, what its top-level call is, when the trace says.
+    pub kind: Option<String>,
 }
 
 /// Lines of source around a step.
@@ -517,6 +520,8 @@ struct StepInfo {
     storage: Option<usize>,
     /// EVM depth, zero at the root.
     evm_depth: u32,
+    /// True when this step starts a top-level call after the first.
+    starts_root: bool,
     /// EVM depth plus the inferred internal-function depth, zero at the root.
     frame_depth: u32,
     /// True when this step enters a frame: an external call, or an internal function.
@@ -546,6 +551,8 @@ pub struct StepMap {
     variable_layouts: Vec<Vec<InferredVariable>>,
     /// Per step, the index into `variable_layouts`, or `NO_LAYOUT`.
     step_variables: Vec<u32>,
+    /// The top-level calls, in execution order. Never empty.
+    roots: Vec<RootCall>,
 }
 
 const NO_LAYOUT: u32 = u32::MAX;
@@ -625,6 +632,8 @@ impl Evidence {
 struct FramedStep {
     evm_depth: u32,
     frame_id: u32,
+    /// Index into the top-level calls of the one this step belongs to.
+    root: usize,
     contract: Option<usize>,
     address: Option<usize>,
     storage: Option<usize>,
@@ -915,16 +924,29 @@ fn live_index(function: &SourceFunction, index: usize, offset: u64) -> usize {
         .count()
 }
 
-/// The calldata of the frame executing `step`: the transaction's input at the root, the
-/// recorded call's input in a nested frame.
-fn calldata_for_step(trace: &TransactionTrace, step: usize) -> &str {
+/// The calldata of the frame executing `step`: the input of its top-level call in `roots`
+/// at the root, the recorded call's input in a nested frame, and empty when the backend
+/// did not record that call.
+pub(crate) fn calldata_for_step<'a>(
+    trace: &'a TransactionTrace,
+    roots: &[RootCall],
+    step: usize,
+) -> &'a str {
+    let root_input = roots
+        .get(root_index(roots, step))
+        .map_or("", |root| root.input(trace));
+    frame_calldata(trace, step, root_input)
+}
+
+/// The calldata of the frame executing `step`, given its top-level call's input.
+fn frame_calldata<'a>(trace: &'a TransactionTrace, step: usize, root_input: &'a str) -> &'a str {
     let root_depth = trace.steps.first().map_or(0, |first| first.depth);
     let depth = trace
         .steps
         .get(step)
         .map_or(root_depth, |current| current.depth);
     if depth == root_depth {
-        return &trace.input_data;
+        return root_input;
     }
     trace
         .artifacts
@@ -1076,6 +1098,7 @@ fn place_at_entry_landing(
     contract: &ContractDebugInfo,
     function: usize,
     trace: &TransactionTrace,
+    root_input: &str,
     index: usize,
     own: LocationRef,
     height: usize,
@@ -1103,7 +1126,7 @@ fn place_at_entry_landing(
         return;
     }
     let stack = trace.steps[index].snapshot_ref().stack;
-    let calldata = calldata_for_step(trace, index);
+    let calldata = frame_calldata(trace, index, root_input);
     if argument_evidence(declared, calldata, stack) == Evidence::Contradicted {
         return;
     }
@@ -1163,9 +1186,11 @@ impl StepMap {
     /// Maps every step of `trace` through the contracts' debug info.
     ///
     /// The root frame executes the transaction's target, or the created contract for a
-    /// deployment. A contract given with an address describes any frame that executes
-    /// it; when only one contract is given, it also describes the root whatever address
-    /// it names, so a single `--ethdebug-dir` applies to the transaction it was passed for.
+    /// deployment; a trace with several top-level calls has a root frame for each. A
+    /// contract given with an address describes any frame that executes it; when only one
+    /// contract is given and the trace has one root, it also describes the root whatever
+    /// address it names, so a single `--ethdebug-dir` applies to the transaction it was
+    /// passed for.
     #[must_use]
     pub fn new(trace: &TransactionTrace, contracts: Vec<ContractDebugInfo>) -> Self {
         Self::build(trace, contracts, true)
@@ -1195,6 +1220,8 @@ impl StepMap {
         // the frame's environment is preferred, and one that names no environment describes
         // both. When only the other program is loaded it still names the address's sources,
         // and is used as before.
+        let roots = root_calls(trace);
+        let single_root = roots.len() == 1;
         let contract_for =
             |address: Option<&str>, environment: CodeEnvironment, root: bool| -> Option<usize> {
                 let address = address.map(normalize_address);
@@ -1212,33 +1239,41 @@ impl StepMap {
                         return Some(index);
                     }
                 }
-                (root && contracts.len() == 1).then_some(0)
+                (root && single_root && contracts.len() == 1).then_some(0)
             };
 
         // Pass 1: EVM frames, executing addresses, and each step's own span.
-        let root_address = trace
-            .to_addr
-            .as_deref()
-            .or(trace.contract_address.as_deref());
-        let root_environment = if trace.to_addr.is_none() && trace.contract_address.is_some() {
-            CodeEnvironment::Create
-        } else {
-            CodeEnvironment::Call
-        };
         let root_depth = trace.steps.first().map_or(0, |step| step.depth);
-        let mut next_frame_id = 1_u32;
-        let root_storage = root_address.map(&mut intern);
-        let mut evm_frames = vec![EvmFrame {
-            id: 0,
-            contract: contract_for(root_address, root_environment, true),
-            address: root_storage,
-            storage: root_storage,
-            entry_step: 0,
-        }];
+        let mut next_frame_id = 0_u32;
+        let mut evm_frames = Vec::<EvmFrame>::new();
+        let mut upcoming_roots = roots.iter().enumerate().peekable();
+        let mut current_root = 0;
         let mut reverted = Vec::new();
         let mut framed = Vec::with_capacity(trace.steps.len());
         for (index, step) in trace.steps.iter().enumerate() {
             let evm_depth = step.depth.saturating_sub(root_depth) as usize;
+            if let Some((position, root)) =
+                upcoming_roots.next_if(|(_, root)| root.entry_step == index)
+            {
+                current_root = position;
+                // A top-level call starts here and replaces the previous one's frames.
+                let environment = if root.creation(trace) {
+                    CodeEnvironment::Create
+                } else {
+                    CodeEnvironment::Call
+                };
+                let root_address = root.address(trace);
+                let address = root_address.map(&mut intern);
+                evm_frames.clear();
+                evm_frames.push(EvmFrame {
+                    id: next_frame_id,
+                    contract: contract_for(root_address, environment, true),
+                    address,
+                    storage: address,
+                    entry_step: index,
+                });
+                next_frame_id += 1;
+            }
             evm_frames.truncate(evm_depth + 1);
             while evm_frames.len() <= evm_depth {
                 // A new EVM frame. The backend's record of the call or creation entered at
@@ -1295,6 +1330,7 @@ impl StepMap {
             framed.push(FramedStep {
                 evm_depth: evm_depth as u32,
                 frame_id: frame.id,
+                root: current_root,
                 contract: frame.contract,
                 address: frame.address,
                 storage: frame.storage,
@@ -1352,7 +1388,7 @@ impl StepMap {
                 let contract = &contracts[contract_index];
                 let function = contract.functions.get(function)?;
                 let landed_from_function = index > 0
-                    && framed[index - 1].evm_depth == step.evm_depth
+                    && framed[index - 1].frame_id == step.frame_id
                     && &*trace.steps[index - 1].op == "JUMP"
                     && framed[index - 1]
                         .location
@@ -1369,7 +1405,10 @@ impl StepMap {
             let contract_info = step.contract.map(|index| &contracts[index]);
             let evm_depth = step.evm_depth as usize;
             let mut frame_entry = false;
-            internal.truncate(evm_depth + 1);
+            // A new top-level call starts with no functions.
+            let new_root = index > 0 && framed[index - 1].root != step.root;
+            let root_input = roots[step.root].input(trace);
+            internal.truncate(if new_root { evm_depth } else { evm_depth + 1 });
             while internal.len() <= evm_depth {
                 internal.push(InternalFrame::default());
                 frame_entry = true;
@@ -1379,12 +1418,12 @@ impl StepMap {
             // A step reached by a `JUMP` from the same EVM frame is a landing: the jump's
             // marker, or landing on a function's entry point, says whether it was a call.
             let landed_by_jump = index > 0
-                && framed[index - 1].evm_depth == step.evm_depth
+                && framed[index - 1].frame_id == step.frame_id
                 && &*trace.steps[index - 1].op == "JUMP";
             // Whether the previous step ran another function's own code in this EVM
             // frame, as opposed to the dispatcher's.
             let from_function_code = index > 0
-                && framed[index - 1].evm_depth == step.evm_depth
+                && framed[index - 1].frame_id == step.frame_id
                 && framed[index - 1].location.is_some_and(|location| {
                     location.function.is_some()
                         && location.function != step.location.and_then(|own| own.function)
@@ -1452,7 +1491,8 @@ impl StepMap {
                         {
                             if let Some(contract) = contract_info {
                                 place_at_entry_landing(
-                                    frame, contract, function, trace, index, own, height, false,
+                                    frame, contract, function, trace, root_input, index, own,
+                                    height, false,
                                 );
                             }
                         }
@@ -1473,7 +1513,8 @@ impl StepMap {
                             // helper whose span is the calling line.
                             if let Some(contract) = contract_info {
                                 place_at_entry_landing(
-                                    frame, contract, function, trace, index, own, height, true,
+                                    frame, contract, function, trace, root_input, index, own,
+                                    height, true,
                                 );
                             }
                             frame.push_placeholder();
@@ -1640,6 +1681,7 @@ impl StepMap {
                 address: step.address,
                 storage: step.storage,
                 evm_depth: step.evm_depth,
+                starts_root: new_root,
                 frame_depth: (evm_depth + internal_total) as u32,
                 frame_entry,
                 line_start: false,
@@ -1657,6 +1699,7 @@ impl StepMap {
             locals_support,
             variable_layouts,
             step_variables,
+            roots,
         };
         if smooth {
             map.smooth_single_step_excursions();
@@ -1667,7 +1710,8 @@ impl StepMap {
 
     /// A lone instruction attributed to another line, between two runs of the same line
     /// at the same depth, counts as that line. solc emits such instructions at function
-    /// entry, and stopping on them would show a later line before an earlier one.
+    /// entry, and stopping on them would show a later line before an earlier one. The runs
+    /// are looked for within the step's own top-level call.
     fn smooth_single_step_excursions(&mut self) {
         let neighbours =
             |steps: &[StepInfo], index: usize, forward: bool| -> Option<Option<LineKey>> {
@@ -1678,6 +1722,11 @@ impl StepMap {
                     Box::new((0..index).rev())
                 };
                 for candidate in range {
+                    // The step after a boundary is the one marked as starting a root.
+                    let boundary = if forward { candidate } else { candidate + 1 };
+                    if steps[boundary].starts_root {
+                        return None;
+                    }
                     let step = &steps[candidate];
                     if step.frame_depth > depth {
                         continue;
@@ -1716,6 +1765,9 @@ impl StepMap {
     fn mark_line_starts(&mut self) {
         let mut last_key_at_or_below = Vec::<Option<LineKey>>::new();
         for step in &mut self.steps {
+            if step.starts_root {
+                last_key_at_or_below.clear();
+            }
             let depth = step.frame_depth as usize;
             if last_key_at_or_below.len() <= depth {
                 last_key_at_or_below.resize(depth + 1, None);
@@ -1854,6 +1906,13 @@ impl StepMap {
         }
     }
 
+    /// The calldata of the frame executing `step`; empty in a nested frame whose call the
+    /// backend did not record.
+    #[must_use]
+    pub fn calldata_at<'a>(&self, trace: &'a TransactionTrace, step: usize) -> &'a str {
+        calldata_for_step(trace, &self.roots, step)
+    }
+
     /// The contract whose code declares the function executing at `step`: where a bare
     /// type name written in that function resolves.
     pub(crate) fn scope_at_step(&self, step: usize) -> Option<&str> {
@@ -1950,7 +2009,7 @@ impl StepMap {
         let stack = snapshot.map_or(&[][..], |snapshot| snapshot.stack);
         let reader = ValueReader {
             memory: snapshot.and_then(|snapshot| snapshot.memory),
-            calldata: calldata_for_step(trace, step),
+            calldata: self.calldata_at(trace, step),
             storage: words,
             layout: contract.storage_layout.as_ref(),
             types: &contract.types,
@@ -2016,7 +2075,7 @@ impl StepMap {
         let stack = snapshot.map_or(&[][..], |snapshot| snapshot.stack);
         let reader = ValueReader {
             memory: snapshot.and_then(|snapshot| snapshot.memory),
-            calldata: calldata_for_step(trace, step),
+            calldata: self.calldata_at(trace, step),
             storage: words,
             layout: contract.storage_layout.as_ref(),
             types: &contract.types,
@@ -2168,12 +2227,15 @@ impl StepMap {
         })
     }
 
-    /// The step where the current frame has returned to its caller.
+    /// The step where the current frame has returned to its caller. A root frame returns
+    /// where the next top-level call starts.
     #[must_use]
     pub fn finish(&self, step: usize) -> Option<usize> {
         let current = *self.steps.get(step)?;
-        ((step + 1)..self.steps.len())
-            .find(|&index| self.steps[index].frame_depth < current.frame_depth)
+        ((step + 1)..self.steps.len()).find(|&index| {
+            let candidate = &self.steps[index];
+            candidate.frame_depth < current.frame_depth || candidate.starts_root
+        })
     }
 
     /// The start of the previous source line at this frame or a caller's, skipping the
@@ -2212,25 +2274,31 @@ impl StepMap {
         Some(self.run_start(previous, skip_deeper))
     }
 
-    /// The step in the caller that entered the current frame.
+    /// The step in the caller that entered the current frame. A root frame was entered
+    /// where its top-level call starts.
     #[must_use]
     pub fn reverse_finish(&self, step: usize) -> Option<usize> {
         let current = *self.steps.get(step)?;
-        (0..step)
-            .rev()
-            .find(|&index| self.steps[index].frame_depth < current.frame_depth)
+        (0..step).rev().find(|&index| {
+            let candidate = &self.steps[index];
+            candidate.frame_depth < current.frame_depth || candidate.starts_root
+        })
     }
 
     /// The first step of the run of one line that `step` belongs to. With `skip_deeper`,
     /// steps in frames the line called into do not break the run; steps without source at
-    /// the same depth never do.
+    /// the same depth never do. A run never starts in an earlier top-level call.
     fn run_start(&self, step: usize, skip_deeper: bool) -> usize {
         let info = self.steps[step];
         let key = info.key;
+        let root = root_index(&self.roots, step);
         let mut current = step;
         while let Some(previous) = self.previous_mapped(current, info.frame_depth, skip_deeper) {
             let candidate = self.steps[previous];
             if candidate.frame_depth != info.frame_depth || candidate.key != key {
+                break;
+            }
+            if root_index(&self.roots, previous) != root {
                 break;
             }
             current = previous;
@@ -2363,10 +2431,11 @@ impl StepMap {
         let mut stack = Vec::<Record>::new();
         for (index, info) in self.steps.iter().enumerate().take(step + 1) {
             let depth = info.frame_depth as usize;
-            stack.truncate(depth + 1);
+            stack.truncate(if info.starts_root { 0 } else { depth + 1 });
             // Frames entered at this step. When an external call and a function both begin
             // here, the outer one is the call.
-            let entered_call = index == 0 || info.evm_depth > self.steps[index - 1].evm_depth;
+            let entered_call =
+                index == 0 || info.starts_root || info.evm_depth > self.steps[index - 1].evm_depth;
             let mut first_new = true;
             while stack.len() <= depth {
                 stack.push(Record {
@@ -2409,9 +2478,23 @@ impl StepMap {
                     pc: self.pcs[record.last_step],
                     location,
                     arguments: Vec::new(),
+                    kind: self.root_kind(depth, record.entry_step),
                 }
             })
             .collect()
+    }
+
+    /// The kind of the top-level call a frame at `depth` entered at `entry_step` runs, for
+    /// a root frame: it is entered where its top-level call starts.
+    fn root_kind(&self, depth: usize, entry_step: usize) -> Option<String> {
+        if depth != 0 {
+            return None;
+        }
+        let root = self.roots.get(root_index(&self.roots, entry_step))?;
+        if root.entry_step != entry_step {
+            return None;
+        }
+        root.kind.clone()
     }
 
     /// The source around `step`: `radius` lines on each side of its line.
@@ -4336,5 +4419,108 @@ contract P {
         );
         assert_eq!(address_from_word("0x0"), None);
         assert_eq!(address_from_word("zz"), None);
+    }
+
+    const SECOND_ROOT: &str = "0xbbbb000000000000000000000000000000000002";
+
+    /// Two top-level calls one after the other, as a test runner records `setUp` and the
+    /// test: `outer_calls_inner` at `ROOT` (steps 0 to 10), then again at `SECOND_ROOT`
+    /// (steps 11 to 21).
+    fn two_roots() -> TransactionTrace {
+        let mut trace = outer_calls_inner();
+        let again = trace.steps.clone();
+        trace.steps.extend(again);
+        let mut first = call(0, 0, 11, "CALL", ROOT);
+        first.input = "0x01".to_owned();
+        let mut second = call(1, 11, 22, "CALL", SECOND_ROOT);
+        second.input = "0x02".to_owned();
+        trace.artifacts.calls = vec![first, second];
+        trace
+    }
+
+    #[test]
+    fn each_root_call_maps_through_its_own_contract() {
+        let trace = two_roots();
+        let map = StepMap::new(
+            &trace,
+            vec![contract(Some(ROOT)), contract(Some(SECOND_ROOT))],
+        );
+        let address_at = |step: usize| {
+            map.contract_at_step(step)
+                .and_then(|contract| contract.address.clone())
+        };
+        assert_eq!(address_at(3).as_deref(), Some(ROOT));
+        assert_eq!(address_at(14).as_deref(), Some(SECOND_ROOT));
+
+        // The second root starts with no functions of the first on its stack.
+        let frames = map.frames(17);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].function_name.as_deref(), Some("inner"));
+        assert!(frames[2].external);
+        assert_eq!(frames[2].entry_step, 11);
+        assert_eq!(frames[2].address.as_deref(), Some(SECOND_ROOT));
+
+        // `next` from the end of the first call goes on into the second.
+        let next = map.next_source(10).expect("a line in the second call");
+        assert!(next > 10);
+        assert_eq!(address_at(next).as_deref(), Some(SECOND_ROOT));
+
+        assert_eq!(map.calldata_at(&trace, 3), "0x01");
+        assert_eq!(map.calldata_at(&trace, 14), "0x02");
+    }
+
+    #[test]
+    fn finish_from_a_root_frame_stops_where_the_next_root_starts() {
+        let map = StepMap::new(
+            &two_roots(),
+            vec![contract(Some(ROOT)), contract(Some(SECOND_ROOT))],
+        );
+        // In the first call's root frame, before and after its function.
+        assert_eq!(map.finish(1), Some(11));
+        assert_eq!(map.finish(10), Some(11));
+        // The second call's root frame goes back to where that call starts.
+        assert_eq!(map.reverse_finish(12), Some(11));
+        // The last call still runs to the end, and the first back to the start.
+        assert_eq!(map.finish(12), None);
+        assert_eq!(map.reverse_finish(1), None);
+    }
+
+    #[test]
+    fn reverse_next_stays_within_a_root() {
+        // Both calls run `outer`. The first ends on its declaration line, as solc's return
+        // jump does (steps 0 to 10); the second enters `outer` on that line at step 13.
+        let mut trace = outer_calls_inner();
+        trace.steps.truncate(10);
+        trace.steps.push(step(10, 1, "JUMP", &[]));
+        trace.steps.extend(outer_calls_inner().steps);
+        trace.artifacts.calls = vec![call(0, 0, 11, "CALL", ROOT), call(1, 11, 22, "CALL", ROOT)];
+        let map = StepMap::new(&trace, vec![contract(Some(ROOT))]);
+        assert_eq!(map.line_key(10), map.line_key(13));
+        assert_eq!(map.previous_source(14), Some(13));
+    }
+
+    #[test]
+    fn a_single_contract_describes_only_a_single_root() {
+        let map = StepMap::new(&two_roots(), vec![contract(None)]);
+        assert!(map.contract_at_step(3).is_none());
+        assert!(map.contract_at_step(14).is_none());
+        let map = StepMap::new(&outer_calls_inner(), vec![contract(None)]);
+        assert!(map.contract_at_step(3).is_some());
+    }
+
+    #[test]
+    fn smoothing_stays_within_a_root() {
+        // The first call ends on `b = 0;` in `outer`; the second enters `outer` at its
+        // declaration, a lone step before `b = 0;` again.
+        let mut trace = outer_calls_inner();
+        trace.steps.truncate(10);
+        trace.steps.push(step(10, 1, "JUMPDEST", &[]));
+        trace.steps.push(step(14, 1, "POP", &[]));
+        trace.steps.push(step(30, 1, "STOP", &[]));
+        trace.artifacts.calls = vec![call(0, 0, 10, "CALL", ROOT), call(1, 10, 13, "CALL", ROOT)];
+        let map = StepMap::new(&trace, vec![contract(Some(ROOT))]);
+        assert_eq!(map.frames(10)[0].function_name.as_deref(), Some("outer"));
+        assert_ne!(map.line_key(10), map.line_key(9));
+        assert_eq!(map.line_key(9), map.line_key(11));
     }
 }

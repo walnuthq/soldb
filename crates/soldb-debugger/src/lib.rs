@@ -21,11 +21,14 @@ use soldb_core::{StepSnapshot, TraceStep, TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
 use crate::decode::ValueReader;
+use crate::roots::root_calls;
+use crate::stepping::calldata_for_step;
 
 pub mod condition;
 pub mod debug_diff;
 mod decode;
 mod locals;
+mod roots;
 pub mod state;
 pub mod stepping;
 mod types;
@@ -36,6 +39,7 @@ pub use debug_diff::{
     DebugDifference, DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent,
     DebugTraceSummary,
 };
+pub use roots::check_root_calls;
 pub use soldb_ethdebug::{CodeGenerator, StorageLayout};
 pub use state::{
     short_hex, state_value, state_variables, CachedChain, ChainRead, ChainStorage, StateSource,
@@ -113,7 +117,7 @@ impl DebugSession {
             source: self.source_span(step.pc),
             function: self.function_at_pc(step.pc).cloned(),
             snapshot: step.normalized_snapshot(),
-            variables: self.variables_at_step(step),
+            variables: self.variables_at_step(step_index),
         })
     }
 
@@ -162,11 +166,11 @@ impl DebugSession {
     }
 
     #[must_use]
-    pub fn variables_at_step(&self, step: &TraceStep) -> Vec<DebugVariable> {
+    pub fn variables_at_step(&self, step_index: usize) -> Vec<DebugVariable> {
         let Some(ethdebug) = &self.ethdebug else {
             return Vec::new();
         };
-        variables_for_step(&self.trace, ethdebug, step)
+        variables_for_step(&self.trace, ethdebug, step_index)
     }
 }
 
@@ -343,21 +347,26 @@ struct SourcePosition {
 pub fn variables_for_step(
     trace: &TransactionTrace,
     ethdebug: &EthdebugInfo,
-    step: &TraceStep,
+    step_index: usize,
 ) -> Vec<DebugVariable> {
-    ethdebug
-        .variables_at_pc(step.pc)
+    let Some(step) = trace.steps.get(step_index) else {
+        return Vec::new();
+    };
+    let variables = ethdebug.variables_at_pc(step.pc);
+    if variables.is_empty() {
+        return Vec::new();
+    }
+    // The top-level calls are found only when a variable may read calldata.
+    let roots = root_calls(trace);
+    let calldata = calldata_for_step(trace, &roots, step_index);
+    variables
         .into_iter()
-        .map(|variable| decode_variable(trace, step, variable))
+        .map(|variable| decode_variable(step, calldata, variable))
         .collect()
 }
 
-fn decode_variable(
-    trace: &TransactionTrace,
-    step: &TraceStep,
-    variable: &VariableLocation,
-) -> DebugVariable {
-    let raw = raw_value_for_location(trace, step, variable);
+fn decode_variable(step: &TraceStep, calldata: &str, variable: &VariableLocation) -> DebugVariable {
+    let raw = raw_value_for_location(step, calldata, variable);
     let value = raw.map_or_else(
         || DebugValue {
             display: "<unavailable>".to_owned(),
@@ -378,8 +387,8 @@ fn decode_variable(
 }
 
 fn raw_value_for_location(
-    trace: &TransactionTrace,
     step: &TraceStep,
+    calldata: &str,
     variable: &VariableLocation,
 ) -> Option<String> {
     let snapshot = step.snapshot_ref();
@@ -389,7 +398,7 @@ fn raw_value_for_location(
             .get(variable.offset as usize)
             .map(|value| normalize_hex(value)),
         "memory" => word_from_hex_bytes(snapshot.memory?, variable.offset as usize),
-        "calldata" => word_from_hex_bytes(&trace.input_data, variable.offset as usize),
+        "calldata" => word_from_hex_bytes(calldata, variable.offset as usize),
         "storage" => storage_value(snapshot.storage, variable.offset),
         _ => None,
     }
@@ -1174,7 +1183,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
-    use soldb_core::{TraceStep, TransactionTrace};
+    use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
     use soldb_ethdebug::{EthdebugInfo, Instruction, VariableLocation};
 
     use super::{parse_source_functions, DebugSession, DebugValueStatus};
@@ -1246,6 +1255,64 @@ mod tests {
             step.variables[1].value.display,
             "0x1111111111111111111111111111111111111111"
         );
+    }
+
+    #[test]
+    fn calldata_variables_read_the_input_of_their_top_level_call() {
+        let root = |id: usize, entry: usize, input: String| ExecutionCall {
+            id,
+            parent_id: None,
+            depth: 1,
+            entry_step: Some(entry),
+            exit_step: Some(entry + 1),
+            call_type: "CALL".to_owned(),
+            from: "0x1".to_owned(),
+            to: "0x2".to_owned(),
+            bytecode_address: "0x2".to_owned(),
+            value: "0x0".to_owned(),
+            input,
+            gas_limit: 0,
+            gas_used: None,
+            output: None,
+            success: Some(true),
+            error: None,
+        };
+        let mut trace = sample_trace();
+        trace.steps.push(trace.steps[0].clone());
+        let second_input = format!(
+            "0x12345678{:0>64}",
+            "2222222222222222222222222222222222222222"
+        );
+        trace.artifacts.calls = vec![
+            root(0, 0, trace.input_data.clone()),
+            root(1, 1, second_input),
+        ];
+        let info = EthdebugInfo {
+            compilation: json!({}),
+            contract_name: "Counter".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: Vec::new(),
+            sources: BTreeMap::new(),
+            variable_locations: BTreeMap::from([(
+                0,
+                vec![VariableLocation {
+                    name: "sender".to_owned(),
+                    ty: "address".to_owned(),
+                    location_type: "calldata".to_owned(),
+                    offset: 4,
+                    pc_range: (0, 1),
+                }],
+            )]),
+        };
+        let session = DebugSession::with_ethdebug(trace, info, BTreeMap::new());
+        let sender = |step: usize| {
+            session.step(step).expect("debug step").variables[0]
+                .value
+                .display
+                .clone()
+        };
+        assert_eq!(sender(0), "0x1111111111111111111111111111111111111111");
+        assert_eq!(sender(1), "0x2222222222222222222222222222222222222222");
     }
 
     #[test]

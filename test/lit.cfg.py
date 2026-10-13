@@ -94,6 +94,17 @@ def check_soldb():
 if check_soldb():
     config.available_features.add('soldb')
 
+# The DAP server is built next to soldb.
+soldb_dap_path = None
+if soldb_path and os.path.isabs(soldb_path):
+    candidate = os.path.join(os.path.dirname(soldb_path), 'soldb-dap-server')
+    if os.access(candidate, os.X_OK):
+        soldb_dap_path = candidate
+soldb_dap_path = soldb_dap_path or shutil.which('soldb-dap-server')
+if soldb_dap_path:
+    config.substitutions.append(('%{soldb_dap}', soldb_dap_path))
+    config.available_features.add('soldb-dap')
+
 # Check if Sepolia RPC is configured
 if hasattr(config, 'sepolia_rpc_url') and config.sepolia_rpc_url:
     config.available_features.add('sepolia-rpc')

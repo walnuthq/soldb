@@ -1,0 +1,35 @@
+# A Foundry unit test as one trace with three top-level calls over DAP: the test
+# contract's deployment, `setUp()`, and `test_Increment()`. Each root frame shows its kind,
+# and `next` from the end of one call goes on into the next. No node: the trace is a
+# fixture.
+# REQUIRES: soldb-dap
+# RUN: python3 %{project_root}/test/dap-session.py %{soldb_dap} %{project_root}/test/fixtures/foundry-unit-test/trace.json %{project_root}/test/fixtures/foundry-unit-test/contracts.json next next next next next next 2>&1 | FileCheck %s
+
+# CHECK: stopped: entry
+# CHECK-NEXT: frame: [deployment] CounterTest (step 0: PUSH1 @ pc 0) Counter.t.sol:6
+# CHECK-NEXT: stopped: step
+# CHECK-NEXT: frame: setUp (step 41: JUMPDEST @ pc 56) Counter.t.sol:9
+# CHECK-NEXT: frame: [setup] CounterTest (step 40: JUMPI @ pc 40) Counter.t.sol:6
+# CHECK-NEXT: stopped: step
+# CHECK-NEXT: frame: setUp (step 46: PUSH1 @ pc 77) Counter.t.sol:10
+# CHECK-NEXT: frame: [setup] CounterTest (step 40: JUMPI @ pc 40) Counter.t.sol:6
+# CHECK-NEXT: stopped: step
+# CHECK-NEXT: frame: setUp (step 115: PUSH0 @ pc 177) Counter.t.sol:11
+# CHECK-NEXT: frame: [setup] CounterTest (step 40: JUMPI @ pc 40) Counter.t.sol:6
+# CHECK-NEXT: stopped: step
+# CHECK-NEXT: frame: setUp (step 374: JUMP @ pc 312) Counter.t.sol:9
+# CHECK-NEXT: frame: [setup] CounterTest (step 40: JUMPI @ pc 40) Counter.t.sol:6
+# The test call starts with none of setUp's frames.
+# CHECK-NEXT: stopped: step
+# CHECK-NEXT: frame: [execution] CounterTest (step 377: PUSH1 @ pc 0) Counter.t.sol:6
+# CHECK-NEXT: stopped: step
+# CHECK-NEXT: frame: test_Increment (step 406: JUMPDEST @ pc 66) Counter.t.sol:14
+# CHECK-NEXT: frame: [execution] CounterTest (step 405: JUMPI @ pc 51) Counter.t.sol:6
+
+# A breakpoint in the last call stops there.
+# RUN: python3 %{project_root}/test/dap-session.py %{soldb_dap} %{project_root}/test/fixtures/foundry-unit-test/trace.json %{project_root}/test/fixtures/foundry-unit-test/contracts.json break %{project_root}/test/fixtures/foundry-unit-test/test/Counter.t.sol:16 continue 2>&1 | FileCheck %s --check-prefix=BREAK
+
+# BREAK: breakpoint: {{.*}}test/Counter.t.sol:16 verified=True
+# BREAK-NEXT: stopped: breakpoint
+# BREAK-NEXT: frame: test_Increment (step 559: PUSH1 @ pc 437) Counter.t.sol:16
+# BREAK-NEXT: frame: [execution] CounterTest (step 405: JUMPI @ pc 51) Counter.t.sol:6

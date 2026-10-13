@@ -1732,7 +1732,7 @@ fn run_debugger_session(
     options: &SessionOptions,
 ) -> SoldbResult<()> {
     let mut state = DebuggerState::new();
-    state.load_trace(trace);
+    state.load_trace(trace)?;
     state.attach_debug_info(
         source_indexes
             .iter()
@@ -3905,7 +3905,9 @@ mod tests {
         }
 
         let mut state = DebuggerState::new();
-        state.load_trace(trace);
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
         state.attach_debug_info(vec![debug]);
         let outcome =
             state.set_breakpoint_target(&BreakpointTarget::SourceLine(SourceBreakpointTarget {
@@ -4091,7 +4093,9 @@ contract Counter {
             vec![trace_step(0, &[]), trace_step(2, &[])],
         );
         let mut state = DebuggerState::new();
-        state.load_trace(trace);
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
         state.attach_debug_info(vec![index.debug.clone()]);
         let outcome =
             state.set_breakpoint_target(&BreakpointTarget::SourceLine(SourceBreakpointTarget {
