@@ -16,8 +16,14 @@ because decoding PUSH widths is required to translate instruction indexes into
 program counters.
 
 Legacy source maps preserve exact PC-to-source attribution. They do not contain
-variable locations or unambiguous function identities, so profiles report their
-function bucket as `<contract>` instead of inferring one from source text.
+variable locations or function names.
+
+Functions are named from the compiler's ETHDebug function contexts when the
+program has them, and otherwise the way the debugger's `backtrace` names them.
+Compiler-generated helpers without a source range are charged to the function
+that called them. Gas outside every function, such as the dispatcher, is
+reported as `<contract>` when its instruction has a source range, and as
+`<no source>` when it does not.
 
 ## Profile a local transaction
 

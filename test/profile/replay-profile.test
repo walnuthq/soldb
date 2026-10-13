@@ -13,3 +13,11 @@
 # CHECK: Hot source lines
 # CHECK: Opcodes
 # CHECK: Hot instructions
+
+# Functions are named even though this solc emits no ETHDebug function contexts.
+# RUN: %soldb profile %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} --json | jq -r '.functions[].function' | sort | FileCheck %s --check-prefix=FUNCTIONS
+
+# FUNCTIONS-NOT: <anonymous>
+# FUNCTIONS: {{^}}increment{{$}}
+# FUNCTIONS-NEXT: increment2
+# FUNCTIONS-NEXT: increment3
