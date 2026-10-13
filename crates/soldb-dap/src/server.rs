@@ -1244,7 +1244,7 @@ mod tests {
             .with_return_data(Some(data)),
         );
         let mut server = DapServer::with_session(trace, Vec::new(), &std::env::temp_dir())
-            .expect("a valid trace");
+            .expect("top-level calls must start at different steps");
         server.handle_message(&DapMessage::request(1, "launch", None));
 
         let scopes = server.handle_message(&DapMessage::request(2, "scopes", None));
@@ -1641,7 +1641,8 @@ mod tests {
         ];
 
         let root = temp.join("project");
-        let mut server = DapServer::with_session(trace, contracts, &root).expect("a valid trace");
+        let mut server = DapServer::with_session(trace, contracts, &root)
+            .expect("top-level calls must start at different steps");
 
         let set_breakpoints = DapMessage::request(
             1,

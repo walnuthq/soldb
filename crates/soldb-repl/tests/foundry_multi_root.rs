@@ -45,7 +45,9 @@ fn session() -> Session {
         })
         .collect();
     let mut state = DebuggerState::new();
-    state.load_trace(trace).expect("a valid trace");
+    state
+        .load_trace(trace)
+        .expect("top-level calls must start at different steps");
     state.attach_debug_info(contracts);
     Session::new(state)
 }

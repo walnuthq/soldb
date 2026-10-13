@@ -1273,7 +1273,9 @@ mod tests {
         assert_eq!(state.next_source(), StepOutcome::NoTrace);
         assert_eq!(state.finish(), StepOutcome::NoTrace);
 
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         assert_eq!(state.step_count(), 4);
         assert_eq!(&*state.current_step_data().expect("step").op, "PUSH1");
         assert!(!state.has_source());
@@ -1309,7 +1311,9 @@ mod tests {
     #[test]
     fn continues_until_breakpoint_or_end() {
         let mut state = DebuggerState::new();
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         let set = state.set_breakpoint(3);
         let StepOutcome::BreakpointSet(breakpoint) = &set else {
             panic!("{set:?}");
@@ -1342,7 +1346,9 @@ mod tests {
     #[test]
     fn numbered_breakpoints_can_be_deleted() {
         let mut state = DebuggerState::new();
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         state.set_breakpoint(2);
         state.set_breakpoint(3);
         assert_eq!(
@@ -1373,7 +1379,9 @@ mod tests {
         let mut state = DebuggerState::new();
         assert_eq!(state.goto_step(1), StepOutcome::NoTrace);
 
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         assert_eq!(
             state.goto_step(3),
             StepOutcome::Moved {
@@ -1433,7 +1441,9 @@ mod tests {
         assert_eq!(state.previous_instruction(), StepOutcome::NoTrace);
         assert_eq!(state.reverse_continue(), StepOutcome::NoTrace);
 
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         assert_eq!(
             state.previous_instruction(),
             StepOutcome::AtStart { step: 0 }
@@ -1473,7 +1483,9 @@ mod tests {
     #[test]
     fn reverse_continue_stops_at_earlier_breakpoints_then_the_start() {
         let mut state = DebuggerState::new();
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         let last = state.step_count() - 1;
         state.goto_step(last);
         let breakpoint_pc = sample_trace().steps[1].pc;
@@ -1498,7 +1510,9 @@ mod tests {
     #[test]
     fn applies_state_changing_commands() {
         let mut state = DebuggerState::new();
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
 
         assert_eq!(
             state.apply_command(DebuggerCommand::Mode(Some(DisplayMode::Assembly))),
@@ -1536,7 +1550,9 @@ mod tests {
         );
 
         let mut state = DebuggerState::new();
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         // No debug info at all: the message is about the missing metadata.
         assert!(matches!(
             state.set_breakpoint_target(&BreakpointTarget::State("counter".to_owned())),
@@ -1547,7 +1563,9 @@ mod tests {
     #[test]
     fn a_condition_gates_a_breakpoint_and_says_when_it_cannot_be_read() {
         let mut state = DebuggerState::new();
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
 
         // `pc` and `gas` are facts about the step, so they need no debug info.
         assert!(matches!(
@@ -1629,7 +1647,9 @@ mod tests {
     #[test]
     fn tape_breakpoints_search_the_recording() {
         let mut state = DebuggerState::new();
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
 
         // The storage write at step 2 is an SSTORE to slot 0; a call to 0x..02 at step 3.
         assert!(matches!(
@@ -1709,13 +1729,17 @@ mod tests {
         let mut state = DebuggerState::new();
         assert!(state.frames().is_empty());
         assert_eq!(state.calldata(), None);
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         assert_eq!(state.calldata().as_deref(), Some("0xabcd"));
         // An empty root input is still the root's calldata.
         let mut empty = sample_trace();
         empty.input_data = String::new();
         let mut empty_state = DebuggerState::new();
-        empty_state.load_trace(empty).expect("a valid trace");
+        empty_state
+            .load_trace(empty)
+            .expect("top-level calls must start at different steps");
         assert_eq!(empty_state.calldata().as_deref(), Some(""));
         let frames = state.frames();
         assert_eq!(frames.len(), 1);
@@ -1779,7 +1803,9 @@ contract C {
         trace.steps[6].op = "SSTORE".into();
         trace.steps[6].stack = vec!["0x2a".into(), "0x5".into()];
         let mut state = DebuggerState::new();
-        state.load_trace(trace).expect("a valid trace");
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
         state.attach_debug_info(vec![contract]);
         state
     }
@@ -1816,7 +1842,9 @@ contract C {
         trace.steps[3].snapshot.transient_storage =
             BTreeMap::from([("0x0".to_owned(), "0x7".to_owned())]);
         let contracts = state.step_map().expect("map").contracts().to_vec();
-        state.load_trace(trace).expect("a valid trace");
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
         state.attach_debug_info(
             contracts
                 .into_iter()
@@ -1869,7 +1897,9 @@ contract C {
 
         // A trace recorded without it says so.
         let mut state = DebuggerState::new();
-        state.load_trace(sample_trace()).expect("a valid trace");
+        state
+            .load_trace(sample_trace())
+            .expect("top-level calls must start at different steps");
         let [Output::Message { text, .. }] = &Session::new(state)
             .execute(DebuggerCommand::Info(DebuggerInfoCommand::TransientStorage))[..]
         else {
@@ -1893,7 +1923,9 @@ contract C {
             .normalized_snapshot()
             .with_return_data(Some("2a".to_owned()));
         let mut state = DebuggerState::new();
-        state.load_trace(trace.clone()).expect("a valid trace");
+        state
+            .load_trace(trace.clone())
+            .expect("top-level calls must start at different steps");
         assert!(matches!(
             &Session::new(state).execute(DebuggerCommand::ReturnData)[..],
             [Output::Message { text, .. }] if text.contains("not in this trace")
@@ -1901,7 +1933,9 @@ contract C {
 
         trace.capabilities.return_data = true;
         let mut state = DebuggerState::new();
-        state.load_trace(trace).expect("a valid trace");
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
         let mut session = Session::new(state);
         assert_eq!(
             session.execute(DebuggerCommand::ReturnData),
@@ -2089,7 +2123,9 @@ contract C {
         ];
 
         let mut state = DebuggerState::new();
-        state.load_trace(trace.clone()).expect("a valid trace");
+        state
+            .load_trace(trace.clone())
+            .expect("top-level calls must start at different steps");
         state.attach_debug_info(vec![contract(Some(CodeGenerator::Legacy))]);
         assert_eq!(
             state.variables().unwrap_err(),
@@ -2109,7 +2145,9 @@ contract C {
 
         // The via-IR pipeline keeps no layout to read.
         let mut state = DebuggerState::new();
-        state.load_trace(trace).expect("a valid trace");
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
         state.attach_debug_info(vec![contract(Some(CodeGenerator::ViaIr))]);
         state.goto_step(3);
         assert!(state.variables().unwrap_err().contains("via-IR pipeline"));
@@ -2229,7 +2267,9 @@ contract C {
             step(3, "POP", 0, &["0x9", "0x5", "0x1", "0x5"]),
         ];
         let mut state = DebuggerState::new();
-        state.load_trace(trace).expect("a valid trace");
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
         state.attach_debug_info(vec![contract]);
 
         // The local is read off its slot, the enum parameter by name and against an enum
