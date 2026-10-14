@@ -277,6 +277,12 @@ pub fn parse_context_variables(program: &Value) -> SoldbResult<Vec<ContextVariab
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VariableLocation {
+    /// Structured draft-schema variable; legacy records leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextVariable>,
+    /// Named lexical contexts and inlining instances, outermost first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
     pub name: String,
     pub ty: String,
     pub location_type: String,
@@ -370,9 +376,8 @@ impl EthdebugInfo {
 
     /// Whether the artifact carries variable locations at all.
     ///
-    /// No compiler release emits them yet, so this is usually false, and the difference
-    /// matters to a user: nothing in scope at one program counter is not the same as a
-    /// compiler that describes no variables anywhere.
+    /// Nothing in scope at one program counter is not the same as a compiler that describes
+    /// no variables anywhere. Includes structured postconditions and legacy location records.
     #[must_use]
     pub fn has_variable_locations(&self) -> bool {
         !self.variable_locations.is_empty()
@@ -514,19 +519,14 @@ pub fn parse_variable_locations(
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| SoldbError::Message("Instruction missing offset".to_owned()))?;
 
-            let Some(variables) = instruction
-                .get("context")
-                .and_then(|context| context.get("variables"))
-                .and_then(serde_json::Value::as_array)
-            else {
-                continue;
-            };
-
-            for variable in variables {
-                variable_locations
-                    .entry(pc)
-                    .or_default()
-                    .push(parse_context_variable(variable, pc));
+            if let Some(context) = instruction.get("context") {
+                collect_variable_locations(
+                    context,
+                    pc,
+                    &mut Vec::new(),
+                    &mut variable_locations,
+                    0,
+                )?;
             }
         }
     }
@@ -554,6 +554,8 @@ fn parse_context_variable(variable: &Value, pc: u64) -> VariableLocation {
     let scope = variable.get("scope");
 
     VariableLocation {
+        context: None,
+        scopes: Vec::new(),
         name: get_string(variable, "name", "unknown"),
         ty: get_string(variable, "type", "unknown"),
         location_type: location
@@ -578,8 +580,93 @@ fn parse_context_variable(variable: &Value, pc: u64) -> VariableLocation {
     }
 }
 
+/// `gather` contributes all its contexts. `pick` contributes only guarantees common to every
+/// alternative; merging alternatives as simultaneous locals would invent an active scope.
+fn collect_variable_locations(
+    context: &Value,
+    pc: u64,
+    scopes: &mut Vec<String>,
+    locations: &mut BTreeMap<u64, Vec<VariableLocation>>,
+    depth: usize,
+) -> SoldbResult<()> {
+    if depth >= 64 {
+        return Err(SoldbError::Message(
+            "variable context nesting exceeds 64".to_owned(),
+        ));
+    }
+    let previous = scopes.len();
+    if let Some(name) = context.get("name").and_then(Value::as_str) {
+        scopes.push(name.to_owned());
+    }
+    if let Some(variables) = context.get("variables") {
+        let variables = variables
+            .as_array()
+            .ok_or_else(|| SoldbError::Message("context variables is not an array".to_owned()))?;
+        for variable in variables {
+            let record =
+                if variable.get("identifier").is_some() || variable.get("declaration").is_some() {
+                    let modern = parse_context_variables(
+                        &serde_json::json!({"context": {"variables": [variable]}}),
+                    )?
+                    .remove(0);
+                    // Parse now: malformed pointers must not silently fall back to stack slot zero.
+                    modern.parsed_pointer()?;
+                    modern.type_reference()?;
+                    VariableLocation {
+                        name: modern.name(),
+                        ty: "<structured type>".to_owned(),
+                        location_type: "pointer".to_owned(),
+                        offset: 0,
+                        pc_range: (pc, pc),
+                        context: Some(modern),
+                        scopes: scopes.clone(),
+                    }
+                } else {
+                    parse_context_variable(variable, pc)
+                };
+            let entries = locations.entry(pc).or_default();
+            if !entries.contains(&record) {
+                entries.push(record);
+            }
+        }
+    }
+    if let Some(gather) = context.get("gather") {
+        let gather = gather
+            .as_array()
+            .ok_or_else(|| SoldbError::Message("context gather is not an array".to_owned()))?;
+        for child in gather {
+            collect_variable_locations(child, pc, scopes, locations, depth + 1)?;
+        }
+    }
+    if let Some(pick) = context.get("pick").and_then(Value::as_array) {
+        let mut alternatives = Vec::new();
+        for child in pick {
+            let mut alternative = BTreeMap::new();
+            collect_variable_locations(child, pc, scopes, &mut alternative, depth + 1)?;
+            alternatives.push(alternative.remove(&pc).unwrap_or_default());
+        }
+        if let Some(first) = alternatives.first() {
+            for record in first {
+                if alternatives
+                    .iter()
+                    .all(|alternative| alternative.contains(record))
+                {
+                    let entries = locations.entry(pc).or_default();
+                    if !entries.contains(record) {
+                        entries.push(record.clone());
+                    }
+                }
+            }
+        }
+    }
+    scopes.truncate(previous);
+    Ok(())
+}
+
 fn parse_top_level_variable(variable: &Value) -> VariableLocation {
     VariableLocation {
+        context: None,
+        scopes: Vec::new(),
         name: get_string(variable, "name", "unknown"),
         ty: get_string(variable, "type", "unknown"),
         location_type: get_string(variable, "location_type", "stack"),
@@ -850,6 +937,8 @@ mod tests {
         .expect("instruction");
 
         let variable = super::VariableLocation {
+            context: None,
+            scopes: Vec::new(),
             name: "stored".to_owned(),
             ty: "uint256".to_owned(),
             location_type: "storage".to_owned(),
@@ -912,5 +1001,24 @@ mod tests {
             "storage"
         );
         assert_eq!(variables.get(&21).expect("pc 21")[0].name, "stored");
+    }
+
+    #[test]
+    fn legacy_variable_locations_preserve_their_wire_format() {
+        let legacy = json!({
+            "name": "amount",
+            "ty": "uint256",
+            "location_type": "stack",
+            "offset": 1,
+            "pc_range": [10, 12]
+        });
+        let location: super::VariableLocation =
+            serde_json::from_value(legacy.clone()).expect("legacy variable location");
+        assert!(location.context.is_none());
+        assert!(location.scopes.is_empty());
+        assert_eq!(
+            serde_json::to_value(location).expect("serialize legacy location"),
+            legacy
+        );
     }
 }

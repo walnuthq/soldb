@@ -39,10 +39,10 @@ pub use session::{
     breakpoint_lines, Session, FRAME_ARGUMENTS_NOTE, FRAME_ARGUMENTS_WARNING, LISTING_RADIUS,
 };
 use soldb_debugger::{
-    call_target, normalize_address, variables_for_step, ChainStorage, Condition, ConditionContext,
-    ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState, LocalsStatus,
-    ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap, StorageLayout,
-    StorageTape, StorageWords,
+    call_target, normalize_address, variables_for_step_at, ChainStorage, Condition,
+    ConditionContext, ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState,
+    LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
+    StorageLayout, StorageTape, StorageWords,
 };
 
 /// Where a step's variables came from.
@@ -904,7 +904,7 @@ impl DebuggerState {
         let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
             return Err("no trace is loaded".to_owned());
         };
-        let Some(step) = trace.steps.get(self.current_step) else {
+        let Some(_) = trace.steps.get(self.current_step) else {
             return Err(format!("step {} is outside the trace", self.current_step));
         };
         let Some(contract) = map.contract_at_step(self.current_step) else {
@@ -912,7 +912,12 @@ impl DebuggerState {
         };
         if contract.info.has_variable_locations() {
             return Ok(StepVariables {
-                variables: variables_for_step(trace, &contract.info, step),
+                variables: variables_for_step_at(
+                    trace,
+                    &contract.info,
+                    contract.resources.as_ref(),
+                    self.current_step,
+                ),
                 origin: VariablesOrigin::Ethdebug,
             });
         }

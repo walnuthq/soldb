@@ -716,7 +716,7 @@ impl Part {
 /// relative to the variable: `x` is a struct member, `item` an array element and
 /// `from-x` a member of a member. `document` is the variable's type: a dynamic array is
 /// shown by its length rather than its elements.
-fn composed(values: &[StateValue], document: Option<&TypeDocument>) -> DebugValue {
+pub(crate) fn composed(values: &[StateValue], document: Option<&TypeDocument>) -> DebugValue {
     let mut root = Part::Members(Vec::new());
     for value in values {
         let path = value

@@ -606,7 +606,11 @@ impl Resources {
 /// The segments come from splitting the name on `-`; a struct member that happens to be
 /// called `length` resolves to its type first and is never taken for bookkeeping.
 fn is_bookkeeping(path: &[&str]) -> bool {
-    matches!(path, [.., "length"] | [.., "length", "flag"])
+    path.first() == Some(&"")
+        || matches!(
+            path,
+            [.., "length"] | [.., "length", "flag"] | [.., "address"] | [.., "count"]
+        )
 }
 
 // ---------------------------------------------------------------------------

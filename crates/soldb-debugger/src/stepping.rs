@@ -916,7 +916,7 @@ fn live_index(function: &SourceFunction, index: usize, offset: u64) -> usize {
 
 /// The calldata of the frame executing `step`: the transaction's input at the root, the
 /// recorded call's input in a nested frame.
-fn calldata_for_step(trace: &TransactionTrace, step: usize) -> &str {
+pub(crate) fn calldata_for_step(trace: &TransactionTrace, step: usize) -> &str {
     let root_depth = trace.steps.first().map_or(0, |first| first.depth);
     let depth = trace
         .steps

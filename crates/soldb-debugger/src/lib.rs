@@ -25,6 +25,7 @@ use crate::decode::ValueReader;
 pub mod condition;
 pub mod debug_diff;
 mod decode;
+mod instruction_variables;
 mod locals;
 pub mod state;
 pub mod stepping;
@@ -36,6 +37,7 @@ pub use debug_diff::{
     DebugDifference, DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent,
     DebugTraceSummary,
 };
+pub use instruction_variables::variables_for_step_at;
 pub use soldb_ethdebug::{CodeGenerator, StorageLayout};
 pub use state::{
     code_from_hex, context_state_variables, short_hex, state_value, state_variables, CachedChain,
@@ -114,7 +116,9 @@ impl DebugSession {
             source: self.source_span(step.pc),
             function: self.function_at_pc(step.pc).cloned(),
             snapshot: step.normalized_snapshot(),
-            variables: self.variables_at_step(step),
+            variables: self.ethdebug.as_ref().map_or_else(Vec::new, |info| {
+                variables_for_step_at(&self.trace, info, None, step_index)
+            }),
         })
     }
 
@@ -346,9 +350,27 @@ pub fn variables_for_step(
     ethdebug: &EthdebugInfo,
     step: &TraceStep,
 ) -> Vec<DebugVariable> {
+    // Preserve the trace-position API without scanning the recording on every stop. A borrowed
+    // step has an exact index; a detached copy cannot identify an execution of a repeated PC.
+    let address = std::ptr::from_ref(step) as usize;
+    let start = trace.steps.as_ptr() as usize;
+    let index = address
+        .checked_sub(start)
+        .filter(|offset| offset.is_multiple_of(std::mem::size_of::<TraceStep>()))
+        .map(|offset| offset / std::mem::size_of::<TraceStep>())
+        .filter(|&index| {
+            trace
+                .steps
+                .get(index)
+                .is_some_and(|recorded| std::ptr::eq(recorded, step))
+        });
+    if let Some(index) = index {
+        return variables_for_step_at(trace, ethdebug, None, index);
+    }
     ethdebug
         .variables_at_pc(step.pc)
         .into_iter()
+        .filter(|variable| variable.context.is_none())
         .map(|variable| decode_variable(trace, step, variable))
         .collect()
 }
@@ -1195,6 +1217,8 @@ mod tests {
             0,
             vec![
                 VariableLocation {
+                    context: None,
+                    scopes: Vec::new(),
                     name: "x".to_owned(),
                     ty: "uint256".to_owned(),
                     location_type: "stack".to_owned(),
@@ -1202,6 +1226,8 @@ mod tests {
                     pc_range: (0, 1),
                 },
                 VariableLocation {
+                    context: None,
+                    scopes: Vec::new(),
                     name: "sender".to_owned(),
                     ty: "address".to_owned(),
                     location_type: "calldata".to_owned(),
@@ -1258,6 +1284,8 @@ mod tests {
             0,
             vec![
                 VariableLocation {
+                    context: None,
+                    scopes: Vec::new(),
                     name: "name".to_owned(),
                     ty: "string".to_owned(),
                     location_type: "stack".to_owned(),
@@ -1265,6 +1293,8 @@ mod tests {
                     pc_range: (0, 0),
                 },
                 VariableLocation {
+                    context: None,
+                    scopes: Vec::new(),
                     name: "missing".to_owned(),
                     ty: "uint256".to_owned(),
                     location_type: "stack".to_owned(),
