@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use soldb_core::{encode_hex, SoldbError, SoldbResult, TransactionTrace};
-use soldb_debugger::{CachedChain, ChainRead, ChainStorage, CodeRead, ContractDebugInfo, StepLocation};
+use soldb_debugger::{
+    CachedChain, ChainRead, ChainStorage, CodeRead, ContractDebugInfo, StepLocation,
+};
 use soldb_ethdebug::{load_contract_mapping, load_debug_program, SourceMapEnvironment};
 use soldb_repl::{
     BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
@@ -849,7 +851,10 @@ impl DapServer {
             self.debugger.transient_words(),
         ) {
             for variable in soldb_debugger::state_variables(layout, &words) {
-                if let Some(existing) = variables.iter_mut().find(|existing| existing.name == variable.name) {
+                if let Some(existing) = variables
+                    .iter_mut()
+                    .find(|existing| existing.name == variable.name)
+                {
                     *existing = variable;
                 } else {
                     variables.push(variable);
