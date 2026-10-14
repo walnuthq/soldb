@@ -73,7 +73,7 @@ pub type CodeRead = Box<dyn Fn(&str) -> Option<Vec<u8>>>;
 /// Deployed code a frontend has without asking a chain, such as what a local deployment
 /// returned, by address.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct KnownCode(HashMap<String, Vec<u8>>);
+pub struct KnownCode(FxHashMap<String, Vec<u8>>);
 
 impl KnownCode {
     /// Adds the deployed `code` of `address`.
@@ -822,7 +822,7 @@ impl Part {
 /// relative to the variable: `x` is a struct member, `item` an array element and
 /// `from-x` a member of a member. `document` is the variable's type: a dynamic array is
 /// shown by its length rather than its elements.
-fn composed(values: &[StateValue], document: Option<&TypeDocument>) -> DebugValue {
+pub(crate) fn composed(values: &[StateValue], document: Option<&TypeDocument>) -> DebugValue {
     let mut root = Part::Members(Vec::new());
     for value in values {
         let path = value

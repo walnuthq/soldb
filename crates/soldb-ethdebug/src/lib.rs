@@ -51,8 +51,9 @@ pub use events::{
 pub use metadata::{
     parse_compilation_sources, parse_context_variables, parse_ethdebug_spec,
     parse_multi_contract_spec, parse_single_contract_spec, parse_variable_locations,
-    read_compilation_source, source_range, ContextVariable, EthdebugInfo, EthdebugSpec, FunctionExit,
-    FunctionIdentity, Instruction, SourceLocation, SourceMapContext, SourceMapJump, VariableLocation,
+    read_compilation_source, source_range, ContextVariable, EthdebugInfo, EthdebugSpec,
+    FunctionExit, FunctionIdentity, Instruction, SourceLocation, SourceMapContext, SourceMapJump,
+    VariableLocation,
 };
 pub use pointers::{
     dereference, dereference_pointer, is_identifier, read_region, Expression, Location, Machine,

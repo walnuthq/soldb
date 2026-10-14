@@ -39,8 +39,8 @@ pub use session::{
     breakpoint_lines, Session, FRAME_ARGUMENTS_NOTE, FRAME_ARGUMENTS_WARNING, LISTING_RADIUS,
 };
 use soldb_debugger::{
-    call_target, check_root_calls, normalize_address, variables_for_step, ChainStorage, Condition,
-    ConditionContext, ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState,
+    call_target, check_root_calls, normalize_address, variables_for_step_at, ChainStorage,
+    Condition, ConditionContext, ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState,
     LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
     StorageLayout, StorageTape, StorageWords,
 };
@@ -958,7 +958,12 @@ impl DebuggerState {
         };
         if contract.info.has_variable_locations() {
             return Ok(StepVariables {
-                variables: variables_for_step(trace, &contract.info, self.current_step),
+                variables: variables_for_step_at(
+                    trace,
+                    &contract.info,
+                    contract.resources.as_ref(),
+                    self.current_step,
+                ),
                 origin: VariablesOrigin::Ethdebug,
             });
         }

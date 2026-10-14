@@ -5066,6 +5066,7 @@ contract P {
             instructions,
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
@@ -5161,6 +5162,7 @@ contract D {
             instructions,
             sources: BTreeMap::from([(0, "D.sol".to_owned()), (1, "E.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract = ContractDebugInfo::new(
             None,

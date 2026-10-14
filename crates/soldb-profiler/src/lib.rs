@@ -2632,6 +2632,7 @@ mod tests {
                 instructions,
                 sources: BTreeMap::from([(0, format!("{name}.sol"))]),
                 variable_locations: BTreeMap::new(),
+                state_variables: Vec::new(),
             },
             BTreeMap::from([(0, source.to_owned())]),
         )

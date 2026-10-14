@@ -21,11 +21,11 @@ use soldb_core::{encode_hex, Bytes, EvmWord, StepSnapshot, StepView, Transaction
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
 use crate::decode::ValueReader;
-use crate::stepping::calldata_for_step;
 
 pub mod condition;
 pub mod debug_diff;
 mod decode;
+mod instruction_variables;
 mod locals;
 mod roots;
 pub mod state;
@@ -38,6 +38,7 @@ pub use debug_diff::{
     DebugDifference, DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent,
     DebugTraceSummary,
 };
+pub use instruction_variables::variables_for_step_at;
 pub use roots::{check_root_calls, root_calls, RootCall, RootRecord};
 pub use soldb_ethdebug::{CodeGenerator, StorageLayout};
 pub use state::{
@@ -349,20 +350,7 @@ pub fn variables_for_step(
     ethdebug: &EthdebugInfo,
     step_index: usize,
 ) -> Vec<DebugVariable> {
-    let Some(step) = trace.steps.get(step_index) else {
-        return Vec::new();
-    };
-    let variables = ethdebug.variables_at_pc(step.pc());
-    if variables.is_empty() {
-        return Vec::new();
-    }
-    // The top-level calls are found only when a variable may read calldata.
-    let roots = root_calls(trace);
-    let calldata = calldata_for_step(trace, &roots, step_index);
-    variables
-        .into_iter()
-        .map(|variable| decode_variable(step, calldata, variable))
-        .collect()
+    variables_for_step_at(trace, ethdebug, None, step_index)
 }
 
 fn decode_variable(
@@ -1255,6 +1243,8 @@ mod tests {
             0,
             vec![
                 VariableLocation {
+                    context: None,
+                    scopes: Vec::new(),
                     name: "x".to_owned(),
                     ty: "uint256".to_owned(),
                     location_type: "stack".to_owned(),
@@ -1262,6 +1252,8 @@ mod tests {
                     pc_range: (0, 1),
                 },
                 VariableLocation {
+                    context: None,
+                    scopes: Vec::new(),
                     name: "sender".to_owned(),
                     ty: "address".to_owned(),
                     location_type: "calldata".to_owned(),
@@ -1270,6 +1262,8 @@ mod tests {
                 },
                 VariableLocation {
                     name: "tail".to_owned(),
+                    context: None,
+                    scopes: Vec::new(),
                     ty: "bytes32".to_owned(),
                     location_type: "memory".to_owned(),
                     offset: 32,
@@ -1277,6 +1271,8 @@ mod tests {
                 },
                 VariableLocation {
                     name: "straddle".to_owned(),
+                    context: None,
+                    scopes: Vec::new(),
                     ty: "uint256".to_owned(),
                     location_type: "memory".to_owned(),
                     offset: 48,
@@ -1371,12 +1367,15 @@ mod tests {
                 0,
                 vec![VariableLocation {
                     name: "sender".to_owned(),
+                    context: None,
+                    scopes: Vec::new(),
                     ty: "address".to_owned(),
                     location_type: "calldata".to_owned(),
                     offset: 4,
                     pc_range: (0, 1),
                 }],
             )]),
+            state_variables: Vec::new(),
         };
         let session = DebugSession::with_ethdebug(trace, info, BTreeMap::new());
         let sender = |step: usize| {
@@ -1397,6 +1396,8 @@ mod tests {
             0,
             vec![
                 VariableLocation {
+                    context: None,
+                    scopes: Vec::new(),
                     name: "name".to_owned(),
                     ty: "string".to_owned(),
                     location_type: "stack".to_owned(),
@@ -1404,6 +1405,8 @@ mod tests {
                     pc_range: (0, 0),
                 },
                 VariableLocation {
+                    context: None,
+                    scopes: Vec::new(),
                     name: "missing".to_owned(),
                     ty: "uint256".to_owned(),
                     location_type: "stack".to_owned(),
