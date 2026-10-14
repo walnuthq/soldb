@@ -4,7 +4,8 @@
 //! compiler-authored source context in one or more [`EthdebugInfo`] programs. It never
 //! guesses which contract owns a program counter: runtime instructions are keyed by code
 //! address and creation/runtime environment, and nested steps without call identity stay
-//! visibly unmapped.
+//! visibly unmapped. Functions the program's contexts leave unnamed are named by the
+//! debugger's [`StepMap`], so a profile and a backtrace agree on them.
 //!
 //! This crate performs no file I/O, RPC, or presentation. A frontend supplies traces and
 //! programs, then renders the returned [`ProfileReport`] as text, JSON, folded stacks, or
@@ -15,6 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
+use soldb_debugger::{ContractDebugInfo, SourceFunction, StepMap};
 use soldb_ethdebug::{EthdebugInfo, FunctionExit, FunctionIdentity, SourceLocation};
 
 const PROFILE_SCHEMA_VERSION: u32 = 1;
@@ -44,10 +46,11 @@ pub struct ProfileProgram {
     address: Option<String>,
     contract_name: String,
     environment: ProgramEnvironment,
-    info: EthdebugInfo,
-    source_contents: BTreeMap<u64, String>,
+    debug: ContractDebugInfo,
     source_indexes: HashMap<u64, SourceTextIndex>,
     functions: Vec<ProfileFunction>,
+    /// The entry in `functions` for each function the debugger parsed, by its index there.
+    source_functions: Vec<usize>,
     pc_contexts: HashMap<u64, ProgramCounterContext>,
 }
 
@@ -115,14 +118,23 @@ impl ProfileProgram {
             }
         }
 
+        let address = address.map(|address| normalize_address(&address));
+        let debug =
+            ContractDebugInfo::new(address.as_deref(), &contract_name, info, source_contents);
+        let source_functions = debug
+            .functions
+            .iter()
+            .map(|function| source_function_index(&mut functions, function))
+            .collect();
+
         Ok(Self {
-            address: address.map(|address| normalize_address(&address)),
+            address,
             contract_name,
             environment,
-            info,
-            source_contents,
+            debug,
             source_indexes,
             functions,
+            source_functions,
             pc_contexts,
         })
     }
@@ -140,6 +152,40 @@ impl ProfileProgram {
     #[must_use]
     pub fn environment(&self) -> ProgramEnvironment {
         self.environment
+    }
+
+    /// The parsed function the debugger places a step in, when it is this program's.
+    fn traced_function(
+        &self,
+        step_map: &StepMap,
+        step: usize,
+        program_index: usize,
+    ) -> Option<usize> {
+        let id = step_map
+            .function_id(step)
+            .filter(|id| id.contract == program_index)?;
+        self.source_functions.get(id.function).copied()
+    }
+
+    /// The function a step runs in: the compiler's when it is named, otherwise the one the
+    /// debugger traced into. An unnamed compiler function the debugger cannot place is a
+    /// generated helper, charged to the function that called it, or to none when the
+    /// dispatcher did.
+    fn named_function(
+        &self,
+        invoked: Option<usize>,
+        traced: Option<usize>,
+        caller: Option<usize>,
+    ) -> Option<usize> {
+        let named =
+            invoked.filter(|function| self.functions[*function].identity.identifier.is_some());
+        if named.is_some() {
+            return named;
+        }
+        if traced.is_some() {
+            return traced;
+        }
+        invoked.and(caller)
     }
 
     fn source_for_function(
@@ -161,6 +207,41 @@ impl ProfileProgram {
         let source = matches.next()?;
         matches.next().is_none().then_some(source)
     }
+}
+
+/// The entry for a function the debugger parsed: the compiler's own when it names the same
+/// declaration, otherwise a new one named from the source.
+fn source_function_index(functions: &mut Vec<ProfileFunction>, function: &SourceFunction) -> usize {
+    let declaration = SourceLocation {
+        source_id: function.source_id,
+        offset: function.declaration_start,
+        length: function
+            .body_end
+            .saturating_add(1)
+            .saturating_sub(function.declaration_start),
+    };
+    let existing = functions.iter().position(|candidate| {
+        candidate.identity.identifier.is_some()
+            && candidate
+                .identity
+                .declaration
+                .as_ref()
+                .is_some_and(|candidate| {
+                    candidate.source_id == declaration.source_id
+                        && candidate.offset == declaration.offset
+                })
+    });
+    if let Some(index) = existing {
+        return index;
+    }
+    functions.push(ProfileFunction {
+        identity: FunctionIdentity {
+            identifier: Some(function.name.clone()),
+            declaration: Some(declaration),
+            activation: None,
+        },
+    });
+    functions.len() - 1
 }
 
 fn index_source_location(
@@ -359,6 +440,14 @@ pub fn profile_transaction(
     );
 
     let frames = build_execution_frames(trace, programs, &program_lookup);
+    // Names the functions a program's own contexts leave anonymous or unmarked.
+    let step_map = StepMap::new(
+        trace,
+        programs
+            .iter()
+            .map(|program| program.debug.clone())
+            .collect(),
+    );
     let events = build_frame_events(&frames);
     let mut frame_cursor = FrameCursor::new(events);
     let mut paths = vec![Vec::new()];
@@ -367,6 +456,8 @@ pub fn profile_transaction(
     let mut function_paths = vec![Vec::new()];
     let mut function_path_lookup = HashMap::from([(Vec::new(), 0)]);
     let mut function_path_ids = HashMap::<FunctionFrameKey, usize>::new();
+    // Per entry of `function_stacks`, the function of the step that invoked it.
+    let mut function_callers = HashMap::<FunctionFrameKey, Vec<Option<usize>>>::new();
 
     let mut step_metrics = Metrics::default();
     let mut program_metrics = Metrics::default();
@@ -423,9 +514,17 @@ pub fn profile_transaction(
             FunctionFrameKey::Root(step.depth),
             FunctionFrameKey::External,
         );
-        let function = function_stacks
+        let invoked = function_stacks
             .get(&function_frame)
             .and_then(|stack| stack.last().copied());
+        // A step whose opcode contradicts the program is not the program's code.
+        let traced =
+            context.and_then(|_| program.traced_function(&step_map, step_index, program_index));
+        let caller = function_callers
+            .get(&function_frame)
+            .and_then(|callers| callers.last().copied())
+            .flatten();
+        let function = program.named_function(invoked, traced, caller);
         let function_path = function_path_ids.get(&function_frame).copied().unwrap_or(0);
         let source = context.and_then(|context| program.source_for_function(context, function));
         program_metrics.add(step.gas_cost, "program gas")?;
@@ -467,15 +566,17 @@ pub fn profile_transaction(
             .entry(HotspotKey {
                 program: program_index,
                 pc: step.pc,
-                function,
                 source,
             })
             .or_insert_with(|| HotspotMetrics {
                 opcode: &step.op,
                 context_matches: context.is_some(),
+                function,
+                functions_agree: true,
                 metrics: Metrics::default(),
             });
         hotspot.context_matches &= context.is_some();
+        hotspot.functions_agree &= hotspot.function == function;
         hotspot.metrics.add(step.gas_cost, "instruction gas")?;
 
         folded
@@ -489,16 +590,24 @@ pub fn profile_transaction(
             .or_default()
             .add(step.gas_cost, "folded-stack gas")?;
 
+        let caller_function = function;
         if let Some(function) = context.and_then(|context| match context.invokes.as_slice() {
             [function] => Some(*function),
             _ => None,
         }) {
+            function_callers
+                .entry(function_frame)
+                .or_default()
+                .push(caller_function);
             let stack = function_stacks.entry(function_frame).or_default();
             stack.push(function);
             let path = intern_function_path(stack, &mut function_paths, &mut function_path_lookup);
             function_path_ids.insert(function_frame, path);
         }
         if context.and_then(|context| context.exit).is_some() {
+            if let Some(callers) = function_callers.get_mut(&function_frame) {
+                callers.pop();
+            }
             if let Some(stack) = function_stacks.get_mut(&function_frame) {
                 stack.pop();
                 let path =
@@ -908,7 +1017,6 @@ struct SourceLineKey {
 struct HotspotKey {
     program: usize,
     pc: u64,
-    function: Option<usize>,
     source: Option<IndexedSource>,
 }
 
@@ -916,6 +1024,10 @@ struct HotspotKey {
 struct HotspotMetrics<'a> {
     opcode: &'a str,
     context_matches: bool,
+    /// The function of the first sample; named only if every sample ran in it, since a
+    /// helper shared by several functions belongs to none of them.
+    function: Option<usize>,
+    functions_agree: bool,
     metrics: Metrics,
 }
 
@@ -967,7 +1079,7 @@ fn function_rows(
             let function = key.function.map(|function| &program.functions[function]);
             let declaration = function.and_then(|function| function.identity.declaration.as_ref());
             let source_id = declaration.map(|declaration| declaration.source_id);
-            let source = source_id.and_then(|source_id| program.info.sources.get(&source_id));
+            let source = source_id.and_then(|source_id| program.debug.info.sources.get(&source_id));
             let line = declaration.and_then(|declaration| {
                 program
                     .source_indexes
@@ -1015,8 +1127,9 @@ fn source_line_rows(
         .into_iter()
         .filter_map(|(key, metrics)| {
             let program = &programs[key.program];
-            let path = program.info.sources.get(&key.source_id)?.clone();
+            let path = program.debug.info.sources.get(&key.source_id)?.clone();
             let text = program
+                .debug
                 .source_contents
                 .get(&key.source_id)
                 .and_then(|source| {
@@ -1075,9 +1188,8 @@ fn hotspot_rows(
                 environment: program.environment,
                 pc: key.pc,
                 opcode: hotspot.opcode.to_owned(),
-                function: hotspot
-                    .context_matches
-                    .then_some(key.function)
+                function: (hotspot.context_matches && hotspot.functions_agree)
+                    .then_some(hotspot.function)
                     .flatten()
                     .map(|function| program.functions[function].name().to_owned()),
                 source: hotspot
@@ -1106,7 +1218,7 @@ fn profile_source_location(
     source: &IndexedSource,
 ) -> Option<ProfileSourceLocation> {
     Some(ProfileSourceLocation {
-        path: program.info.sources.get(&source.source_id)?.clone(),
+        path: program.debug.info.sources.get(&source.source_id)?.clone(),
         offset: source.offset,
         length: source.length,
         line: source.line,
@@ -1163,6 +1275,7 @@ fn folded_rows(
             }
             if let Some(source) = key.source {
                 let path = program
+                    .debug
                     .info
                     .sources
                     .get(&source.source_id)
@@ -1273,6 +1386,149 @@ mod tests {
         assert_eq!(report.hotspots[0].pc, 2);
         assert!(report.folded_text().contains("Counter::add"));
         assert!(report.folded_text().contains("Counter.sol:3"));
+    }
+
+    #[test]
+    fn names_functions_the_program_does_not_mark() {
+        let source =
+            "contract Counter {\n    function add() external {\n        uint x = 1;\n    }\n}\n";
+        let offset = source.find("uint x").expect("statement offset") as u64;
+        let program = program(
+            Some("0xcafe"),
+            "Counter",
+            "call",
+            source,
+            &[(0, "PUSH1", offset)],
+        );
+        let trace = trace(Some("0xcafe"), vec![step(0, "PUSH1", 3, 0)]);
+
+        let report = profile_transaction(&trace, &[program]).expect("profile");
+
+        assert_eq!(report.functions.len(), 1);
+        assert_eq!(report.functions[0].function, "add");
+        assert_eq!(report.functions[0].line, Some(2));
+    }
+
+    #[test]
+    fn names_anonymous_functions_and_charges_their_helpers_to_them() {
+        let source =
+            "contract Counter {\n    function add() external {\n        uint x = 1;\n    }\n}\n";
+        let offset = source.find("uint x").expect("statement offset") as u64;
+        let code = json!({"source": {"id": 0}, "range": {"offset": offset, "length": 1}});
+        // A legacy map's jump into a function carries no name, and its helpers no source.
+        let program = program_from_contexts(
+            "Counter",
+            source,
+            &[
+                (0, "JUMP", json!({"code": code, "invoke": {}})),
+                (1, "PUSH1", json!({"code": code})),
+                (3, "JUMP", json!({"invoke": {}})),
+                (4, "ADD", json!({})),
+            ],
+        );
+        let trace = trace(
+            Some("0xcafe"),
+            vec![
+                step(0, "JUMP", 8, 0),
+                step(1, "PUSH1", 3, 0),
+                step(3, "JUMP", 8, 0),
+                step(4, "ADD", 3, 0),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[program]).expect("profile");
+
+        assert_eq!(report.functions.len(), 1);
+        assert_eq!(report.functions[0].function, "add");
+        assert_eq!(report.functions[0].gas, 22);
+    }
+
+    #[test]
+    fn does_not_charge_dispatcher_helpers_to_a_returned_function() {
+        let source =
+            "contract Counter {\n    function add() external {\n        uint x = 1;\n    }\n}\n";
+        let offset = source.find("uint x").expect("statement offset") as u64;
+        let code = json!({"source": {"id": 0}, "range": {"offset": offset, "length": 1}});
+        // After `add` returns, the dispatcher jumps into an unnamed encoder helper.
+        let program = program_from_contexts(
+            "Counter",
+            source,
+            &[
+                (0, "PUSH1", json!({"code": code})),
+                (2, "JUMP", json!({"return": {}})),
+                (3, "JUMP", json!({"invoke": {}})),
+                (10, "ADD", json!({})),
+            ],
+        );
+        let trace = trace(
+            Some("0xcafe"),
+            vec![
+                step(0, "PUSH1", 3, 0),
+                step(2, "JUMP", 8, 0),
+                step(3, "JUMP", 8, 0),
+                step(10, "ADD", 3, 0),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[program]).expect("profile");
+
+        let add = report
+            .functions
+            .iter()
+            .find(|row| row.function == "add")
+            .expect("add row");
+        assert_eq!(add.gas, 3);
+    }
+
+    #[test]
+    fn keeps_one_hotspot_for_a_helper_shared_by_functions() {
+        let source = "contract Counter {\n    function add() external { uint x = 1; }\n    function sub() external { uint y = 2; }\n}\n";
+        let add = source.find("uint x").expect("add statement") as u64;
+        let sub = source.find("uint y").expect("sub statement") as u64;
+        let add = json!({"source": {"id": 0}, "range": {"offset": add, "length": 1}});
+        let sub = json!({"source": {"id": 0}, "range": {"offset": sub, "length": 1}});
+        let program = program_from_contexts(
+            "Counter",
+            source,
+            &[
+                (0, "PUSH1", json!({"code": add})),
+                (2, "JUMP", json!({"code": add, "invoke": {}})),
+                (3, "PUSH1", json!({"code": sub})),
+                (5, "JUMP", json!({"code": sub, "invoke": {}})),
+                (10, "ADD", json!({})),
+                (11, "JUMP", json!({"return": {}})),
+            ],
+        );
+        let trace = trace(
+            Some("0xcafe"),
+            vec![
+                step(0, "PUSH1", 3, 0),
+                step(2, "JUMP", 8, 0),
+                step(10, "ADD", 3, 0),
+                step(11, "JUMP", 8, 0),
+                step(3, "PUSH1", 3, 0),
+                step(5, "JUMP", 8, 0),
+                step(10, "ADD", 3, 0),
+                step(11, "JUMP", 8, 0),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[program]).expect("profile");
+
+        let helper = report
+            .hotspots
+            .iter()
+            .filter(|hotspot| hotspot.pc == 10)
+            .collect::<Vec<_>>();
+        assert_eq!(helper.len(), 1);
+        assert_eq!(helper[0].gas, 6);
+        assert_eq!(helper[0].function, None);
+        let functions = report
+            .functions
+            .iter()
+            .map(|row| (row.function.as_str(), row.gas))
+            .collect::<Vec<_>>();
+        assert_eq!(functions, vec![("add", 22), ("sub", 22)]);
     }
 
     #[test]
@@ -1661,6 +1917,34 @@ mod tests {
             instructions,
             Some(function),
         )
+    }
+
+    fn program_from_contexts(
+        name: &str,
+        source: &str,
+        instructions: &[(u64, &str, serde_json::Value)],
+    ) -> ProfileProgram {
+        let instructions = instructions
+            .iter()
+            .map(|(pc, opcode, context)| Instruction {
+                offset: *pc,
+                operation: json!({"mnemonic": opcode}),
+                context: Some(context.clone()),
+            })
+            .collect();
+        ProfileProgram::new(
+            Some("0xcafe".to_owned()),
+            EthdebugInfo {
+                compilation: json!({}),
+                contract_name: name.to_owned(),
+                environment: "call".to_owned(),
+                instructions,
+                sources: BTreeMap::from([(0, format!("{name}.sol"))]),
+                variable_locations: BTreeMap::new(),
+            },
+            BTreeMap::from([(0, source.to_owned())]),
+        )
+        .expect("profile program")
     }
 
     fn make_program(

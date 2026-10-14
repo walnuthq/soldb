@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 serde.workspace = true
 soldb-core.workspace = true
+soldb-debugger.workspace = true
 soldb-ethdebug.workspace = true
 
 [dev-dependencies]
