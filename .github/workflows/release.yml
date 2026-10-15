@@ -10,18 +10,24 @@ name: Release
 # `soldb-wasm` sets `publish = false` and ships through `wasm-pack` instead, so
 # `cargo publish --workspace` skips it.
 #
+# The publish step uploads only the crates whose version is not on crates.io
+# yet, so a release that stops partway is finished by re-running the failed
+# job once the cause is fixed. A run that finds every crate already published
+# uploads nothing and succeeds.
+#
 # A crate added to the workspace does not publish from here on its first release.
 # A trusted-publishing token cannot create a crate, so the upload fails with
 # `403 Trusted Publishing tokens do not support creating new crates`, and that
 # crate and everything downstream of it are left unpublished. Publishing it by
 # hand before the release does not help either: it requires its siblings at the
-# version being released, which are not on crates.io yet. Such a release is
-# finished by hand from the release commit, with a token carrying the
-# `publish-new` scope, and the new crate gets its owners and its
+# version being released, which are not on crates.io yet. Instead, once the run
+# has failed, the new crate is published by hand from the release commit with a
+# token carrying the `publish-new` scope, given its owners and its
 # trusted-publisher config (this repository, this filename, the `release`
-# environment) so the next release publishes it from here. See the release
-# section of CONTRIBUTING.md. `soldb-evm` was added in 0.3.0 and `soldb-tui` in
-# 0.4.0, and both went this way.
+# environment), and the failed job is re-run to publish the rest. A crate
+# missing its trusted-publisher config fails the same way, with `403 The
+# provided access token is not valid for crate`, and is finished the same way.
+# See the release section of CONTRIBUTING.md.
 
 on:
   release:
@@ -64,8 +70,31 @@ jobs:
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
-      # `cargo publish --workspace` resolves the inter-crate publish order itself.
+      # `cargo publish --workspace` refuses to start once any member is on
+      # crates.io, so name the members still missing instead; `cargo publish`
+      # resolves the inter-crate publish order of the `-p` set itself.
       - name: Publish
-        run: cargo publish --workspace
+        run: |
+          set -euo pipefail
+          packages=()
+          while read -r name version; do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A 'soldb release workflow (https://github.com/walnuthq/soldb)' \
+              "https://crates.io/api/v1/crates/$name/$version")
+            case "$status" in
+              200) echo "skipping \`$name\` $version: already on crates.io" ;;
+              404) packages+=(-p "$name") ;;
+              *)
+                echo "could not check \`$name\` $version on crates.io: HTTP $status" >&2
+                exit 1
+                ;;
+            esac
+          done < <(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.publish != []) | "\(.name) \(.version)"')
+          if [ ${#packages[@]} -eq 0 ]; then
+            echo "::notice::every crate is already on crates.io at this version; nothing to publish"
+            exit 0
+          fi
+          cargo publish "${packages[@]}"
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
