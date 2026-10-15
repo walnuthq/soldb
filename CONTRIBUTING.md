@@ -40,6 +40,15 @@ Versions on crates.io are permanent: yanking hides a release from resolution but
 does not free the number. A crate dropped from the workspace keeps whatever it
 already published and simply stops getting new versions.
 
+### When a release stops partway
+
+The workflow publishes only the crates whose version is not on crates.io yet.
+If it fails partway — crates.io was unavailable, or a crate is missing its
+trusted-publisher configuration (`403 The provided access token is not valid for
+crate`) — fix the cause and re-run the failed job: it skips what was already
+published and uploads the rest. A run that finds every crate already published
+uploads nothing and succeeds.
+
 ### When the release adds a crate
 
 A trusted-publishing token cannot create a crate, so the workflow cannot publish
@@ -50,19 +59,18 @@ of it unpublished. Publishing the new crate ahead of the release does not avoid
 this: it requires its siblings at the version being released, and they are not on
 crates.io yet.
 
-Finish that release by hand from the release commit, with an API token carrying
-the `publish-new` scope:
+Finish that release once the workflow has failed:
 
-1. Let the workflow publish everything it can reach.
-2. `cargo publish -p <new crate>`, then the crates left over, in dependency
-   order. `cargo publish --workspace` cannot finish the job: it checks every
-   member against the index up front and refuses to run once any of them is
-   published.
-3. Give the new crate the owners its siblings have; `cargo owner --list soldb-core`
+1. From the release commit, `cargo publish -p <new crate>` with an API token
+   carrying the `publish-new` scope.
+2. Give the new crate the owners its siblings have; `cargo owner --list soldb-core`
    says who they are.
-4. Add its trusted-publisher configuration on crates.io: this repository, the
-   `release.yml` filename, and the `release` environment. The next release then
-   publishes it from CI like the rest.
+3. Add its trusted-publisher configuration on crates.io: this repository, the
+   `release.yml` filename, and the `release` environment. Without it, the
+   crate's next release stops on it again: `soldb-tui` missed this step in
+   0.4.0, so 0.4.1 had to be finished by hand.
+4. Re-run the failed job. It publishes the crates left over, and every later
+   release publishes the new crate from CI like the rest.
 
 `soldb-evm` was new in 0.3.0 and `soldb-tui` in 0.4.0, and both went this way.
 
