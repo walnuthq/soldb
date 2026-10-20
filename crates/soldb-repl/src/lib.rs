@@ -270,8 +270,20 @@ impl DebuggerState {
     /// [`DebuggerState::attach_debug_info`]; until then stepping is by instruction. Fails
     /// on a trace whose top-level calls no execution produces.
     pub fn load_trace(&mut self, trace: TransactionTrace) -> SoldbResult<()> {
+        self.load_trace_with_debug_info(trace, Vec::new())
+    }
+
+    /// Loads a trace and maps every step through the contracts' debug info, as
+    /// [`DebuggerState::load_trace`] followed by [`DebuggerState::attach_debug_info`] does,
+    /// but maps the trace once instead of twice. Fails on a trace whose top-level calls no
+    /// execution produces.
+    pub fn load_trace_with_debug_info(
+        &mut self,
+        trace: TransactionTrace,
+        contracts: Vec<ContractDebugInfo>,
+    ) -> SoldbResult<()> {
         check_root_calls(&trace)?;
-        let map = StepMap::new(&trace, Vec::new());
+        let map = StepMap::new(&trace, contracts);
         self.storage_tape = Some(StorageTape::new(&trace, &map));
         self.transient_tape = Some(StorageTape::transient(&trace, &map));
         self.step_map = Some(map);
@@ -1808,6 +1820,20 @@ contract C {
             .expect("top-level calls must start at different steps");
         state.attach_debug_info(vec![contract]);
         state
+    }
+
+    #[test]
+    fn loading_with_debug_info_matches_attaching_it_later() {
+        let attached = source_state();
+        let trace = attached.trace().expect("trace").clone();
+        let contracts = attached.step_map().expect("map").contracts().to_vec();
+        let mut loaded = DebuggerState::new();
+        loaded
+            .load_trace_with_debug_info(trace, contracts)
+            .expect("top-level calls must start at different steps");
+        assert_eq!(loaded.step_map, attached.step_map);
+        assert_eq!(loaded.storage_tape, attached.storage_tape);
+        assert_eq!(loaded.transient_tape, attached.transient_tape);
     }
 
     #[test]
