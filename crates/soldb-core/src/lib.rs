@@ -57,6 +57,8 @@ pub struct TraceStep {
     /// couple of hundred of them and hundreds of thousands of steps.
     pub op: Word,
     pub gas: u64,
+    /// The cost as the tracer reports it: for a call, its own cost plus the gas it forwards to
+    /// the callee; for a creation, the same under REVM but without the forwarded gas under geth.
     pub gas_cost: u64,
     pub depth: u64,
     /// Legacy layout; empty unless a caller filled it by hand. See the type docs.

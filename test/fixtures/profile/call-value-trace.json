@@ -1,0 +1,25 @@
+{
+  "tx_hash": "0xabd",
+  "from_addr": "0x0000000000000000000000000000000000000001",
+  "to_addr": "0x000000000000000000000000000000000000cafe",
+  "value": "10",
+  "input_data": "0x",
+  "gas_used": 47808,
+  "output": "0x",
+  "success": true,
+  "error": null,
+  "debug_trace_available": true,
+  "contract_address": null,
+  "backend": "debug-rpc",
+  "capabilities": {"opcode_steps": true, "gas_details": true},
+  "artifacts": {},
+  "steps": [
+    {"pc": 134, "op": "GAS", "gas": 29550, "gas_cost": 2, "depth": 1},
+    {"pc": 135, "op": "CALL", "gas": 29548, "gas_cost": 29229, "depth": 1},
+    {"pc": 0, "op": "PUSH1", "gas": 22429, "gas_cost": 3, "depth": 2},
+    {"pc": 112, "op": "SSTORE", "gas": 22426, "gas_cost": 20000, "depth": 2},
+    {"pc": 113, "op": "STOP", "gas": 2426, "gas_cost": 0, "depth": 2},
+    {"pc": 136, "op": "ISZERO", "gas": 2745, "gas_cost": 3, "depth": 1},
+    {"pc": 137, "op": "STOP", "gas": 2742, "gas_cost": 0, "depth": 1}
+  ]
+}

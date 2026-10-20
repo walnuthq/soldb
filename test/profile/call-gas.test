@@ -1,0 +1,11 @@
+# A call's reported cost includes the gas it forwards; the profile counts only its own cost
+# REQUIRES: soldb
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/call-gas-trace.json 2>&1 | FileCheck %s
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/call-gas-trace.json --json | jq '.opcodes[] | select(.opcode == "CALL") | .gas' | FileCheck %s --check-prefix=JSON
+
+# CHECK: Traced instruction gas: 22208 across 7 steps
+# CHECK: Opcodes
+# CHECK: 22100 {{.*}} SSTORE
+# CHECK: 100 {{.*}} CALL
+
+# JSON: {{^}}100{{$}}
