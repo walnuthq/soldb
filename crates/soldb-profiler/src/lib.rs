@@ -15,11 +15,13 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
-use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
+use soldb_core::{SoldbError, SoldbResult, TraceStep, TransactionTrace};
 use soldb_debugger::{ContractDebugInfo, SourceFunction, StepMap};
 use soldb_ethdebug::{EthdebugInfo, FunctionExit, FunctionIdentity, SourceLocation};
 
 const PROFILE_SCHEMA_VERSION: u32 = 1;
+/// `G_create`: the base cost of `CREATE` and `CREATE2`, below which no creation's own cost falls.
+const CREATE_GAS: u64 = 32_000;
 
 /// Whether a program describes contract creation or deployed runtime bytecode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -325,7 +327,7 @@ pub struct ProfileTransaction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileTotals {
-    /// Sum of `gas_cost` across all opcode steps.
+    /// Sum of the gas each opcode step spent itself; a call's forwarded gas is not counted.
     pub step_gas: u64,
     /// Step gas assigned to a known creation or runtime program.
     pub program_gas: u64,
@@ -475,11 +477,13 @@ pub fn profile_transaction(
             current_path = paths.len() - 1;
         }
 
-        step_metrics.add(step.gas_cost, "total step gas")?;
+        let next = trace.steps.get(step_index + 1);
+        let gas_cost = own_gas_cost(step, next);
+        step_metrics.add(gas_cost, "total step gas")?;
         opcodes
             .entry(&*step.op)
             .or_default()
-            .add(step.gas_cost, "opcode gas")?;
+            .add(gas_cost, "opcode gas")?;
 
         let active_frame = frame_cursor.current_index(&frames, step.depth);
         let program_index = active_frame
@@ -499,7 +503,7 @@ pub fn profile_transaction(
                     unmapped_depth: Some(step.depth),
                 })
                 .or_default()
-                .add(step.gas_cost, "folded-stack gas")?;
+                .add(gas_cost, "folded-stack gas")?;
             continue;
         };
 
@@ -527,11 +531,11 @@ pub fn profile_transaction(
         let function = program.named_function(invoked, traced, caller);
         let function_path = function_path_ids.get(&function_frame).copied().unwrap_or(0);
         let source = context.and_then(|context| program.source_for_function(context, function));
-        program_metrics.add(step.gas_cost, "program gas")?;
+        program_metrics.add(gas_cost, "program gas")?;
         contracts
             .entry(program_index)
             .or_default()
-            .add(step.gas_cost, "contract gas")?;
+            .add(gas_cost, "contract gas")?;
 
         let function_key = FunctionKey {
             program: program_index,
@@ -541,7 +545,7 @@ pub fn profile_transaction(
         functions
             .entry(function_key)
             .or_default()
-            .add(step.gas_cost, "function gas")?;
+            .add(gas_cost, "function gas")?;
 
         let source_key = source.map(|source| FlameSourceKey {
             source_id: source.source_id,
@@ -549,7 +553,7 @@ pub fn profile_transaction(
             offset: source.line.is_none().then_some(source.offset),
         });
         if let Some(source) = source {
-            source_metrics.add(step.gas_cost, "source gas")?;
+            source_metrics.add(gas_cost, "source gas")?;
             if let Some(line) = source.line {
                 source_lines
                     .entry(SourceLineKey {
@@ -558,7 +562,7 @@ pub fn profile_transaction(
                         line,
                     })
                     .or_default()
-                    .add(step.gas_cost, "source-line gas")?;
+                    .add(gas_cost, "source-line gas")?;
             }
         }
 
@@ -577,7 +581,7 @@ pub fn profile_transaction(
             });
         hotspot.context_matches &= context.is_some();
         hotspot.functions_agree &= hotspot.function == function;
-        hotspot.metrics.add(step.gas_cost, "instruction gas")?;
+        hotspot.metrics.add(gas_cost, "instruction gas")?;
 
         folded
             .entry(FoldedKey {
@@ -588,7 +592,7 @@ pub fn profile_transaction(
                 unmapped_depth: None,
             })
             .or_default()
-            .add(step.gas_cost, "folded-stack gas")?;
+            .add(gas_cost, "folded-stack gas")?;
 
         let caller_function = function;
         if let Some(function) = context.and_then(|context| match context.invokes.as_slice() {
@@ -667,6 +671,41 @@ pub fn profile_transaction(
         hotspots: hotspot_rows,
         folded_stacks,
     })
+}
+
+/// Returns a step's gas without the gas a call forwards, which the callee's steps already count.
+///
+/// The callee starts with the forwarded gas plus any stipend, and the stipend comes back to the
+/// caller unless spent, so the whole `next.gas` comes off. A call with no steps lost `step.gas -
+/// next.gas`.
+fn own_gas_cost(step: &TraceStep, next: Option<&TraceStep>) -> u64 {
+    let base_cost = match &*step.op {
+        "CALL" | "CALLCODE" | "DELEGATECALL" | "STATICCALL" => 0,
+        "CREATE" | "CREATE2" => CREATE_GAS,
+        _ => return step.gas_cost,
+    };
+    if step.error.is_some() {
+        return step.gas_cost;
+    }
+    let Some(next) = next else {
+        return step.gas_cost;
+    };
+    // Deeper than one frame when the callee ran no steps but called on, as a cheatcode does.
+    if next.depth > step.depth {
+        // geth leaves a creation's forwarded gas out of its `gas_cost`, so less than the base
+        // cost would remain.
+        let Some(own) = step.gas_cost.checked_sub(next.gas) else {
+            return step.gas_cost;
+        };
+        return if own >= base_cost { own } else { step.gas_cost };
+    }
+    if next.depth == step.depth {
+        let Some(lost) = step.gas.checked_sub(next.gas) else {
+            return step.gas_cost;
+        };
+        return lost.min(step.gas_cost);
+    }
+    step.gas_cost
 }
 
 #[derive(Debug, Clone)]
@@ -1352,7 +1391,7 @@ mod tests {
     };
     use soldb_ethdebug::{EthdebugInfo, Instruction};
 
-    use super::{profile_transaction, ProfileProgram};
+    use super::{profile_transaction, ProfileProgram, ProfileReport};
 
     #[test]
     fn attributes_gas_to_source_functions_and_opcodes() {
@@ -1873,6 +1912,135 @@ mod tests {
     }
 
     #[test]
+    fn does_not_count_gas_forwarded_to_a_call() {
+        // The CALL reports 618: 118 its own and 500 forwarded, of which the callee spends 3.
+        let trace = trace(
+            Some("0x1"),
+            vec![
+                gas_step("PUSH1", 1_000, 3, 1),
+                gas_step("CALL", 997, 618, 1),
+                gas_step("PUSH1", 500, 3, 2),
+                gas_step("STOP", 497, 0, 2),
+                gas_step("STOP", 876, 0, 1),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[]).expect("profile");
+
+        assert_eq!(opcode_gas(&report, "CALL"), 118);
+        // Each step is counted once, so the total is what the caller lost.
+        assert_eq!(report.totals.step_gas, 1_000 - 876);
+    }
+
+    #[test]
+    fn does_not_count_gas_forwarded_to_nested_calls_and_creations() {
+        let trace = trace(
+            Some("0x1"),
+            vec![
+                gas_step("CALL", 100_000, 90_100, 1),
+                gas_step("CREATE", 90_000, 82_032, 2),
+                gas_step("STOP", 50_000, 0, 3),
+                gas_step("STOP", 57_968, 0, 2),
+                gas_step("STOP", 67_868, 0, 1),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[]).expect("profile");
+
+        assert_eq!(opcode_gas(&report, "CALL"), 100);
+        assert_eq!(opcode_gas(&report, "CREATE"), 32_032);
+        assert_eq!(report.totals.step_gas, 100_000 - 67_868);
+    }
+
+    #[test]
+    fn charges_a_value_call_net_of_the_stipend() {
+        // A `CALL` sending 1 wei: 9,100 its own, of which the 2,300 stipend comes back.
+        let trace = trace(
+            Some("0x1"),
+            vec![
+                gas_step("CALL", 29_548, 29_229, 1),
+                gas_step("PUSH1", 22_429, 3, 2),
+                gas_step("SSTORE", 22_426, 22_100, 2),
+                gas_step("STOP", 326, 0, 2),
+                gas_step("STOP", 645, 0, 1),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[]).expect("profile");
+
+        assert_eq!(opcode_gas(&report, "CALL"), 6_800);
+        assert_eq!(report.totals.step_gas, 29_548 - 645);
+    }
+
+    #[test]
+    fn does_not_count_gas_forwarded_through_a_frame_without_steps() {
+        // A cheatcode runs no steps and forwards everything to the creation it makes.
+        let trace = trace(
+            Some("0x1"),
+            vec![
+                gas_step("CALL", 100_000, 98_600, 1),
+                gas_step("STOP", 96_000, 0, 3),
+                gas_step("STOP", 97_400, 0, 1),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[]).expect("profile");
+
+        assert_eq!(opcode_gas(&report, "CALL"), 2_600);
+    }
+
+    #[test]
+    fn keeps_a_creation_cost_reported_without_forwarded_gas() {
+        // geth reports 32,000 and forwards the 7,875 left after the 1/64 it keeps.
+        let trace = trace(
+            Some("0x1"),
+            vec![
+                gas_step("CREATE", 40_000, 32_000, 1),
+                gas_step("STOP", 7_875, 0, 2),
+                gas_step("STOP", 8_000, 0, 1),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[]).expect("profile");
+
+        assert_eq!(opcode_gas(&report, "CREATE"), 32_000);
+    }
+
+    #[test]
+    fn charges_a_call_without_steps_what_the_caller_lost() {
+        // A precompile runs no steps: 118 for the call and 100 for the precompile.
+        let trace = trace(
+            Some("0x1"),
+            vec![
+                gas_step("STATICCALL", 1_000, 700, 1),
+                gas_step("STOP", 782, 0, 1),
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[]).expect("profile");
+
+        assert_eq!(opcode_gas(&report, "STATICCALL"), 218);
+    }
+
+    #[test]
+    fn keeps_call_costs_reported_without_forwarded_gas() {
+        let mut failed = gas_step("CALL", 1_000, 1_000, 1);
+        failed.error = Some("OutOfGas".to_owned());
+        let trace = trace(
+            Some("0x1"),
+            vec![
+                gas_step("CALL", 2_000, 118, 1),
+                gas_step("STOP", 500, 0, 2),
+                failed,
+            ],
+        );
+
+        let report = profile_transaction(&trace, &[]).expect("profile");
+
+        assert_eq!(opcode_gas(&report, "CALL"), 1_118);
+    }
+
+    #[test]
     fn rejects_out_of_bounds_source_ranges() {
         let program = program(
             Some("0x1"),
@@ -2023,6 +2191,23 @@ mod tests {
             artifacts: TraceArtifacts::default(),
             steps,
         }
+    }
+
+    fn gas_step(op: &str, gas: u64, gas_cost: u64, depth: u64) -> TraceStep {
+        TraceStep::new(
+            0,
+            op.into(),
+            gas,
+            gas_cost,
+            depth,
+            None,
+            StepSnapshot::default(),
+        )
+    }
+
+    fn opcode_gas(report: &ProfileReport, opcode: &str) -> u64 {
+        let row = report.opcodes.iter().find(|row| row.opcode == opcode);
+        row.expect("opcode row").gas
     }
 
     fn step(pc: u64, op: &str, gas_cost: u64, depth: u64) -> TraceStep {

@@ -1,0 +1,12 @@
+# A call that sends value is charged net of the 2,300 stipend the callee returns or spends
+# REQUIRES: soldb
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/call-value-trace.json 2>&1 | FileCheck %s
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/call-value-trace.json --json | jq '.opcodes[] | select(.opcode == "CALL") | .gas' | FileCheck %s --check-prefix=JSON
+
+# The total is what the caller lost: 29550 - 2742.
+# CHECK: Traced instruction gas: 26808 across 7 steps
+# CHECK: Opcodes
+# CHECK: 20000 {{.*}} SSTORE
+# CHECK: 6800 {{.*}} CALL
+
+# JSON: {{^}}6800{{$}}

@@ -46,13 +46,27 @@ contracts remains unavailable when the node omits call identities.
 The report separates:
 
 - transaction gas used, as reported by the transaction receipt;
-- traced instruction gas, the sum of per-step `gas_cost` values;
+- traced instruction gas, the sum of the gas each step spent itself;
 - gas attributed to a known creation or runtime program;
 - gas attributed to a compiler-provided source range; and
 - gas deliberately left unmapped because the executing program was unknown.
 
 Transaction gas and traced instruction gas are separate quantities. Intrinsic
 transaction gas, refunds, and backend accounting can make them differ.
+
+### Call and creation gas
+
+A call's `gas_cost` includes the gas it forwards to the callee, whose steps count it
+again. The profiler charges a call or creation the reported cost minus the gas the next
+step starts with:
+
+- The 2,300 stipend of a value call comes off too, so the transfer costs 6,700.
+- geth leaves the forwarded gas out of a creation's cost; one that would drop below
+  32,000 is kept as reported.
+- A call that runs no steps, such as one to a precompile, is charged what the caller
+  lost before its next step.
+
+Gas charged outside any step, such as a creation's code deposit, is not in the profile.
 
 ## Captured traces
 
