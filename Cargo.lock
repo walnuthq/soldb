@@ -3194,7 +3194,7 @@ checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "soldb"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "clap",
  "inferno",
@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-bridge"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3223,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-compiler"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3234,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-dap"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3256,7 +3256,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-debugger"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-ethdebug"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-evm"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "getrandom 0.2.17",
  "revm",
@@ -3287,7 +3287,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-profiler"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3298,7 +3298,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-repl"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3309,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-rpc"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3319,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-tui"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "soldb-wasm"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
