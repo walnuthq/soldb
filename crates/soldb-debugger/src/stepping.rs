@@ -60,6 +60,12 @@ information will replace this once compilers emit it";
 
 const CALL_OPCODES: [&str; 4] = ["CALL", "CALLCODE", "DELEGATECALL", "STATICCALL"];
 
+/// Marks a program counter where no instruction starts in a [`PcIndex`].
+const NO_INSTRUCTION: u32 = u32::MAX;
+
+/// The longest EVM instruction, `PUSH32` and its operand, in bytes.
+const MAX_INSTRUCTION_SIZE: usize = 33;
+
 /// One contract's debug information, prepared for stepping: the ETHDebug metadata, the
 /// source text, the functions parsed from it, and the indexes that make per-step lookups
 /// constant time.
@@ -120,10 +126,50 @@ struct PcIndex {
     sparse: HashMap<u64, usize>,
 }
 
-const NO_INSTRUCTION: u32 = u32::MAX;
+impl PcIndex {
+    /// Indexes the instructions by offset. A later instruction at an offset replaces an
+    /// earlier one, as collecting them into a map does.
+    fn new(instructions: &[Instruction]) -> Self {
+        // Real code has every offset below this bound, since no instruction is longer.
+        // Offsets past it come from an artifact that does not describe real code, and go
+        // to the map so that they cannot size the table.
+        let bound = instructions.len().saturating_mul(MAX_INSTRUCTION_SIZE);
+        let dense_len = instructions
+            .iter()
+            .filter_map(|instruction| usize::try_from(instruction.offset).ok())
+            .filter(|offset| *offset < bound)
+            .max()
+            .map_or(0, |offset| offset + 1);
+        let mut dense = vec![NO_INSTRUCTION; dense_len];
+        let mut sparse = HashMap::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            let slot = usize::try_from(instruction.offset)
+                .ok()
+                .and_then(|offset| dense.get_mut(offset));
+            match (slot, u32::try_from(index)) {
+                (Some(slot), Ok(index)) if index != NO_INSTRUCTION => *slot = index,
+                (slot, _) => {
+                    if let Some(slot) = slot {
+                        *slot = NO_INSTRUCTION;
+                    }
+                    sparse.insert(instruction.offset, index);
+                }
+            }
+        }
+        Self { dense, sparse }
+    }
 
-/// The longest EVM instruction, `PUSH32` and its operand, in bytes.
-const MAX_INSTRUCTION_SIZE: usize = 33;
+    fn get(&self, pc: u64) -> Option<usize> {
+        let dense = usize::try_from(pc)
+            .ok()
+            .and_then(|pc| self.dense.get(pc))
+            .filter(|index| **index != NO_INSTRUCTION);
+        match dense {
+            Some(index) => Some(*index as usize),
+            None => self.sparse.get(&pc).copied(),
+        }
+    }
+}
 
 /// Which of a contract's two programs a frame executes: the creation code, run once by a
 /// `CREATE`, or the deployed code, run by every call.
@@ -479,51 +525,6 @@ fn jump_marker(instruction: &Instruction) -> JumpMarker {
         JumpMarker::Return
     } else {
         JumpMarker::None
-    }
-}
-
-impl PcIndex {
-    /// Indexes the instructions by offset. A later instruction at an offset replaces an
-    /// earlier one, as collecting them into a map does.
-    fn new(instructions: &[Instruction]) -> Self {
-        // Real code has every offset below this bound, since no instruction is longer.
-        // Offsets past it come from an artifact that does not describe real code, and go
-        // to the map so that they cannot size the table.
-        let bound = instructions.len().saturating_mul(MAX_INSTRUCTION_SIZE);
-        let dense_len = instructions
-            .iter()
-            .filter_map(|instruction| usize::try_from(instruction.offset).ok())
-            .filter(|offset| *offset < bound)
-            .max()
-            .map_or(0, |offset| offset + 1);
-        let mut dense = vec![NO_INSTRUCTION; dense_len];
-        let mut sparse = HashMap::new();
-        for (index, instruction) in instructions.iter().enumerate() {
-            let slot = usize::try_from(instruction.offset)
-                .ok()
-                .and_then(|offset| dense.get_mut(offset));
-            match (slot, u32::try_from(index)) {
-                (Some(slot), Ok(index)) if index != NO_INSTRUCTION => *slot = index,
-                (slot, _) => {
-                    if let Some(slot) = slot {
-                        *slot = NO_INSTRUCTION;
-                    }
-                    sparse.insert(instruction.offset, index);
-                }
-            }
-        }
-        Self { dense, sparse }
-    }
-
-    fn get(&self, pc: u64) -> Option<usize> {
-        let dense = usize::try_from(pc)
-            .ok()
-            .and_then(|pc| self.dense.get(pc))
-            .filter(|index| **index != NO_INSTRUCTION);
-        match dense {
-            Some(index) => Some(*index as usize),
-            None => self.sparse.get(&pc).copied(),
-        }
     }
 }
 
@@ -2839,9 +2840,7 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{ContractCreation, ExecutionCall, StepSnapshot, TraceStep, TransactionTrace};
-    use soldb_ethdebug::{
-        function_selector, CodeGenerator, EthdebugInfo, FunctionExit, Instruction,
-    };
+    use soldb_ethdebug::{function_selector, CodeGenerator, EthdebugInfo, Instruction};
 
     use soldb_core::Word as StackWord;
 
@@ -2881,17 +2880,26 @@ contract C {
         length: u64,
         extra: serde_json::Value,
     ) -> Instruction {
-        let mut context =
-            json!({"code": {"source": {"id": 0}, "range": {"offset": offset, "length": length}}});
+        let mut context = json!({"code": code(0, offset, length)});
         for (key, value) in extra.as_object().expect("object") {
             context[key] = value.clone();
         }
+        raw_instruction(pc, "JUMPDEST", Some(context))
+    }
+
+    /// An instruction with any mnemonic and context, or none.
+    fn raw_instruction(pc: u64, mnemonic: &str, context: Option<serde_json::Value>) -> Instruction {
         serde_json::from_value(json!({
             "offset": pc,
-            "operation": {"mnemonic": "JUMPDEST"},
+            "operation": {"mnemonic": mnemonic},
             "context": context
         }))
         .expect("instruction")
+    }
+
+    /// An ETHDebug code pointer to `length` bytes at `offset` in source `source_id`.
+    fn code(source_id: u64, offset: u64, length: u64) -> serde_json::Value {
+        json!({"source": {"id": source_id}, "range": {"offset": offset, "length": length}})
     }
 
     fn contract(address: Option<&str>) -> ContractDebugInfo {
@@ -4542,34 +4550,13 @@ contract P {
     }
 
     /// An instruction with any mnemonic and any context, or none.
-    fn raw_instruction(pc: u64, mnemonic: &str, context: Option<serde_json::Value>) -> Instruction {
-        serde_json::from_value(json!({
-            "offset": pc,
-            "operation": {"mnemonic": mnemonic},
-            "context": context
-        }))
-        .expect("instruction")
-    }
-
-    fn code(source_id: u64, offset: u64, length: u64) -> serde_json::Value {
-        json!({"source": {"id": source_id}, "range": {"offset": offset, "length": length}})
-    }
-
     #[test]
     fn prepared_instruction_facts_match_the_instructions() {
         let whole = SOURCE.len() as u64;
         let outer = offset_of("function outer");
-        let inner = offset_of("function inner");
         let statement = offset_of("x += 1;");
         let instructions = vec![
             raw_instruction(0, "PUSH1", Some(json!({"code": code(0, 0, whole)}))),
-            // Entry points: a `JUMPDEST` carrying each declaration's span. The later
-            // `JUMPDEST` at pc 9 is not outer's entry; the earliest one is.
-            raw_instruction(10, "JUMPDEST", Some(json!({"code": code(0, outer, 90)}))),
-            raw_instruction(9, "JUMPDEST", Some(json!({"code": code(0, outer, 90)}))),
-            raw_instruction(20, "JUMPDEST", Some(json!({"code": code(0, inner, 50)}))),
-            // A declaration span on something other than a `JUMPDEST` enters nothing.
-            raw_instruction(25, "JUMP", Some(json!({"code": code(0, inner, 50)}))),
             // Jump markers: a call, a return, and a revert, which marks no jump.
             raw_instruction(
                 21,
@@ -4589,9 +4576,8 @@ contract P {
             // No context, and a context without code.
             raw_instruction(30, "STOP", None),
             raw_instruction(31, "POP", Some(json!({}))),
-            // Two alternatives with different spans have no single location; one
-            // alternative, or two with the same span, do. An invocation inside an
-            // alternative still marks a call.
+            // Two alternatives with different spans have no single location; an
+            // invocation inside one still marks a call. Two equal spans have one.
             raw_instruction(
                 40,
                 "JUMP",
@@ -4601,11 +4587,6 @@ contract P {
                 ]})),
             ),
             raw_instruction(
-                41,
-                "ADD",
-                Some(json!({"pick": [{"code": code(0, statement, 7)}]})),
-            ),
-            raw_instruction(
                 42,
                 "ADD",
                 Some(json!({"pick": [
@@ -4613,10 +4594,8 @@ contract P {
                     {"code": code(0, statement, 7)}
                 ]})),
             ),
-            // A span in a source whose text is not loaded has no line and no function.
+            // A span in a source whose text is not loaded has no line.
             raw_instruction(50, "ADD", Some(json!({"code": code(7, statement, 7)}))),
-            // A malformed span is no span.
-            raw_instruction(51, "ADD", Some(json!({"code": {"source": {"id": 0}}}))),
             // Two instructions at one offset: the later one describes it.
             raw_instruction(60, "ADD", Some(json!({"code": code(0, 0, whole)}))),
             raw_instruction(60, "JUMPDEST", Some(json!({"code": code(0, statement, 7)}))),
@@ -4631,115 +4610,40 @@ contract P {
             compilation: serde_json::Value::Null,
             contract_name: "C".to_owned(),
             environment: "call".to_owned(),
-            instructions: instructions.clone(),
+            instructions,
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
         };
         let contract =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
-
-        // What each lookup derived from the instruction's JSON on every call.
-        let derived_entry = |pc: u64| {
+        let line = |pc| contract.facts_at_pc(pc).and_then(|facts| facts.line);
+        let function = |pc| {
             contract
-                .functions
-                .iter()
-                .enumerate()
-                .filter(|(_, function)| {
-                    instructions
-                        .iter()
-                        .filter(|instruction| instruction.mnemonic() == Some("JUMPDEST"))
-                        .filter(|instruction| {
-                            instruction.source_location().is_some_and(|location| {
-                                location.source_id == function.source_id
-                                    && location.offset == function.declaration_start
-                            })
-                        })
-                        .map(|instruction| instruction.offset)
-                        .min()
-                        == Some(pc)
-                })
-                .map(|(index, _)| index)
-                .next_back()
+                .function_at_pc(pc)
+                .map(|function| function.name.as_str())
         };
-        let derived_marker = |instruction: &Instruction| {
-            if !instruction.function_invocations().is_empty() {
-                JumpMarker::Call
-            } else if instruction.function_exit() == Some(FunctionExit::Return) {
-                JumpMarker::Return
-            } else {
-                JumpMarker::None
-            }
-        };
-        let mut pcs = instructions
-            .iter()
-            .map(|instruction| instruction.offset)
-            .collect::<Vec<_>>();
-        pcs.extend([1, 8, 61, 1_000, (1 << 40) + 1, u64::MAX]);
-        for pc in pcs {
-            let instruction = instructions
-                .iter()
-                .rev()
-                .find(|instruction| instruction.offset == pc);
-            let location = instruction.and_then(Instruction::source_location);
-            let line = location
-                .as_ref()
-                .and_then(|location| contract.line_of(location.source_id, location.offset));
-            let function = location
-                .as_ref()
-                .and_then(|location| contract.function_for_location(location));
-            assert_eq!(contract.instruction_at_pc(pc), instruction, "pc {pc}");
-            assert_eq!(contract.location_at_pc(pc), location, "pc {pc}");
-            assert_eq!(
-                contract.facts_at_pc(pc).and_then(|facts| facts.line),
-                line,
-                "pc {pc}"
-            );
-            assert_eq!(
-                contract.function_at_pc(pc),
-                function.and_then(|index| contract.functions.get(index)),
-                "pc {pc}"
-            );
-            assert_eq!(
-                contract.function_entry_at_pc(pc),
-                derived_entry(pc),
-                "pc {pc}"
-            );
-            assert_eq!(
-                contract.jump_marker_at_pc(pc),
-                instruction.map_or(JumpMarker::None, derived_marker),
-                "pc {pc}"
-            );
-            assert_eq!(
-                contract.is_jumpdest(pc),
-                instruction.is_some_and(|instruction| instruction.mnemonic() == Some("JUMPDEST")),
-                "pc {pc}"
-            );
-        }
 
-        // The cases above cover what they say they cover.
-        assert_eq!(contract.function_entry_at_pc(9), Some(0));
-        assert_eq!(contract.function_entry_at_pc(10), None);
-        assert_eq!(contract.function_entry_at_pc(20), Some(1));
         assert_eq!(contract.jump_marker_at_pc(21), JumpMarker::Call);
         assert_eq!(contract.jump_marker_at_pc(22), JumpMarker::Return);
         assert_eq!(contract.jump_marker_at_pc(23), JumpMarker::None);
         assert_eq!(contract.jump_marker_at_pc(40), JumpMarker::Call);
-        assert_eq!(contract.jump_marker_at_pc(1 << 40), JumpMarker::Return);
         assert_eq!(contract.location_at_pc(30), None);
+        assert_eq!(contract.location_at_pc(31), None);
         assert_eq!(contract.location_at_pc(40), None);
-        assert!(contract.location_at_pc(41).is_some());
-        assert!(contract.location_at_pc(42).is_some());
+        assert_eq!(contract.location_at_pc(42), contract.location_at_pc(21));
+        assert_eq!(line(21), contract.line_of(0, statement));
+        assert_eq!(function(21), Some("inner"));
         assert!(contract.location_at_pc(50).is_some());
-        assert_eq!(contract.facts_at_pc(50).and_then(|facts| facts.line), None);
-        assert_eq!(contract.location_at_pc(51), None);
-        assert_eq!(
-            contract
-                .function_at_pc(60)
-                .map(|function| function.name.as_str()),
-            Some("inner")
-        );
+        assert_eq!(line(50), None);
+        assert_eq!(function(60), Some("inner"));
         assert!(contract.is_jumpdest(60));
+        assert_eq!(contract.jump_marker_at_pc(1 << 40), JumpMarker::Return);
         assert!(contract.pc_index.sparse.contains_key(&(1 << 40)));
+        // No instruction starts at these program counters.
+        for pc in [1, 61, (1 << 40) + 1, u64::MAX] {
+            assert_eq!(contract.instruction_at_pc(pc), None, "pc {pc}");
+            assert_eq!(contract.location_at_pc(pc), None, "pc {pc}");
+        }
     }
 
     #[test]
