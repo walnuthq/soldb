@@ -17,10 +17,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use serde::de::{SeqAccess, Visitor};
+use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+
+pub use bytes::Bytes;
 
 #[derive(Debug, Error)]
 pub enum SoldbError {
@@ -64,7 +66,7 @@ pub struct TraceStep {
     /// Legacy layout; empty unless a caller filled it by hand. See the type docs.
     pub stack: Vec<Word>,
     /// Legacy layout; `None` unless a caller filled it by hand. See the type docs.
-    pub memory: Option<String>,
+    pub memory: Option<Bytes>,
     /// Legacy layout; `None` unless a caller filled it by hand. See the type docs.
     pub storage: Option<BTreeMap<String, String>>,
     pub error: Option<String>,
@@ -146,7 +148,7 @@ impl TraceStep {
         if self.snapshot.is_empty() {
             self.snapshot = StepSnapshot {
                 stack: std::mem::take(&mut self.stack),
-                memory: self.memory.take().map(Arc::from),
+                memory: self.memory.take(),
                 storage: Arc::new(self.storage.take().unwrap_or_default()),
                 storage_diff: BTreeMap::new(),
                 transient_storage: BTreeMap::new(),
@@ -186,7 +188,7 @@ impl Serialize for TraceStep {
         state.serialize_field("gas_cost", &self.gas_cost)?;
         state.serialize_field("depth", &self.depth)?;
         state.serialize_field("stack", snapshot.stack)?;
-        state.serialize_field("memory", &snapshot.memory)?;
+        state.serialize_field("memory", &snapshot.memory.map(Hex))?;
         state.serialize_field("storage", snapshot.storage)?;
         state.serialize_field("error", &self.error)?;
         state.serialize_field("snapshot", &snapshot)?;
@@ -204,8 +206,8 @@ struct TraceStepRepr {
     depth: u64,
     #[serde(default)]
     stack: Vec<String>,
-    #[serde(default)]
-    memory: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_memory")]
+    memory: Option<Bytes>,
     #[serde(default)]
     storage: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -295,7 +297,9 @@ impl WordInterner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StepSnapshotRef<'a> {
     pub stack: &'a [Word],
-    pub memory: Option<&'a str>,
+    /// Memory as bytes; written out as one unprefixed lowercase hex string.
+    #[serde(serialize_with = "serialize_memory")]
+    pub memory: Option<&'a [u8]>,
     pub storage: &'a BTreeMap<String, String>,
     pub storage_diff: &'a BTreeMap<String, StorageChange>,
     #[serde(skip_serializing_if = "is_empty_ref")]
@@ -308,13 +312,20 @@ fn is_empty_ref(map: &&BTreeMap<String, String>) -> bool {
     map.is_empty()
 }
 
+fn serialize_memory<S: Serializer>(
+    memory: &Option<&[u8]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    memory.map(Hex).serialize(serializer)
+}
+
 impl StepSnapshotRef<'_> {
     /// Copies this view into an owned [`StepSnapshot`].
     #[must_use]
     pub fn to_owned_snapshot(&self) -> StepSnapshot {
         StepSnapshot {
             stack: self.stack.to_vec(),
-            memory: self.memory.map(Arc::from),
+            memory: self.memory.map(Bytes::copy_from_slice),
             storage: Arc::new(self.storage.clone()),
             storage_diff: self.storage_diff.clone(),
             transient_storage: self.transient_storage.clone(),
@@ -329,12 +340,17 @@ impl StepSnapshotRef<'_> {
 /// value on unchanged, so a trace holds one copy of memory per change rather than one
 /// per step. Reads see plain values through `Deref`; a step that changes them gets its
 /// own.
+///
+/// Memory is held as bytes. Trace files spell it as one unprefixed lowercase hex string,
+/// and serialization writes and reads that spelling, so the bytes are only a change in
+/// how a step holds memory, not in what a file says.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(from = "StepSnapshotRepr")]
 pub struct StepSnapshot {
     pub stack: Vec<Word>,
-    /// Memory as one unprefixed hex string.
-    pub memory: Option<Arc<str>>,
+    /// Memory as bytes. A [`Bytes`] clone shares the buffer, which is how consecutive
+    /// steps hold one copy of unchanged memory.
+    pub memory: Option<Bytes>,
     pub storage: Arc<BTreeMap<String, String>>,
     pub storage_diff: BTreeMap<String, StorageChange>,
     /// The transient slots this step read or wrote, with their value after it.
@@ -348,13 +364,13 @@ impl StepSnapshot {
     #[must_use]
     pub fn new(
         stack: Vec<Word>,
-        memory: Option<String>,
+        memory: Option<Bytes>,
         storage: BTreeMap<String, String>,
         storage_diff: BTreeMap<String, StorageChange>,
     ) -> Self {
         Self {
             stack,
-            memory: memory.map(Arc::from),
+            memory,
             storage: Arc::new(storage),
             storage_diff,
             transient_storage: BTreeMap::new(),
@@ -391,7 +407,7 @@ impl Serialize for StepSnapshot {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut state = serializer.serialize_struct("StepSnapshot", 6)?;
         state.serialize_field("stack", &self.stack)?;
-        state.serialize_field("memory", &self.memory.as_deref())?;
+        state.serialize_field("memory", &self.memory.as_deref().map(Hex))?;
         state.serialize_field("storage", &*self.storage)?;
         state.serialize_field("storage_diff", &self.storage_diff)?;
         // Only where a step touched it, so files without it are unchanged.
@@ -413,8 +429,8 @@ impl Serialize for StepSnapshot {
 struct StepSnapshotRepr {
     #[serde(default)]
     stack: Vec<Word>,
-    #[serde(default)]
-    memory: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_memory")]
+    memory: Option<Bytes>,
     #[serde(default)]
     storage: BTreeMap<String, String>,
     #[serde(default)]
@@ -543,8 +559,8 @@ fn share_snapshot(previous: &TraceStep, step: &mut TraceStep) {
     let previous = &previous.snapshot;
     let current = &mut step.snapshot;
     if let (Some(previous_memory), Some(current_memory)) = (&previous.memory, &current.memory) {
-        if !Arc::ptr_eq(previous_memory, current_memory) && **previous_memory == **current_memory {
-            current.memory = Some(Arc::clone(previous_memory));
+        if !same_buffer(previous_memory, current_memory) && previous_memory == current_memory {
+            current.memory = Some(previous_memory.clone());
         }
     }
     if !Arc::ptr_eq(&previous.storage, &current.storage) && *previous.storage == *current.storage {
@@ -727,6 +743,161 @@ pub struct FunctionCall {
     pub contract_address: Option<String>,
 }
 
+/// Whether two byte views are the same bytes in the same place, which is how a shared
+/// [`Bytes`] is recognized without comparing its contents.
+#[must_use]
+pub fn same_buffer(a: &[u8], b: &[u8]) -> bool {
+    a.as_ptr() == b.as_ptr() && a.len() == b.len()
+}
+
+/// Why a string is not hex.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum HexError {
+    /// Hex spells a byte with two digits, so a byte string has an even number of them.
+    #[error("{0} hex digits is not a whole number of bytes")]
+    OddLength(usize),
+    /// A character that is not a hex digit, at its byte offset after any `0x` prefix.
+    #[error("`{character}` at offset {offset} is not a hex digit")]
+    InvalidDigit { offset: usize, character: char },
+}
+
+/// Bytes as lowercase hex digits without a `0x` prefix, the spelling trace files use for
+/// memory.
+#[must_use]
+pub fn encode_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+    hex
+}
+
+/// Hex digits, with or without a `0x` prefix and in either case, as bytes.
+///
+/// # Errors
+///
+/// Returns a [`HexError`] when the digits are not a whole number of bytes or a character
+/// is not a hex digit.
+pub fn decode_hex(hex: &str) -> Result<Vec<u8>, HexError> {
+    let mut bytes = Vec::new();
+    decode_hex_into(hex, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// [`decode_hex`] appending to `bytes`, for a caller joining many pieces into one buffer.
+///
+/// # Errors
+///
+/// As [`decode_hex`]. On an error `bytes` may hold some of the digits decoded before it.
+pub fn decode_hex_into(hex: &str, bytes: &mut Vec<u8>) -> Result<(), HexError> {
+    let digits = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
+    // Decoded over bytes, never by slicing the string: input from a node or a file is not
+    // guaranteed to be ASCII.
+    let raw = digits.as_bytes();
+    let invalid = |offset: usize| HexError::InvalidDigit {
+        offset,
+        // Every byte before `offset` is an ASCII digit, so `offset` is a character boundary.
+        character: digits
+            .get(offset..)
+            .and_then(|rest| rest.chars().next())
+            .unwrap_or(char::REPLACEMENT_CHARACTER),
+    };
+    bytes.reserve(raw.len() / 2);
+    let (pairs, rest) = raw.as_chunks::<2>();
+    for (index, [high, low]) in pairs.iter().enumerate() {
+        let high = hex_value(*high).ok_or_else(|| invalid(index * 2))?;
+        let low = hex_value(*low).ok_or_else(|| invalid(index * 2 + 1))?;
+        bytes.push(high << 4 | low);
+    }
+    if let [last] = rest {
+        return Err(match hex_value(*last) {
+            Some(_) => HexError::OddLength(raw.len()),
+            None => invalid(raw.len() - 1),
+        });
+    }
+    Ok(())
+}
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Writes bytes as one unprefixed lowercase hex string without building the string
+/// first: a serializer that streams, as `serde_json` does, writes the digits straight
+/// into the output.
+#[derive(Clone, Copy)]
+struct Hex<'a>(&'a [u8]);
+
+impl fmt::Display for Hex<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buffer = [0_u8; 128];
+        for chunk in self.0.chunks(buffer.len() / 2) {
+            for (index, byte) in chunk.iter().enumerate() {
+                buffer[index * 2] = HEX_DIGITS[usize::from(byte >> 4)];
+                buffer[index * 2 + 1] = HEX_DIGITS[usize::from(byte & 0x0f)];
+            }
+            let digits = std::str::from_utf8(&buffer[..chunk.len() * 2]).map_err(|_| fmt::Error)?;
+            formatter.write_str(digits)?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for Hex<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Reads memory spelled as hex, the way every trace file writes it, into bytes.
+fn deserialize_memory<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Bytes>, D::Error> {
+    struct MemoryHex;
+
+    impl<'de> Visitor<'de> for MemoryHex {
+        type Value = Option<Bytes>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("memory as a hex string")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_str(self)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            decode_hex(value)
+                .map(|bytes| Some(Bytes::from(bytes)))
+                .map_err(|error| E::custom(format!("memory is not hex: {error}")))
+        }
+    }
+
+    deserializer.deserialize_option(MemoryHex)
+}
+
 #[cfg(test)]
 mod tests {
     /// Borrows a stack as plain strings, for comparing in assertions.
@@ -789,9 +960,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        FunctionCall, StepSnapshot, StorageChange, TraceArtifacts, TraceCapabilities, TraceStep,
-        TransactionTrace,
+        decode_hex, encode_hex, same_buffer, Bytes, FunctionCall, HexError, StepSnapshot,
+        StorageChange, TraceArtifacts, TraceCapabilities, TraceStep, TransactionTrace,
     };
+
+    /// Memory spelled as the hex a test reads easiest.
+    fn memory(hex: &str) -> Bytes {
+        Bytes::from(decode_hex(hex).expect("test memory is hex"))
+    }
 
     fn step_with(snapshot: StepSnapshot) -> TraceStep {
         TraceStep {
@@ -801,7 +977,7 @@ mod tests {
             gas_cost: 5,
             depth: 1,
             stack: vec![Arc::from("0x01"), Arc::from("0x02")],
-            memory: Some("aabb".to_owned()),
+            memory: Some(memory("aabb")),
             storage: Some(BTreeMap::from([("0x00".to_owned(), "0x2a".to_owned())])),
             error: None,
             snapshot,
@@ -817,7 +993,7 @@ mod tests {
         let flat = step_with(StepSnapshot::default());
         let populated = step_with(StepSnapshot::new(
             vec![Arc::from("0x09")],
-            Some("ccdd".to_owned()),
+            Some(memory("ccdd")),
             BTreeMap::from([("0x01".to_owned(), "0x63".to_owned())]),
             BTreeMap::from([(
                 "0x01".to_owned(),
@@ -841,12 +1017,12 @@ mod tests {
 
         // The flat shape falls back to the top-level fields and reports no storage diff.
         assert_eq!(words(flat.snapshot_ref().stack), ["0x01", "0x02"]);
-        assert_eq!(flat.snapshot_ref().memory, Some("aabb"));
+        assert_eq!(flat.snapshot_ref().memory, Some(&[0xaa, 0xbb][..]));
         assert!(flat.snapshot_ref().storage_diff.is_empty());
 
         // A populated snapshot wins over the flat fields.
         assert_eq!(words(populated.snapshot_ref().stack), ["0x09"]);
-        assert_eq!(populated.snapshot_ref().memory, Some("ccdd"));
+        assert_eq!(populated.snapshot_ref().memory, Some(&[0xcc, 0xdd][..]));
         assert_eq!(populated.snapshot_ref().storage_diff.len(), 1);
     }
 
@@ -863,7 +1039,7 @@ mod tests {
             None,
             StepSnapshot::new(
                 vec![Arc::from("0x01")],
-                Some("aabb".to_owned()),
+                Some(memory("aabb")),
                 BTreeMap::from([("0x00".to_owned(), "0x2a".to_owned())]),
                 BTreeMap::new(),
             ),
@@ -897,7 +1073,7 @@ mod tests {
         )
         .expect("legacy step");
         assert_eq!(words(legacy.snapshot_ref().stack), ["0x1"]);
-        assert_eq!(legacy.snapshot_ref().memory, Some("cc"));
+        assert_eq!(legacy.snapshot_ref().memory, Some(&[0xcc][..]));
         assert_eq!(legacy.snapshot_ref().storage["0x0"], "0x1");
         assert!(legacy.stack.is_empty());
         assert_eq!(legacy, step_with_legacy_fields());
@@ -923,7 +1099,11 @@ mod tests {
             &shared.snapshot.storage,
             &step.snapshot.storage
         ));
-        assert_eq!(shared.snapshot_ref().memory, Some("aabb"));
+        assert_eq!(shared.snapshot_ref().memory, Some(&[0xaa, 0xbb][..]));
+        assert!(same_buffer(
+            shared.snapshot_ref().memory.expect("memory"),
+            step.snapshot_ref().memory.expect("memory")
+        ));
     }
 
     #[test]
@@ -1057,7 +1237,7 @@ mod tests {
             gas_cost: 3,
             depth: 1,
             stack: vec![Arc::from("0x1")],
-            memory: Some("cc".to_owned()),
+            memory: Some(memory("cc")),
             storage: Some(BTreeMap::from([("0x0".to_owned(), "0x1".to_owned())])),
             error: None,
             snapshot: StepSnapshot::default(),
@@ -1066,10 +1246,10 @@ mod tests {
 
     #[test]
     fn reading_a_trace_back_shares_unchanged_state_between_steps() {
-        let snapshot = |memory: &str, slot: &str| {
+        let snapshot = |hex: &str, slot: &str| {
             StepSnapshot::new(
                 Vec::new(),
-                Some(memory.to_owned()),
+                Some(memory(hex)),
                 BTreeMap::from([("0x0".to_owned(), slot.to_owned())]),
                 BTreeMap::new(),
             )
@@ -1106,23 +1286,34 @@ mod tests {
             restored.steps[index]
                 .snapshot
                 .memory
-                .as_ref()
+                .as_deref()
                 .expect("memory")
         };
-        assert!(Arc::ptr_eq(memory(0), memory(1)));
-        assert!(!Arc::ptr_eq(memory(1), memory(2)));
-        assert!(Arc::ptr_eq(memory(2), memory(3)));
+        assert!(same_buffer(memory(0), memory(1)));
+        assert!(!same_buffer(memory(1), memory(2)));
+        assert!(same_buffer(memory(2), memory(3)));
         let storage = |index: usize| &restored.steps[index].snapshot.storage;
         assert!(Arc::ptr_eq(storage(0), storage(2)));
         assert!(!Arc::ptr_eq(storage(2), storage(3)));
 
         // The same pass is available for a trace assembled by hand.
         let mut by_hand = trace.clone();
+        let by_hand_memory = |trace: &TransactionTrace, index: usize| {
+            trace.steps[index].snapshot.memory.clone().expect("memory")
+        };
+        assert!(!same_buffer(
+            &by_hand_memory(&by_hand, 0),
+            &by_hand_memory(&by_hand, 1)
+        ));
         assert!(!Arc::ptr_eq(
             &by_hand.steps[0].snapshot.storage,
             &by_hand.steps[1].snapshot.storage
         ));
         by_hand.share_unchanged_state();
+        assert!(same_buffer(
+            &by_hand_memory(&by_hand, 0),
+            &by_hand_memory(&by_hand, 1)
+        ));
         assert!(Arc::ptr_eq(
             &by_hand.steps[0].snapshot.storage,
             &by_hand.steps[1].snapshot.storage
@@ -1180,5 +1371,113 @@ mod tests {
             after: Some("0x2a".to_owned()),
         };
         assert_eq!(change.after.as_deref(), Some("0x2a"));
+    }
+
+    #[test]
+    fn memory_reads_and_writes_as_the_same_hex_string() {
+        // A trace file spells memory as one unprefixed lowercase hex string, in the flat
+        // field and in the snapshot. Holding it as bytes must not change a byte of the
+        // file: what is read back writes out exactly as it was read.
+        let words = format!("{}{}", "00".repeat(31), "2a").repeat(3);
+        let document = serde_json::json!({
+            "tx_hash": "0xabc",
+            "from_addr": "0x1",
+            "to_addr": "0x2",
+            "value": "0x0",
+            "input_data": "0x",
+            "gas_used": 0,
+            "output": "0x",
+            "success": true,
+            "error": null,
+            "debug_trace_available": true,
+            "contract_address": null,
+            "backend": "replay",
+            "capabilities": TraceCapabilities::default(),
+            "artifacts": TraceArtifacts::default(),
+            "steps": [
+                {"pc": 0, "op": "MSTORE", "gas": 1, "gas_cost": 1, "depth": 1,
+                 "stack": [], "memory": "", "storage": {}, "error": null,
+                 "snapshot": {"stack": [], "memory": "", "storage": {}, "storage_diff": {}}},
+                {"pc": 1, "op": "MLOAD", "gas": 1, "gas_cost": 1, "depth": 1,
+                 "stack": [], "memory": words, "storage": {}, "error": null,
+                 "snapshot": {"stack": [], "memory": words, "storage": {}, "storage_diff": {}}},
+                {"pc": 2, "op": "POP", "gas": 1, "gas_cost": 1, "depth": 1,
+                 "stack": [], "memory": words, "storage": {}, "error": null,
+                 "snapshot": {"stack": [], "memory": words, "storage": {}, "storage_diff": {}}},
+                {"pc": 3, "op": "STOP", "gas": 1, "gas_cost": 0, "depth": 1,
+                 "stack": [], "memory": null, "storage": {}, "error": null,
+                 "snapshot": {"stack": [], "memory": null, "storage": {}, "storage_diff": {}}}
+            ]
+        })
+        .to_string();
+        let trace: TransactionTrace = serde_json::from_str(&document).expect("trace");
+        let written = serde_json::to_string(&trace).expect("json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&written).expect("written json"),
+            serde_json::from_str::<serde_json::Value>(&document).expect("document json"),
+        );
+        // Byte for byte, once the keys are in the order the writer puts them.
+        let again: TransactionTrace = serde_json::from_str(&written).expect("trace");
+        assert_eq!(serde_json::to_string(&again).expect("json"), written);
+
+        let memory = |index: usize| trace.steps[index].snapshot_ref().memory;
+        assert_eq!(memory(0), Some(&[][..]));
+        assert_eq!(memory(1).map(<[u8]>::len), Some(96));
+        assert_eq!(memory(1).and_then(|memory| memory.get(31)), Some(&0x2a));
+        assert_eq!(memory(3), None);
+        // The unchanged memory of the third step is the second step's buffer.
+        assert!(same_buffer(
+            memory(1).expect("memory"),
+            memory(2).expect("memory")
+        ));
+    }
+
+    #[test]
+    fn memory_from_a_file_may_be_prefixed_but_must_be_hex() {
+        let step = |memory: &str| {
+            serde_json::from_str::<TraceStep>(&format!(
+                r#"{{"pc":0,"op":"STOP","gas":0,"gas_cost":0,"depth":1,"memory":{memory}}}"#
+            ))
+        };
+        let prefixed = step(r#""0xAABB""#).expect("prefixed memory");
+        assert_eq!(prefixed.snapshot_ref().memory, Some(&[0xaa, 0xbb][..]));
+        // Written back in the one canonical spelling.
+        assert_eq!(
+            serde_json::to_value(&prefixed).expect("json")["memory"],
+            "aabb"
+        );
+
+        let odd = step(r#""abc""#).expect_err("odd length");
+        assert!(odd
+            .to_string()
+            .starts_with("memory is not hex: 3 hex digits"));
+        let invalid = step(r#""aazz""#).expect_err("not hex");
+        assert!(invalid
+            .to_string()
+            .starts_with("memory is not hex: `z` at offset 2"));
+    }
+
+    #[test]
+    fn hex_round_trips_and_names_what_is_wrong() {
+        assert_eq!(encode_hex(&[0x00, 0x2a, 0xff]), "002aff");
+        assert_eq!(decode_hex("002AfF"), Ok(vec![0x00, 0x2a, 0xff]));
+        assert_eq!(decode_hex("0x"), Ok(Vec::new()));
+        assert_eq!(decode_hex(""), Ok(Vec::new()));
+        assert_eq!(decode_hex("0x2"), Err(HexError::OddLength(1)));
+        assert_eq!(
+            decode_hex("2x"),
+            Err(HexError::InvalidDigit {
+                offset: 1,
+                character: 'x'
+            })
+        );
+        // A multi-byte character is reported whole rather than split.
+        assert_eq!(
+            decode_hex("aé"),
+            Err(HexError::InvalidDigit {
+                offset: 1,
+                character: 'é'
+            })
+        );
     }
 }

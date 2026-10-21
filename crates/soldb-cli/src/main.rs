@@ -3682,7 +3682,7 @@ fn format_snapshot_state(snapshot: soldb_core::StepSnapshotRef<'_>) -> String {
     let mut items = Vec::new();
     if let Some(memory) = snapshot.memory {
         if !memory.is_empty() {
-            items.push(format!("mem={}b", memory.len() / 2));
+            items.push(format!("mem={}b", memory.len()));
         }
     }
     if !snapshot.storage.is_empty() {

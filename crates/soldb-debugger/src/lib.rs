@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use soldb_core::{StepSnapshot, TraceStep, TransactionTrace, Word as StackWord};
+use soldb_core::{encode_hex, StepSnapshot, TraceStep, TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
 use crate::decode::ValueReader;
@@ -397,7 +397,8 @@ fn raw_value_for_location(
             .stack
             .get(variable.offset as usize)
             .map(|value| normalize_hex(value)),
-        "memory" => word_from_hex_bytes(snapshot.memory?, variable.offset as usize),
+        "memory" => memory_word(snapshot.memory?, usize::try_from(variable.offset).ok()?)
+            .map(|word| format!("0x{}", encode_hex(&word))),
         "calldata" => word_from_hex_bytes(calldata, variable.offset as usize),
         "storage" => storage_value(snapshot.storage, variable.offset),
         _ => None,
@@ -497,9 +498,8 @@ impl ArgumentOrder {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FrameState<'a> {
     pub stack: &'a [StackWord],
-    /// Memory at the entry step, as one unprefixed hex string, when the backend captured
-    /// it.
-    pub memory: Option<&'a str>,
+    /// Memory at the entry step, when the backend captured it.
+    pub memory: Option<&'a [u8]>,
 }
 
 /// The arguments a function was entered with, read off the stack at its entry point.
@@ -548,7 +548,7 @@ pub fn decode_arguments(
 fn argument_value(
     param: &SourceParam,
     word: &str,
-    memory: Option<&str>,
+    memory: Option<&[u8]>,
     types: &SourceTypes,
     scope: Option<&str>,
 ) -> DebugValue {
@@ -612,18 +612,20 @@ pub(crate) fn array_shape(ty: &str) -> Option<(&str, Option<usize>)> {
 }
 
 /// The 32 bytes at `offset` of a memory image, when it reaches that far.
-pub(crate) fn memory_word(memory: &str, offset: usize) -> Option<Word> {
-    let bytes = memory_bytes(memory, offset, 32)?;
-    let mut word = [0_u8; 32];
-    word.copy_from_slice(&bytes);
-    Some(word)
+pub(crate) fn memory_word(memory: &[u8], offset: usize) -> Option<Word> {
+    memory_bytes(memory, offset, 32)?.try_into().ok()
 }
 
-/// `length` bytes at `offset` of a memory image, which is two hex digits per byte.
-pub(crate) fn memory_bytes(memory: &str, offset: usize, length: usize) -> Option<Vec<u8>> {
+/// `length` bytes at `offset` of a memory image, when it reaches that far.
+pub(crate) fn memory_bytes(memory: &[u8], offset: usize, length: usize) -> Option<&[u8]> {
+    memory.get(offset..offset.checked_add(length)?)
+}
+
+/// `length` bytes at `offset` of hex data such as calldata, two digits per byte.
+pub(crate) fn hex_bytes(hex: &str, offset: usize, length: usize) -> Option<Vec<u8>> {
     let start = offset.checked_mul(2)?;
     let end = start.checked_add(length.checked_mul(2)?)?;
-    let digits = memory.get(start..end)?;
+    let digits = hex.get(start..end)?;
     if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
@@ -647,7 +649,7 @@ pub(crate) fn word_as_usize(word: &Word) -> Option<usize> {
 }
 
 pub(crate) fn hex_of(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    encode_hex(bytes)
 }
 
 /// The bytes of a stack word a value of type `ty` occupies: a signed integer is its own
@@ -1216,6 +1218,20 @@ mod tests {
                     offset: 4,
                     pc_range: (0, 1),
                 },
+                VariableLocation {
+                    name: "tail".to_owned(),
+                    ty: "bytes32".to_owned(),
+                    location_type: "memory".to_owned(),
+                    offset: 32,
+                    pc_range: (0, 1),
+                },
+                VariableLocation {
+                    name: "straddle".to_owned(),
+                    ty: "uint256".to_owned(),
+                    location_type: "memory".to_owned(),
+                    offset: 48,
+                    pc_range: (0, 1),
+                },
             ],
         );
         let info = EthdebugInfo {
@@ -1254,6 +1270,17 @@ mod tests {
         assert_eq!(
             step.variables[1].value.display,
             "0x1111111111111111111111111111111111111111"
+        );
+        // A memory variable is the word at its byte offset of the step's memory.
+        assert_eq!(
+            step.variables[2].value.display,
+            format!("0x{}", "2a".repeat(32))
+        );
+        // A word that runs past the end of memory is not there to read.
+        assert_eq!(step.variables[3].value.display, "<unavailable>");
+        assert_eq!(
+            step.variables[3].value.status,
+            DebugValueStatus::Unavailable
         );
     }
 
@@ -1564,7 +1591,7 @@ mod tests {
                 gas_cost: 0,
                 depth: 0,
                 stack: vec!["0x2a".into()],
-                memory: Some(format!("{}{}", "00".repeat(32), "2a".repeat(32))),
+                memory: Some(soldb_core::Bytes::from([[0_u8; 32], [0x2a; 32]].concat())),
                 storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                 error: None,
                 snapshot: Default::default(),
@@ -1573,11 +1600,12 @@ mod tests {
     }
     /// Solidity memory: a `string` is a length then its bytes; an array is a length then
     /// one word per element; a fixed-size array is those words with no length.
-    fn memory_image(words: &[&str]) -> String {
-        words
+    fn memory_image(words: &[&str]) -> Vec<u8> {
+        let hex = words
             .iter()
             .map(|word| format!("{:0>64}", word.trim_start_matches("0x")))
-            .collect()
+            .collect::<String>();
+        soldb_core::decode_hex(&hex).expect("test memory is hex")
     }
 
     #[test]

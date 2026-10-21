@@ -24,7 +24,7 @@ use crate::condition::Value;
 use crate::state::{short_hex, StorageWords};
 use crate::types::SourceTypes;
 use crate::{
-    array_shape, decode_static_word, hex_of, is_value_type, memory_bytes, memory_word,
+    array_shape, decode_static_word, hex_bytes, hex_of, is_value_type, memory_bytes, memory_word,
     word_as_usize, DebugValue, DebugValueStatus,
 };
 
@@ -36,8 +36,8 @@ const SHOWN_ELEMENTS: usize = 8;
 /// The data a step offers to read values from.
 #[derive(Clone, Copy)]
 pub(crate) struct ValueReader<'a> {
-    /// Memory as one unprefixed hex string, when the backend captured it.
-    pub memory: Option<&'a str>,
+    /// Memory, when the backend captured it.
+    pub memory: Option<&'a [u8]>,
     /// The calldata of the executing frame.
     pub calldata: &'a str,
     /// The storage words known at the step, for storage pointers.
@@ -440,7 +440,7 @@ impl<'a> ValueReader<'a> {
                 )
                 .and_then(|length| memory_bytes(memory, pointer + 32, length))
                 .ok_or_else(|| beyond_memory(path))?;
-                text_value(bytes, ty, path)
+                text_value(bytes.to_vec(), ty, path)
             }
             Place::Calldata {
                 offset,
@@ -608,7 +608,7 @@ impl<'a> ValueReader<'a> {
     }
 
     fn calldata_bytes(&self, offset: usize, length: usize) -> Option<Vec<u8>> {
-        memory_bytes(self.calldata.trim_start_matches("0x"), offset, length)
+        hex_bytes(self.calldata.trim_start_matches("0x"), offset, length)
     }
 
     /// A value at `pointer` of memory, or `None` when the capture does not reach it or
@@ -622,11 +622,11 @@ impl<'a> ValueReader<'a> {
             let length = word_as_usize(&memory_word(memory, pointer)?)?;
             let bytes = memory_bytes(memory, pointer.checked_add(32)?, length)?;
             if ty == "string" {
-                if let Ok(text) = std::str::from_utf8(&bytes) {
+                if let Ok(text) = std::str::from_utf8(bytes) {
                     return Some(format!("{text:?}"));
                 }
             }
-            return Some(format!("0x{}", hex_of(&bytes)));
+            return Some(format!("0x{}", hex_of(bytes)));
         }
         if let Some((element, count)) = array_shape(ty) {
             let (first, count) = match count {
@@ -977,7 +977,7 @@ contract Shop {
         format!("{value:064x}")
     }
 
-    fn reader<'a>(memory: Option<&'a str>, types: &'a SourceTypes) -> ValueReader<'a> {
+    fn reader<'a>(memory: Option<&'a [u8]>, types: &'a SourceTypes) -> ValueReader<'a> {
         ValueReader {
             memory,
             calldata: "0x",
@@ -1057,7 +1057,8 @@ contract Shop {
         memory.push_str(&word(2));
         memory.push_str(&word(3));
         memory.push_str(&word(4));
-        let reader = reader(Some(&memory), &types);
+        let image = soldb_core::decode_hex(&memory).expect("test memory is hex");
+        let reader = reader(Some(&image), &types);
         let item = reader.variable("Item memory", &["0x80"]);
         assert_eq!(item.status, DebugValueStatus::Decoded);
         assert_eq!(
@@ -1080,6 +1081,7 @@ contract Shop {
             reader.variable("Item[] memory", &["0x1a0"]).display,
             "<Item[] in memory at 0x1a0, beyond what this step captured>"
         );
+        let nested = soldb_core::decode_hex(&nested).expect("test memory is hex");
         let reader = ValueReader {
             memory: Some(&nested),
             ..reader
@@ -1120,7 +1122,8 @@ contract Shop {
         memory.push_str(&word(4));
         memory.push_str(&word(1));
         memory.push_str(&word(0x80));
-        let reader = reader(Some(&memory), &types);
+        let image = soldb_core::decode_hex(&memory).expect("test memory is hex");
+        let reader = reader(Some(&image), &types);
         let show = |path: &str| -> Result<String, String> {
             at(&reader, "Item memory", &["0x80"], path).map(|place| reader.show(&place).display)
         };

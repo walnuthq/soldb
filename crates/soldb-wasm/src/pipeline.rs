@@ -395,7 +395,10 @@ mod tests {
         assert!(inner.capabilities.memory);
         assert!(inner.capabilities.gas_details);
         assert_eq!(inner.steps.len(), 3);
-        assert_eq!(inner.steps[1].snapshot_ref().memory, Some("aabb"));
+        assert_eq!(
+            inner.steps[1].snapshot_ref().memory,
+            Some(&[0xaa, 0xbb][..])
+        );
         assert_eq!(trace.step_count(), 3);
         assert!(!trace.has_ethdebug());
     }
@@ -548,7 +551,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["0x80", "0x40"]
         );
-        assert_eq!(step.snapshot.memory.as_deref(), Some("aabb"));
+        assert_eq!(step.snapshot.memory.as_deref(), Some(&[0xaa, 0xbb][..]));
         assert!(step.variables.is_empty());
 
         let pcs: Vec<u64> = (0..trace.step_count())

@@ -14,6 +14,7 @@ categories.workspace = true
 doctest = false
 
 [dependencies]
+bytes.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

@@ -6,6 +6,7 @@
 //! locals are inferred, that frame arguments are read off the stack — is remembered
 //! here, so it is said once whichever frontend asks first.
 
+use soldb_core::encode_hex;
 use soldb_debugger::{
     state_value, state_variables, ChainStorage, DebugValueStatus, DebugVariable, StateSource,
     StateVariable, StorageWords, INFERRED_LOCALS_WARNING,
@@ -388,14 +389,10 @@ impl Session {
                 message(Level::Warning, "Memory was not captured by this backend.")
             };
         };
-        let hex = memory.trim_start_matches("0x");
-        if hex.is_empty() {
+        if memory.is_empty() {
             return message(Level::Info, "Memory is empty at this step.");
         }
-        if !hex.is_ascii() {
-            return message(Level::Info, format!("Memory: {hex}"));
-        }
-        let total = hex.len() / 2;
+        let total = memory.len();
         let start = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
         if start >= total {
             return message(
@@ -407,19 +404,14 @@ impl Session {
             .and_then(|length| usize::try_from(length).ok())
             .and_then(|length| start.checked_add(length))
             .map_or(total, |end| end.min(total));
-        let bytes = hex.as_bytes();
-        let mut words = Vec::new();
-        let mut word_start = start;
-        while word_start < end {
-            let word_end = word_start.saturating_add(32).min(end);
-            words.push(MemoryWord {
-                offset: word_start,
-                hex: std::str::from_utf8(&bytes[word_start * 2..word_end * 2])
-                    .unwrap_or("")
-                    .to_owned(),
-            });
-            word_start = word_end;
-        }
+        let words = memory[start..end]
+            .chunks(32)
+            .enumerate()
+            .map(|(index, word)| MemoryWord {
+                offset: start + index * 32,
+                hex: encode_hex(word),
+            })
+            .collect();
         Output::Memory(MemoryInfo {
             total,
             start,

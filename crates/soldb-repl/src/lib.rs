@@ -1981,6 +1981,71 @@ contract C {
     }
 
     #[test]
+    fn memory_is_shown_in_words_of_hex() {
+        let mut trace = sample_trace();
+        let mut snapshot = trace.steps[2].normalized_snapshot();
+        snapshot.memory = Some(soldb_core::Bytes::from(
+            [vec![0_u8; 31], vec![0x2a], vec![0xff; 8]].concat(),
+        ));
+        trace.steps[2].snapshot = snapshot;
+        trace.capabilities.memory = true;
+        let mut state = DebuggerState::new();
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
+        let mut session = crate::Session::new(state);
+        session.execute(DebuggerCommand::Goto(2));
+
+        let whole = session.execute(DebuggerCommand::Memory {
+            offset: None,
+            length: None,
+        });
+        assert_eq!(
+            whole,
+            [crate::Output::Memory(crate::MemoryInfo {
+                total: 40,
+                start: 0,
+                end: 40,
+                words: vec![
+                    crate::MemoryWord {
+                        offset: 0,
+                        hex: format!("{}2a", "00".repeat(31)),
+                    },
+                    crate::MemoryWord {
+                        offset: 32,
+                        hex: "ff".repeat(8),
+                    },
+                ],
+            })]
+        );
+        assert_eq!(
+            crate::Renderer::new(false).lines(&whole[0]),
+            [
+                "Memory: 40 bytes".to_owned(),
+                format!("0x0000: {}2a", "00".repeat(31)),
+                format!("0x0020: {}", "ff".repeat(8)),
+            ]
+        );
+
+        // A range is cut out of the bytes, across a word boundary.
+        assert_eq!(
+            session.execute(DebuggerCommand::Memory {
+                offset: Some(30),
+                length: Some(4),
+            }),
+            [crate::Output::Memory(crate::MemoryInfo {
+                total: 40,
+                start: 30,
+                end: 34,
+                words: vec![crate::MemoryWord {
+                    offset: 30,
+                    hex: "002affff".to_owned(),
+                }],
+            })]
+        );
+    }
+
+    #[test]
     fn source_stepping_moves_by_line_and_frame() {
         let mut state = source_state();
         assert!(state.has_source());
