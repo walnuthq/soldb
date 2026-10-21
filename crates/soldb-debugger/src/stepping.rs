@@ -30,6 +30,7 @@
 //! Everything here is a search over the recording. Nothing re-executes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 
 use soldb_core::{TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{
@@ -59,12 +60,6 @@ variable whose frame could not be placed shows as unavailable; ETHDebug variable
 information will replace this once compilers emit it";
 
 const CALL_OPCODES: [&str; 4] = ["CALL", "CALLCODE", "DELEGATECALL", "STATICCALL"];
-
-/// Marks a program counter where no instruction starts in a [`PcIndex`].
-const NO_INSTRUCTION: u32 = u32::MAX;
-
-/// The longest EVM instruction, `PUSH32` and its operand, in bytes.
-const MAX_INSTRUCTION_SIZE: usize = 33;
 
 /// One contract's debug information, prepared for stepping: the ETHDebug metadata, the
 /// source text, the functions parsed from it, and the indexes that make per-step lookups
@@ -120,9 +115,10 @@ struct InstructionFacts {
 /// step of a trace looks up, and a map for offsets beyond any real code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PcIndex {
-    /// Indexed by program counter; `NO_INSTRUCTION` where no instruction starts.
-    dense: Vec<u32>,
-    /// Offsets past `dense`, and indexes that do not fit in it.
+    /// Indexed by program counter: the instruction's index plus one, or `None` where no
+    /// instruction starts.
+    dense: Vec<Option<NonZeroU32>>,
+    /// Offsets past `dense`.
     sparse: HashMap<u64, usize>,
 }
 
@@ -130,27 +126,28 @@ impl PcIndex {
     /// Indexes the instructions by offset. A later instruction at an offset replaces an
     /// earlier one, as collecting them into a map does.
     fn new(instructions: &[Instruction]) -> Self {
-        // Real code has every offset below this bound, since no instruction is longer.
-        // Offsets past it come from an artifact that does not describe real code, and go
-        // to the map so that they cannot size the table.
-        let bound = instructions.len().saturating_mul(MAX_INSTRUCTION_SIZE);
+        // No instruction is longer than 33 bytes (`PUSH32` and its operand), so real code
+        // has every offset below this bound. Offsets past it come from an artifact that
+        // does not describe real code, and go to the map so they cannot size the table.
+        let bound = instructions.len().saturating_mul(33);
         let dense_len = instructions
             .iter()
             .filter_map(|instruction| usize::try_from(instruction.offset).ok())
             .filter(|offset| *offset < bound)
             .max()
             .map_or(0, |offset| offset + 1);
-        let mut dense = vec![NO_INSTRUCTION; dense_len];
+        let mut dense = vec![None; dense_len];
         let mut sparse = HashMap::new();
         for (index, instruction) in instructions.iter().enumerate() {
             let slot = usize::try_from(instruction.offset)
                 .ok()
                 .and_then(|offset| dense.get_mut(offset));
-            match (slot, u32::try_from(index)) {
-                (Some(slot), Ok(index)) if index != NO_INSTRUCTION => *slot = index,
+            let entry = u32::try_from(index + 1).ok().and_then(NonZeroU32::new);
+            match (slot, entry) {
+                (Some(slot), Some(entry)) => *slot = Some(entry),
                 (slot, _) => {
                     if let Some(slot) = slot {
-                        *slot = NO_INSTRUCTION;
+                        *slot = None;
                     }
                     sparse.insert(instruction.offset, index);
                 }
@@ -162,10 +159,9 @@ impl PcIndex {
     fn get(&self, pc: u64) -> Option<usize> {
         let dense = usize::try_from(pc)
             .ok()
-            .and_then(|pc| self.dense.get(pc))
-            .filter(|index| **index != NO_INSTRUCTION);
+            .and_then(|pc| self.dense.get(pc).copied().flatten());
         match dense {
-            Some(index) => Some(*index as usize),
+            Some(entry) => Some(entry.get() as usize - 1),
             None => self.sparse.get(&pc).copied(),
         }
     }
