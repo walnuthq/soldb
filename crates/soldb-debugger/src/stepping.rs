@@ -1015,6 +1015,9 @@ struct FrameVariables {
     /// The stack slots the function's parameters take, counted once from their types
     /// rather than at every step.
     param_slots: usize,
+    /// The span and stack height of the step last followed.
+    last_span: Option<ByteRange>,
+    last_height: usize,
 }
 
 /// Everything a frame's layout depends on besides its function: the slots placed so far
@@ -1044,6 +1047,8 @@ impl FrameVariables {
             inlined: false,
             layout_inputs: LayoutInputs::default(),
             param_slots: parameter_slots(&function.params),
+            last_span: None,
+            last_height: 0,
         }
     }
 
@@ -1067,6 +1072,39 @@ impl FrameVariables {
     /// Follows the frame's variables through one step of its function's own code, at
     /// `span` with the stack `height` high, and returns the layout after it.
     fn track(
+        &mut self,
+        function: &SourceFunction,
+        span: ByteRange,
+        height: usize,
+        layouts: &mut Vec<Vec<InferredVariable>>,
+    ) -> u32 {
+        // Following a step only places what is not placed yet, from its span, so a step
+        // of the span the last one had places nothing more and has its layout, unless
+        // something else placed a slot since. The height only matters while the locals
+        // are not placed: a local the span declares is placed below it.
+        if !self.inlined
+            && self.last_span == Some(span)
+            && (self.locals_base.is_some() || self.last_height == height)
+        {
+            if let Some(id) = self.layout {
+                let inputs = &self.layout_inputs;
+                if inputs.params_base == self.params_base
+                    && inputs.locals_base == self.locals_base
+                    && inputs.returns == self.returns
+                {
+                    self.last_height = height;
+                    return id;
+                }
+            }
+        }
+        let id = self.track_span(function, span, height, layouts);
+        self.last_span = Some(span);
+        self.last_height = height;
+        id
+    }
+
+    /// [`FrameVariables::track`] for a step whose layout is worked out again.
+    fn track_span(
         &mut self,
         function: &SourceFunction,
         span: ByteRange,
