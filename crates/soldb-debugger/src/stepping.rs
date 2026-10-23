@@ -1004,6 +1004,9 @@ struct FrameVariables {
     /// What `layout` was computed from, so a step that changes none of it reuses the
     /// layout instead of building it again.
     layout_inputs: LayoutInputs,
+    /// The stack slots the function's parameters take, counted once from their types
+    /// rather than at every step.
+    param_slots: usize,
 }
 
 /// Everything a frame's layout depends on besides its function: the slots placed so far
@@ -1032,6 +1035,7 @@ impl FrameVariables {
             modifier_slots,
             inlined: false,
             layout_inputs: LayoutInputs::default(),
+            param_slots: parameter_slots(&function.params),
         }
     }
 
@@ -1041,7 +1045,7 @@ impl FrameVariables {
         let Some(base) = self.params_base else {
             return;
         };
-        let returns_base = base + parameter_slots(&function.params);
+        let returns_base = base + self.param_slots;
         for (index, slot) in self.returns.iter_mut().enumerate() {
             slot.get_or_insert(returns_base + index);
         }
@@ -1066,7 +1070,7 @@ impl FrameVariables {
             return INLINED_LAYOUT;
         }
         let length = span.end - span.start;
-        let param_slots = parameter_slots(&function.params);
+        let param_slots = self.param_slots;
         // Known parameters place everything else before any instruction is read.
         self.place_from_parameters(function);
         // The body's first instruction runs right above whatever was reserved before it:
@@ -1332,6 +1336,11 @@ fn locals_support(contract: &ContractDebugInfo, evidence: Evidence) -> Result<()
 struct InternalFrame {
     /// The frames active in this EVM frame, innermost last.
     functions: Vec<FrameEntry>,
+    /// How many of `functions` are functions rather than helper placeholders.
+    named: usize,
+    /// How many functions the EVM frames below this one have active, which cannot
+    /// change while this one runs.
+    named_below: usize,
     /// The last real statement executed in this frame, which generated code belongs to.
     statement: Option<LocationRef>,
     /// The variables of frames that were left without returning, by function: a modifier
@@ -1360,6 +1369,29 @@ impl InternalFrame {
             return_pc,
             variables,
         });
+        self.named += 1;
+    }
+
+    /// Leaves the innermost function or placeholder.
+    fn pop(&mut self) {
+        if self
+            .functions
+            .pop()
+            .is_some_and(|entry| entry.function.is_some())
+        {
+            self.named -= 1;
+        }
+    }
+
+    /// Leaves every function and placeholder.
+    fn clear(&mut self) {
+        self.functions.clear();
+        self.named = 0;
+    }
+
+    /// The functions active in this EVM frame and the ones below it.
+    fn depth(&self) -> usize {
+        self.named_below + self.named
     }
 
     fn push_placeholder(&mut self) {
@@ -1704,7 +1736,11 @@ impl StepMap {
             let root_input = roots[step.root].input(trace);
             internal.truncate(if new_root { evm_depth } else { evm_depth + 1 });
             while internal.len() <= evm_depth {
-                internal.push(InternalFrame::default());
+                let named_below = internal.last().map_or(0, InternalFrame::depth);
+                internal.push(InternalFrame {
+                    named_below,
+                    ..InternalFrame::default()
+                });
                 frame_entry = true;
             }
             let frame = internal.last_mut().expect("the root frame is never popped");
@@ -1737,12 +1773,8 @@ impl StepMap {
                 let pc = trace.steps.step(index).pc();
                 match previous_marker {
                     JumpMarker::Call => pending_call = true,
-                    JumpMarker::Return => {
-                        frame.functions.pop();
-                    }
-                    JumpMarker::None if frame.returns_to(pc) => {
-                        frame.functions.pop();
-                    }
+                    JumpMarker::Return => frame.pop(),
+                    JumpMarker::None if frame.returns_to(pc) => frame.pop(),
                     JumpMarker::None => {}
                 }
             }
@@ -1820,6 +1852,10 @@ impl StepMap {
                                 Some(position) => {
                                     // A modifier handing over to the body keeps its slots;
                                     // remember them for when it resumes.
+                                    frame.named -= frame.functions[position + 1..]
+                                        .iter()
+                                        .filter(|entry| entry.function.is_some())
+                                        .count();
                                     for left in frame.functions.drain(position + 1..) {
                                         if let (Some(function), Some(variables)) =
                                             (left.function, left.variables)
@@ -1866,7 +1902,7 @@ impl StepMap {
                         (Some(own), Some(own.key))
                     }
                     None if epilogue[index] => {
-                        frame.functions.clear();
+                        frame.clear();
                         frame.statement = None;
                         (Some(own), None)
                     }
@@ -1956,16 +1992,7 @@ impl StepMap {
                 }
             };
             step_variables.push(layout.unwrap_or(NO_LAYOUT));
-            let internal_total = internal
-                .iter()
-                .map(|frame| {
-                    frame
-                        .functions
-                        .iter()
-                        .filter(|entry| entry.function.is_some())
-                        .count()
-                })
-                .sum::<usize>();
+            let internal_total = internal.last().map_or(0, InternalFrame::depth);
             steps.push(StepInfo {
                 location,
                 generated,
