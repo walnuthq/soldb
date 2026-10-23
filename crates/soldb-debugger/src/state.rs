@@ -26,7 +26,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use soldb_core::TransactionTrace;
+use soldb_core::{opcode, TransactionTrace};
 use soldb_ethdebug::{parse_word, word_hex, StorageLayout, StorageRef, Word};
 
 use crate::stepping::StepMap;
@@ -299,42 +299,43 @@ impl StorageTape {
 
 /// Indexes the words every step of `trace` recorded, in the storage context `map`
 /// computed for the step: the persistent ones when `persistent`, the transient ones when
-/// `transient`. One walk fills both.
+/// `transient`. Only the steps that touched storage are visited.
 fn index_records(
     trace: &TransactionTrace,
     map: &StepMap,
     persistent: bool,
     transient: bool,
 ) -> (Records, Records) {
-    let mut persistent_records = Records::new();
-    let mut transient_records = Records::new();
-    // With neither space to index there is nothing to walk.
-    if !persistent && !transient {
-        return (persistent_records, transient_records);
-    }
-    for (index, step) in trace.steps.iter().enumerate() {
-        let snapshot = step.snapshot_ref();
-        let has_persistent = persistent && !snapshot.storage_diff.is_empty();
-        let has_transient = transient && !snapshot.transient_storage.is_empty();
-        if !has_persistent && !has_transient {
-            continue;
+    // A write takes effect after its step; a read reports what is there at it.
+    let starts = |index: usize, write: u8| {
+        if trace.steps.step(index).op() == write {
+            index + 1
+        } else {
+            index
         }
-        let Some(context) = map.storage_context_index(index) else {
-            continue;
-        };
-        // A write takes effect after its step; a read reports what is there at it.
-        let starts = |write: &str| if &*step.op == write { index + 1 } else { index };
-        if has_persistent {
-            let from = starts("SSTORE");
-            for (slot, change) in snapshot.storage_diff {
+    };
+    let mut persistent_records = Records::new();
+    if persistent {
+        for (index, diff) in trace.steps.storage_diffs() {
+            let Some(context) = map.storage_context_index(index) else {
+                continue;
+            };
+            let from = starts(index, opcode::SSTORE);
+            for (slot, change) in diff {
                 if let Some(value) = &change.after {
                     push_record(&mut persistent_records, context, from, slot, value);
                 }
             }
         }
-        if has_transient {
-            let from = starts("TSTORE");
-            for (slot, value) in snapshot.transient_storage {
+    }
+    let mut transient_records = Records::new();
+    if transient {
+        for (index, slots) in trace.steps.transient_storage() {
+            let Some(context) = map.storage_context_index(index) else {
+                continue;
+            };
+            let from = starts(index, opcode::TSTORE);
+            for (slot, value) in slots {
                 push_record(&mut transient_records, context, from, slot, value);
             }
         }
@@ -658,7 +659,7 @@ mod tests {
                 ..Default::default()
             },
             artifacts: Default::default(),
-            steps,
+            steps: steps.into(),
         }
     }
 

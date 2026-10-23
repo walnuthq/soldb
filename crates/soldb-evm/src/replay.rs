@@ -222,7 +222,7 @@ pub fn replay_transaction_trace(
         backend: Some(TraceBackend::Replay.as_str().to_owned()),
         capabilities: replay_capabilities(chain_id),
     };
-    Ok(build_transaction_trace(envelope, debug_result))
+    build_transaction_trace(envelope, debug_result)
 }
 
 /// Assembles the trace of a simulated call replayed locally; the replay counterpart of
@@ -2836,8 +2836,8 @@ mod tests {
         assert_eq!(trace.backend.as_deref(), Some("replay"));
         assert!(trace.success, "{:?}", trace.error);
         assert_eq!(trace.steps.len(), 10);
-        assert_eq!(trace.steps[4].snapshot.storage["0x0"], "0x29");
-        assert_eq!(trace.steps[8].snapshot.storage["0x0"], "0x2a");
+        assert_eq!(trace.steps.step(4).storage()["0x0"], "0x29");
+        assert_eq!(trace.steps.step(8).storage()["0x0"], "0x2a");
         // Accounts never described, the fee recipient here, are simply empty.
         assert!(chain.state().expect("state").missing().is_empty());
     }
@@ -2860,7 +2860,11 @@ mod tests {
             Some(created.as_str())
         );
         assert_eq!(constructor.output, COUNTER_CODE);
-        let ops: Vec<&str> = constructor.steps.iter().map(|step| &*step.op).collect();
+        let ops: Vec<&str> = constructor
+            .steps
+            .iter()
+            .map(|step| step.mnemonic())
+            .collect();
         assert_eq!(&ops[..3], ["PUSH1", "PUSH1", "SSTORE"]);
         assert_eq!(*ops.last().expect("last"), "RETURN");
 
@@ -2870,8 +2874,8 @@ mod tests {
             .expect("call");
         assert!(trace.success, "{:?}", trace.error);
         assert_eq!(trace.to_addr.as_deref(), Some(created.as_str()));
-        assert_eq!(trace.steps[4].snapshot.storage["0x0"], "0x29");
-        assert_eq!(trace.steps[8].snapshot.storage["0x0"], "0x2a");
+        assert_eq!(trace.steps.step(4).storage()["0x0"], "0x29");
+        assert_eq!(trace.steps.step(8).storage()["0x0"], "0x2a");
     }
 
     #[test]

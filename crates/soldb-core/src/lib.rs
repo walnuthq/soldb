@@ -1,9 +1,11 @@
 //! Shared vocabulary types for the SolDB workspace.
 //!
-//! Every other crate agrees on the types defined here: [`TransactionTrace`] and its
-//! [`TraceStep`]s are what an execution backend produces and what the debugger, the
-//! serializer, and the frontends consume. This crate deliberately has no soldb
-//! dependencies so that it can stay the single type boundary in the graph.
+//! Every other crate agrees on the types defined here: a [`TransactionTrace`] and the
+//! [`StepTable`] of its steps are what an execution backend produces and what the
+//! debugger and the frontends consume. A backend builds steps as [`TraceStep`]s or
+//! appends them field by field; readers get a [`StepView`] per step. This crate
+//! deliberately has no soldb dependencies so that it can stay the single type boundary in
+//! the graph.
 //!
 //! These types are also a serialization contract. They round-trip through `serde` into
 //! trace files and into the web-facing JSON document, so adding a field is additive and
@@ -17,12 +19,20 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use serde::de::{self, SeqAccess, Visitor};
+use serde::de::{self, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 pub use bytes::Bytes;
+
+mod memory;
+pub mod opcode;
+mod table;
+mod word;
+
+pub use table::{Stack, StepError, StepRecord, StepTable, StepView, Steps, STACK_CHECKPOINT};
+pub use word::{EvmWord, WordError};
 
 #[derive(Debug, Error)]
 pub enum SoldbError {
@@ -40,7 +50,17 @@ pub enum SoldbError {
 
 pub type SoldbResult<T> = Result<T, SoldbError>;
 
-/// One recorded EVM step.
+impl From<StepError> for SoldbError {
+    fn from(error: StepError) -> Self {
+        Self::Message(format!("invalid trace step: {error}"))
+    }
+}
+
+/// One recorded EVM step, as a backend builds it.
+///
+/// A [`TransactionTrace`] holds its steps in a [`StepTable`], which takes them with
+/// [`StepTable::push`] and gives each back as a [`StepView`] or, when ownership is needed,
+/// with [`StepView::to_trace_step`].
 ///
 /// The machine state lives in `snapshot`, once. The flat `stack`, `memory`, and
 /// `storage` fields are the layout older trace files and web clients read: every
@@ -144,7 +164,7 @@ impl TraceStep {
 
     /// Moves legacy flat fields into the snapshot, so a step read from an older file is
     /// stored once like every other.
-    fn normalized(mut self) -> Self {
+    pub(crate) fn normalized(mut self) -> Self {
         if self.snapshot.is_empty() {
             self.snapshot = StepSnapshot {
                 stack: std::mem::take(&mut self.stack),
@@ -457,10 +477,9 @@ pub struct StorageChange {
 
 /// A complete recording of one execution.
 ///
-/// Reading one back from JSON shares unchanged memory and storage between consecutive
-/// steps as they are read, so a trace loaded from a file costs what one built by a
-/// backend costs, at its peak as well as afterwards. [`TransactionTrace::share_unchanged_state`]
-/// does the same for a trace assembled by hand.
+/// Its steps are a [`StepTable`], which shares what did not change between consecutive
+/// steps however they were added, so a trace read from a file costs what one built by a
+/// backend costs, at its peak as well as afterwards.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "TransactionTraceRepr")]
 pub struct TransactionTrace {
@@ -481,23 +500,10 @@ pub struct TransactionTrace {
     pub capabilities: TraceCapabilities,
     #[serde(default)]
     pub artifacts: TraceArtifacts,
-    pub steps: Vec<TraceStep>,
+    pub steps: StepTable,
 }
 
-impl TransactionTrace {
-    /// Makes consecutive steps whose memory or storage is equal share one copy.
-    ///
-    /// Backends build steps that way; a trace deserialized from a file arrives with a
-    /// copy per step, and this pass, linear in the size of the trace, folds them back.
-    pub fn share_unchanged_state(&mut self) {
-        for index in 1..self.steps.len() {
-            let (before, after) = self.steps.split_at_mut(index);
-            share_snapshot(&before[index - 1], &mut after[0]);
-        }
-    }
-}
-
-/// The wire shape of a trace; `From` restores the sharing between steps.
+/// The wire shape of a trace.
 #[derive(Deserialize)]
 struct TransactionTraceRepr {
     tx_hash: Option<String>,
@@ -517,61 +523,7 @@ struct TransactionTraceRepr {
     capabilities: TraceCapabilities,
     #[serde(default)]
     artifacts: TraceArtifacts,
-    #[serde(deserialize_with = "deserialize_shared_steps")]
-    steps: Vec<TraceStep>,
-}
-
-/// Deserializes the steps, pointing each one's memory and storage at the previous step's
-/// when they are equal, so the duplicates a file carries are never all resident at once.
-fn deserialize_shared_steps<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<TraceStep>, D::Error> {
-    struct SharedSteps;
-
-    impl<'de> Visitor<'de> for SharedSteps {
-        type Value = Vec<TraceStep>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("an array of trace steps")
-        }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut steps = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-            let mut words = WordInterner::new();
-            while let Some(mut step) = seq.next_element::<TraceStep>()? {
-                if let Some(previous) = steps.last() {
-                    share_snapshot(previous, &mut step);
-                }
-                // The stack words a file repeats are stored once, as they are when a
-                // backend builds the steps itself.
-                words.intern_stack(&mut step.snapshot.stack);
-                steps.push(step);
-            }
-            Ok(steps)
-        }
-    }
-
-    deserializer.deserialize_seq(SharedSteps)
-}
-
-/// Points `step`'s memory, storage, and return data at `previous`'s when they are equal.
-fn share_snapshot(previous: &TraceStep, step: &mut TraceStep) {
-    let previous = &previous.snapshot;
-    let current = &mut step.snapshot;
-    if let (Some(previous_memory), Some(current_memory)) = (&previous.memory, &current.memory) {
-        if !same_buffer(previous_memory, current_memory) && previous_memory == current_memory {
-            current.memory = Some(previous_memory.clone());
-        }
-    }
-    if !Arc::ptr_eq(&previous.storage, &current.storage) && *previous.storage == *current.storage {
-        current.storage = Arc::clone(&previous.storage);
-    }
-    if let (Some(previous_data), Some(current_data)) = (&previous.return_data, &current.return_data)
-    {
-        if !Arc::ptr_eq(previous_data, current_data) && **previous_data == **current_data {
-            current.return_data = Some(Arc::clone(previous_data));
-        }
-    }
+    steps: StepTable,
 }
 
 impl From<TransactionTraceRepr> for TransactionTrace {
@@ -837,7 +789,7 @@ fn hex_value(digit: u8) -> Option<u8> {
 /// first: a serializer that streams, as `serde_json` does, writes the digits straight
 /// into the output.
 #[derive(Clone, Copy)]
-struct Hex<'a>(&'a [u8]);
+pub(crate) struct Hex<'a>(pub(crate) &'a [u8]);
 
 impl fmt::Display for Hex<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -925,8 +877,8 @@ mod tests {
     }
 
     #[test]
-    fn a_parsed_trace_shares_its_repeated_stack_words() {
-        // Two steps holding the same words: reading them back leaves one copy of each.
+    fn a_parsed_trace_reads_its_stack_words() {
+        // Two steps holding the same words, the second in another spelling.
         let document = serde_json::json!({
             "tx_hash": "0xabc",
             "from_addr": "0x1",
@@ -941,16 +893,20 @@ mod tests {
                 {"pc": 0, "op": "PUSH1", "gas": 1, "gas_cost": 1, "depth": 1,
                  "stack": ["0x2a", "0x1"]},
                 {"pc": 2, "op": "ADD", "gas": 0, "gas_cost": 1, "depth": 1,
-                 "stack": ["0x2a", "0x1"]}
+                 "stack": ["0x002A", "0x1"]}
             ]
         })
         .to_string();
         let trace: TransactionTrace = serde_json::from_str(&document).expect("trace");
-        let first = &trace.steps[0].snapshot.stack;
-        let second = &trace.steps[1].snapshot.stack;
-        assert_eq!(words(first), ["0x2a", "0x1"]);
-        assert!(Arc::ptr_eq(&first[0], &second[0]));
-        assert!(Arc::ptr_eq(&first[1], &second[1]));
+        let stack = |index: usize| trace.steps.step(index).stack().to_vec();
+        assert_eq!(stack(0), [EvmWord::from(0x2a), EvmWord::from(1)]);
+        assert_eq!(stack(1), stack(0));
+        // Written back in the one spelling stack words have.
+        let written = serde_json::to_value(&trace).expect("json");
+        assert_eq!(
+            written["steps"][1]["stack"],
+            serde_json::json!(["0x2a", "0x1"])
+        );
     }
     fn words(stack: &[super::Word]) -> Vec<&str> {
         stack.iter().map(|word| &**word).collect()
@@ -960,7 +916,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        decode_hex, encode_hex, same_buffer, Bytes, FunctionCall, HexError, StepSnapshot,
+        decode_hex, encode_hex, same_buffer, Bytes, EvmWord, FunctionCall, HexError, StepSnapshot,
         StorageChange, TraceArtifacts, TraceCapabilities, TraceStep, TransactionTrace,
     };
 
@@ -1215,17 +1171,11 @@ mod tests {
             backend: None,
             capabilities: TraceCapabilities::default(),
             artifacts: TraceArtifacts::default(),
-            steps: vec![filled.clone(), filled],
+            steps: vec![filled.clone(), filled].into(),
         };
         trace = serde_json::from_str(&serde_json::to_string(&trace).expect("json")).expect("trace");
-        let data = |index: usize| {
-            trace.steps[index]
-                .snapshot
-                .return_data
-                .as_ref()
-                .expect("data")
-        };
-        assert!(Arc::ptr_eq(data(0), data(1)));
+        let data = |index: usize| trace.steps.step(index).return_data().expect("data");
+        assert!(std::ptr::eq(data(0), data(1)));
         assert!(!trace.capabilities.return_data);
     }
 
@@ -1277,47 +1227,23 @@ mod tests {
                 step(1, snapshot("aa", "0x1")),
                 step(2, snapshot("bb", "0x1")),
                 step(3, snapshot("bb", "0x2")),
-            ],
+            ]
+            .into(),
         };
         let json = serde_json::to_string(&trace).expect("json");
         let restored: TransactionTrace = serde_json::from_str(&json).expect("trace");
         assert_eq!(restored, trace);
-        let memory = |index: usize| {
-            restored.steps[index]
-                .snapshot
-                .memory
-                .as_deref()
-                .expect("memory")
-        };
-        assert!(same_buffer(memory(0), memory(1)));
-        assert!(!same_buffer(memory(1), memory(2)));
-        assert!(same_buffer(memory(2), memory(3)));
-        let storage = |index: usize| &restored.steps[index].snapshot.storage;
-        assert!(Arc::ptr_eq(storage(0), storage(2)));
-        assert!(!Arc::ptr_eq(storage(2), storage(3)));
-
-        // The same pass is available for a trace assembled by hand.
-        let mut by_hand = trace.clone();
-        let by_hand_memory = |trace: &TransactionTrace, index: usize| {
-            trace.steps[index].snapshot.memory.clone().expect("memory")
-        };
-        assert!(!same_buffer(
-            &by_hand_memory(&by_hand, 0),
-            &by_hand_memory(&by_hand, 1)
-        ));
-        assert!(!Arc::ptr_eq(
-            &by_hand.steps[0].snapshot.storage,
-            &by_hand.steps[1].snapshot.storage
-        ));
-        by_hand.share_unchanged_state();
-        assert!(same_buffer(
-            &by_hand_memory(&by_hand, 0),
-            &by_hand_memory(&by_hand, 1)
-        ));
-        assert!(Arc::ptr_eq(
-            &by_hand.steps[0].snapshot.storage,
-            &by_hand.steps[1].snapshot.storage
-        ));
+        // Steps share what did not change however the trace was put together: read back
+        // from a file, or built from steps that each held their own copy.
+        for trace in [&restored, &trace] {
+            let memory = |index: usize| trace.steps.step(index).memory().expect("memory");
+            assert!(same_buffer(&memory(0), &memory(1)));
+            assert!(!same_buffer(&memory(1), &memory(2)));
+            assert!(same_buffer(&memory(2), &memory(3)));
+            let storage = |index: usize| trace.steps.step(index).storage();
+            assert!(std::ptr::eq(storage(0), storage(2)));
+            assert!(!std::ptr::eq(storage(2), storage(3)));
+        }
     }
 
     #[test]
@@ -1343,7 +1269,8 @@ mod tests {
                 storage: None,
                 error: None,
                 snapshot: StepSnapshot::default(),
-            }],
+            }]
+            .into(),
             debug_trace_available: true,
             contract_address: None,
             backend: Some("debug-rpc".to_owned()),
@@ -1420,15 +1347,18 @@ mod tests {
         let again: TransactionTrace = serde_json::from_str(&written).expect("trace");
         assert_eq!(serde_json::to_string(&again).expect("json"), written);
 
-        let memory = |index: usize| trace.steps[index].snapshot_ref().memory;
-        assert_eq!(memory(0), Some(&[][..]));
-        assert_eq!(memory(1).map(<[u8]>::len), Some(96));
-        assert_eq!(memory(1).and_then(|memory| memory.get(31)), Some(&0x2a));
+        let memory = |index: usize| trace.steps.step(index).memory();
+        assert_eq!(memory(0).as_deref(), Some(&[][..]));
+        assert_eq!(memory(1).map(|memory| memory.len()), Some(96));
+        assert_eq!(
+            memory(1).and_then(|memory| memory.get(31).copied()),
+            Some(0x2a)
+        );
         assert_eq!(memory(3), None);
         // The unchanged memory of the third step is the second step's buffer.
         assert!(same_buffer(
-            memory(1).expect("memory"),
-            memory(2).expect("memory")
+            &memory(1).expect("memory"),
+            &memory(2).expect("memory")
         ));
     }
 

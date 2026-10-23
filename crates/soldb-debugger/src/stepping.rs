@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 
-use soldb_core::{TransactionTrace, Word as StackWord};
+use soldb_core::{opcode, EvmWord, StepView, TransactionTrace};
 use soldb_ethdebug::{
     function_selector, parse_path, CodeGenerator, EthdebugInfo, FunctionExit, Instruction,
     PathSegment, SourceLocation, StorageLayout,
@@ -58,8 +58,6 @@ variable locations";
 pub const INFERRED_LOCALS_NOTE: &str = "values can be wrong under the optimizer, and a \
 variable whose frame could not be placed shows as unavailable; ETHDebug variable \
 information will replace this once compilers emit it";
-
-const CALL_OPCODES: [&str; 4] = ["CALL", "CALLCODE", "DELEGATECALL", "STATICCALL"];
 
 /// One contract's debug information, prepared for stepping: the ETHDebug metadata, the
 /// source text, the functions parsed from it, and the indexes that make per-step lookups
@@ -846,15 +844,15 @@ impl FrameEntered {
 
     /// What the call instruction at `caller` says about the frame it entered.
     fn from_call(trace: &TransactionTrace, caller: Option<usize>) -> Self {
-        let op = caller.map(|caller| &*trace.steps[caller].op);
+        let op = caller.map(|caller| trace.steps.step(caller).op());
         Self {
-            address: caller.and_then(|caller| call_target(&trace.steps[caller])),
-            environment: if matches!(op, Some("CREATE" | "CREATE2")) {
+            address: caller.and_then(|caller| call_target(trace.steps.step(caller))),
+            environment: if matches!(op, Some(opcode::CREATE | opcode::CREATE2)) {
                 CodeEnvironment::Create
             } else {
                 CodeEnvironment::Call
             },
-            delegated: matches!(op, Some("DELEGATECALL" | "CALLCODE")),
+            delegated: matches!(op, Some(opcode::DELEGATECALL | opcode::CALLCODE)),
         }
     }
 }
@@ -1145,11 +1143,11 @@ pub(crate) fn calldata_for_step<'a>(
 
 /// The calldata of the frame executing `step`, given its top-level call's input.
 fn frame_calldata<'a>(trace: &'a TransactionTrace, step: usize, root_input: &'a str) -> &'a str {
-    let root_depth = trace.steps.first().map_or(0, |first| first.depth);
+    let root_depth = trace.steps.first().map_or(0, |first| first.depth());
     let depth = trace
         .steps
         .get(step)
-        .map_or(root_depth, |current| current.depth);
+        .map_or(root_depth, |current| current.depth());
     if depth == root_depth {
         return root_input;
     }
@@ -1312,8 +1310,8 @@ fn place_at_entry_landing(
     let Some(declared) = contract.functions.get(function) else {
         return;
     };
-    let at_declaration =
-        contract.is_jumpdest(trace.steps[index].pc) && own.offset == declared.declaration_start;
+    let at_declaration = contract.is_jumpdest(trace.steps.step(index).pc())
+        && own.offset == declared.declaration_start;
     let from_dispatcher =
         !from_call || (index > 0 && framed_declaration(trace, contract, index - 1, declared));
     if !at_declaration || !from_dispatcher {
@@ -1330,9 +1328,9 @@ fn place_at_entry_landing(
     if variables.params_base.is_some() || variables.body_seen {
         return;
     }
-    let stack = trace.steps[index].snapshot_ref().stack;
+    let stack = trace.steps.step(index).stack().to_vec();
     let calldata = frame_calldata(trace, index, root_input);
-    if argument_evidence(declared, calldata, stack) == Evidence::Contradicted {
+    if argument_evidence(declared, calldata, &stack) == Evidence::Contradicted {
         return;
     }
     variables.params_base = height.checked_sub(parameter_slots(&declared.params));
@@ -1346,15 +1344,13 @@ fn framed_declaration(
     index: usize,
     function: &SourceFunction,
 ) -> bool {
-    if &*trace.steps[index].op != "JUMP" {
+    let step = trace.steps.step(index);
+    if step.op() != opcode::JUMP {
         return false;
     }
-    contract
-        .location_at_pc(trace.steps[index].pc)
-        .is_some_and(|location| {
-            location.source_id == function.source_id
-                && location.offset == function.declaration_start
-        })
+    contract.location_at_pc(step.pc()).is_some_and(|location| {
+        location.source_id == function.source_id && location.offset == function.declaration_start
+    })
 }
 
 /// The slot of the first parameter of the modifier `function`, from the placed function
@@ -1448,7 +1444,7 @@ impl StepMap {
             };
 
         // Pass 1: EVM frames, executing addresses, and each step's own span.
-        let root_depth = trace.steps.first().map_or(0, |step| step.depth);
+        let root_depth = trace.steps.first().map_or(0, |step| step.depth());
         let mut next_frame_id = 0_u32;
         let mut evm_frames = Vec::<EvmFrame>::new();
         let mut upcoming_roots = roots.iter().enumerate().peekable();
@@ -1456,7 +1452,7 @@ impl StepMap {
         let mut reverted = Vec::new();
         let mut framed = Vec::with_capacity(trace.steps.len());
         for (index, step) in trace.steps.iter().enumerate() {
-            let evm_depth = step.depth.saturating_sub(root_depth) as usize;
+            let evm_depth = step.depth().saturating_sub(root_depth) as usize;
             if let Some((position, root)) =
                 upcoming_roots.next_if(|(_, root)| root.entry_step == index)
             {
@@ -1508,7 +1504,7 @@ impl StepMap {
                 });
                 next_frame_id += 1;
             }
-            if &*step.op == "REVERT" || step.error.is_some() {
+            if step.op() == opcode::REVERT || step.error().is_some() {
                 let entry_step = evm_frames
                     .last()
                     .expect("the root frame is never popped")
@@ -1518,7 +1514,7 @@ impl StepMap {
             let frame = evm_frames.last().expect("the root frame is never popped");
             let facts = frame
                 .contract
-                .and_then(|index| contracts[index].facts_at_pc(step.pc));
+                .and_then(|index| contracts[index].facts_at_pc(step.pc()));
             let location = frame.contract.zip(facts).and_then(|(contract, facts)| {
                 let location = facts.location.as_ref()?;
                 Some(LocationRef {
@@ -1581,7 +1577,7 @@ impl StepMap {
         let mut variable_layouts = Vec::<Vec<InferredVariable>>::new();
         let mut step_variables = Vec::with_capacity(framed.len());
         for (index, step) in framed.iter().enumerate() {
-            let height = trace.steps[index].snapshot_ref().stack.len();
+            let height = trace.steps.step(index).stack().len();
             // Variables are tracked for a frame whose contract keeps them at fixed slots.
             // A frame entered by a jump from inside another function has its parameters
             // on top of the stack at entry, which places them; a public function entered
@@ -1593,7 +1589,7 @@ impl StepMap {
                 let function = contract.functions.get(function)?;
                 let landed_from_function = index > 0
                     && framed[index - 1].frame_id == step.frame_id
-                    && &*trace.steps[index - 1].op == "JUMP"
+                    && trace.steps.step(index - 1).op() == opcode::JUMP
                     && framed[index - 1]
                         .location
                         .is_some_and(|location| location.function.is_some());
@@ -1623,7 +1619,7 @@ impl StepMap {
             // marker, or landing on a function's entry point, says whether it was a call.
             let landed_by_jump = index > 0
                 && framed[index - 1].frame_id == step.frame_id
-                && &*trace.steps[index - 1].op == "JUMP";
+                && trace.steps.step(index - 1).op() == opcode::JUMP;
             // Whether the previous step ran another function's own code in this EVM
             // frame, as opposed to the dispatcher's.
             let from_function_code = index > 0
@@ -1644,7 +1640,7 @@ impl StepMap {
             // call. A marked call is resolved once the landing's function is known.
             let mut pending_call = false;
             if landed_by_jump {
-                let pc = trace.steps[index].pc;
+                let pc = trace.steps.step(index).pc();
                 match previous_marker {
                     JumpMarker::Call => pending_call = true,
                     JumpMarker::Return => {
@@ -1664,9 +1660,8 @@ impl StepMap {
                 }
                 let contract = &contracts[step.contract?];
                 let arguments = contract.functions.get(function)?.params.len();
-                let stack = trace.steps[index - 1].snapshot_ref().stack;
-                let word = stack.get(stack.len().checked_sub(2 + arguments)?)?;
-                let pc = u64::from_str_radix(word.trim_start_matches("0x"), 16).ok()?;
+                let word = trace.steps.step(index - 1).stack().peek(1 + arguments)?;
+                let pc = word.to_u64()?;
                 contract.is_jumpdest(pc).then_some(pc)
             };
             let (location, key) = match step.location {
@@ -1890,7 +1885,7 @@ impl StepMap {
                 frame_entry,
                 line_start: false,
             });
-            pcs.push(trace.steps[index].pc);
+            pcs.push(trace.steps.step(index).pc());
         }
 
         let mut map = Self {
@@ -2186,13 +2181,10 @@ impl StepMap {
             .rev()
             .find(|variable| variable.name == *name)?;
         let contract = self.contract_at_step(step)?;
-        let snapshot = trace
-            .steps
-            .get(step)
-            .map(soldb_core::TraceStep::snapshot_ref);
-        let stack = snapshot.map_or(&[][..], |snapshot| snapshot.stack);
+        let view = trace.steps.get(step);
+        let stack = view.map(|view| view.stack().to_vec()).unwrap_or_default();
         let reader = ValueReader {
-            memory: snapshot.and_then(|snapshot| snapshot.memory),
+            memory: view.and_then(|view| view.memory()),
             calldata: self.calldata_at(trace, step),
             storage: words,
             layout: contract.storage_layout.as_ref(),
@@ -2209,7 +2201,11 @@ impl StepMap {
                 "`{name}` is in scope but its stack slot is above the stack here"
             )));
         };
-        let stack_words = stack_words.iter().map(|word| &**word).collect::<Vec<_>>();
+        let stack_words = stack_words
+            .iter()
+            .map(EvmWord::to_string)
+            .collect::<Vec<_>>();
+        let stack_words = stack_words.iter().map(String::as_str).collect::<Vec<_>>();
         let mut place = match reader.root(&variable.ty, &stack_words) {
             Ok(place) => place,
             Err(shown) if segments.len() == 1 => {
@@ -2252,13 +2248,10 @@ impl StepMap {
         let Some(contract) = self.contract_at_step(step) else {
             return Vec::new();
         };
-        let snapshot = trace
-            .steps
-            .get(step)
-            .map(soldb_core::TraceStep::snapshot_ref);
-        let stack = snapshot.map_or(&[][..], |snapshot| snapshot.stack);
+        let view = trace.steps.get(step);
+        let stack = view.map(|view| view.stack().to_vec()).unwrap_or_default();
         let reader = ValueReader {
-            memory: snapshot.and_then(|snapshot| snapshot.memory),
+            memory: view.and_then(|view| view.memory()),
             calldata: self.calldata_at(trace, step),
             storage: words,
             layout: contract.storage_layout.as_ref(),
@@ -2276,9 +2269,12 @@ impl StepMap {
                 let words = variable
                     .slot
                     .and_then(|slot| stack.get(slot..slot + variable.words))
-                    .map(|words| words.iter().map(|word| &**word).collect::<Vec<_>>());
+                    .map(|words| words.iter().map(EvmWord::to_string).collect::<Vec<_>>());
                 let value = match words {
-                    Some(words) => reader.variable(&variable.ty, &words),
+                    Some(words) => {
+                        let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+                        reader.variable(&variable.ty, &words)
+                    }
                     None => unavailable(),
                 };
                 DebugVariable {
@@ -2763,8 +2759,8 @@ fn prove_argument_layouts(
         let Some(function) = contracts[contract_index].functions.get(function_index) else {
             continue;
         };
-        let stack = trace.steps[index].snapshot_ref().stack;
-        let observed = argument_evidence(function, calldata, stack);
+        let stack = trace.steps.step(index).stack().to_vec();
+        let observed = argument_evidence(function, calldata, &stack);
         evidence[contract_index] = evidence[contract_index].merge(observed);
     }
     evidence
@@ -2777,7 +2773,7 @@ fn prove_argument_layouts(
 /// reference parameter is a calldata offset in one and a memory pointer in the other —
 /// and that is enough as long as one of them sits at a different depth under the two
 /// orders.
-fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[StackWord]) -> Evidence {
+fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[EvmWord]) -> Evidence {
     let count = function.params.len();
     if count == 0 || stack.len() < count {
         return Evidence::Unknown;
@@ -2828,7 +2824,7 @@ fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[StackWo
     let matches = |order: ArgumentOrder| {
         checkable.iter().all(|index| {
             let candidate = &stack[order.word_index(*index, count, stack.len())];
-            normalize_word(candidate) == expected[*index]
+            hex_bytes(candidate.as_bytes()) == expected[*index]
         })
     };
     // A position at the same depth under both orders proves nothing about the order.
@@ -2862,25 +2858,17 @@ fn canonical_value_type(ty: &str) -> String {
     }
 }
 
-/// A stack word as 64 lowercase hex digits, however the backend spelled it.
-fn normalize_word(word: &str) -> String {
-    let digits = word.trim_start_matches("0x").trim_start_matches('0');
-    format!("{:0>64}", digits.to_ascii_lowercase())
-}
-
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The code address a call instruction targets, read off its stack.
 #[must_use]
-pub fn call_target(step: &soldb_core::TraceStep) -> Option<String> {
-    if !CALL_OPCODES.contains(&&*step.op) {
+pub fn call_target(step: StepView<'_>) -> Option<String> {
+    if !opcode::is_call(step.op()) {
         return None;
     }
-    let stack = step.snapshot_ref().stack;
-    let word = stack.get(stack.len().checked_sub(2)?)?;
-    address_from_word(word)
+    address_from_word(&step.stack().peek(1)?.to_string())
 }
 
 /// The address in the low 20 bytes of a stack word, or `None` for the zero address or a
@@ -2909,7 +2897,7 @@ mod tests {
         function_selector, source_range, CodeGenerator, EthdebugInfo, Instruction,
     };
 
-    use soldb_core::Word as StackWord;
+    use soldb_core::{EvmWord, Word as StackWord};
 
     use crate::FrameState;
 
@@ -3015,7 +3003,7 @@ contract C {
             backend: None,
             capabilities: Default::default(),
             artifacts: Default::default(),
-            steps,
+            steps: steps.into(),
         }
     }
 
@@ -3075,6 +3063,14 @@ contract P {
         )
     }
 
+    /// A stack as the words a table holds.
+    fn evm_words(stack: &[StackWord]) -> Vec<EvmWord> {
+        stack
+            .iter()
+            .map(|word| EvmWord::parse(word).expect("test word"))
+            .collect()
+    }
+
     fn word_of(value: &str) -> StackWord {
         StackWord::from(format!("0x{:0>64}", value.trim_start_matches("0x")).as_str())
     }
@@ -3129,7 +3125,7 @@ contract P {
         let arguments = map.frame_arguments(
             inner,
             FrameState {
-                stack: &first_on_top,
+                stack: &evm_words(&first_on_top),
                 memory: None,
             },
         );
@@ -3156,7 +3152,7 @@ contract P {
         let arguments = map.frame_arguments(
             frames.first().expect("frame"),
             FrameState {
-                stack: &last_on_top,
+                stack: &evm_words(&last_on_top),
                 memory: None,
             },
         );
@@ -3177,7 +3173,7 @@ contract P {
             .frame_arguments(
                 frames.first().expect("frame"),
                 FrameState {
-                    stack: &first_on_top,
+                    stack: &evm_words(&first_on_top),
                     memory: None
                 }
             )
@@ -3193,7 +3189,7 @@ contract P {
             .frame_arguments(
                 frames.first().expect("frame"),
                 FrameState {
-                    stack: &first_on_top,
+                    stack: &evm_words(&first_on_top),
                     memory: None
                 }
             )
@@ -3216,8 +3212,10 @@ contract P {
             &amount[2..]
         );
         let stack = [word_of("2a"), amount.clone()];
-        trace.steps[2].snapshot =
+        let mut steps = trace.steps.to_steps();
+        steps[2].snapshot =
             StepSnapshot::new(stack.to_vec(), None, BTreeMap::new(), BTreeMap::new());
+        trace.steps = steps.into();
         let map = StepMap::new(&trace, vec![contract(None)]);
         assert_eq!(map.argument_layout(0), Some(ArgumentLayout::TopWords));
         let frames = map.frames(3);
@@ -3228,7 +3226,7 @@ contract P {
         let arguments = map.frame_arguments(
             outer,
             FrameState {
-                stack: &stack,
+                stack: &evm_words(&stack),
                 memory: None,
             },
         );
@@ -4810,7 +4808,7 @@ contract D {
     /// (steps 11 to 21).
     fn two_roots() -> TransactionTrace {
         let mut trace = outer_calls_inner();
-        let again = trace.steps.clone();
+        let again = trace.steps.to_steps();
         trace.steps.extend(again);
         let mut first = call(0, 0, 11, "CALL", ROOT);
         first.input = "0x01".to_owned();
@@ -4874,7 +4872,7 @@ contract D {
         let mut trace = outer_calls_inner();
         trace.steps.truncate(10);
         trace.steps.push(step(10, 1, "JUMP", &[]));
-        trace.steps.extend(outer_calls_inner().steps);
+        trace.steps.extend(outer_calls_inner().steps.to_steps());
         trace.artifacts.calls = vec![call(0, 0, 11, "CALL", ROOT), call(1, 11, 22, "CALL", ROOT)];
         let map = StepMap::new(&trace, vec![contract(Some(ROOT))]);
         assert_eq!(map.line_key(10), map.line_key(13));

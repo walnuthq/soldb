@@ -26,9 +26,9 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use soldb_core::{
-    decode_hex_into, Bytes, ExecutionLog, GasSummary, HexError, SoldbError, SoldbResult,
-    StepSnapshot, StorageChange, TraceArtifacts, TraceCapabilities, TraceStep, TransactionTrace,
-    Word, WordInterner,
+    decode_hex_into, Bytes, ExecutionLog, GasSummary, HexError, SoldbError, SoldbResult, StepError,
+    StepSnapshot, StepTable, StorageChange, TraceArtifacts, TraceCapabilities, TraceStep,
+    TransactionTrace, Word, WordInterner,
 };
 
 #[cfg(feature = "replay")]
@@ -409,32 +409,38 @@ fn share_unchanged(previous: &StructLog, log: &mut StructLog) {
 /// Fills `transient_storage` on each `TLOAD` and `TSTORE` from the stack, for every backend.
 fn record_transient_storage(steps: &mut [TraceStep]) {
     for index in 0..steps.len() {
-        let step = &steps[index];
-        if step.error.is_some() {
-            continue;
+        if let Some(touched) = transient_storage_of(&steps[index], steps.get(index + 1)) {
+            steps[index].snapshot.transient_storage = touched;
         }
-        let stack = step.snapshot_ref().stack;
-        let Some(slot) = stack.last() else {
-            continue;
-        };
-        // A `TLOAD`'s value is what it leaves on top: the next step's stack in its frame.
-        let value = match &*step.op {
-            "TSTORE" => stack
-                .len()
-                .checked_sub(2)
-                .and_then(|below| stack.get(below)),
-            "TLOAD" => steps
-                .get(index + 1)
-                .filter(|next| next.depth == step.depth)
-                .and_then(|next| next.snapshot_ref().stack.last()),
-            _ => continue,
-        };
-        let Some(value) = value else {
-            continue;
-        };
-        let touched = BTreeMap::from([(normalize_storage_key(slot), normalize_storage_key(value))]);
-        steps[index].snapshot.transient_storage = touched;
     }
+}
+
+/// The transient slot `step` reads or writes and its value after it, when it is a
+/// `TLOAD` or a `TSTORE` that completed; `next` is the step after it.
+fn transient_storage_of(
+    step: &TraceStep,
+    next: Option<&TraceStep>,
+) -> Option<BTreeMap<String, String>> {
+    if step.error.is_some() {
+        return None;
+    }
+    let stack = step.snapshot_ref().stack;
+    let slot = stack.last()?;
+    // A `TLOAD`'s value is what it leaves on top: the next step's stack in its frame.
+    let value = match &*step.op {
+        "TSTORE" => stack
+            .len()
+            .checked_sub(2)
+            .and_then(|below| stack.get(below)),
+        "TLOAD" => next
+            .filter(|next| next.depth == step.depth)
+            .and_then(|next| next.snapshot_ref().stack.last()),
+        _ => None,
+    }?;
+    Some(BTreeMap::from([(
+        normalize_storage_key(slot),
+        normalize_storage_key(value),
+    )]))
 }
 
 /// Whether an opcode can leave data in its frame's return data buffer.
@@ -511,6 +517,48 @@ impl DebugTraceResult {
         steps
     }
 
+    /// Builds every step into a [`StepTable`], consuming the logs so that each one is
+    /// freed as its step is appended: the logs, the steps and the table are never all
+    /// whole at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StepError`] when a stack word the node reported is not hex.
+    pub fn into_step_table(self) -> Result<StepTable, StepError> {
+        let mut table = StepTable::with_capacity(self.struct_logs.len());
+        // The previous log's memory and storage, kept by reference count rather than as
+        // the log itself, which has moved into its step.
+        let mut previous = None::<(Arc<Vec<String>>, Arc<BTreeMap<String, String>>)>;
+        // A step is appended once the next one is built: a `TLOAD`'s value is on the next
+        // step's stack.
+        let mut pending = None::<TraceStep>;
+        for log in self.struct_logs {
+            let memory = Arc::clone(&log.memory);
+            let storage = Arc::clone(&log.storage);
+            let step = match (&previous, &pending) {
+                (Some((previous_memory, previous_storage)), Some(before)) => {
+                    log.into_trace_step_sharing(previous_storage, Some((previous_memory, before)))
+                }
+                _ => log.into_trace_step_sharing(&BTreeMap::new(), None),
+            };
+            if let Some(mut before) = pending.take() {
+                if let Some(touched) = transient_storage_of(&before, Some(&step)) {
+                    before.snapshot.transient_storage = touched;
+                }
+                table.try_push(before)?;
+            }
+            pending = Some(step);
+            previous = Some((memory, storage));
+        }
+        if let Some(mut last) = pending {
+            if let Some(touched) = transient_storage_of(&last, None) {
+                last.snapshot.transient_storage = touched;
+            }
+            table.try_push(last)?;
+        }
+        Ok(table)
+    }
+
     #[must_use]
     pub fn failure_message(&self) -> Option<String> {
         if let Some(error) = &self.error {
@@ -585,10 +633,14 @@ pub struct SimulateCallRequest {
 
 /// The one place every backend's execution becomes a trace. Takes the result by value so
 /// the node's logs are freed as the steps are built.
+///
+/// # Errors
+///
+/// Returns an error when a stack word the backend reported is not hex.
 pub fn build_transaction_trace(
     envelope: TraceEnvelope,
     debug_result: DebugTraceResult,
-) -> TransactionTrace {
+) -> SoldbResult<TransactionTrace> {
     let failure = debug_result.failure_message();
     let success = envelope.success && failure.is_none();
     let error = failure.or(envelope.debug_error.clone());
@@ -609,7 +661,7 @@ pub fn build_transaction_trace(
         artifacts.revert_data = Some(output.clone());
     }
 
-    TransactionTrace {
+    Ok(TransactionTrace {
         tx_hash: envelope.tx_hash,
         from_addr: envelope.from_addr,
         to_addr: envelope.to_addr,
@@ -624,8 +676,8 @@ pub fn build_transaction_trace(
         backend: envelope.backend,
         capabilities: envelope.capabilities,
         artifacts,
-        steps: debug_result.into_steps(),
-    }
+        steps: debug_result.into_step_table()?,
+    })
 }
 
 /// Assembles the `debug-rpc` trace of a mined transaction from the node's responses to
@@ -653,7 +705,7 @@ pub fn debug_rpc_transaction_trace(
         backend: Some(TraceBackend::DebugRpc.as_str().to_owned()),
         capabilities: debug_rpc_capabilities(&debug_result),
     };
-    let mut trace = build_transaction_trace(envelope, debug_result);
+    let mut trace = build_transaction_trace(envelope, debug_result)?;
     if !receipt.logs.is_empty() && trace.artifacts.logs.is_empty() {
         trace.artifacts.logs = receipt_logs_to_artifacts(&receipt.logs);
         trace.capabilities.logs = true;
@@ -710,7 +762,7 @@ pub(crate) fn simulation_trace(
             }
             artifacts
         },
-        steps: debug_result.into_steps(),
+        steps: debug_result.into_step_table()?,
     })
 }
 
@@ -1029,7 +1081,7 @@ mod tests {
         assert_eq!(trace.artifacts.logs.len(), 2);
         assert_eq!(trace.steps.len(), 3);
         assert_eq!(
-            trace.steps[1].snapshot_ref().memory,
+            trace.steps.step(1).memory().as_deref(),
             Some(&[0xaa, 0xbb][..])
         );
     }
@@ -1457,7 +1509,7 @@ mod tests {
             capabilities: debug_rpc_capabilities(&result),
         };
 
-        let trace = build_transaction_trace(envelope, result.clone());
+        let trace = build_transaction_trace(envelope, result.clone()).expect("trace");
         assert!(trace.success);
         assert_eq!(trace.output, "0x");
         assert_eq!(trace.backend.as_deref(), Some("debug-rpc"));
@@ -1466,7 +1518,7 @@ mod tests {
         assert!(trace.capabilities.memory);
         assert!(trace.capabilities.gas_details);
         assert_eq!(trace.artifacts.gas.as_ref().map(|gas| gas.used), Some(7));
-        assert_eq!(&*trace.steps[0].op, "STOP");
+        assert_eq!(trace.steps.step(0).mnemonic(), "STOP");
     }
 
     #[test]
@@ -1523,7 +1575,7 @@ mod tests {
             capabilities: TraceCapabilities::default(),
         };
 
-        let trace = build_transaction_trace(envelope, result.clone());
+        let trace = build_transaction_trace(envelope, result.clone()).expect("trace");
         assert!(trace.success);
         assert_eq!(
             trace.error.as_deref(),

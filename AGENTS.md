@@ -130,10 +130,11 @@ the same steps and report the same values. Debug artifacts are found and read th
 command's call-frame summary itself in `main.rs`; new frontend logic that both would want
 belongs in `soldb-debugger`, not in a second copy.
 
-- **soldb-core**: the shared vocabulary — `TraceStep`, `StepSnapshot`,
-  `TransactionTrace`, `TraceCapabilities`, `TraceArtifacts`, `SoldbError`. It has no
-  soldb dependencies and must stay that way; it is the type boundary every other crate
-  agrees on.
+- **soldb-core**: the shared vocabulary — `TransactionTrace` and the `StepTable` of its
+  steps, read through `StepView`; `TraceStep` and `StepSnapshot`, a step as a backend
+  builds it; `EvmWord`, the opcode table in `opcode`, `TraceCapabilities`,
+  `TraceArtifacts`, `SoldbError`. It has no soldb dependencies and must stay that way; it
+  is the type boundary every other crate agrees on.
 - **soldb-ethdebug**: ETHDebug artifact loading (`metadata.rs`), legacy `srcmap` parsing
   (`source_map.rs`), ABI encode/decode and signature parsing (`abi.rs`), event decoding
   (`events.rs`), and the storage layout (`storage_layout.rs`): where solc put each state
@@ -601,49 +602,52 @@ Beyond the rule:
 ## Notes
 
 - **Trace steps are the hot loop.** A mainnet transaction is easily hundreds of thousands
-  of `TraceStep`s, each carrying a dozen stack words and all of memory.
-  Avoid per-step `clone()`, `format!`, and `String`-keyed map lookups in anything that
-  walks the full trace; borrow, and hoist allocation out of the loop.
-- **Stack words are shared, not copied.** A stack word is a `soldb_core::Word`
-  (`Arc<str>`), handed out by a `WordInterner`: the replay inspector interns as it
-  records and the trace-file visitor interns as it parses, so the same value costs one
-  allocation for the whole trace rather than one per occurrence. A 614,000-step trace of
-  one loop holds 1.7 million stack words drawn from about 1,200 distinct ones, and
-  interning them took it from 543 MB to 341 MB, mnemonics included: `TraceStep::op` is a
-  `Word` too, since a couple of hundred of them cover every step. Keep new step-building
-  paths interning; what is left per step is the `Vec` itself.
-- **Read a step's state with `TraceStep::snapshot_ref`, never `normalized_snapshot`.**
-  The borrowed view costs nothing; the owned one copies the stack, all of memory, and the
-  storage map. Reach for `normalized_snapshot` only where ownership is genuinely required.
-  The same rule applies to the flat `step.stack`/`step.memory`/`step.storage` fields: go
-  through `snapshot_ref`, which also reads correctly for a step that carries only a
-  snapshot.
+  of steps, and a Foundry test millions. Avoid per-step `clone()`, `format!`, and
+  `String`-keyed map lookups in anything that walks the full trace; borrow, and hoist
+  allocation out of the loop.
+- **A trace holds its steps in columns.** `TransactionTrace::steps` is a `StepTable`: the
+  program counter, the opcode byte, the depth and the gas of every step in columns of
+  plain values, a tape of stack words in which a step stores only the words above what it
+  kept from the step before (and its whole stack every `STACK_CHECKPOINT` steps), what
+  only some steps have (an error, a storage diff, transient storage) for those steps
+  alone, and what changes rarely (storage, return data, memory) once per change. Read a
+  step through a `StepView` (`trace.steps.step(i)`, `get(i)`, `iter()`); compare opcodes
+  as bytes against `soldb_core::opcode`, not as mnemonics; and visit storage writes with
+  `StepTable::storage_diffs` and `StepTable::transient_storage` rather than every step.
+  Reading a stack word walks back at most `STACK_CHECKPOINT` steps; `Stack::to_vec`
+  reads a whole stack in one pass.
+- **A stack word is an `EvmWord`, formatted only for display.** `EvmWord` holds the 32
+  bytes and prints them as minimal lowercase `0x` hex, which is the spelling trace files
+  have whatever a node sent: a padded or upper-case word reads back as the same value and
+  is written in that one spelling.
+- **A backend builds `TraceStep`s or appends fields.** `StepTable::push` takes a
+  `TraceStep` built with `TraceStep::new` and `StepSnapshot::new`, never by filling the
+  flat fields; a stack word the step shares by pointer with the step before is not parsed
+  again, so keep new step-building paths interning their words through a `WordInterner`.
+  Words that come from a node or a file go through `StepTable::try_push`, which refuses a
+  word that is not hex instead of panicking. An embedder that has the plain fields and
+  the stack as words appends with `StepTable::append`, or `append_kept` when it knows how
+  much of the stack an instruction left alone, and never builds a `TraceStep` at all.
+  `DebugTraceResult::into_step_table` streams the node's logs into a table, freeing each
+  log as its step is appended.
 - **Do not materialize a trace to answer a question about it.** `DebugTraceResult::steps`
-  builds every `TraceStep`; calling it to compute a flag or a count costs a full second
-  copy of the trace. Read the raw `struct_logs` instead, and pin the result against the
-  definition it replaces with a test. The same applies to writing one out: serialize the
-  steps as they are; do not build a `Vec<serde_json::Value>` of them.
-- **A `TraceStep` stores its state once and serializes it twice.** The flat `stack`,
-  `memory`, and `storage` fields are the wire format older files and clients read; every
-  constructor leaves them empty, `Serialize` fills them from `snapshot`, and
-  `Deserialize` moves whatever they held into `snapshot`. Build steps with
-  `TraceStep::new` and `StepSnapshot::new`, never by filling the flat fields. Memory in a
-  snapshot is `Bytes` and storage an `Arc`, and `DebugTraceResult::steps` hands the previous
-  step's on when a log did not change them, so a trace holds one copy per change rather
-  than one per step; keep that sharing when you touch step construction. The node's
-  payload is held the same way: `StructLog` memory and storage are `Arc`s shared with the
-  previous log as `structLogs` is parsed and as the replay inspector records, and
-  `build_transaction_trace` takes the result by value so `into_steps` frees each log as
-  its step is built. A trace read from a file shares as its steps are parsed. Loading a
-  20,000-step, 89 MB file through the DAP server peaks at 114 MB; it peaked at 236 MB
-  when every step held two copies.
-- **Memory is bytes in a step and hex in a file.** `StepSnapshot::memory` is
-  `soldb_core::Bytes`, so an embedder that already holds memory as `bytes::Bytes` hands
-  it over without a copy, and readers index it by byte offset directly. Serialization
-  writes it as one unprefixed lowercase hex string and reads that back, with or without a
-  `0x` prefix; memory that is not hex is refused when it is read, from a trace file or a
-  node's `structLogs`, rather than shown as something it is not. Use
-  `soldb_core::encode_hex` where a view needs hex, and only for what it shows.
+  and `StepTable::to_steps` build every `TraceStep`; calling them to compute a flag or a
+  count costs a full second copy of the trace. Read the raw `struct_logs` or the table
+  instead, and pin the result against the definition it replaces with a test. The same
+  applies to writing one out: serialize the table as it is; do not build a
+  `Vec<serde_json::Value>` of it.
+- **A step is written in the shape a `TraceStep` always had.** A table serializes each
+  step with the flat `stack`, `memory`, and `storage` fields older files and clients read
+  and the `snapshot` beside them, and reads any version back step by step, so a file's
+  steps are never all resident as `TraceStep`s. The format is pinned by a randomized test
+  that writes the same steps both ways and compares the bytes.
+- **Memory is bytes in a step and hex in a file.** `StepView::memory` is
+  `soldb_core::Bytes`, shared with the table, so readers index it by byte offset directly
+  and an embedder that already holds memory as `bytes::Bytes` hands it over without a
+  copy. Serialization writes it as one unprefixed lowercase hex string and reads that
+  back, with or without a `0x` prefix; memory that is not hex is refused when it is read,
+  from a trace file or a node's `structLogs`, rather than shown as something it is not.
+  Use `soldb_core::encode_hex` where a view needs hex, and only for what it shows.
 - **PC-to-source lookups should be indexed, not scanned.** Build the PC map once per
   contract (`build_pc_to_instruction_map`) and reuse it; a linear scan per step turns a
   trace walk quadratic.

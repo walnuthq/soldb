@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use soldb_core::{encode_hex, StepSnapshot, TraceStep, TransactionTrace, Word as StackWord};
+use soldb_core::{encode_hex, Bytes, EvmWord, StepSnapshot, StepView, TransactionTrace};
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
 use crate::decode::ValueReader;
@@ -109,14 +109,14 @@ impl DebugSession {
         let step = self.trace.steps.get(step_index)?;
         Some(DebugStep {
             index: step_index,
-            pc: step.pc,
-            op: step.op.to_string(),
-            gas: step.gas,
-            gas_cost: step.gas_cost,
-            depth: step.depth,
-            source: self.source_span(step.pc),
-            function: self.function_at_pc(step.pc).cloned(),
-            snapshot: step.normalized_snapshot(),
+            pc: step.pc(),
+            op: step.mnemonic().to_owned(),
+            gas: step.gas(),
+            gas_cost: step.gas_cost(),
+            depth: step.depth(),
+            source: self.source_span(step.pc()),
+            function: self.function_at_pc(step.pc()).cloned(),
+            snapshot: step.to_trace_step().snapshot,
             variables: self.variables_at_step(step_index),
         })
     }
@@ -352,7 +352,7 @@ pub fn variables_for_step(
     let Some(step) = trace.steps.get(step_index) else {
         return Vec::new();
     };
-    let variables = ethdebug.variables_at_pc(step.pc);
+    let variables = ethdebug.variables_at_pc(step.pc());
     if variables.is_empty() {
         return Vec::new();
     }
@@ -365,7 +365,11 @@ pub fn variables_for_step(
         .collect()
 }
 
-fn decode_variable(step: &TraceStep, calldata: &str, variable: &VariableLocation) -> DebugVariable {
+fn decode_variable(
+    step: StepView<'_>,
+    calldata: &str,
+    variable: &VariableLocation,
+) -> DebugVariable {
     let raw = raw_value_for_location(step, calldata, variable);
     let value = raw.map_or_else(
         || DebugValue {
@@ -387,20 +391,19 @@ fn decode_variable(step: &TraceStep, calldata: &str, variable: &VariableLocation
 }
 
 fn raw_value_for_location(
-    step: &TraceStep,
+    step: StepView<'_>,
     calldata: &str,
     variable: &VariableLocation,
 ) -> Option<String> {
-    let snapshot = step.snapshot_ref();
     match variable.location_type.as_str() {
-        "stack" => snapshot
-            .stack
-            .get(variable.offset as usize)
-            .map(|value| normalize_hex(value)),
-        "memory" => memory_word(snapshot.memory?, usize::try_from(variable.offset).ok()?)
+        "stack" => step
+            .stack()
+            .get(usize::try_from(variable.offset).ok()?)
+            .map(|value| normalize_hex(&value.to_string())),
+        "memory" => memory_word(&step.memory()?, usize::try_from(variable.offset).ok()?)
             .map(|word| format!("0x{}", encode_hex(&word))),
         "calldata" => word_from_hex_bytes(calldata, variable.offset as usize),
-        "storage" => storage_value(snapshot.storage, variable.offset),
+        "storage" => storage_value(step.storage(), variable.offset),
         _ => None,
     }
 }
@@ -495,11 +498,12 @@ impl ArgumentOrder {
 
 /// What a frame's arguments are read from: the stack at its entry point, and the memory
 /// a pointer among them refers into.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FrameState<'a> {
-    pub stack: &'a [StackWord],
+    /// The stack at the entry step, bottom first.
+    pub stack: &'a [EvmWord],
     /// Memory at the entry step, when the backend captured it.
-    pub memory: Option<&'a [u8]>,
+    pub memory: Option<Bytes>,
 }
 
 /// The arguments a function was entered with, read off the stack at its entry point.
@@ -535,11 +539,11 @@ pub fn decode_arguments(
         .iter()
         .enumerate()
         .map(|(index, param)| {
-            let word = &stack[order.word_index(index, params.len(), stack.len())];
+            let word = stack[order.word_index(index, params.len(), stack.len())].to_string();
             FrameArgument {
                 name: param.name.clone(),
                 ty: param.ty.clone(),
-                value: argument_value(param, word, state.memory, types, scope),
+                value: argument_value(param, &word, state.memory.clone(), types, scope),
             }
         })
         .collect()
@@ -548,7 +552,7 @@ pub fn decode_arguments(
 fn argument_value(
     param: &SourceParam,
     word: &str,
-    memory: Option<&[u8]>,
+    memory: Option<Bytes>,
     types: &SourceTypes,
     scope: Option<&str>,
 ) -> DebugValue {
@@ -1300,7 +1304,7 @@ mod tests {
             error: None,
         };
         let mut trace = sample_trace();
-        trace.steps.push(trace.steps[0].clone());
+        trace.steps.push(trace.steps.step(0).to_trace_step());
         let second_input = format!(
             "0x12345678{:0>64}",
             "2222222222222222222222222222222222222222"
@@ -1588,7 +1592,8 @@ mod tests {
                 storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                 error: None,
                 snapshot: Default::default(),
-            }],
+            }]
+            .into(),
         }
     }
     /// Solidity memory: a `string` is a length then its bytes; an array is a length then
@@ -1614,7 +1619,7 @@ mod tests {
         ]);
         let types = super::SourceTypes::default();
         let reader = super::ValueReader {
-            memory: Some(&memory),
+            memory: Some(soldb_core::Bytes::from(memory)),
             calldata: "",
             storage: None,
             layout: None,

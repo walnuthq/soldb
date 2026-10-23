@@ -24,7 +24,9 @@ mod profile;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
-use soldb_core::{ExecutionLog, SoldbResult, TransactionTrace, Word as StackWord};
+use soldb_core::{
+    encode_hex, opcode, EvmWord, ExecutionLog, SoldbResult, StepView, TransactionTrace,
+};
 use soldb_debugger::{
     CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam,
 };
@@ -1901,18 +1903,19 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
 
     let mut call_count = 0;
     for step in &trace.steps {
-        if !matches!(&*step.op, "CALL" | "DELEGATECALL" | "STATICCALL") {
+        if !matches!(
+            step.op(),
+            opcode::CALL | opcode::DELEGATECALL | opcode::STATICCALL
+        ) {
             continue;
         }
-        let Some(address_word) = call_target_stack_word(step.snapshot_ref().stack) else {
-            continue;
-        };
-        let Some(address) = extract_address_from_stack_word(address_word) else {
+        // The address is the second word from the top.
+        let Some(address) = step.stack().peek(1).and_then(address_of_word) else {
             continue;
         };
         call_count += 1;
         println!("Contract Address: {address}");
-        println!("Gas: {}", step.gas);
+        println!("Gas: {}", step.gas());
         println!("{}", "-".repeat(80));
     }
 
@@ -2053,15 +2056,14 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceView) {
     };
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
-        let snapshot = step.snapshot_ref();
         println!(
             "{} | {} | {} | {} | {} | {}",
             number_color(format!("{index:>4}")),
-            number_color(format!("{:>4}", step.pc)),
-            opcode_color(format!("{:<14}", step.op)),
-            success(format!("{:>8}", step.gas)),
-            format_stack(snapshot.stack),
-            format_snapshot_state(snapshot)
+            number_color(format!("{:>4}", step.pc())),
+            opcode_color(format!("{:<14}", step.mnemonic())),
+            success(format!("{:>8}", step.gas())),
+            format_stack(&step.stack().to_vec()),
+            format_step_state(step)
         );
     }
 }
@@ -2094,15 +2096,14 @@ fn print_raw_simulation(trace: &TransactionTrace, args: &SimulationView, contrac
     };
 
     for (index, step) in trace.steps.iter().take(max_steps).enumerate() {
-        let snapshot = step.snapshot_ref();
         println!(
             "{} | {} | {} | {} | {} | {}",
             number_color(format!("{index:>4}")),
-            number_color(format!("{:>4}", step.pc)),
-            opcode_color(format!("{:<14}", step.op)),
-            success(format!("{:>8}", step.gas)),
-            format_stack(snapshot.stack),
-            format_snapshot_state(snapshot)
+            number_color(format!("{:>4}", step.pc())),
+            opcode_color(format!("{:<14}", step.mnemonic())),
+            success(format!("{:>8}", step.gas())),
+            format_stack(&step.stack().to_vec()),
+            format_step_state(step)
         );
     }
 }
@@ -2182,7 +2183,7 @@ struct CallFrame {
     source_params: Vec<SourceParam>,
     source_path: Option<String>,
     source_line: Option<u64>,
-    raw_stack: Vec<StackWord>,
+    raw_stack: Vec<EvmWord>,
     internal: bool,
 }
 
@@ -2429,7 +2430,7 @@ fn build_call_frames(
 
     if let Some(index) = source_index {
         for step in &trace.steps {
-            let Some(function) = index.function_at_pc(step.pc) else {
+            let Some(function) = index.function_at_pc(step.pc()) else {
                 continue;
             };
             if frames.iter().any(|frame| frame.name == function.name) {
@@ -2444,7 +2445,7 @@ fn build_call_frames(
                     .source_path(function.source_id)
                     .map(str::to_owned),
                 source_line: Some(function.declaration_line),
-                raw_stack: step.snapshot_ref().stack.to_vec(),
+                raw_stack: step.stack().to_vec(),
                 internal: false,
             });
         }
@@ -2824,14 +2825,14 @@ fn format_decoded_call_param(param: &DecodedCallParam) -> String {
     }
 }
 
-fn format_raw_stack(stack: &[StackWord]) -> String {
+fn format_raw_stack(stack: &[EvmWord]) -> String {
     if stack.is_empty() {
         return "[empty]".to_owned();
     }
     stack
         .iter()
         .enumerate()
-        .map(|(index, value)| format!("[{index}] {}", normalize_stack_word(value)))
+        .map(|(index, value)| format!("[{index}] 0x{}", encode_hex(value.as_bytes())))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -3609,17 +3610,6 @@ fn normalize_hex(value: &str) -> String {
     }
 }
 
-fn normalize_stack_word(value: &str) -> String {
-    let hex = value.strip_prefix("0x").unwrap_or(value);
-    if hex.is_empty() {
-        return "0x0000000000000000000000000000000000000000000000000000000000000000".to_owned();
-    }
-    if hex.len() >= 64 {
-        return format!("0x{hex}");
-    }
-    format!("0x{:0>64}", hex)
-}
-
 fn display_json_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
@@ -3634,28 +3624,16 @@ fn print_json<T: serde::Serialize>(value: &T) -> SoldbResult<()> {
     Ok(())
 }
 
-fn call_target_stack_word(stack: &[StackWord]) -> Option<&str> {
-    if stack.len() < 2 {
+/// The address in the low 20 bytes of a stack word, or `None` for the zero address.
+fn address_of_word(word: EvmWord) -> Option<String> {
+    let address = &word.as_bytes()[12..];
+    if address.iter().all(|byte| *byte == 0) {
         return None;
     }
-    stack.get(stack.len() - 2).map(|word| &**word)
+    Some(format!("0x{}", encode_hex(address)))
 }
 
-fn extract_address_from_stack_word(word: &str) -> Option<String> {
-    let hex = word.trim_start_matches("0x");
-    if hex.len() < 40 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-
-    let address = &hex[hex.len() - 40..];
-    if address.bytes().all(|byte| byte == b'0') {
-        return None;
-    }
-
-    Some(format!("0x{}", address.to_ascii_lowercase()))
-}
-
-fn format_stack(stack: &[StackWord]) -> String {
+fn format_stack(stack: &[EvmWord]) -> String {
     if stack.is_empty() {
         return dim("[empty]");
     }
@@ -3668,7 +3646,7 @@ fn format_stack(stack: &[StackWord]) -> String {
             format!(
                 "{} {}",
                 dim(format!("[{index}]")),
-                number_color(shorten_hex(value))
+                number_color(shorten_hex(&value.to_string()))
             )
         })
         .collect::<Vec<_>>();
@@ -3678,18 +3656,18 @@ fn format_stack(stack: &[StackWord]) -> String {
     items.join(" ")
 }
 
-fn format_snapshot_state(snapshot: soldb_core::StepSnapshotRef<'_>) -> String {
+fn format_step_state(step: StepView<'_>) -> String {
     let mut items = Vec::new();
-    if let Some(memory) = snapshot.memory {
+    if let Some(memory) = step.memory() {
         if !memory.is_empty() {
             items.push(format!("mem={}b", memory.len()));
         }
     }
-    if !snapshot.storage.is_empty() {
-        items.push(format!("storage={}", snapshot.storage.len()));
+    if !step.storage().is_empty() {
+        items.push(format!("storage={}", step.storage().len()));
     }
-    if !snapshot.storage_diff.is_empty() {
-        items.push(format!("diff={}", snapshot.storage_diff.len()));
+    if !step.storage_diff().is_empty() {
+        items.push(format!("diff={}", step.storage_diff().len()));
     }
     if items.is_empty() {
         dim("[none]")
@@ -3749,7 +3727,10 @@ mod tests {
             gas: 100,
             gas_cost: 1,
             depth: 0,
-            stack: stack.iter().map(|value| StackWord::from(*value)).collect(),
+            stack: stack
+                .iter()
+                .map(|value| soldb_core::Word::from(*value))
+                .collect(),
             memory: None,
             storage: None,
             error: None,
@@ -3776,7 +3757,7 @@ mod tests {
             backend: Some("debug-rpc".to_owned()),
             capabilities: Default::default(),
             artifacts: Default::default(),
-            steps,
+            steps: steps.into(),
         }
     }
 
@@ -3885,7 +3866,7 @@ mod tests {
             backend: None,
             capabilities: Default::default(),
             artifacts: Default::default(),
-            steps: Vec::new(),
+            steps: Default::default(),
         };
         for pc in [2, 4, 64] {
             trace.steps.push(soldb_core::TraceStep {
@@ -4343,24 +4324,18 @@ contract Counter {
         assert_eq!(shorten_hex("0x1234567890"), "0x1234...");
         assert_eq!(shorten_hex("0x1234"), "0x1234");
         assert_eq!(format_stack(&[]), dim("[empty]"));
-        assert!(
-            format_stack(&["0x01".into(), "0x02".into(), "0x03".into(), "0x04".into()])
-                .contains("... +1 more")
-        );
+        assert!(format_stack(&[1, 2, 3, 4].map(EvmWord::from)).contains("... +1 more"));
+        let word = |hex: &str| EvmWord::parse(hex).expect("word");
         assert_eq!(
-            call_target_stack_word(&["0x1".into(), "0x2".into()]),
-            Some("0x1")
-        );
-        assert_eq!(call_target_stack_word(&["0x1".into()]), None);
-        assert_eq!(
-            extract_address_from_stack_word(
-                "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
-            )
-            .as_deref(),
+            address_of_word(word("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266")).as_deref(),
             Some("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266")
         );
-        assert!(extract_address_from_stack_word("0x0").is_none());
-        assert!(extract_address_from_stack_word(&format!("0x{}", "0".repeat(64))).is_none());
+        // An address with leading zero bytes keeps them.
+        assert_eq!(
+            address_of_word(word("0x1234")).as_deref(),
+            Some("0x0000000000000000000000000000000000001234")
+        );
+        assert!(address_of_word(EvmWord::ZERO).is_none());
     }
 
     #[test]

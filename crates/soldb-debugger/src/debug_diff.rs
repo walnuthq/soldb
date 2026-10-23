@@ -243,16 +243,16 @@ pub fn capture_debug_trace(
     let mut events = Vec::new();
 
     for instruction in 0..map.step_count() {
-        let step = &trace.steps[instruction];
+        let step = trace.steps.step(instruction);
         if let Some(contract) = map.contract_at_step(instruction) {
             let opcode = contract
-                .instruction_at_pc(step.pc)
+                .instruction_at_pc(step.pc())
                 .and_then(|inst| inst.mnemonic());
-            if !opcode.is_some_and(|opcode| opcodes_match(opcode, &step.op)) {
+            if !opcode.is_some_and(|opcode| opcodes_match(opcode, step.mnemonic())) {
                 diagnostics.insert(format!(
                     "trace opcode `{}` at PC {} disagrees with artifact `{}` in `{}`",
-                    step.op,
-                    step.pc,
+                    step.mnemonic(),
+                    step.pc(),
                     opcode.unwrap_or("<missing>"),
                     contract.name
                 ));
@@ -275,10 +275,10 @@ pub fn capture_debug_trace(
         };
         let modifier_depth = map
             .contract_at_step(instruction)
-            .and_then(|contract| contract.modifier_depth_at_pc(step.pc));
+            .and_then(|contract| contract.modifier_depth_at_pc(step.pc()));
         events.push(DebugTraceEvent {
             instruction,
-            pc: step.pc,
+            pc: step.pc(),
             contract: location.contract_name,
             source: normalize_source_path(&location.path),
             source_hash: source_hashes
@@ -777,7 +777,9 @@ mod tests {
         let reference =
             capture_debug_trace(&trace(&[0], "0x"), vec![contract(&[0], &[offset], "C.sol")]);
         let mut wrong = trace(&[0], "0x");
-        wrong.steps[0].op = "INVALID".into();
+        let mut steps = wrong.steps.to_steps();
+        steps[0].op = "INVALID".into();
+        wrong.steps = steps.into();
         let candidate = capture_debug_trace(&wrong, vec![contract(&[0], &[offset], "C.sol")]);
         let report = compare_debug_traces(&reference, &candidate, DebugDiffMode::Steps, 8);
         assert!(!report.equivalent);

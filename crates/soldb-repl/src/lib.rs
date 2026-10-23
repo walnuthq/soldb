@@ -19,7 +19,7 @@
 
 use std::cell::RefCell;
 
-use soldb_core::{SoldbResult, TraceStep, TransactionTrace};
+use soldb_core::{opcode, SoldbResult, StepView, TransactionTrace};
 
 mod command;
 mod render;
@@ -376,7 +376,7 @@ impl DebuggerState {
         self.step_map.as_ref().is_some_and(StepMap::has_source)
     }
 
-    pub fn current_step_data(&self) -> Option<&TraceStep> {
+    pub fn current_step_data(&self) -> Option<StepView<'_>> {
         self.trace
             .as_ref()
             .and_then(|trace| trace.steps.get(self.current_step))
@@ -800,10 +800,10 @@ impl DebuggerState {
     }
 
     /// Whether a breakpoint's target matches this step, before any condition.
-    fn kind_matches(&self, kind: &BreakpointKind, step: usize, trace_step: &TraceStep) -> bool {
+    fn kind_matches(&self, kind: &BreakpointKind, step: usize, trace_step: StepView<'_>) -> bool {
         let map = self.step_map.as_ref();
         match kind {
-            BreakpointKind::Pc(pc) => trace_step.pc == *pc,
+            BreakpointKind::Pc(pc) => trace_step.pc() == *pc,
             BreakpointKind::Line(lines) => map.is_some_and(|map| {
                 map.is_line_start(step)
                     && map
@@ -817,23 +817,26 @@ impl DebuggerState {
                         .is_some_and(|id| functions.iter().any(|function| function.id == id))
             }),
             BreakpointKind::Storage(slot) | BreakpointKind::StateWrite { slot, .. } => {
-                &*trace_step.op == "SSTORE"
+                trace_step.op() == opcode::SSTORE
                     && trace_step
-                        .snapshot_ref()
-                        .stack
-                        .last()
-                        .and_then(|word| normalize_slot(word))
+                        .stack()
+                        .top()
+                        .and_then(|word| normalize_slot(&word.to_string()))
                         .is_some_and(|written| written == *slot)
             }
-            BreakpointKind::Revert => &*trace_step.op == "REVERT" || trace_step.error.is_some(),
+            BreakpointKind::Revert => {
+                trace_step.op() == opcode::REVERT || trace_step.error().is_some()
+            }
             BreakpointKind::Call(address) => {
                 let target = call_target(trace_step);
                 match address {
                     Some(address) => target.as_deref() == Some(address.as_str()),
-                    None => target.is_some() || is_call_opcode(&trace_step.op),
+                    None => target.is_some() || opcode::is_call(trace_step.op()),
                 }
             }
-            BreakpointKind::Opcode(mnemonic) => trace_step.op.eq_ignore_ascii_case(mnemonic),
+            BreakpointKind::Opcode(mnemonic) => {
+                trace_step.mnemonic().eq_ignore_ascii_case(mnemonic)
+            }
         }
     }
 
@@ -912,12 +915,12 @@ impl DebuggerState {
             let Some(entry) = trace.steps.get(frame.entry_step) else {
                 continue;
             };
-            let snapshot = entry.snapshot_ref();
+            let stack = entry.stack().to_vec();
             frame.arguments = map.frame_arguments(
                 frame,
                 FrameState {
-                    stack: snapshot.stack,
-                    memory: snapshot.memory,
+                    stack: &stack,
+                    memory: entry.memory(),
                 },
             );
         }
@@ -1000,8 +1003,8 @@ impl DebuggerState {
         let step = trace.steps.get(self.current_step)?;
         let calldata = map.calldata_at(trace, self.current_step);
         // A root's input is always known, even when it is empty.
-        let root_depth = trace.steps.first().map_or(0, |first| first.depth);
-        if step.depth == root_depth || !calldata.is_empty() {
+        let root_depth = trace.steps.first().map_or(0, |first| first.depth());
+        if step.depth() == root_depth || !calldata.is_empty() {
             return Some(calldata.to_owned());
         }
         None
@@ -1048,7 +1051,7 @@ impl DebuggerState {
         self.trace
             .as_ref()
             .and_then(|trace| trace.steps.get(step))
-            .map_or(0, |step| step.pc)
+            .map_or(0, |step| step.pc())
     }
 
     fn outcome_for_current_step(&self) -> StepOutcome {
@@ -1058,20 +1061,16 @@ impl DebuggerState {
         if let Some(breakpoint) = self.breakpoint_hit(self.current_step) {
             return StepOutcome::BreakpointHit {
                 step: self.current_step,
-                pc: step.pc,
+                pc: step.pc(),
                 breakpoint,
             };
         }
         StepOutcome::Moved {
             step: self.current_step,
-            pc: step.pc,
-            op: step.op.to_string(),
+            pc: step.pc(),
+            op: step.mnemonic().to_owned(),
         }
     }
-}
-
-fn is_call_opcode(op: &str) -> bool {
-    matches!(op, "CALL" | "CALLCODE" | "DELEGATECALL" | "STATICCALL")
 }
 
 /// A storage slot as lowercase hex without `0x` or leading zeros, from decimal or hex
@@ -1291,7 +1290,7 @@ mod tests {
             .load_trace(sample_trace())
             .expect("top-level calls must start at different steps");
         assert_eq!(state.step_count(), 4);
-        assert_eq!(&*state.current_step_data().expect("step").op, "PUSH1");
+        assert_eq!(state.current_step_data().expect("step").mnemonic(), "PUSH1");
         assert!(!state.has_source());
 
         assert_eq!(
@@ -1488,8 +1487,8 @@ mod tests {
             state.apply_command(DebuggerCommand::ReverseNextInstruction),
             Some(StepOutcome::Moved {
                 step: 1,
-                pc: sample_trace().steps[1].pc,
-                op: sample_trace().steps[1].op.to_string(),
+                pc: sample_trace().steps.step(1).pc(),
+                op: sample_trace().steps.step(1).mnemonic().to_owned(),
             })
         );
     }
@@ -1502,7 +1501,7 @@ mod tests {
             .expect("top-level calls must start at different steps");
         let last = state.step_count() - 1;
         state.goto_step(last);
-        let breakpoint_pc = sample_trace().steps[1].pc;
+        let breakpoint_pc = sample_trace().steps.step(1).pc();
         state.set_breakpoint(breakpoint_pc);
 
         assert!(matches!(
@@ -1812,9 +1811,13 @@ contract C {
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
         let pcs = [0, 1, 10, 11, 12, 20, 21, 21, 13, 14, 30];
         let mut trace = sample_trace();
-        trace.steps = pcs.iter().map(|pc| step(*pc, "JUMPDEST", 0, &[])).collect();
-        trace.steps[6].op = "SSTORE".into();
-        trace.steps[6].stack = vec!["0x2a".into(), "0x5".into()];
+        let mut steps = pcs
+            .iter()
+            .map(|pc| step(*pc, "JUMPDEST", 0, &[]))
+            .collect::<Vec<_>>();
+        steps[6].op = "SSTORE".into();
+        steps[6].stack = vec!["0x2a".into(), "0x5".into()];
+        trace.steps = steps.into();
         let mut state = DebuggerState::new();
         state
             .load_trace(trace)
@@ -1865,9 +1868,11 @@ contract C {
         let mut state = source_state();
         let mut trace = state.trace().expect("trace").clone();
         trace.capabilities.transient_storage = true;
-        trace.steps[3].op = "TSTORE".into();
-        trace.steps[3].snapshot.transient_storage =
+        let mut steps = trace.steps.to_steps();
+        steps[3].op = "TSTORE".into();
+        steps[3].snapshot.transient_storage =
             BTreeMap::from([("0x0".to_owned(), "0x7".to_owned())]);
+        trace.steps = steps.into();
         let contracts = state.step_map().expect("map").contracts().to_vec();
         state
             .load_trace(trace)
@@ -1946,9 +1951,11 @@ contract C {
         );
 
         let mut trace = sample_trace();
-        trace.steps[2].snapshot = trace.steps[2]
+        let mut steps = trace.steps.to_steps();
+        steps[2].snapshot = steps[2]
             .normalized_snapshot()
             .with_return_data(Some("2a".to_owned()));
+        trace.steps = steps.into();
         let mut state = DebuggerState::new();
         state
             .load_trace(trace.clone())
@@ -1984,11 +1991,13 @@ contract C {
     #[test]
     fn memory_is_shown_in_words_of_hex() {
         let mut trace = sample_trace();
-        let mut snapshot = trace.steps[2].normalized_snapshot();
+        let mut steps = trace.steps.to_steps();
+        let mut snapshot = steps[2].normalized_snapshot();
         snapshot.memory = Some(soldb_core::Bytes::from(
             [vec![0_u8; 31], vec![0x2a], vec![0xff; 8]].concat(),
         ));
-        trace.steps[2].snapshot = snapshot;
+        steps[2].snapshot = snapshot;
+        trace.steps = steps.into();
         trace.capabilities.memory = true;
         let mut state = DebuggerState::new();
         state
@@ -2208,7 +2217,8 @@ contract C {
             step(1, "JUMPDEST", 0, &["0x9", "0x5"]),
             step(2, "PUSH0", 0, &["0x9", "0x5"]),
             step(3, "POP", 0, &["0x9", "0x5", "0x5"]),
-        ];
+        ]
+        .into();
 
         let mut state = DebuggerState::new();
         state
@@ -2349,7 +2359,8 @@ contract C {
             step(1, "JUMPDEST", 0, &["0x9", "0x5", "0x1"]),
             step(2, "PUSH0", 0, &["0x9", "0x5", "0x1"]),
             step(3, "POP", 0, &["0x9", "0x5", "0x1", "0x5"]),
-        ];
+        ]
+        .into();
         let mut state = DebuggerState::new();
         state
             .load_trace(trace)
@@ -2426,7 +2437,8 @@ contract C {
                     last.error = Some("execution reverted".to_owned());
                     last
                 },
-            ],
+            ]
+            .into(),
         }
     }
 

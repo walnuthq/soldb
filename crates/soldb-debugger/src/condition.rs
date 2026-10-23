@@ -325,17 +325,17 @@ impl<'a> ConditionContext<'a> {
     pub fn new(
         map: &'a StepMap,
         step: usize,
-        trace_step: &'a soldb_core::TraceStep,
+        trace_step: soldb_core::StepView<'a>,
         words: Option<StorageWords<'a>>,
     ) -> Self {
         Self {
             map,
             step,
             words,
-            op: &trace_step.op,
-            pc: trace_step.pc,
-            gas: trace_step.gas,
-            depth: trace_step.depth,
+            op: trace_step.mnemonic(),
+            pc: trace_step.pc(),
+            gas: trace_step.gas(),
+            depth: trace_step.depth(),
             trace: None,
             frame: None,
         }
