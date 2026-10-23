@@ -18,7 +18,7 @@ use soldb_core::{SoldbError, SoldbResult};
 
 use crate::opcodes;
 use crate::storage_layout::StorageLayout;
-use crate::{EthdebugInfo, Instruction};
+use crate::{source_range, EthdebugInfo, Instruction};
 
 /// The bytecode environment described by a legacy source map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,19 +283,19 @@ fn source_map_program_from_combined(
         let Some(entry) = source_map.get(instruction_index) else {
             break;
         };
-        instructions.push(Instruction {
-            offset: u64::try_from(pc).map_err(|_| {
+        instructions.push(Instruction::new(
+            u64::try_from(pc).map_err(|_| {
                 SoldbError::Message("program counter does not fit in `u64`".to_owned())
             })?,
-            operation: opcode_operation(bytecode[pc]),
-            context: source_context(
+            &opcode_mnemonic(bytecode[pc]),
+            source_context(
                 entry,
                 sources.len(),
                 &source_contents,
                 instruction_index,
                 contract_key,
             )?,
-        });
+        ));
     }
 
     let compiler_version = combined
@@ -438,10 +438,8 @@ fn decode_hex_digit(digit: u8) -> Option<u8> {
     }
 }
 
-fn opcode_operation(opcode: u8) -> Value {
-    let mnemonic =
-        opcodes::mnemonic(opcode).map_or_else(|| format!("UNKNOWN(0x{opcode:02x})"), str::to_owned);
-    json!({"mnemonic": mnemonic})
+fn opcode_mnemonic(opcode: u8) -> String {
+    opcodes::mnemonic(opcode).map_or_else(|| format!("UNKNOWN(0x{opcode:02x})"), str::to_owned)
 }
 
 /// The ETHDebug-shaped context of one legacy entry: its source range, and the jump
@@ -538,13 +536,7 @@ fn source_code(
         }
     }
 
-    Ok(Some(json!({
-        "source": {"id": source_id},
-        "range": {
-            "offset": offset,
-            "length": length,
-        },
-    })))
+    Ok(Some(source_range(source_id, offset, length)))
 }
 
 fn read_source(
@@ -630,7 +622,7 @@ mod tests {
     use crate::Instruction;
 
     use super::{
-        build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, opcode_operation,
+        build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program, opcode_mnemonic,
         parse_srcmap, SourceMapEnvironment, SourceMapInfo,
     };
 
@@ -648,10 +640,10 @@ mod tests {
     fn names_instructions_and_marks_invalid_bytes() {
         // The names are what a trace records for the same steps, so a `JUMPDEST` in an
         // artifact is a `JUMPDEST` in a trace; a byte that is no instruction says so.
-        assert_eq!(opcode_operation(0x5b)["mnemonic"], "JUMPDEST");
-        assert_eq!(opcode_operation(0x60)["mnemonic"], "PUSH1");
-        assert_eq!(opcode_operation(0xf1)["mnemonic"], "CALL");
-        assert_eq!(opcode_operation(0x0c)["mnemonic"], "UNKNOWN(0x0c)");
+        assert_eq!(opcode_mnemonic(0x5b), "JUMPDEST");
+        assert_eq!(opcode_mnemonic(0x60), "PUSH1");
+        assert_eq!(opcode_mnemonic(0xf1), "CALL");
+        assert_eq!(opcode_mnemonic(0x0c), "UNKNOWN(0x0c)");
     }
 
     #[test]

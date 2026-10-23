@@ -1389,7 +1389,7 @@ mod tests {
         ContractCreation, ExecutionCall, StepSnapshot, TraceArtifacts, TraceCapabilities,
         TraceStep, TransactionTrace,
     };
-    use soldb_ethdebug::{EthdebugInfo, Instruction};
+    use soldb_ethdebug::{source_range, EthdebugInfo, Instruction};
 
     use super::{profile_transaction, ProfileProgram, ProfileReport};
 
@@ -1453,7 +1453,7 @@ mod tests {
         let source =
             "contract Counter {\n    function add() external {\n        uint x = 1;\n    }\n}\n";
         let offset = source.find("uint x").expect("statement offset") as u64;
-        let code = json!({"source": {"id": 0}, "range": {"offset": offset, "length": 1}});
+        let code = source_range(0, offset, 1);
         // A legacy map's jump into a function carries no name, and its helpers no source.
         let program = program_from_contexts(
             "Counter",
@@ -1487,7 +1487,7 @@ mod tests {
         let source =
             "contract Counter {\n    function add() external {\n        uint x = 1;\n    }\n}\n";
         let offset = source.find("uint x").expect("statement offset") as u64;
-        let code = json!({"source": {"id": 0}, "range": {"offset": offset, "length": 1}});
+        let code = source_range(0, offset, 1);
         // After `add` returns, the dispatcher jumps into an unnamed encoder helper.
         let program = program_from_contexts(
             "Counter",
@@ -1524,8 +1524,8 @@ mod tests {
         let source = "contract Counter {\n    function add() external { uint x = 1; }\n    function sub() external { uint y = 2; }\n}\n";
         let add = source.find("uint x").expect("add statement") as u64;
         let sub = source.find("uint y").expect("sub statement") as u64;
-        let add = json!({"source": {"id": 0}, "range": {"offset": add, "length": 1}});
-        let sub = json!({"source": {"id": 0}, "range": {"offset": sub, "length": 1}});
+        let add = source_range(0, add, 1);
+        let sub = source_range(0, sub, 1);
         let program = program_from_contexts(
             "Counter",
             source,
@@ -1582,44 +1582,28 @@ mod tests {
             .expect("calculate statement");
         let declaration_length = source.len() as u64 - calculate_declaration;
         let instructions = vec![
-            Instruction {
-                offset: 0,
-                operation: json!({"mnemonic": "JUMPDEST"}),
-                context: Some(json!({
+            Instruction::new(
+                0,
+                "JUMPDEST",
+                Some(json!({
                     "invoke": {
                         "identifier": "calculate",
-                        "declaration": {
-                            "source": {"id": 0},
-                            "range": {
-                                "offset": calculate_declaration,
-                                "length": declaration_length
-                            }
-                        },
+                        "declaration": source_range(0, calculate_declaration, declaration_length),
                         "jump": true
                     }
                 })),
-            },
-            Instruction {
-                offset: 1,
-                operation: json!({"mnemonic": "SSTORE"}),
-                context: Some(json!({
+            ),
+            Instruction::new(
+                1,
+                "SSTORE",
+                Some(json!({
                     "pick": [
-                        {"code": {
-                            "source": {"id": 0},
-                            "range": {"offset": add_statement, "length": 10}
-                        }},
-                        {"code": {
-                            "source": {"id": 0},
-                            "range": {"offset": calculate_statement, "length": 10}
-                        }}
+                        {"code": source_range(0, add_statement, 10)},
+                        {"code": source_range(0, calculate_statement, 10)}
                     ]
                 })),
-            },
-            Instruction {
-                offset: 2,
-                operation: json!({"mnemonic": "STOP"}),
-                context: Some(json!({"return": {}})),
-            },
+            ),
+            Instruction::new(2, "STOP", Some(json!({"return": {}}))),
         ];
         let program = ProfileProgram::new(
             Some("0x1".to_owned()),
@@ -1878,11 +1862,7 @@ mod tests {
             .to_string()
             .contains("unknown ETHDebug program environment"));
 
-        let instruction = Instruction {
-            offset: 0,
-            operation: json!({"mnemonic": "STOP"}),
-            context: None,
-        };
+        let instruction = Instruction::new(0, "STOP", None);
         let duplicate_instructions = EthdebugInfo {
             compilation: json!({}),
             contract_name: "Counter".to_owned(),
@@ -2094,11 +2074,7 @@ mod tests {
     ) -> ProfileProgram {
         let instructions = instructions
             .iter()
-            .map(|(pc, opcode, context)| Instruction {
-                offset: *pc,
-                operation: json!({"mnemonic": opcode}),
-                context: Some(context.clone()),
-            })
+            .map(|(pc, opcode, context)| Instruction::new(*pc, opcode, Some(context.clone())))
             .collect();
         ProfileProgram::new(
             Some("0xcafe".to_owned()),
@@ -2127,29 +2103,17 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, (pc, opcode, offset))| {
-                let mut context = json!({
-                    "code": {
-                        "source": {"id": 0},
-                        "range": {"offset": offset, "length": 1}
-                    }
-                });
+                let mut context = json!({"code": source_range(0, *offset, 1)});
                 if index == 0 {
                     if let Some(function) = function {
                         context["invoke"] = json!({
                             "identifier": function,
-                            "declaration": {
-                                "source": {"id": 0},
-                                "range": {"offset": 0, "length": source.len()}
-                            },
+                            "declaration": source_range(0, 0, source.len() as u64),
                             "jump": true
                         });
                     }
                 }
-                Instruction {
-                    offset: *pc,
-                    operation: json!({"mnemonic": opcode}),
-                    context: Some(context),
-                }
+                Instruction::new(*pc, opcode, Some(context))
             })
             .collect();
         ProfileProgram::new(

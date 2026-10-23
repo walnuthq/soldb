@@ -44,8 +44,9 @@ pub use events::{
 };
 pub use metadata::{
     parse_compilation_sources, parse_ethdebug_spec, parse_multi_contract_spec,
-    parse_single_contract_spec, parse_variable_locations, read_compilation_source, EthdebugInfo,
-    EthdebugSpec, FunctionExit, FunctionIdentity, Instruction, SourceLocation, VariableLocation,
+    parse_single_contract_spec, parse_variable_locations, read_compilation_source, source_range,
+    EthdebugInfo, EthdebugSpec, FunctionExit, FunctionIdentity, Instruction, SourceLocation,
+    VariableLocation,
 };
 pub use source_map::{
     build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program,

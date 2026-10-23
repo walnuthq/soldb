@@ -2833,7 +2833,9 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{ContractCreation, ExecutionCall, StepSnapshot, TraceStep, TransactionTrace};
-    use soldb_ethdebug::{function_selector, CodeGenerator, EthdebugInfo, Instruction};
+    use soldb_ethdebug::{
+        function_selector, source_range, CodeGenerator, EthdebugInfo, Instruction,
+    };
 
     use soldb_core::Word as StackWord;
 
@@ -2873,26 +2875,11 @@ contract C {
         length: u64,
         extra: serde_json::Value,
     ) -> Instruction {
-        let mut context = json!({"code": code(0, offset, length)});
+        let mut context = json!({"code": source_range(0, offset, length)});
         for (key, value) in extra.as_object().expect("object") {
             context[key] = value.clone();
         }
-        raw_instruction(pc, "JUMPDEST", Some(context))
-    }
-
-    /// An instruction with any mnemonic and context, or none.
-    fn raw_instruction(pc: u64, mnemonic: &str, context: Option<serde_json::Value>) -> Instruction {
-        serde_json::from_value(json!({
-            "offset": pc,
-            "operation": {"mnemonic": mnemonic},
-            "context": context
-        }))
-        .expect("instruction")
-    }
-
-    /// An ETHDebug code pointer to `length` bytes at `offset` in source `source_id`.
-    fn code(source_id: u64, offset: u64, length: u64) -> serde_json::Value {
-        json!({"source": {"id": source_id}, "range": {"offset": offset, "length": length}})
+        Instruction::new(pc, "JUMPDEST", Some(context))
     }
 
     fn contract(address: Option<&str>) -> ContractDebugInfo {
@@ -2994,27 +2981,16 @@ contract P {
     fn pay_contract() -> ContractDebugInfo {
         let whole = PAY_SOURCE.len() as u64;
         let at = |needle: &str| PAY_SOURCE.find(needle).expect(needle) as u64;
-        let span = |pc: u64, offset: u64, length: u64| {
-            serde_json::from_value::<Instruction>(json!({
-                "offset": pc,
-                "operation": {"mnemonic": "JUMPDEST"},
-                "context": {"code": {
-                    "source": {"id": 0},
-                    "range": {"offset": offset, "length": length}
-                }}
-            }))
-            .expect("instruction")
-        };
         let info = EthdebugInfo {
             compilation: serde_json::Value::Null,
             contract_name: "P".to_owned(),
             environment: "runtime".to_owned(),
             instructions: vec![
-                span(0, 0, whole),
-                span(10, at("function pay"), 80),
-                span(11, at("total(to, amount);"), 18),
-                span(20, at("function total"), 70),
-                span(21, at("amount += 1;"), 12),
+                instruction(0, 0, whole),
+                instruction(10, at("function pay"), 80),
+                instruction(11, at("total(to, amount);"), 18),
+                instruction(20, at("function total"), 70),
+                instruction(21, at("amount += 1;"), 12),
             ],
             sources: BTreeMap::from([(0, "P.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
@@ -4549,54 +4525,62 @@ contract P {
         let outer = offset_of("function outer");
         let statement = offset_of("x += 1;");
         let instructions = vec![
-            raw_instruction(0, "PUSH1", Some(json!({"code": code(0, 0, whole)}))),
+            Instruction::new(0, "PUSH1", Some(json!({"code": source_range(0, 0, whole)}))),
             // Jump markers: a call, a return, and a revert, which marks no jump.
-            raw_instruction(
+            Instruction::new(
                 21,
                 "JUMP",
-                Some(json!({"code": code(0, statement, 7), "invoke": {"identifier": "f"}})),
+                Some(json!({"code": source_range(0, statement, 7), "invoke": {"identifier": "f"}})),
             ),
-            raw_instruction(
+            Instruction::new(
                 22,
                 "JUMP",
-                Some(json!({"code": code(0, statement, 7), "return": {}})),
+                Some(json!({"code": source_range(0, statement, 7), "return": {}})),
             ),
-            raw_instruction(
+            Instruction::new(
                 23,
                 "REVERT",
-                Some(json!({"code": code(0, statement, 7), "revert": {}})),
+                Some(json!({"code": source_range(0, statement, 7), "revert": {}})),
             ),
             // No context, and a context without code.
-            raw_instruction(30, "STOP", None),
-            raw_instruction(31, "POP", Some(json!({}))),
+            Instruction::new(30, "STOP", None),
+            Instruction::new(31, "POP", Some(json!({}))),
             // Two alternatives with different spans have no single location; an
             // invocation inside one still marks a call. Two equal spans have one.
-            raw_instruction(
+            Instruction::new(
                 40,
                 "JUMP",
                 Some(json!({"pick": [
-                    {"code": code(0, statement, 7), "invoke": {}},
-                    {"code": code(0, outer, 90)}
+                    {"code": source_range(0, statement, 7), "invoke": {}},
+                    {"code": source_range(0, outer, 90)}
                 ]})),
             ),
-            raw_instruction(
+            Instruction::new(
                 42,
                 "ADD",
                 Some(json!({"pick": [
-                    {"code": code(0, statement, 7)},
-                    {"code": code(0, statement, 7)}
+                    {"code": source_range(0, statement, 7)},
+                    {"code": source_range(0, statement, 7)}
                 ]})),
             ),
             // A span in a source whose text is not loaded has no line.
-            raw_instruction(50, "ADD", Some(json!({"code": code(7, statement, 7)}))),
+            Instruction::new(
+                50,
+                "ADD",
+                Some(json!({"code": source_range(7, statement, 7)})),
+            ),
             // Two instructions at one offset: the later one describes it.
-            raw_instruction(60, "ADD", Some(json!({"code": code(0, 0, whole)}))),
-            raw_instruction(60, "JUMPDEST", Some(json!({"code": code(0, statement, 7)}))),
+            Instruction::new(60, "ADD", Some(json!({"code": source_range(0, 0, whole)}))),
+            Instruction::new(
+                60,
+                "JUMPDEST",
+                Some(json!({"code": source_range(0, statement, 7)})),
+            ),
             // An offset past any real code is still indexed.
-            raw_instruction(
+            Instruction::new(
                 1 << 40,
                 "JUMPDEST",
-                Some(json!({"code": code(0, statement, 7), "return": {}})),
+                Some(json!({"code": source_range(0, statement, 7), "return": {}})),
             ),
         ];
         let info = EthdebugInfo {
@@ -4659,20 +4643,40 @@ contract D {
         );
         let instructions = vec![
             // A declaration span on something other than a `JUMPDEST` enters nothing.
-            raw_instruction(3, "JUMP", Some(json!({"code": code(0, a, 10)}))),
+            Instruction::new(3, "JUMP", Some(json!({"code": source_range(0, a, 10)}))),
             // Two `JUMPDEST`s carry a's span; the lower pc is its entry, not the first listed.
-            raw_instruction(30, "JUMPDEST", Some(json!({"code": code(0, a, 10)}))),
-            raw_instruction(10, "JUMPDEST", Some(json!({"code": code(0, a, 10)}))),
-            raw_instruction(40, "JUMPDEST", Some(json!({"code": code(0, b, 10)}))),
+            Instruction::new(
+                30,
+                "JUMPDEST",
+                Some(json!({"code": source_range(0, a, 10)})),
+            ),
+            Instruction::new(
+                10,
+                "JUMPDEST",
+                Some(json!({"code": source_range(0, a, 10)})),
+            ),
+            Instruction::new(
+                40,
+                "JUMPDEST",
+                Some(json!({"code": source_range(0, b, 10)})),
+            ),
             // c has a `JUMPDEST` in its body and a `JUMP` at its declaration, and d has
             // no instruction at all: neither has an entry point.
-            raw_instruction(50, "JUMP", Some(json!({"code": code(0, c, 10)}))),
-            raw_instruction(51, "JUMPDEST", Some(json!({"code": code(0, c + 22, 10)}))),
+            Instruction::new(50, "JUMP", Some(json!({"code": source_range(0, c, 10)}))),
+            Instruction::new(
+                51,
+                "JUMPDEST",
+                Some(json!({"code": source_range(0, c + 22, 10)})),
+            ),
             // The same offset in the other source enters the other source's function.
-            raw_instruction(5, "JUMPDEST", Some(json!({"code": code(1, a, 10)}))),
+            Instruction::new(5, "JUMPDEST", Some(json!({"code": source_range(1, a, 10)}))),
             // At a repeated offset, a `JUMPDEST` the later instruction hides still counts.
-            raw_instruction(20, "JUMPDEST", Some(json!({"code": code(1, b, 10)}))),
-            raw_instruction(20, "ADD", Some(json!({"code": code(1, b, 10)}))),
+            Instruction::new(
+                20,
+                "JUMPDEST",
+                Some(json!({"code": source_range(1, b, 10)})),
+            ),
+            Instruction::new(20, "ADD", Some(json!({"code": source_range(1, b, 10)}))),
         ];
         let info = EthdebugInfo {
             compilation: serde_json::Value::Null,

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,6 +45,17 @@ pub struct Instruction {
 }
 
 impl Instruction {
+    /// An instruction at program counter `offset` that runs `mnemonic`, with its ETHDebug
+    /// context, if any.
+    #[must_use]
+    pub fn new(offset: u64, mnemonic: &str, context: Option<Value>) -> Self {
+        Self {
+            offset,
+            operation: json!({"mnemonic": mnemonic}),
+            context,
+        }
+    }
+
     #[must_use]
     pub fn mnemonic(&self) -> Option<&str> {
         self.operation
@@ -147,6 +158,13 @@ fn collect_function_invocations(context: &Value, functions: &mut Vec<FunctionIde
             collect_function_invocations(alternative, functions);
         }
     }
+}
+
+/// The ETHDebug source range of `length` bytes at `offset` in source `source_id`, as an
+/// instruction context carries it under `code`.
+#[must_use]
+pub fn source_range(source_id: u64, offset: u64, length: u64) -> Value {
+    json!({"source": {"id": source_id}, "range": {"offset": offset, "length": length}})
 }
 
 fn parse_source_location(value: &Value) -> Option<SourceLocation> {
