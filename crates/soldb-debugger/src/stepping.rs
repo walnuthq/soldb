@@ -30,6 +30,7 @@
 //! Everything here is a search over the recording. Nothing re-executes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 
 use soldb_core::{TransactionTrace, Word as StackWord};
 use soldb_ethdebug::{
@@ -86,10 +87,84 @@ pub struct ContractDebugInfo {
     /// Byte offsets at which each line of each source starts.
     line_starts: BTreeMap<u64, Vec<usize>>,
     /// Instruction index by program counter.
-    pc_index: HashMap<u64, usize>,
-    /// The program counter each parsed function is entered at: its first `JUMPDEST`
-    /// carrying the declaration's span.
-    function_entries: HashMap<u64, usize>,
+    pc_index: PcIndex,
+    /// What each instruction says, parallel to `info.instructions` as it was given. Like
+    /// the line and PC indexes, these are derived once in [`ContractDebugInfo::new`], so
+    /// mapping a step reads them rather than walking the instruction's JSON again.
+    facts: Vec<InstructionFacts>,
+}
+
+/// What one instruction's debug info says, as stepping reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstructionFacts {
+    /// The source span the compiler attached, when it attached exactly one.
+    location: Option<SourceLocation>,
+    /// The line `location` starts on, when the source text is loaded.
+    line: Option<u64>,
+    /// The narrowest parsed function whose declaration contains `location`.
+    function: Option<usize>,
+    /// The function whose entry point this instruction's program counter is: the first
+    /// `JUMPDEST` carrying the declaration's span.
+    entry: Option<usize>,
+    /// What the artifact says about the jump the instruction makes.
+    marker: JumpMarker,
+    jumpdest: bool,
+}
+
+/// Instruction index by program counter: a table over the program's code, which every
+/// step of a trace looks up, and a map for offsets beyond any real code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PcIndex {
+    /// Indexed by program counter: the instruction's index plus one, or `None` where no
+    /// instruction starts.
+    dense: Vec<Option<NonZeroU32>>,
+    /// Offsets past `dense`.
+    sparse: HashMap<u64, usize>,
+}
+
+impl PcIndex {
+    /// Indexes the instructions by offset. A later instruction at an offset replaces an
+    /// earlier one, as collecting them into a map does.
+    fn new(instructions: &[Instruction]) -> Self {
+        // No instruction is longer than 33 bytes (`PUSH32` and its operand), so real code
+        // has every offset below this bound. Offsets past it come from an artifact that
+        // does not describe real code, and go to the map so they cannot size the table.
+        let bound = instructions.len().saturating_mul(33);
+        let dense_len = instructions
+            .iter()
+            .filter_map(|instruction| usize::try_from(instruction.offset).ok())
+            .filter(|offset| *offset < bound)
+            .max()
+            .map_or(0, |offset| offset + 1);
+        let mut dense = vec![None; dense_len];
+        let mut sparse = HashMap::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            let slot = usize::try_from(instruction.offset)
+                .ok()
+                .and_then(|offset| dense.get_mut(offset));
+            let entry = u32::try_from(index + 1).ok().and_then(NonZeroU32::new);
+            match (slot, entry) {
+                (Some(slot), Some(entry)) => *slot = Some(entry),
+                (slot, _) => {
+                    if let Some(slot) = slot {
+                        *slot = None;
+                    }
+                    sparse.insert(instruction.offset, index);
+                }
+            }
+        }
+        Self { dense, sparse }
+    }
+
+    fn get(&self, pc: u64) -> Option<usize> {
+        let dense = usize::try_from(pc)
+            .ok()
+            .and_then(|pc| self.dense.get(pc).copied().flatten());
+        match dense {
+            Some(entry) => Some(entry.get() as usize - 1),
+            None => self.sparse.get(&pc).copied(),
+        }
+    }
 }
 
 /// Which of a contract's two programs a frame executes: the creation code, run once by a
@@ -133,31 +208,43 @@ impl ContractDebugInfo {
             .iter()
             .map(|(source_id, source)| (*source_id, line_starts(source)))
             .collect();
-        let pc_index = info
+        let pc_index = PcIndex::new(&info.instructions);
+        let locations = info
             .instructions
             .iter()
-            .enumerate()
-            .map(|(index, instruction)| (instruction.offset, index))
-            .collect();
+            .map(Instruction::source_location)
+            .collect::<Vec<_>>();
+        let jumpdests = info
+            .instructions
+            .iter()
+            .map(|instruction| instruction.mnemonic() == Some("JUMPDEST"))
+            .collect::<Vec<_>>();
+        // The earliest `JUMPDEST` at each span start, in one pass, so that finding a
+        // function's entry point is one lookup and not a scan of every instruction.
+        let mut earliest_jumpdests = HashMap::<(u64, u64), u64>::new();
+        for (index, instruction) in info.instructions.iter().enumerate() {
+            if !jumpdests[index] {
+                continue;
+            }
+            let Some(location) = &locations[index] else {
+                continue;
+            };
+            let earliest = earliest_jumpdests
+                .entry((location.source_id, location.offset))
+                .or_insert(instruction.offset);
+            *earliest = (*earliest).min(instruction.offset);
+        }
+        // A later function with the same entry point replaces an earlier one.
         let function_entries = functions
             .iter()
             .enumerate()
             .filter_map(|(function_index, function)| {
-                info.instructions
-                    .iter()
-                    .filter(|instruction| instruction.mnemonic() == Some("JUMPDEST"))
-                    .filter(|instruction| {
-                        instruction.source_location().is_some_and(|location| {
-                            location.source_id == function.source_id
-                                && location.offset == function.declaration_start
-                        })
-                    })
-                    .map(|instruction| instruction.offset)
-                    .min()
-                    .map(|pc| (pc, function_index))
+                earliest_jumpdests
+                    .get(&(function.source_id, function.declaration_start))
+                    .map(|pc| (*pc, function_index))
             })
-            .collect();
-        Self {
+            .collect::<HashMap<_, _>>();
+        let mut contract = Self {
             address: address.map(normalize_address),
             name: name.to_owned(),
             info,
@@ -169,8 +256,43 @@ impl ContractDebugInfo {
             code_generator: None,
             line_starts,
             pc_index,
-            function_entries,
-        }
+            facts: Vec::new(),
+        };
+        contract.facts = contract.instruction_facts(locations, &jumpdests, &function_entries);
+        contract
+    }
+
+    /// Derives what each instruction says, from its parsed span, whether it is a
+    /// `JUMPDEST`, and the prepared line index and functions.
+    fn instruction_facts(
+        &self,
+        locations: Vec<Option<SourceLocation>>,
+        jumpdests: &[bool],
+        function_entries: &HashMap<u64, usize>,
+    ) -> Vec<InstructionFacts> {
+        self.info
+            .instructions
+            .iter()
+            .zip(locations)
+            .zip(jumpdests)
+            .map(|((instruction, location), jumpdest)| InstructionFacts {
+                line: location
+                    .as_ref()
+                    .and_then(|location| self.line_of(location.source_id, location.offset)),
+                function: location
+                    .as_ref()
+                    .and_then(|location| self.function_for_location(location)),
+                entry: function_entries.get(&instruction.offset).copied(),
+                marker: jump_marker(instruction),
+                jumpdest: *jumpdest,
+                location,
+            })
+            .collect()
+    }
+
+    /// What the instruction at `pc` says, using the prepared index.
+    fn facts_at_pc(&self, pc: u64) -> Option<&InstructionFacts> {
+        self.facts.get(self.pc_index.get(pc)?)
     }
 
     /// Records which code generator produced the program.
@@ -215,35 +337,20 @@ impl ContractDebugInfo {
     /// The function whose entry point `pc` is, when it is one.
     #[must_use]
     pub fn function_entry_at_pc(&self, pc: u64) -> Option<usize> {
-        self.function_entries.get(&pc).copied()
+        self.facts_at_pc(pc).and_then(|facts| facts.entry)
     }
 
     /// Whether the instruction at `pc` is a `JUMPDEST`.
     #[must_use]
     pub fn is_jumpdest(&self, pc: u64) -> bool {
-        self.pc_index
-            .get(&pc)
-            .and_then(|index| self.info.instructions.get(*index))
-            .is_some_and(|instruction| instruction.mnemonic() == Some("JUMPDEST"))
+        self.facts_at_pc(pc).is_some_and(|facts| facts.jumpdest)
     }
 
     /// What the artifact says about the jump the instruction at `pc` makes.
     #[must_use]
     pub fn jump_marker_at_pc(&self, pc: u64) -> JumpMarker {
-        let Some(instruction) = self
-            .pc_index
-            .get(&pc)
-            .and_then(|index| self.info.instructions.get(*index))
-        else {
-            return JumpMarker::None;
-        };
-        if !instruction.function_invocations().is_empty() {
-            JumpMarker::Call
-        } else if instruction.function_exit() == Some(FunctionExit::Return) {
-            JumpMarker::Return
-        } else {
-            JumpMarker::None
-        }
+        self.facts_at_pc(pc)
+            .map_or(JumpMarker::None, |facts| facts.marker)
     }
 
     #[must_use]
@@ -285,21 +392,19 @@ impl ContractDebugInfo {
     /// The source span the compiler attached to the instruction at `pc`.
     #[must_use]
     pub fn location_at_pc(&self, pc: u64) -> Option<SourceLocation> {
-        let index = *self.pc_index.get(&pc)?;
-        self.info.instructions.get(index)?.source_location()
+        self.facts_at_pc(pc)?.location.clone()
     }
 
     /// The compiler's instruction at `pc`, using the prepared index.
     #[must_use]
     pub fn instruction_at_pc(&self, pc: u64) -> Option<&Instruction> {
-        self.info.instructions.get(*self.pc_index.get(&pc)?)
+        self.info.instructions.get(self.pc_index.get(pc)?)
     }
 
     /// Legacy source-map modifier depth at `pc`, when the artifact carries it.
     #[must_use]
     pub fn modifier_depth_at_pc(&self, pc: u64) -> Option<i64> {
-        let index = *self.pc_index.get(&pc)?;
-        self.info.instructions.get(index)?.modifier_depth()
+        self.instruction_at_pc(pc)?.modifier_depth()
     }
 
     /// The narrowest parsed function whose declaration contains the span.
@@ -321,9 +426,7 @@ impl ContractDebugInfo {
 
     #[must_use]
     pub fn function_at_pc(&self, pc: u64) -> Option<&SourceFunction> {
-        let location = self.location_at_pc(pc)?;
-        self.function_for_location(&location)
-            .and_then(|index| self.functions.get(index))
+        self.functions.get(self.facts_at_pc(pc)?.function?)
     }
 
     /// The line a breakpoint on `line` of `source_id` resolves to: the line itself when
@@ -405,6 +508,17 @@ fn line_starts(source: &str) -> Vec<usize> {
             .map(|(index, _)| index + 1),
     );
     starts
+}
+
+/// What an instruction's context says about the jump it makes.
+fn jump_marker(instruction: &Instruction) -> JumpMarker {
+    if !instruction.function_invocations().is_empty() {
+        JumpMarker::Call
+    } else if instruction.function_exit() == Some(FunctionExit::Return) {
+        JumpMarker::Return
+    } else {
+        JumpMarker::None
+    }
 }
 
 /// Identifies a source line across every contract in a [`StepMap`].
@@ -1311,22 +1425,22 @@ impl StepMap {
                 reverted.push((entry_step, index));
             }
             let frame = evm_frames.last().expect("the root frame is never popped");
-            let location = frame.contract.and_then(|contract_index| {
-                let contract = &contracts[contract_index];
-                let location = contract.location_at_pc(step.pc)?;
-                let line = contract.line_of(location.source_id, location.offset)?;
+            let facts = frame
+                .contract
+                .and_then(|index| contracts[index].facts_at_pc(step.pc));
+            let location = frame.contract.zip(facts).and_then(|(contract, facts)| {
+                let location = facts.location.as_ref()?;
                 Some(LocationRef {
                     key: LineKey {
-                        contract: contract_index,
+                        contract,
                         source_id: location.source_id,
-                        line,
+                        line: facts.line?,
                     },
                     offset: location.offset,
                     length: location.length,
-                    function: contract.function_for_location(&location),
+                    function: facts.function,
                 })
             });
-            let contract = frame.contract.map(|index| &contracts[index]);
             framed.push(FramedStep {
                 evm_depth: evm_depth as u32,
                 frame_id: frame.id,
@@ -1335,10 +1449,8 @@ impl StepMap {
                 address: frame.address,
                 storage: frame.storage,
                 location,
-                entry: contract.and_then(|contract| contract.function_entry_at_pc(step.pc)),
-                marker: contract.map_or(JumpMarker::None, |contract| {
-                    contract.jump_marker_at_pc(step.pc)
-                }),
+                entry: facts.and_then(|facts| facts.entry),
+                marker: facts.map_or(JumpMarker::None, |facts| facts.marker),
             });
         }
 
@@ -2761,17 +2873,26 @@ contract C {
         length: u64,
         extra: serde_json::Value,
     ) -> Instruction {
-        let mut context =
-            json!({"code": {"source": {"id": 0}, "range": {"offset": offset, "length": length}}});
+        let mut context = json!({"code": code(0, offset, length)});
         for (key, value) in extra.as_object().expect("object") {
             context[key] = value.clone();
         }
+        raw_instruction(pc, "JUMPDEST", Some(context))
+    }
+
+    /// An instruction with any mnemonic and context, or none.
+    fn raw_instruction(pc: u64, mnemonic: &str, context: Option<serde_json::Value>) -> Instruction {
         serde_json::from_value(json!({
             "offset": pc,
-            "operation": {"mnemonic": "JUMPDEST"},
+            "operation": {"mnemonic": mnemonic},
             "context": context
         }))
         .expect("instruction")
+    }
+
+    /// An ETHDebug code pointer to `length` bytes at `offset` in source `source_id`.
+    fn code(source_id: u64, offset: u64, length: u64) -> serde_json::Value {
+        json!({"source": {"id": source_id}, "range": {"offset": offset, "length": length}})
     }
 
     fn contract(address: Option<&str>) -> ContractDebugInfo {
@@ -4419,6 +4540,191 @@ contract P {
         );
         assert_eq!(address_from_word("0x0"), None);
         assert_eq!(address_from_word("zz"), None);
+    }
+
+    /// An instruction with any mnemonic and any context, or none.
+    #[test]
+    fn prepared_instruction_facts_match_the_instructions() {
+        let whole = SOURCE.len() as u64;
+        let outer = offset_of("function outer");
+        let statement = offset_of("x += 1;");
+        let instructions = vec![
+            raw_instruction(0, "PUSH1", Some(json!({"code": code(0, 0, whole)}))),
+            // Jump markers: a call, a return, and a revert, which marks no jump.
+            raw_instruction(
+                21,
+                "JUMP",
+                Some(json!({"code": code(0, statement, 7), "invoke": {"identifier": "f"}})),
+            ),
+            raw_instruction(
+                22,
+                "JUMP",
+                Some(json!({"code": code(0, statement, 7), "return": {}})),
+            ),
+            raw_instruction(
+                23,
+                "REVERT",
+                Some(json!({"code": code(0, statement, 7), "revert": {}})),
+            ),
+            // No context, and a context without code.
+            raw_instruction(30, "STOP", None),
+            raw_instruction(31, "POP", Some(json!({}))),
+            // Two alternatives with different spans have no single location; an
+            // invocation inside one still marks a call. Two equal spans have one.
+            raw_instruction(
+                40,
+                "JUMP",
+                Some(json!({"pick": [
+                    {"code": code(0, statement, 7), "invoke": {}},
+                    {"code": code(0, outer, 90)}
+                ]})),
+            ),
+            raw_instruction(
+                42,
+                "ADD",
+                Some(json!({"pick": [
+                    {"code": code(0, statement, 7)},
+                    {"code": code(0, statement, 7)}
+                ]})),
+            ),
+            // A span in a source whose text is not loaded has no line.
+            raw_instruction(50, "ADD", Some(json!({"code": code(7, statement, 7)}))),
+            // Two instructions at one offset: the later one describes it.
+            raw_instruction(60, "ADD", Some(json!({"code": code(0, 0, whole)}))),
+            raw_instruction(60, "JUMPDEST", Some(json!({"code": code(0, statement, 7)}))),
+            // An offset past any real code is still indexed.
+            raw_instruction(
+                1 << 40,
+                "JUMPDEST",
+                Some(json!({"code": code(0, statement, 7), "return": {}})),
+            ),
+        ];
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "call".to_owned(),
+            instructions,
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let contract =
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
+        let line = |pc| contract.facts_at_pc(pc).and_then(|facts| facts.line);
+        let function = |pc| {
+            contract
+                .function_at_pc(pc)
+                .map(|function| function.name.as_str())
+        };
+
+        assert_eq!(contract.jump_marker_at_pc(21), JumpMarker::Call);
+        assert_eq!(contract.jump_marker_at_pc(22), JumpMarker::Return);
+        assert_eq!(contract.jump_marker_at_pc(23), JumpMarker::None);
+        assert_eq!(contract.jump_marker_at_pc(40), JumpMarker::Call);
+        assert_eq!(contract.location_at_pc(30), None);
+        assert_eq!(contract.location_at_pc(31), None);
+        assert_eq!(contract.location_at_pc(40), None);
+        assert_eq!(contract.location_at_pc(42), contract.location_at_pc(21));
+        assert_eq!(line(21), contract.line_of(0, statement));
+        assert_eq!(function(21), Some("inner"));
+        assert!(contract.location_at_pc(50).is_some());
+        assert_eq!(line(50), None);
+        assert_eq!(function(60), Some("inner"));
+        assert!(contract.is_jumpdest(60));
+        assert_eq!(contract.jump_marker_at_pc(1 << 40), JumpMarker::Return);
+        assert!(contract.pc_index.sparse.contains_key(&(1 << 40)));
+        // No instruction starts at these program counters.
+        for pc in [1, 61, (1 << 40) + 1, u64::MAX] {
+            assert_eq!(contract.instruction_at_pc(pc), None, "pc {pc}");
+            assert_eq!(contract.location_at_pc(pc), None, "pc {pc}");
+        }
+    }
+
+    #[test]
+    fn function_entries_are_the_earliest_jumpdest_at_each_declaration() {
+        // The same text in two sources, so each declaration offset names one function in
+        // each source.
+        let source = "\
+contract D {
+    function a() public { uint256 x = 1; }
+    function b() public { uint256 y = 2; }
+    function c() public { uint256 z = 3; }
+    function d() public { uint256 w = 4; }
+}
+";
+        let start = |needle: &str| source.find(needle).expect(needle) as u64;
+        let (a, b, c) = (
+            start("function a"),
+            start("function b"),
+            start("function c"),
+        );
+        let instructions = vec![
+            // A declaration span on something other than a `JUMPDEST` enters nothing.
+            raw_instruction(3, "JUMP", Some(json!({"code": code(0, a, 10)}))),
+            // Two `JUMPDEST`s carry a's span; the lower pc is its entry, not the first listed.
+            raw_instruction(30, "JUMPDEST", Some(json!({"code": code(0, a, 10)}))),
+            raw_instruction(10, "JUMPDEST", Some(json!({"code": code(0, a, 10)}))),
+            raw_instruction(40, "JUMPDEST", Some(json!({"code": code(0, b, 10)}))),
+            // c has a `JUMPDEST` in its body and a `JUMP` at its declaration, and d has
+            // no instruction at all: neither has an entry point.
+            raw_instruction(50, "JUMP", Some(json!({"code": code(0, c, 10)}))),
+            raw_instruction(51, "JUMPDEST", Some(json!({"code": code(0, c + 22, 10)}))),
+            // The same offset in the other source enters the other source's function.
+            raw_instruction(5, "JUMPDEST", Some(json!({"code": code(1, a, 10)}))),
+            // At a repeated offset, a `JUMPDEST` the later instruction hides still counts.
+            raw_instruction(20, "JUMPDEST", Some(json!({"code": code(1, b, 10)}))),
+            raw_instruction(20, "ADD", Some(json!({"code": code(1, b, 10)}))),
+        ];
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "D".to_owned(),
+            environment: "call".to_owned(),
+            instructions,
+            sources: BTreeMap::from([(0, "D.sol".to_owned()), (1, "E.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let contract = ContractDebugInfo::new(
+            None,
+            "D",
+            info,
+            BTreeMap::from([(0, source.to_owned()), (1, source.to_owned())]),
+        );
+        let names = contract
+            .functions
+            .iter()
+            .map(|function| (function.source_id, function.name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                (0, "a"),
+                (0, "b"),
+                (0, "c"),
+                (0, "d"),
+                (1, "a"),
+                (1, "b"),
+                (1, "c"),
+                (1, "d")
+            ]
+        );
+        let entries = [3, 5, 10, 20, 30, 40, 50, 51, 999]
+            .into_iter()
+            .map(|pc| (pc, contract.function_entry_at_pc(pc)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [
+                (3, None),
+                (5, Some(4)),
+                (10, Some(0)),
+                (20, Some(5)),
+                (30, None),
+                (40, Some(1)),
+                (50, None),
+                (51, None),
+                (999, None)
+            ]
+        );
+        assert!(!contract.is_jumpdest(20));
     }
 
     const SECOND_ROOT: &str = "0xbbbb000000000000000000000000000000000002";
