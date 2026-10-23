@@ -1104,7 +1104,7 @@ mod tests {
     use soldb_debugger::{
         CodeGenerator, ContractDebugInfo, FunctionId, LineKey, ResolvedFunction, ResolvedLine,
     };
-    use soldb_ethdebug::{EthdebugInfo, Instruction};
+    use soldb_ethdebug::{source_range, EthdebugInfo, Instruction};
 
     use super::{
         Breakpoint, BreakpointKind, BreakpointTarget, DebuggerCommand, DebuggerInfoCommand,
@@ -1780,13 +1780,12 @@ contract C {
     fn source_state() -> DebuggerState {
         let offset = |needle: &str| SOURCE.find(needle).expect(needle) as u64;
         let whole = SOURCE.len() as u64;
-        let instruction = |pc: u64, offset: u64, length: u64| -> Instruction {
-            serde_json::from_value(json!({
-                "offset": pc,
-                "operation": {"mnemonic": "JUMPDEST"},
-                "context": {"code": {"source": {"id": 0}, "range": {"offset": offset, "length": length}}}
-            }))
-            .expect("instruction")
+        let instruction = |pc: u64, offset: u64, length: u64| {
+            Instruction::new(
+                pc,
+                "JUMPDEST",
+                Some(json!({"code": source_range(0, offset, length)})),
+            )
         };
         let info = EthdebugInfo {
             compilation: serde_json::Value::Null,
@@ -2115,13 +2114,9 @@ contract C {
     fn variables_are_inferred_from_the_stack_when_the_artifact_has_no_locations() {
         let source = "contract C {\n    function f(uint256 a) public {\n        uint256 b = a;\n        b = 0;\n    }\n}\n";
         let offset = |needle: &str| source.find(needle).expect(needle) as u64;
-        let instruction = |pc: u64, needle: &str| -> Instruction {
-            serde_json::from_value(json!({
-                "offset": pc,
-                "operation": {"mnemonic": "JUMPDEST"},
-                "context": {"code": {"source": {"id": 0}, "range": {"offset": offset(needle), "length": needle.len()}}}
-            }))
-            .expect("instruction")
+        let instruction = |pc: u64, needle: &str| {
+            let code = source_range(0, offset(needle), needle.len() as u64);
+            Instruction::new(pc, "JUMPDEST", Some(json!({"code": code})))
         };
         let contract = |code_generator: Option<CodeGenerator>| {
             let info = EthdebugInfo {
@@ -2261,13 +2256,9 @@ contract C {
     fn a_breakpoint_condition_reads_an_inferred_local() {
         let source = "contract C {\n    enum Mode { Off, On }\n    function f(uint256 a, Mode m) public {\n        uint256 b = a;\n        b = 0;\n    }\n}\n";
         let offset = |needle: &str| source.find(needle).expect(needle) as u64;
-        let instruction = |pc: u64, needle: &str| -> Instruction {
-            serde_json::from_value(json!({
-                "offset": pc,
-                "operation": {"mnemonic": "JUMPDEST"},
-                "context": {"code": {"source": {"id": 0}, "range": {"offset": offset(needle), "length": needle.len()}}}
-            }))
-            .expect("instruction")
+        let instruction = |pc: u64, needle: &str| {
+            let code = source_range(0, offset(needle), needle.len() as u64);
+            Instruction::new(pc, "JUMPDEST", Some(json!({"code": code})))
         };
         let info = EthdebugInfo {
             compilation: serde_json::Value::Null,

@@ -1184,7 +1184,7 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{ExecutionCall, TraceStep, TransactionTrace};
-    use soldb_ethdebug::{EthdebugInfo, Instruction, VariableLocation};
+    use soldb_ethdebug::{source_range, EthdebugInfo, Instruction, VariableLocation};
 
     use super::{parse_source_functions, DebugSession, DebugValueStatus};
 
@@ -1222,16 +1222,11 @@ mod tests {
             compilation: json!({}),
             contract_name: "Counter".to_owned(),
             environment: "runtime".to_owned(),
-            instructions: vec![Instruction {
-                offset: 0,
-                operation: json!({"mnemonic": "PUSH1"}),
-                context: Some(json!({
-                    "code": {
-                        "source": {"id": 0},
-                        "range": {"offset": offset, "length": 9}
-                    }
-                })),
-            }],
+            instructions: vec![Instruction::new(
+                0,
+                "PUSH1",
+                Some(json!({"code": source_range(0, offset, 9)})),
+            )],
             sources,
             variable_locations,
         };
@@ -1366,13 +1361,11 @@ mod tests {
             compilation: json!({}),
             contract_name: "Counter".to_owned(),
             environment: "runtime".to_owned(),
-            instructions: vec![Instruction {
-                offset: 0,
-                operation: json!({"mnemonic": "PUSH1"}),
-                context: Some(json!({
-                    "code": {"source": {"id": 0}, "range": {"offset": offset, "length": 9}}
-                })),
-            }],
+            instructions: vec![Instruction::new(
+                0,
+                "PUSH1",
+                Some(json!({"code": source_range(0, offset, 9)})),
+            )],
             sources: BTreeMap::from([(0, "Counter.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
         };

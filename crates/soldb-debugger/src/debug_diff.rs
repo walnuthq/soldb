@@ -603,7 +603,7 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{TraceStep, TransactionTrace};
-    use soldb_ethdebug::{EthdebugInfo, Instruction};
+    use soldb_ethdebug::{source_range, EthdebugInfo, Instruction};
 
     use super::{
         capture_debug_trace, compare_debug_traces, DebugCheckpoint, DebugDiffMode,
@@ -651,15 +651,9 @@ mod tests {
         let instructions = pcs
             .iter()
             .zip(offsets)
-            .map(|(pc, offset)| Instruction {
-                offset: *pc,
-                operation: json!({"mnemonic": "JUMPDEST"}),
-                context: Some(json!({
-                    "code": {
-                        "source": {"id": 0},
-                        "range": {"offset": offset, "length": 1}
-                    }
-                })),
+            .map(|(pc, offset)| {
+                let code = source_range(0, *offset as u64, 1);
+                Instruction::new(*pc, "JUMPDEST", Some(json!({"code": code})))
             })
             .collect();
         let info = EthdebugInfo {

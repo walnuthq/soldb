@@ -3727,7 +3727,7 @@ mod tests {
     }
     use super::*;
     use serde_json::Value;
-    use soldb_ethdebug::{EthdebugInfo, Instruction};
+    use soldb_ethdebug::{source_range, EthdebugInfo, Instruction};
     use soldb_repl::{BreakpointTarget, SourceBreakpointTarget, StepOutcome};
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3839,13 +3839,11 @@ mod tests {
     }
 
     fn instruction_at(pc: u64, offset: u64, length: u64) -> Instruction {
-        Instruction {
-            offset: pc,
-            operation: serde_json::json!({"mnemonic": "JUMPDEST"}),
-            context: Some(serde_json::json!({
-                "code": {"source": {"id": 0}, "range": {"offset": offset, "length": length}}
-            })),
-        }
+        Instruction::new(
+            pc,
+            "JUMPDEST",
+            Some(json!({"code": source_range(0, offset, length)})),
+        )
     }
 
     #[test]
