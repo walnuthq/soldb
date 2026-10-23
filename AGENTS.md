@@ -105,7 +105,7 @@ Crate dependencies, as actually declared in `crates/*/Cargo.toml`:
 
 | crate | depends on |
 | --- | --- |
-| `soldb-core` | *(nothing)* |
+| `soldb-core` | `bytes` |
 | `soldb-ethdebug` | core, `revm-bytecode` |
 | `soldb-evm` | core, `ruint`, `revm` (behind the default-on `replay` feature) |
 | `soldb-rpc` | core, evm |
@@ -601,7 +601,7 @@ Beyond the rule:
 ## Notes
 
 - **Trace steps are the hot loop.** A mainnet transaction is easily hundreds of thousands
-  of `TraceStep`s, each carrying a dozen stack words and all of memory as a hex string.
+  of `TraceStep`s, each carrying a dozen stack words and all of memory.
   Avoid per-step `clone()`, `format!`, and `String`-keyed map lookups in anything that
   walks the full trace; borrow, and hoist allocation out of the loop.
 - **Stack words are shared, not copied.** A stack word is a `soldb_core::Word`
@@ -627,8 +627,8 @@ Beyond the rule:
   `memory`, and `storage` fields are the wire format older files and clients read; every
   constructor leaves them empty, `Serialize` fills them from `snapshot`, and
   `Deserialize` moves whatever they held into `snapshot`. Build steps with
-  `TraceStep::new` and `StepSnapshot::new`, never by filling the flat fields. Memory and
-  storage in a snapshot are `Arc`s, and `DebugTraceResult::steps` hands the previous
+  `TraceStep::new` and `StepSnapshot::new`, never by filling the flat fields. Memory in a
+  snapshot is `Bytes` and storage an `Arc`, and `DebugTraceResult::steps` hands the previous
   step's on when a log did not change them, so a trace holds one copy per change rather
   than one per step; keep that sharing when you touch step construction. The node's
   payload is held the same way: `StructLog` memory and storage are `Arc`s shared with the
@@ -637,6 +637,13 @@ Beyond the rule:
   its step is built. A trace read from a file shares as its steps are parsed. Loading a
   20,000-step, 89 MB file through the DAP server peaks at 114 MB; it peaked at 236 MB
   when every step held two copies.
+- **Memory is bytes in a step and hex in a file.** `StepSnapshot::memory` is
+  `soldb_core::Bytes`, so an embedder that already holds memory as `bytes::Bytes` hands
+  it over without a copy, and readers index it by byte offset directly. Serialization
+  writes it as one unprefixed lowercase hex string and reads that back, with or without a
+  `0x` prefix; memory that is not hex is refused when it is read, from a trace file or a
+  node's `structLogs`, rather than shown as something it is not. Use
+  `soldb_core::encode_hex` where a view needs hex, and only for what it shows.
 - **PC-to-source lookups should be indexed, not scanned.** Build the PC map once per
   contract (`build_pc_to_instruction_map`) and reuse it; a linear scan per step turns a
   trace walk quadratic.

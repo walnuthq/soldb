@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
+use soldb_core::{encode_hex, SoldbError, SoldbResult, TransactionTrace};
 use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo, StepLocation};
 use soldb_ethdebug::{load_contract_mapping, load_debug_program, SourceMapEnvironment};
 use soldb_repl::{
@@ -860,13 +860,12 @@ impl DapServer {
             return Vec::new();
         }
         memory
-            .as_bytes()
-            .chunks(64)
+            .chunks(32)
             .enumerate()
             .map(|(index, chunk)| {
                 json!({
                     "name": format!("memory[0x{:x}]", index * 32),
-                    "value": std::str::from_utf8(chunk).unwrap_or_default(),
+                    "value": encode_hex(chunk),
                     "variablesReference": 0
                 })
             })
@@ -1885,7 +1884,7 @@ mod tests {
                     gas_cost: 1,
                     depth: 0,
                     stack: vec!["0x2a".into()],
-                    memory: Some("aa".to_owned()),
+                    memory: Some(soldb_core::Bytes::from_static(&[0xaa])),
                     storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                     error: None,
                     snapshot: Default::default(),

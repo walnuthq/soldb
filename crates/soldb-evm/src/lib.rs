@@ -22,12 +22,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use serde::de::{SeqAccess, Visitor};
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use soldb_core::{
-    ExecutionLog, GasSummary, SoldbError, SoldbResult, StepSnapshot, StorageChange, TraceArtifacts,
-    TraceCapabilities, TraceStep, TransactionTrace, Word, WordInterner,
+    decode_hex_into, Bytes, ExecutionLog, GasSummary, HexError, SoldbError, SoldbResult,
+    StepSnapshot, StorageChange, TraceArtifacts, TraceCapabilities, TraceStep, TransactionTrace,
+    Word, WordInterner,
 };
 
 #[cfg(feature = "replay")]
@@ -108,22 +109,18 @@ pub struct StructLog {
     pub return_data: Option<Arc<str>>,
 }
 
-/// Joins a `structLogs` memory array into one unprefixed hex string.
+/// Decodes a `structLogs` memory array into one flat byte sequence.
 ///
-/// Nodes disagree on whether the words carry a `0x` prefix. Joining prefixed words
-/// verbatim produces `0x..0x..0x..`, which is neither valid hex nor indexable by byte
-/// offset, and it makes this backend disagree with the replay backend, which emits one
-/// unprefixed string. A step's memory is documented to be a flat byte sequence, and
-/// byte-offset lookups such as memory-located variable decoding assume exactly that.
-fn joined_memory(words: &[String]) -> String {
-    words
-        .iter()
-        .map(|word| {
-            word.strip_prefix("0x")
-                .or_else(|| word.strip_prefix("0X"))
-                .unwrap_or(word)
-        })
-        .collect()
+/// Nodes disagree on whether the words carry a `0x` prefix, so each word is decoded on its
+/// own with or without one. The result is the same whichever backend recorded the
+/// memory, which is what byte-offset lookups such as memory-located variable decoding
+/// rest on.
+fn joined_memory(words: &[String]) -> Result<Bytes, HexError> {
+    let mut memory = Vec::with_capacity(words.iter().map(|word| word.len() / 2).sum());
+    for word in words {
+        decode_hex_into(word, &mut memory)?;
+    }
+    Ok(Bytes::from(memory))
 }
 
 impl StructLog {
@@ -255,12 +252,15 @@ impl StructLog {
         self.into_trace_step_sharing(previous_storage, None)
     }
 
-    fn shared_memory(&self, previous: Option<(&Arc<Vec<String>>, &TraceStep)>) -> Option<Arc<str>> {
+    fn shared_memory(&self, previous: Option<(&Arc<Vec<String>>, &TraceStep)>) -> Option<Bytes> {
         match previous {
             Some((words, step)) if *words == self.memory && step.snapshot.memory.is_some() => {
                 step.snapshot.memory.clone()
             }
-            _ => Some(Arc::from(joined_memory(&self.memory))),
+            // Parsing `structLogs` rejects memory that is not hex, so only a log built by
+            // hand with bad memory reaches the error, and its memory is reported as not
+            // captured rather than shown as something it is not.
+            _ => joined_memory(&self.memory).ok(),
         }
     }
 }
@@ -358,10 +358,29 @@ fn deserialize_shared_struct_logs<'de, D: Deserializer<'de>>(
         }
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut logs = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            let mut logs = Vec::<StructLog>::with_capacity(seq.size_hint().unwrap_or(0));
+            let mut decoded = Vec::new();
             while let Some(mut log) = seq.next_element::<StructLog>()? {
-                if let Some(previous) = logs.last() {
-                    share_unchanged(previous, &mut log);
+                let shared = match logs.last() {
+                    Some(previous) => {
+                        share_unchanged(previous, &mut log);
+                        Arc::ptr_eq(&previous.memory, &log.memory)
+                    }
+                    None => false,
+                };
+                // A step's memory is bytes, so memory that is not hex is refused here, at
+                // the edge, rather than when the steps are built. Memory shared with the
+                // previous log was checked with it.
+                if !shared {
+                    for word in log.memory.iter() {
+                        decoded.clear();
+                        decode_hex_into(word, &mut decoded).map_err(|error| {
+                            de::Error::custom(format!(
+                                "memory of struct log {} is not hex: {error}",
+                                logs.len()
+                            ))
+                        })?;
+                    }
                 }
                 logs.push(log);
             }
@@ -950,6 +969,8 @@ mod tests {
 
     use serde_json::json;
 
+    use soldb_core::same_buffer;
+
     use super::{
         build_transaction_trace, debug_rpc_capabilities, debug_rpc_simulation_trace,
         debug_rpc_transaction_trace, decode_revert_reason, parse_value_quantity, DebugTraceResult,
@@ -1007,7 +1028,10 @@ mod tests {
         assert!(trace.capabilities.logs);
         assert_eq!(trace.artifacts.logs.len(), 2);
         assert_eq!(trace.steps.len(), 3);
-        assert_eq!(trace.steps[1].snapshot_ref().memory, Some("aabb"));
+        assert_eq!(
+            trace.steps[1].snapshot_ref().memory,
+            Some(&[0xaa, 0xbb][..])
+        );
     }
 
     #[test]
@@ -1296,13 +1320,13 @@ mod tests {
             &steps[0].snapshot.storage,
             &steps[1].snapshot.storage
         ));
-        assert!(Arc::ptr_eq(
+        assert!(same_buffer(
             steps[0].snapshot.memory.as_ref().expect("memory"),
             steps[1].snapshot.memory.as_ref().expect("memory")
         ));
         // Memory changed at step 2, storage at step 3; each got its own copy, and the
         // values are what the log said.
-        assert!(!Arc::ptr_eq(
+        assert!(!same_buffer(
             steps[1].snapshot.memory.as_ref().expect("memory"),
             steps[2].snapshot.memory.as_ref().expect("memory")
         ));
@@ -1314,7 +1338,7 @@ mod tests {
             &steps[2].snapshot.storage,
             &steps[3].snapshot.storage
         ));
-        assert_eq!(steps[2].snapshot_ref().memory, Some("aabb"));
+        assert_eq!(steps[2].snapshot_ref().memory, Some(&[0xaa, 0xbb][..]));
         assert_eq!(steps[3].snapshot_ref().storage["0x0"], "0x2");
         assert_eq!(
             steps[3].snapshot_ref().storage_diff["0x0"].after.as_deref(),
@@ -1331,7 +1355,7 @@ mod tests {
             &consumed[0].snapshot.storage,
             &consumed[1].snapshot.storage
         ));
-        assert!(Arc::ptr_eq(
+        assert!(same_buffer(
             consumed[0].snapshot.memory.as_ref().expect("memory"),
             consumed[1].snapshot.memory.as_ref().expect("memory")
         ));
@@ -1376,12 +1400,17 @@ mod tests {
 
         let steps = result.steps();
         assert_eq!(steps.len(), 2);
-        // Memory words are normalized to one unprefixed hex string whether or not the node
-        // prefixed them, so byte-offset lookups stay valid and both backends agree.
-        assert_eq!(steps[0].snapshot_ref().memory, Some("aabb"));
+        // Memory words are decoded into one byte sequence whether or not the node prefixed
+        // them, so byte-offset lookups stay valid and both backends agree.
+        assert_eq!(steps[0].snapshot_ref().memory, Some(&[0xaa, 0xbb][..]));
         assert_eq!(steps[0].snapshot_ref().storage["0x00"], "0x2a");
         assert_eq!(stack_words(&steps[0].snapshot.stack), ["0x01"]);
-        assert_eq!(steps[0].snapshot.memory.as_deref(), Some("aabb"));
+        assert_eq!(steps[0].snapshot.memory.as_deref(), Some(&[0xaa, 0xbb][..]));
+        // A trace file still spells it as one unprefixed hex string.
+        assert_eq!(
+            serde_json::to_value(&steps[0]).expect("json")["snapshot"]["memory"],
+            "aabb"
+        );
         assert_eq!(steps[0].snapshot.storage["0x00"], "0x2a");
         assert_eq!(
             steps[0].snapshot.storage_diff["0x00"].after.as_deref(),
@@ -1568,5 +1597,20 @@ mod tests {
             "topics": ["0x3cf8b50771c17d723f2cb711ca7dadde485b222e13c84ba0730a14093fad6d5c"],
             "data": format!("0x{}{}", "0".repeat(62), data_suffix),
         })
+    }
+
+    #[test]
+    fn struct_log_memory_that_is_not_hex_is_refused() {
+        let parsed = serde_json::from_value::<DebugTraceResult>(json!({
+            "structLogs": [
+                {"pc": 0, "op": "PUSH1", "gas": 1, "depth": 1, "memory": ["aa"]},
+                {"pc": 2, "op": "MSTORE", "gas": 1, "depth": 1, "memory": ["aa", "0xzz"]}
+            ]
+        }));
+        let error = parsed.expect_err("memory is not hex").to_string();
+        assert_eq!(
+            error,
+            "memory of struct log 1 is not hex: `z` at offset 0 is not a hex digit"
+        );
     }
 }
