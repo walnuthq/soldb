@@ -1039,10 +1039,41 @@ impl FrameVariables {
                     .zip(&inputs.in_scope)
                     .all(|(local, in_scope)| local.scope.contains(span.start) == *in_scope)
             {
+                debug_assert_eq!(
+                    layouts[id as usize],
+                    self.layout_at(function, span.start),
+                    "a cache hit must give the layout its inputs compute"
+                );
                 return id;
             }
         }
 
+        let layout = self.layout_at(function, span.start);
+        let id = match self.layout {
+            Some(id) if layouts[id as usize] == layout => id,
+            _ => {
+                layouts.push(layout);
+                (layouts.len() - 1) as u32
+            }
+        };
+        self.layout = Some(id);
+        let inputs = &mut self.layout_inputs;
+        inputs.params_base = self.params_base;
+        inputs.returns.clone_from(&self.returns);
+        inputs.locals_base = self.locals_base;
+        inputs.in_scope.clear();
+        inputs.in_scope.extend(
+            function
+                .locals
+                .iter()
+                .map(|local| local.scope.contains(span.start)),
+        );
+        id
+    }
+
+    /// The frame's variables at `offset` in its function's own code, as the parameters'
+    /// base, the return slots, and the locals' base place them.
+    fn layout_at(&self, function: &SourceFunction, offset: u64) -> Vec<InferredVariable> {
         let mut layout = Vec::new();
         if let Some(base) = self.params_base {
             let mut slot = base;
@@ -1071,38 +1102,19 @@ impl FrameVariables {
             });
         }
         for (index, local) in function.locals.iter().enumerate() {
-            if local.scope.contains(span.start) {
+            if local.scope.contains(offset) {
                 layout.push(InferredVariable {
                     name: local.name.clone(),
                     ty: local.declared_type(),
                     kind: VariableKind::Local,
                     slot: self
                         .locals_base
-                        .map(|base| base + live_index(function, index, span.start)),
+                        .map(|base| base + live_index(function, index, offset)),
                     words: 1,
                 });
             }
         }
-        let id = match self.layout {
-            Some(id) if layouts[id as usize] == layout => id,
-            _ => {
-                layouts.push(layout);
-                (layouts.len() - 1) as u32
-            }
-        };
-        self.layout = Some(id);
-        let inputs = &mut self.layout_inputs;
-        inputs.params_base = self.params_base;
-        inputs.returns.clone_from(&self.returns);
-        inputs.locals_base = self.locals_base;
-        inputs.in_scope.clear();
-        inputs.in_scope.extend(
-            function
-                .locals
-                .iter()
-                .map(|local| local.scope.contains(span.start)),
-        );
-        id
+        layout
     }
 }
 
