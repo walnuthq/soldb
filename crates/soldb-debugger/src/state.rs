@@ -24,8 +24,8 @@
 //! record is zero: the space starts empty in every transaction.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
+use rustc_hash::FxHashMap;
 use soldb_core::{opcode, TransactionTrace};
 use soldb_ethdebug::{parse_word, word_hex, StorageLayout, StorageRef, Word};
 
@@ -66,7 +66,7 @@ pub type ChainRead = Box<dyn Fn(&str, &Word) -> Option<Word>>;
 pub struct CachedChain<F> {
     read: F,
     label: String,
-    words: RefCell<HashMap<(String, Word), Option<Word>>>,
+    words: RefCell<FxHashMap<(String, Word), Option<Word>>>,
 }
 
 impl<F> std::fmt::Debug for CachedChain<F> {
@@ -89,7 +89,7 @@ where
         Self {
             read,
             label: label.into(),
-            words: RefCell::new(HashMap::new()),
+            words: RefCell::new(FxHashMap::default()),
         }
     }
 }
@@ -132,7 +132,7 @@ pub struct StateVariable {
 /// Every storage word a trace recorded, by storage context and slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageTape {
-    records: HashMap<(usize, Word), Vec<Record>>,
+    records: FxHashMap<(usize, Word), Vec<Record>>,
     /// Whether the backend recorded per-step storage at all.
     captured: bool,
     space: Space,
@@ -148,7 +148,7 @@ enum Space {
 const ZERO_WORD: Word = [0_u8; 32];
 
 /// The records of one storage space, by storage context and slot.
-type Records = HashMap<(usize, Word), Vec<Record>>;
+type Records = FxHashMap<(usize, Word), Vec<Record>>;
 
 /// A value a slot holds from a step on. `None` when a reverted frame undid a write and
 /// the value before it was never recorded.
@@ -314,7 +314,7 @@ fn index_records(
             index
         }
     };
-    let mut persistent_records = Records::new();
+    let mut persistent_records = Records::default();
     if persistent {
         for (index, diff) in trace.steps.storage_diffs() {
             let Some(context) = map.storage_context_index(index) else {
@@ -328,7 +328,7 @@ fn index_records(
             }
         }
     }
-    let mut transient_records = Records::new();
+    let mut transient_records = Records::default();
     if transient {
         for (index, slots) in trace.steps.transient_storage() {
             let Some(context) = map.storage_context_index(index) else {
@@ -345,7 +345,7 @@ fn index_records(
 
 /// Records that `slot` of `context` holds `value` from step `from`, unless it already did.
 fn push_record(
-    records: &mut HashMap<(usize, Word), Vec<Record>>,
+    records: &mut FxHashMap<(usize, Word), Vec<Record>>,
     context: usize,
     from: usize,
     slot: &str,

@@ -29,10 +29,11 @@
 //!
 //! Everything here is a search over the recording. Nothing re-executes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
 use soldb_core::{opcode, EvmWord, StepView, TransactionTrace};
 use soldb_ethdebug::{
     function_selector, parse_path, CodeGenerator, EthdebugInfo, FunctionExit, Instruction,
@@ -118,7 +119,7 @@ struct PcIndex {
     /// instruction starts.
     dense: Vec<Option<NonZeroU32>>,
     /// Offsets past `dense`.
-    sparse: HashMap<u64, usize>,
+    sparse: FxHashMap<u64, usize>,
 }
 
 impl PcIndex {
@@ -136,7 +137,7 @@ impl PcIndex {
             .max()
             .map_or(0, |offset| offset + 1);
         let mut dense = vec![None; dense_len];
-        let mut sparse = HashMap::new();
+        let mut sparse = FxHashMap::default();
         for (index, instruction) in instructions.iter().enumerate() {
             let slot = usize::try_from(instruction.offset)
                 .ok()
@@ -192,7 +193,7 @@ pub enum JumpMarker {
 pub struct SourceCache {
     /// The sources read so far, by id; the same id can name different text in
     /// different compilations.
-    sources: HashMap<u64, Vec<Arc<ReadSource>>>,
+    sources: FxHashMap<u64, Vec<Arc<ReadSource>>>,
 }
 
 #[derive(Debug)]
@@ -282,7 +283,7 @@ impl ContractDebugInfo {
             .collect::<Vec<_>>();
         // The earliest `JUMPDEST` at each span start, in one pass, so that finding a
         // function's entry point is one lookup and not a scan of every instruction.
-        let mut earliest_jumpdests = HashMap::<(u64, u64), u64>::new();
+        let mut earliest_jumpdests = FxHashMap::<(u64, u64), u64>::default();
         for (index, instruction) in info.instructions.iter().enumerate() {
             if !jumpdests[index] {
                 continue;
@@ -304,7 +305,7 @@ impl ContractDebugInfo {
                     .get(&(function.source_id, function.declaration_start))
                     .map(|pc| (*pc, function_index))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<FxHashMap<_, _>>();
         let mut contract = Self {
             address: address.map(normalize_address),
             name: name.to_owned(),
@@ -329,15 +330,15 @@ impl ContractDebugInfo {
         &self,
         locations: Vec<Option<SourceLocation>>,
         jumpdests: &[bool],
-        function_entries: &HashMap<u64, usize>,
+        function_entries: &FxHashMap<u64, usize>,
     ) -> Vec<InstructionFacts> {
         // The function a span is in is one of its own source's, and the instructions of a
         // statement share its span, so each span's function is found once among them.
-        let mut by_source = HashMap::<u64, Vec<usize>>::new();
+        let mut by_source = FxHashMap::<u64, Vec<usize>>::default();
         for (index, function) in self.functions.iter().enumerate() {
             by_source.entry(function.source_id).or_default().push(index);
         }
-        let mut found = HashMap::<(u64, u64), Option<usize>>::new();
+        let mut found = FxHashMap::<(u64, u64), Option<usize>>::default();
         let mut function_for = |location: &SourceLocation| {
             *found
                 .entry((location.source_id, location.offset))
@@ -906,12 +907,12 @@ impl FrameEntered {
     /// ran no steps, such as one to a precompile, ends at the step it started and is not a
     /// frame in the trace; of two records entered at one step, a call is taken before a
     /// creation and an earlier record before a later one.
-    fn recorded(trace: &TransactionTrace) -> HashMap<usize, Self> {
+    fn recorded(trace: &TransactionTrace) -> FxHashMap<usize, Self> {
         let entered = |entry: Option<usize>, exit: Option<usize>| {
             entry.filter(|entry| exit.is_none_or(|exit| exit > *entry))
         };
         let artifacts = &trace.artifacts;
-        let mut recorded = HashMap::new();
+        let mut recorded = FxHashMap::default();
         for call in &artifacts.calls {
             if let Some(step) = entered(call.entry_step, call.exit_step) {
                 recorded.entry(step).or_insert_with(|| Self {
@@ -1345,7 +1346,7 @@ struct InternalFrame {
     statement: Option<LocationRef>,
     /// The variables of frames that were left without returning, by function: a modifier
     /// hands over to the body it wraps and resumes after it with its slots still there.
-    remembered: HashMap<usize, FrameVariables>,
+    remembered: FxHashMap<usize, FrameVariables>,
 }
 
 impl InternalFrame {
@@ -1531,7 +1532,7 @@ impl StepMap {
 
     fn build(trace: &TransactionTrace, contracts: Vec<ContractDebugInfo>, smooth: bool) -> Self {
         let mut addresses = Vec::<String>::new();
-        let mut address_index = HashMap::<String, usize>::new();
+        let mut address_index = FxHashMap::<String, usize>::default();
         let mut intern = |address: &str| -> usize {
             let address = normalize_address(address);
             *address_index.entry(address.clone()).or_insert_with(|| {
@@ -2849,7 +2850,7 @@ fn prove_argument_layouts(
     }
     // The calldata each EVM frame was entered with: the transaction's input at the root,
     // and the recorded input of a call for a nested frame.
-    let mut calldata_by_entry = HashMap::<usize, &str>::new();
+    let mut calldata_by_entry = FxHashMap::<usize, &str>::default();
     calldata_by_entry.insert(0, trace.input_data.as_str());
     for call in &trace.artifacts.calls {
         if let Some(entry_step) = call.entry_step {
@@ -2858,7 +2859,7 @@ fn prove_argument_layouts(
     }
 
     let mut examined = std::collections::HashSet::<u32>::new();
-    let mut frame_calldata = HashMap::<u32, &str>::new();
+    let mut frame_calldata = FxHashMap::<u32, &str>::default();
     for (index, step) in framed.iter().enumerate() {
         let entered = index == 0 || framed[index - 1].frame_id != step.frame_id;
         if entered {
