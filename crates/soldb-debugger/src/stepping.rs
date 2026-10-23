@@ -802,6 +802,7 @@ struct EvmFrame {
 }
 
 /// What is known about an EVM frame as it is entered.
+#[derive(Clone)]
 struct FrameEntered {
     /// The address whose code the frame runs; `None` when nothing recorded it, or for a
     /// creation whose address the backend did not report.
@@ -812,34 +813,36 @@ struct FrameEntered {
 }
 
 impl FrameEntered {
-    /// The call or creation the backend recorded as entered at `step`, when it recorded
-    /// calls at all. A call that ran no steps, such as one to a precompile, ends at the
-    /// step it started and is not a frame in the trace.
-    fn recorded(trace: &TransactionTrace, step: usize) -> Option<Self> {
-        let spans_steps = |entry: Option<usize>, exit: Option<usize>| {
-            entry == Some(step) && exit.is_none_or(|exit| exit > step)
+    /// The calls and creations the backend recorded, by the step each was entered at,
+    /// so that entering a frame finds its record without searching them all. A call that
+    /// ran no steps, such as one to a precompile, ends at the step it started and is not a
+    /// frame in the trace; of two records entered at one step, a call is taken before a
+    /// creation and an earlier record before a later one.
+    fn recorded(trace: &TransactionTrace) -> HashMap<usize, Self> {
+        let entered = |entry: Option<usize>, exit: Option<usize>| {
+            entry.filter(|entry| exit.is_none_or(|exit| exit > *entry))
         };
         let artifacts = &trace.artifacts;
-        if let Some(call) = artifacts
-            .calls
-            .iter()
-            .find(|call| spans_steps(call.entry_step, call.exit_step))
-        {
-            return Some(Self {
-                address: Some(call.bytecode_address.clone()),
-                environment: CodeEnvironment::Call,
-                delegated: matches!(call.call_type.as_str(), "DELEGATECALL" | "CALLCODE"),
-            });
+        let mut recorded = HashMap::new();
+        for call in &artifacts.calls {
+            if let Some(step) = entered(call.entry_step, call.exit_step) {
+                recorded.entry(step).or_insert_with(|| Self {
+                    address: Some(call.bytecode_address.clone()),
+                    environment: CodeEnvironment::Call,
+                    delegated: matches!(call.call_type.as_str(), "DELEGATECALL" | "CALLCODE"),
+                });
+            }
         }
-        let creation = artifacts
-            .creations
-            .iter()
-            .find(|creation| spans_steps(creation.entry_step, creation.exit_step))?;
-        Some(Self {
-            address: creation.address.clone(),
-            environment: CodeEnvironment::Create,
-            delegated: false,
-        })
+        for creation in &artifacts.creations {
+            if let Some(step) = entered(creation.entry_step, creation.exit_step) {
+                recorded.entry(step).or_insert_with(|| Self {
+                    address: creation.address.clone(),
+                    environment: CodeEnvironment::Create,
+                    delegated: false,
+                });
+            }
+        }
+        recorded
     }
 
     /// What the call instruction at `caller` says about the frame it entered.
@@ -1451,6 +1454,7 @@ impl StepMap {
         let mut current_root = 0;
         let mut reverted = Vec::new();
         let mut framed = Vec::with_capacity(trace.steps.len());
+        let recorded = FrameEntered::recorded(trace);
         for (index, step) in trace.steps.iter().enumerate() {
             let evm_depth = step.depth().saturating_sub(root_depth) as usize;
             if let Some((position, root)) =
@@ -1484,8 +1488,10 @@ impl StepMap {
                 let call = (evm_frames.len() == evm_depth)
                     .then(|| index.checked_sub(1))
                     .flatten();
-                let entered = FrameEntered::recorded(trace, index)
+                let entered = recorded
+                    .get(&index)
                     .filter(|_| evm_frames.len() == evm_depth)
+                    .cloned()
                     .unwrap_or_else(|| FrameEntered::from_call(trace, call));
                 let address = entered.address.as_deref().map(&mut intern);
                 // A `DELEGATECALL` or `CALLCODE` runs the callee's code against the
