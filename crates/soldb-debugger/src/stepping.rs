@@ -645,6 +645,41 @@ struct StepInfo {
     line_start: bool,
 }
 
+/// The line of the nearest step at each frame depth, for a walk over the steps in one
+/// direction. A step hides every deeper depth from the steps after it; a step without a
+/// line does not hide the line at its own depth.
+#[derive(Debug, Default)]
+struct NearestLines {
+    /// Depths with a line, shallowest first. A depth that is missing has none.
+    lines: Vec<(u32, LineKey)>,
+}
+
+impl NearestLines {
+    /// Walks past a step and returns the line of the nearest step before it at the same
+    /// depth, or `None` when a shallower step or no step at that depth comes first.
+    fn visit(&mut self, depth: u32, key: Option<LineKey>) -> Option<LineKey> {
+        while self.lines.last().is_some_and(|(level, _)| *level > depth) {
+            self.lines.pop();
+        }
+        let nearest = match self.lines.last() {
+            Some((level, line)) if *level == depth => Some(*line),
+            _ => None,
+        };
+        if let Some(key) = key {
+            if nearest.is_some() {
+                self.lines.pop();
+            }
+            self.lines.push((depth, key));
+        }
+        nearest
+    }
+
+    /// Forgets every step walked past so far.
+    fn clear(&mut self) {
+        self.lines.clear();
+    }
+}
+
 /// Per-step source locations and frame depths over one trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepMap {
@@ -1859,7 +1894,7 @@ impl StepMap {
             roots,
         };
         if smooth {
-            map.smooth_single_step_excursions();
+            Self::smooth_single_step_excursions(&mut map.steps);
         }
         map.mark_line_starts();
         map
@@ -1869,51 +1904,31 @@ impl StepMap {
     /// at the same depth, counts as that line. solc emits such instructions at function
     /// entry, and stopping on them would show a later line before an earlier one. The runs
     /// are looked for within the step's own top-level call.
-    fn smooth_single_step_excursions(&mut self) {
-        let neighbours =
-            |steps: &[StepInfo], index: usize, forward: bool| -> Option<Option<LineKey>> {
-                let depth = steps[index].frame_depth;
-                let range: Box<dyn Iterator<Item = usize>> = if forward {
-                    Box::new((index + 1)..steps.len())
-                } else {
-                    Box::new((0..index).rev())
-                };
-                for candidate in range {
-                    // The step after a boundary is the one marked as starting a root.
-                    let boundary = if forward { candidate } else { candidate + 1 };
-                    if steps[boundary].starts_root {
-                        return None;
-                    }
-                    let step = &steps[candidate];
-                    if step.frame_depth > depth {
-                        continue;
-                    }
-                    if step.frame_depth < depth {
-                        return None;
-                    }
-                    if step.key.is_some() {
-                        return Some(step.key);
-                    }
-                }
-                None
-            };
-        let mut smoothed = Vec::new();
-        for index in 0..self.steps.len() {
-            let Some(key) = self.steps[index].key else {
-                continue;
-            };
-            let Some(before) = neighbours(&self.steps, index, false) else {
-                continue;
-            };
-            let Some(after) = neighbours(&self.steps, index, true) else {
-                continue;
-            };
-            if before == after && before.is_some() && before != Some(key) {
-                smoothed.push((index, before));
+    ///
+    /// One pass in each direction finds every step's neighbours, so deep recursion does
+    /// not make each step search the frames it calls.
+    fn smooth_single_step_excursions(steps: &mut [StepInfo]) {
+        let mut after = vec![None; steps.len()];
+        let mut lines = NearestLines::default();
+        for (index, step) in steps.iter().enumerate().rev() {
+            after[index] = lines.visit(step.frame_depth, step.key);
+            // A step that starts a root ends the search of the steps before it.
+            if step.starts_root {
+                lines.clear();
             }
         }
-        for (index, key) in smoothed {
-            self.steps[index].key = key;
+        let mut lines = NearestLines::default();
+        for (step, after) in steps.iter_mut().zip(after) {
+            if step.starts_root {
+                lines.clear();
+            }
+            let before = lines.visit(step.frame_depth, step.key);
+            let Some(key) = step.key else {
+                continue;
+            };
+            if before.is_some() && before == after && before != Some(key) {
+                step.key = before;
+            }
         }
     }
 
@@ -2886,7 +2901,7 @@ mod tests {
 
     use super::{
         address_from_word, normalize_address, ArgumentLayout, ArgumentOrder, ContractDebugInfo,
-        InferredVariable, JumpMarker, LineKey, LocalsStatus, StepMap, VariableKind,
+        InferredVariable, JumpMarker, LineKey, LocalsStatus, StepInfo, StepMap, VariableKind,
     };
 
     // Two functions; `outer` calls `inner` internally. Line numbers are one-based.
@@ -4873,5 +4888,60 @@ contract D {
         assert_eq!(map.frames(10)[0].function_name.as_deref(), Some("outer"));
         assert_ne!(map.line_key(10), map.line_key(9));
         assert_eq!(map.line_key(9), map.line_key(11));
+    }
+
+    /// A step at `depth` on `line` of contract 0, or on no line.
+    fn step_info(depth: u32, line: Option<u64>, starts_root: bool) -> StepInfo {
+        StepInfo {
+            location: None,
+            generated: false,
+            key: line.and_then(key),
+            contract: None,
+            address: None,
+            storage: None,
+            evm_depth: 0,
+            starts_root,
+            frame_depth: depth,
+            frame_entry: false,
+            line_start: false,
+        }
+    }
+
+    #[test]
+    fn smoothing_looks_past_deeper_frames_only() {
+        let mut steps = vec![
+            step_info(1, Some(1), false),
+            // A lone line 2 between two runs of line 1, with deeper frames and a step
+            // without a line before the second run.
+            step_info(1, Some(2), false),
+            step_info(2, Some(3), false),
+            step_info(3, Some(4), false),
+            step_info(4, Some(5), false),
+            step_info(3, Some(6), false),
+            step_info(1, None, false),
+            step_info(1, Some(1), false),
+            // A shallower step comes between line 8 and the line 1 before it.
+            step_info(0, Some(7), false),
+            step_info(1, Some(8), false),
+            step_info(1, Some(1), false),
+            // A shallower step comes between line 9 and the line 1 after it.
+            step_info(1, Some(9), false),
+            step_info(0, Some(7), false),
+            step_info(1, Some(1), false),
+            // A root starts between line 2 and the line 1 after it.
+            step_info(1, Some(2), false),
+            step_info(1, Some(1), true),
+        ];
+        let mut expected = steps
+            .iter()
+            .map(|step| step.key.map(|key| key.line))
+            .collect::<Vec<_>>();
+        expected[1] = Some(1);
+        StepMap::smooth_single_step_excursions(&mut steps);
+        let lines = steps
+            .iter()
+            .map(|step| step.key.map(|key| key.line))
+            .collect::<Vec<_>>();
+        assert_eq!(lines, expected);
     }
 }
