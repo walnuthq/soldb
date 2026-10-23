@@ -147,6 +147,9 @@ enum Space {
 
 const ZERO_WORD: Word = [0_u8; 32];
 
+/// The records of one storage space, by storage context and slot.
+type Records = HashMap<(usize, Word), Vec<Record>>;
+
 /// A value a slot holds from a step on. `None` when a reverted frame undid a write and
 /// the value before it was never recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,49 +176,42 @@ impl StorageTape {
     /// computed for the step that recorded it.
     #[must_use]
     pub fn new(trace: &TransactionTrace, map: &StepMap) -> Self {
-        Self::index(trace, map, Space::Persistent)
+        let (persistent, _) = index_records(trace, map, true, false);
+        Self::finish(
+            persistent,
+            map,
+            trace.capabilities.storage,
+            Space::Persistent,
+        )
     }
 
     /// Indexes every transient storage word `trace` recorded, the same way.
     #[must_use]
     pub fn transient(trace: &TransactionTrace, map: &StepMap) -> Self {
-        Self::index(trace, map, Space::Transient)
+        let captured = trace.capabilities.transient_storage;
+        let (_, transient) = index_records(trace, map, false, captured);
+        Self::finish(transient, map, captured, Space::Transient)
     }
 
-    fn index(trace: &TransactionTrace, map: &StepMap, space: Space) -> Self {
-        let (write, captured) = match space {
-            Space::Persistent => ("SSTORE", trace.capabilities.storage),
-            Space::Transient => ("TSTORE", trace.capabilities.transient_storage),
-        };
-        let mut records = HashMap::<(usize, Word), Vec<Record>>::new();
-        // A trace without transient storage has nothing to index, so skip the walk.
-        let steps = if space == Space::Transient && !captured {
-            &[][..]
-        } else {
-            &trace.steps[..]
-        };
-        for (index, step) in steps.iter().enumerate() {
-            let snapshot = step.snapshot_ref();
-            let words = match space {
-                Space::Persistent if snapshot.storage_diff.is_empty() => continue,
-                Space::Transient if snapshot.transient_storage.is_empty() => continue,
-                Space::Persistent => snapshot
-                    .storage_diff
-                    .iter()
-                    .filter_map(|(slot, change)| Some((slot, change.after.as_ref()?)))
-                    .collect::<Vec<_>>(),
-                Space::Transient => snapshot.transient_storage.iter().collect(),
-            };
-            let Some(context) = map.storage_context_index(index) else {
-                continue;
-            };
-            // A write takes effect after its step; a read reports what is there at it.
-            let from = if &*step.op == write { index + 1 } else { index };
-            for (slot, value) in words {
-                push_record(&mut records, context, from, slot, value);
-            }
-        }
+    /// Both tapes, [`StorageTape::new`] and [`StorageTape::transient`], from one walk
+    /// over the steps.
+    #[must_use]
+    pub fn persistent_and_transient(trace: &TransactionTrace, map: &StepMap) -> (Self, Self) {
+        let captured = trace.capabilities.transient_storage;
+        let (persistent, transient) = index_records(trace, map, true, captured);
+        (
+            Self::finish(
+                persistent,
+                map,
+                trace.capabilities.storage,
+                Space::Persistent,
+            ),
+            Self::finish(transient, map, captured, Space::Transient),
+        )
+    }
 
+    /// Applies the reverted frames to the records of one space and orders them by step.
+    fn finish(mut records: Records, map: &StepMap, captured: bool, space: Space) -> Self {
         // A frame that reverted kept none of the writes made while it ran, its callees'
         // included; every slot it touched goes back to what it held when it was entered.
         for (entry, last) in map.reverted_spans() {
@@ -299,6 +295,51 @@ impl StorageTape {
     fn starts_at_zero(&self) -> bool {
         self.space == Space::Transient && self.captured
     }
+}
+
+/// Indexes the words every step of `trace` recorded, in the storage context `map`
+/// computed for the step: the persistent ones when `persistent`, the transient ones when
+/// `transient`. One walk fills both.
+fn index_records(
+    trace: &TransactionTrace,
+    map: &StepMap,
+    persistent: bool,
+    transient: bool,
+) -> (Records, Records) {
+    let mut persistent_records = Records::new();
+    let mut transient_records = Records::new();
+    // With neither space to index there is nothing to walk.
+    if !persistent && !transient {
+        return (persistent_records, transient_records);
+    }
+    for (index, step) in trace.steps.iter().enumerate() {
+        let snapshot = step.snapshot_ref();
+        let has_persistent = persistent && !snapshot.storage_diff.is_empty();
+        let has_transient = transient && !snapshot.transient_storage.is_empty();
+        if !has_persistent && !has_transient {
+            continue;
+        }
+        let Some(context) = map.storage_context_index(index) else {
+            continue;
+        };
+        // A write takes effect after its step; a read reports what is there at it.
+        let starts = |write: &str| if &*step.op == write { index + 1 } else { index };
+        if has_persistent {
+            let from = starts("SSTORE");
+            for (slot, change) in snapshot.storage_diff {
+                if let Some(value) = &change.after {
+                    push_record(&mut persistent_records, context, from, slot, value);
+                }
+            }
+        }
+        if has_transient {
+            let from = starts("TSTORE");
+            for (slot, value) in snapshot.transient_storage {
+                push_record(&mut transient_records, context, from, slot, value);
+            }
+        }
+    }
+    (persistent_records, transient_records)
 }
 
 /// Records that `slot` of `context` holds `value` from step `from`, unless it already did.
