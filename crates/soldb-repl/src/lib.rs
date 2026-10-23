@@ -284,8 +284,9 @@ impl DebuggerState {
     ) -> SoldbResult<()> {
         check_root_calls(&trace)?;
         let map = StepMap::new(&trace, contracts);
-        self.storage_tape = Some(StorageTape::new(&trace, &map));
-        self.transient_tape = Some(StorageTape::transient(&trace, &map));
+        let (storage_tape, transient_tape) = StorageTape::persistent_and_transient(&trace, &map);
+        self.storage_tape = Some(storage_tape);
+        self.transient_tape = Some(transient_tape);
         self.step_map = Some(map);
         self.trace = Some(trace);
         self.current_step = 0;
@@ -297,8 +298,9 @@ impl DebuggerState {
     pub fn attach_debug_info(&mut self, contracts: Vec<ContractDebugInfo>) {
         if let Some(trace) = &self.trace {
             let map = StepMap::new(trace, contracts);
-            self.storage_tape = Some(StorageTape::new(trace, &map));
-            self.transient_tape = Some(StorageTape::transient(trace, &map));
+            let (storage_tape, transient_tape) = StorageTape::persistent_and_transient(trace, &map);
+            self.storage_tape = Some(storage_tape);
+            self.transient_tape = Some(transient_tape);
             self.step_map = Some(map);
         }
     }

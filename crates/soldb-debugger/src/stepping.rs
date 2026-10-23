@@ -645,6 +645,41 @@ struct StepInfo {
     line_start: bool,
 }
 
+/// The line of the nearest step at each frame depth, for a walk over the steps in one
+/// direction. A step hides every deeper depth from the steps after it; a step without a
+/// line does not hide the line at its own depth.
+#[derive(Debug, Default)]
+struct NearestLines {
+    /// Depths with a line, shallowest first. A depth that is missing has none.
+    lines: Vec<(u32, LineKey)>,
+}
+
+impl NearestLines {
+    /// Walks past a step and returns the line of the nearest step before it at the same
+    /// depth, or `None` when a shallower step or no step at that depth comes first.
+    fn visit(&mut self, depth: u32, key: Option<LineKey>) -> Option<LineKey> {
+        while self.lines.last().is_some_and(|(level, _)| *level > depth) {
+            self.lines.pop();
+        }
+        let nearest = match self.lines.last() {
+            Some((level, line)) if *level == depth => Some(*line),
+            _ => None,
+        };
+        if let Some(key) = key {
+            if nearest.is_some() {
+                self.lines.pop();
+            }
+            self.lines.push((depth, key));
+        }
+        nearest
+    }
+
+    /// Forgets every step walked past so far.
+    fn clear(&mut self) {
+        self.lines.clear();
+    }
+}
+
 /// Per-step source locations and frame depths over one trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepMap {
@@ -877,6 +912,20 @@ struct FrameVariables {
     /// own — its parameters are the caller's expressions, its results the caller's
     /// temporaries.
     inlined: bool,
+    /// What `layout` was computed from, so a step that changes none of it reuses the
+    /// layout instead of building it again.
+    layout_inputs: LayoutInputs,
+}
+
+/// Everything a frame's layout depends on besides its function: the slots placed so far
+/// and which locals are in scope. Two steps with the same inputs have the same layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LayoutInputs {
+    params_base: Option<usize>,
+    returns: Vec<Option<usize>>,
+    locals_base: Option<usize>,
+    /// Per local of the function, whether it was in scope.
+    in_scope: Vec<bool>,
 }
 
 impl FrameVariables {
@@ -893,6 +942,7 @@ impl FrameVariables {
             layout: None,
             modifier_slots,
             inlined: false,
+            layout_inputs: LayoutInputs::default(),
         }
     }
 
@@ -975,6 +1025,55 @@ impl FrameVariables {
         // Parameters a reservation just placed place the rest.
         self.place_from_parameters(function);
 
+        // The layout is a function of its inputs, so unchanged inputs give the layout
+        // computed last. In a loop that is almost every step.
+        let inputs = &self.layout_inputs;
+        if let Some(id) = self.layout {
+            if inputs.params_base == self.params_base
+                && inputs.locals_base == self.locals_base
+                && inputs.returns == self.returns
+                && inputs.in_scope.len() == function.locals.len()
+                && function
+                    .locals
+                    .iter()
+                    .zip(&inputs.in_scope)
+                    .all(|(local, in_scope)| local.scope.contains(span.start) == *in_scope)
+            {
+                debug_assert_eq!(
+                    layouts[id as usize],
+                    self.layout_at(function, span.start),
+                    "a cache hit must give the layout its inputs compute"
+                );
+                return id;
+            }
+        }
+
+        let layout = self.layout_at(function, span.start);
+        let id = match self.layout {
+            Some(id) if layouts[id as usize] == layout => id,
+            _ => {
+                layouts.push(layout);
+                (layouts.len() - 1) as u32
+            }
+        };
+        self.layout = Some(id);
+        let inputs = &mut self.layout_inputs;
+        inputs.params_base = self.params_base;
+        inputs.returns.clone_from(&self.returns);
+        inputs.locals_base = self.locals_base;
+        inputs.in_scope.clear();
+        inputs.in_scope.extend(
+            function
+                .locals
+                .iter()
+                .map(|local| local.scope.contains(span.start)),
+        );
+        id
+    }
+
+    /// The frame's variables at `offset` in its function's own code, as the parameters'
+    /// base, the return slots, and the locals' base place them.
+    fn layout_at(&self, function: &SourceFunction, offset: u64) -> Vec<InferredVariable> {
         let mut layout = Vec::new();
         if let Some(base) = self.params_base {
             let mut slot = base;
@@ -1003,27 +1102,19 @@ impl FrameVariables {
             });
         }
         for (index, local) in function.locals.iter().enumerate() {
-            if local.scope.contains(span.start) {
+            if local.scope.contains(offset) {
                 layout.push(InferredVariable {
                     name: local.name.clone(),
                     ty: local.declared_type(),
                     kind: VariableKind::Local,
                     slot: self
                         .locals_base
-                        .map(|base| base + live_index(function, index, span.start)),
+                        .map(|base| base + live_index(function, index, offset)),
                     words: 1,
                 });
             }
         }
-        let id = match self.layout {
-            Some(id) if layouts[id as usize] == layout => id,
-            _ => {
-                layouts.push(layout);
-                (layouts.len() - 1) as u32
-            }
-        };
-        self.layout = Some(id);
-        id
+        layout
     }
 }
 
@@ -1460,15 +1551,16 @@ impl StepMap {
         let structured = |contract: Option<usize>| {
             contract.is_some_and(|index| !contracts[index].functions.is_empty())
         };
-        let mut function_follows = std::collections::HashSet::<u32>::new();
+        // Frame ids are dense from zero, so a flag per id stands in for a set of them.
+        let mut function_follows = vec![false; next_frame_id as usize];
         let mut epilogue = vec![false; framed.len()];
         for (index, step) in framed.iter().enumerate().rev() {
             match step.location.map(|location| location.function) {
                 Some(Some(_)) => {
-                    function_follows.insert(step.frame_id);
+                    function_follows[step.frame_id as usize] = true;
                 }
                 Some(None) if structured(step.contract) => {
-                    epilogue[index] = !function_follows.contains(&step.frame_id);
+                    epilogue[index] = !function_follows[step.frame_id as usize];
                 }
                 _ => {}
             }
@@ -1814,7 +1906,7 @@ impl StepMap {
             roots,
         };
         if smooth {
-            map.smooth_single_step_excursions();
+            Self::smooth_single_step_excursions(&mut map.steps);
         }
         map.mark_line_starts();
         map
@@ -1824,51 +1916,31 @@ impl StepMap {
     /// at the same depth, counts as that line. solc emits such instructions at function
     /// entry, and stopping on them would show a later line before an earlier one. The runs
     /// are looked for within the step's own top-level call.
-    fn smooth_single_step_excursions(&mut self) {
-        let neighbours =
-            |steps: &[StepInfo], index: usize, forward: bool| -> Option<Option<LineKey>> {
-                let depth = steps[index].frame_depth;
-                let range: Box<dyn Iterator<Item = usize>> = if forward {
-                    Box::new((index + 1)..steps.len())
-                } else {
-                    Box::new((0..index).rev())
-                };
-                for candidate in range {
-                    // The step after a boundary is the one marked as starting a root.
-                    let boundary = if forward { candidate } else { candidate + 1 };
-                    if steps[boundary].starts_root {
-                        return None;
-                    }
-                    let step = &steps[candidate];
-                    if step.frame_depth > depth {
-                        continue;
-                    }
-                    if step.frame_depth < depth {
-                        return None;
-                    }
-                    if step.key.is_some() {
-                        return Some(step.key);
-                    }
-                }
-                None
-            };
-        let mut smoothed = Vec::new();
-        for index in 0..self.steps.len() {
-            let Some(key) = self.steps[index].key else {
-                continue;
-            };
-            let Some(before) = neighbours(&self.steps, index, false) else {
-                continue;
-            };
-            let Some(after) = neighbours(&self.steps, index, true) else {
-                continue;
-            };
-            if before == after && before.is_some() && before != Some(key) {
-                smoothed.push((index, before));
+    ///
+    /// One pass in each direction finds every step's neighbours, so deep recursion does
+    /// not make each step search the frames it calls.
+    fn smooth_single_step_excursions(steps: &mut [StepInfo]) {
+        let mut after = vec![None; steps.len()];
+        let mut lines = NearestLines::default();
+        for (index, step) in steps.iter().enumerate().rev() {
+            after[index] = lines.visit(step.frame_depth, step.key);
+            // A step that starts a root ends the search of the steps before it.
+            if step.starts_root {
+                lines.clear();
             }
         }
-        for (index, key) in smoothed {
-            self.steps[index].key = key;
+        let mut lines = NearestLines::default();
+        for (step, after) in steps.iter_mut().zip(after) {
+            if step.starts_root {
+                lines.clear();
+            }
+            let before = lines.visit(step.frame_depth, step.key);
+            let Some(key) = step.key else {
+                continue;
+            };
+            if before.is_some() && before == after && before != Some(key) {
+                step.key = before;
+            }
         }
     }
 
@@ -2843,7 +2915,7 @@ mod tests {
 
     use super::{
         address_from_word, normalize_address, ArgumentLayout, ArgumentOrder, ContractDebugInfo,
-        InferredVariable, JumpMarker, LineKey, LocalsStatus, StepMap, VariableKind,
+        InferredVariable, JumpMarker, LineKey, LocalsStatus, StepInfo, StepMap, VariableKind,
     };
 
     // Two functions; `outer` calls `inner` internally. Line numbers are one-based.
@@ -4832,5 +4904,60 @@ contract D {
         assert_eq!(map.frames(10)[0].function_name.as_deref(), Some("outer"));
         assert_ne!(map.line_key(10), map.line_key(9));
         assert_eq!(map.line_key(9), map.line_key(11));
+    }
+
+    /// A step at `depth` on `line` of contract 0, or on no line.
+    fn step_info(depth: u32, line: Option<u64>, starts_root: bool) -> StepInfo {
+        StepInfo {
+            location: None,
+            generated: false,
+            key: line.and_then(key),
+            contract: None,
+            address: None,
+            storage: None,
+            evm_depth: 0,
+            starts_root,
+            frame_depth: depth,
+            frame_entry: false,
+            line_start: false,
+        }
+    }
+
+    #[test]
+    fn smoothing_looks_past_deeper_frames_only() {
+        let mut steps = vec![
+            step_info(1, Some(1), false),
+            // A lone line 2 between two runs of line 1, with deeper frames and a step
+            // without a line before the second run.
+            step_info(1, Some(2), false),
+            step_info(2, Some(3), false),
+            step_info(3, Some(4), false),
+            step_info(4, Some(5), false),
+            step_info(3, Some(6), false),
+            step_info(1, None, false),
+            step_info(1, Some(1), false),
+            // A shallower step comes between line 8 and the line 1 before it.
+            step_info(0, Some(7), false),
+            step_info(1, Some(8), false),
+            step_info(1, Some(1), false),
+            // A shallower step comes between line 9 and the line 1 after it.
+            step_info(1, Some(9), false),
+            step_info(0, Some(7), false),
+            step_info(1, Some(1), false),
+            // A root starts between line 2 and the line 1 after it.
+            step_info(1, Some(2), false),
+            step_info(1, Some(1), true),
+        ];
+        let mut expected = steps
+            .iter()
+            .map(|step| step.key.map(|key| key.line))
+            .collect::<Vec<_>>();
+        expected[1] = Some(1);
+        StepMap::smooth_single_step_excursions(&mut steps);
+        let lines = steps
+            .iter()
+            .map(|step| step.key.map(|key| key.line))
+            .collect::<Vec<_>>();
+        assert_eq!(lines, expected);
     }
 }
