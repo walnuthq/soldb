@@ -36,72 +36,103 @@ pub const STACK_CHECKPOINT: usize = 32;
 const CHUNK_BITS: u32 = 14;
 const CHUNK: usize = 1 << CHUNK_BITS;
 
-/// A column of one field, grown a fixed-size chunk at a time so that growing never moves
-/// what is already in it. The first chunk grows like any vector, which keeps a short
-/// trace small.
+/// A column of values, grown a fixed-size chunk at a time so that growing never moves
+/// what is already in it. The chunk being filled is held apart from the full ones, so
+/// appending is one vector push; it grows like any vector until it is full, which keeps
+/// a short trace small.
 #[derive(Debug, Clone)]
 struct Column<T> {
-    chunks: Vec<Vec<T>>,
-    len: usize,
+    /// The full chunks, of `CHUNK` values each.
+    full: Vec<Box<[T]>>,
+    /// The values after the full chunks, at most `CHUNK` of them.
+    tail: Vec<T>,
 }
 
 impl<T> Default for Column<T> {
     fn default() -> Self {
         Self {
-            chunks: Vec::new(),
-            len: 0,
+            full: Vec::new(),
+            tail: Vec::new(),
         }
     }
 }
 
 impl<T: Copy> Column<T> {
+    fn len(&self) -> usize {
+        self.full.len() * CHUNK + self.tail.len()
+    }
+
     fn push(&mut self, value: T) {
-        match self.chunks.last_mut() {
-            Some(chunk) if chunk.len() < CHUNK => chunk.push(value),
-            _ => {
-                let mut chunk = if self.chunks.is_empty() {
-                    Vec::new()
-                } else {
-                    Vec::with_capacity(CHUNK)
-                };
-                chunk.push(value);
-                self.chunks.push(chunk);
-            }
+        if self.tail.len() == CHUNK {
+            let full = std::mem::replace(&mut self.tail, Vec::with_capacity(CHUNK));
+            self.full.push(full.into_boxed_slice());
         }
-        self.len += 1;
+        self.tail.push(value);
     }
 
-    fn get(&self, index: usize) -> T {
-        self.chunks[index >> CHUNK_BITS][index & (CHUNK - 1)]
+    fn get(&self, index: usize) -> &T {
+        let chunk = index >> CHUNK_BITS;
+        match self.full.get(chunk) {
+            Some(full) => &full[index & (CHUNK - 1)],
+            None => &self.tail[index - self.full.len() * CHUNK],
+        }
     }
 
-    fn set(&mut self, index: usize, value: T) {
-        self.chunks[index >> CHUNK_BITS][index & (CHUNK - 1)] = value;
+    fn get_mut(&mut self, index: usize) -> &mut T {
+        let chunk = index >> CHUNK_BITS;
+        let full = self.full.len();
+        match self.full.get_mut(chunk) {
+            Some(full) => &mut full[index & (CHUNK - 1)],
+            None => &mut self.tail[index - full * CHUNK],
+        }
     }
 
-    fn last(&self) -> Option<T> {
-        self.len.checked_sub(1).map(|index| self.get(index))
+    fn last(&self) -> Option<&T> {
+        self.tail.last().or_else(|| self.full.last()?.last())
     }
 
     /// Makes room for `chunks` chunks, the first of `first` values.
     fn reserve(&mut self, chunks: usize, first: usize) {
-        self.chunks.reserve(chunks);
-        if self.chunks.is_empty() && first > 0 {
-            self.chunks.push(Vec::with_capacity(first));
+        self.full.reserve(chunks);
+        if self.full.is_empty() && self.tail.is_empty() {
+            self.tail.reserve(first.min(CHUNK));
         }
     }
 
     fn truncate(&mut self, len: usize) {
-        if len >= self.len {
+        if len >= self.len() {
             return;
         }
-        let chunks = len.div_ceil(CHUNK);
-        self.chunks.truncate(chunks);
-        if let Some(last) = self.chunks.last_mut() {
-            last.truncate(len - (chunks - 1) * CHUNK);
+        let whole = len / CHUNK;
+        if whole < self.full.len() {
+            // The chunk `len` falls in is the one filled from now on.
+            self.full.truncate(whole + 1);
+            self.tail = self.full.pop().map(Vec::from).unwrap_or_default();
         }
-        self.len = len;
+        self.tail.truncate(len - whole * CHUNK);
     }
+}
+
+/// The fixed-size fields of one step, kept together: a reader of a step reads several of
+/// them, and appending a step is then one push.
+#[derive(Debug, Clone, Copy)]
+struct Row {
+    gas: u64,
+    gas_cost: u64,
+    /// Where the step's words above the kept ones start on the tape.
+    stack_start: u64,
+    memory: MemoryRef,
+    /// The program counter, or `u32::MAX` for one in `wide_pcs`.
+    pc: u32,
+    stack_len: u32,
+    /// How many bottom words of the step's stack are the previous step's; the rest are on
+    /// the tape from `stack_start`.
+    stack_kept: u32,
+    /// The depth, or `u16::MAX` for one in `wide_depths`.
+    depth: u16,
+    op: u8,
+    /// Whether the step is in `errors`, so a step without one does not look.
+    failed: bool,
 }
 
 /// One step as a producer appends it with [`StepTable::append`]: its plain fields, and
@@ -144,20 +175,8 @@ pub enum StepError {
 /// The steps of a trace, in columns. See the module docs.
 #[derive(Clone, Default)]
 pub struct StepTable {
-    /// The program counter, or `u32::MAX` for one in `wide_pcs`.
-    pc: Column<u32>,
-    op: Column<u8>,
-    /// The depth, or `u16::MAX` for one in `wide_depths`.
-    depth: Column<u16>,
-    gas: Column<u64>,
-    gas_cost: Column<u64>,
-    stack_len: Column<u32>,
-    /// How many bottom words of the step's stack are the previous step's; the rest are on
-    /// the tape from `stack_start`.
-    stack_kept: Column<u32>,
-    stack_start: Column<u64>,
+    rows: Column<Row>,
     words: Column<EvmWord>,
-    memory: Column<MemoryRef>,
     /// The steps whose backend spelled their mnemonic other than [`opcode::mnemonic`]
     /// does, ascending, with that spelling.
     mnemonics: Vec<(usize, Word)>,
@@ -203,17 +222,7 @@ impl StepTable {
     #[must_use]
     pub fn with_capacity(steps: usize) -> Self {
         let mut table = Self::new();
-        let chunks = steps.div_ceil(CHUNK);
-        let first = steps.min(CHUNK);
-        table.pc.reserve(chunks, first);
-        table.op.reserve(chunks, first);
-        table.depth.reserve(chunks, first);
-        table.gas.reserve(chunks, first);
-        table.gas_cost.reserve(chunks, first);
-        table.stack_len.reserve(chunks, first);
-        table.stack_kept.reserve(chunks, first);
-        table.stack_start.reserve(chunks, first);
-        table.memory.reserve(chunks, first);
+        table.rows.reserve(steps.div_ceil(CHUNK), steps);
         table
     }
 
@@ -232,7 +241,7 @@ impl StepTable {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.op.len
+        self.rows.len()
     }
 
     #[must_use]
@@ -357,7 +366,7 @@ impl StepTable {
             Some(memory) => self.memories.snapshot(memory),
             None => MemoryRef::NONE,
         };
-        self.memory.set(index, memory);
+        self.rows.get_mut(index).memory = memory;
         Ok(())
     }
 
@@ -435,40 +444,42 @@ impl StepTable {
         } else {
             kept
         };
-        self.stack_start.push(self.words.len as u64);
+        let stack_start = self.words.len() as u64;
         for word in &self.last_stack[stored_from..] {
             self.words.push(*word);
         }
-        // A stack holds at most 1024 words; a count past `u32::MAX` is not a stack.
-        self.stack_kept
-            .push(u32::try_from(stored_from).unwrap_or(u32::MAX));
-        self.stack_len
-            .push(u32::try_from(self.last_stack.len()).unwrap_or(u32::MAX));
-
-        match u32::try_from(record.pc) {
-            Ok(pc) if pc != u32::MAX => self.pc.push(pc),
+        let pc = match u32::try_from(record.pc) {
+            Ok(pc) if pc != u32::MAX => pc,
             _ => {
-                self.pc.push(u32::MAX);
                 self.wide_pcs.push((index, record.pc));
+                u32::MAX
             }
-        }
-        match u16::try_from(record.depth) {
-            Ok(depth) if depth != u16::MAX => self.depth.push(depth),
+        };
+        let depth = match u16::try_from(record.depth) {
+            Ok(depth) if depth != u16::MAX => depth,
             _ => {
-                self.depth.push(u16::MAX);
                 self.wide_depths.push((index, record.depth));
+                u16::MAX
             }
-        }
-        self.op.push(record.op);
-        self.gas.push(record.gas);
-        self.gas_cost.push(record.gas_cost);
-
+        };
         let memory = match record.memory {
             Some(memory) => self.memories.snapshot(memory),
             None if self.memories.recording() => self.memories.current(),
-            None => self.memory.last().unwrap_or(MemoryRef::NONE),
+            None => self.rows.last().map_or(MemoryRef::NONE, |row| row.memory),
         };
-        self.memory.push(memory);
+        self.rows.push(Row {
+            gas: record.gas,
+            gas_cost: record.gas_cost,
+            stack_start,
+            memory,
+            pc,
+            // A stack holds at most 1024 words; a count past `u32::MAX` is not a stack.
+            stack_len: u32::try_from(self.last_stack.len()).unwrap_or(u32::MAX),
+            stack_kept: u32::try_from(stored_from).unwrap_or(u32::MAX),
+            depth,
+            op: record.op,
+            failed: record.error.is_some(),
+        });
         if let Some(error) = record.error {
             self.errors.push((index, error.into_boxed_str()));
         }
@@ -573,22 +584,11 @@ impl StepTable {
             .checked_sub(1)
             .map(|last| self.step(last).stack().to_vec())
             .unwrap_or_default();
-        let words = if len == 0 {
-            0
-        } else {
-            let last = len - 1;
-            self.stack_start.get(last) as usize + self.stack_len.get(last) as usize
-                - self.stack_kept.get(last) as usize
-        };
-        self.pc.truncate(len);
-        self.op.truncate(len);
-        self.depth.truncate(len);
-        self.gas.truncate(len);
-        self.gas_cost.truncate(len);
-        self.stack_len.truncate(len);
-        self.stack_kept.truncate(len);
-        self.stack_start.truncate(len);
-        self.memory.truncate(len);
+        let words = len.checked_sub(1).map_or(0, |last| {
+            let row = self.rows.get(last);
+            row.stack_start as usize + row.stack_len as usize - row.stack_kept as usize
+        });
+        self.rows.truncate(len);
         self.words.truncate(words);
         self.mnemonics.retain(|(index, _)| *index < len);
         self.errors.retain(|(index, _)| *index < len);
@@ -613,11 +613,10 @@ impl StepTable {
     fn stack_word(&self, index: usize, position: usize) -> EvmWord {
         let mut step = index;
         loop {
-            let kept = self.stack_kept.get(step) as usize;
+            let row = self.rows.get(step);
+            let kept = row.stack_kept as usize;
             if position >= kept {
-                return self
-                    .words
-                    .get(self.stack_start.get(step) as usize + position - kept);
+                return *self.words.get(row.stack_start as usize + position - kept);
             }
             // A step that kept words is not a checkpoint, so it has a step before it, and
             // that step's stack holds every word it kept.
@@ -762,9 +761,13 @@ impl<'a> StepView<'a> {
         self.index
     }
 
+    fn row(&self) -> &'a Row {
+        self.table.rows.get(self.index)
+    }
+
     #[must_use]
     pub fn pc(&self) -> u64 {
-        match self.table.pc.get(self.index) {
+        match self.row().pc {
             u32::MAX => sparse_value(&self.table.wide_pcs, self.index)
                 .copied()
                 .unwrap_or(u64::from(u32::MAX)),
@@ -776,7 +779,7 @@ impl<'a> StepView<'a> {
     /// spelled has [`opcode::INVALID`]; [`StepView::mnemonic`] still has the spelling.
     #[must_use]
     pub fn op(&self) -> u8 {
-        self.table.op.get(self.index)
+        self.row().op
     }
 
     /// The mnemonic, as the backend spelled it.
@@ -792,18 +795,18 @@ impl<'a> StepView<'a> {
 
     #[must_use]
     pub fn gas(&self) -> u64 {
-        self.table.gas.get(self.index)
+        self.row().gas
     }
 
     /// The cost as the tracer reports it; see [`TraceStep::gas_cost`].
     #[must_use]
     pub fn gas_cost(&self) -> u64 {
-        self.table.gas_cost.get(self.index)
+        self.row().gas_cost
     }
 
     #[must_use]
     pub fn depth(&self) -> u64 {
-        match self.table.depth.get(self.index) {
+        match self.row().depth {
             u16::MAX => sparse_value(&self.table.wide_depths, self.index)
                 .copied()
                 .unwrap_or(u64::from(u16::MAX)),
@@ -813,7 +816,7 @@ impl<'a> StepView<'a> {
 
     #[must_use]
     pub fn error(&self) -> Option<&'a str> {
-        if self.table.errors.is_empty() {
+        if !self.row().failed {
             return None;
         }
         sparse_value(&self.table.errors, self.index).map(|error| &**error)
@@ -824,7 +827,7 @@ impl<'a> StepView<'a> {
         Stack {
             table: self.table,
             step: self.index,
-            len: self.table.stack_len.get(self.index) as usize,
+            len: self.row().stack_len as usize,
         }
     }
 
@@ -833,7 +836,7 @@ impl<'a> StepView<'a> {
     /// the writes before the step otherwise.
     #[must_use]
     pub fn memory(&self) -> Option<Bytes> {
-        self.table.memories.read(self.table.memory.get(self.index))
+        self.table.memories.read(self.row().memory)
     }
 
     /// The storage the backend reported for the step.
@@ -1078,11 +1081,12 @@ impl<'a> Stack<'a> {
         let mut step = self.step;
         let mut end = self.len;
         loop {
-            let kept = (self.table.stack_kept.get(step) as usize).min(end);
-            let start = self.table.stack_start.get(step) as usize;
-            let stored_from = self.table.stack_kept.get(step) as usize;
+            let row = self.table.rows.get(step);
+            let stored_from = row.stack_kept as usize;
+            let kept = stored_from.min(end);
+            let start = row.stack_start as usize;
             for (position, slot) in words.iter_mut().enumerate().take(end).skip(kept) {
-                *slot = self.table.words.get(start + position - stored_from);
+                *slot = *self.table.words.get(start + position - stored_from);
             }
             if kept == 0 {
                 return words;
@@ -1232,6 +1236,39 @@ mod tests {
     }
 
     #[test]
+    fn columns_span_chunks() {
+        let mut column = super::Column::<u32>::default();
+        let total = 2 * super::CHUNK + 5;
+        for value in 0..total {
+            column.push(value as u32);
+        }
+        assert_eq!(column.len(), total);
+        assert_eq!(column.full.len(), 2);
+        for index in [
+            0,
+            super::CHUNK - 1,
+            super::CHUNK,
+            2 * super::CHUNK,
+            total - 1,
+        ] {
+            assert_eq!(*column.get(index), index as u32);
+        }
+        assert_eq!(column.last(), Some(&(total as u32 - 1)));
+        *column.get_mut(super::CHUNK) = 7;
+        assert_eq!(*column.get(super::CHUNK), 7);
+
+        // Back into a full chunk, which is filled again from where it was cut.
+        column.truncate(super::CHUNK + 3);
+        assert_eq!((column.len(), column.full.len()), (super::CHUNK + 3, 1));
+        column.push(99);
+        assert_eq!(*column.get(super::CHUNK + 3), 99);
+        column.truncate(super::CHUNK);
+        assert_eq!(column.last(), Some(&(super::CHUNK as u32 - 1)));
+        column.truncate(0);
+        assert_eq!((column.len(), column.last()), (0, None));
+    }
+
+    #[test]
     fn writes_exactly_what_the_steps_wrote() {
         for seed in [1, 2, 3] {
             let steps = random_steps(500, seed);
@@ -1275,9 +1312,9 @@ mod tests {
         }
         // Most of every stack is the previous step's and is not stored again.
         assert!(
-            table.words.len < stored / 2,
+            table.words.len() < stored / 2,
             "{} of {stored}",
-            table.words.len
+            table.words.len()
         );
     }
 
@@ -1317,9 +1354,8 @@ mod tests {
             if snapshot.memory.is_none()
                 && previous.is_some_and(|step| step.snapshot.memory.is_some())
             {
-                appended
-                    .memory
-                    .set(appended.len() - 1, super::MemoryRef::NONE);
+                let last = appended.len() - 1;
+                appended.rows.get_mut(last).memory = super::MemoryRef::NONE;
             }
             previous = Some(step);
         }
