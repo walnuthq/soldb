@@ -79,13 +79,13 @@ echo "  DEBUG_DIR=$DEBUG_DIR"
 if [ "$1" = "--deploy-test" ] || [ "$1" = "-d" ]; then
     echo
     echo -e "${BLUE}Deploying TestContract for tests...${NC}"
-    if [ -x "$SCRIPT_DIR/test/deploy-test-contract.sh" ]; then
+    if [ -x "$SCRIPT_DIR/deploy-test-contract.sh" ]; then
         # Ensure SOLC_PATH is properly set
         if [ -z "$SOLC_PATH" ] && command -v solc &> /dev/null; then
             SOLC_PATH=$(which solc)
         fi
         SOLC_PATH="$SOLC_PATH" RPC_URL="$RPC_URL" PRIVATE_KEY="$PRIVATE_KEY" \
-            "$SCRIPT_DIR/test/deploy-test-contract.sh"
+            "$SCRIPT_DIR/deploy-test-contract.sh"
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}✓ Test contract deployed successfully${NC}"
         else
