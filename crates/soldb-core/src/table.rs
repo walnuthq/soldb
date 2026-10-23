@@ -25,7 +25,8 @@ use thiserror::Error;
 
 use crate::memory::{MemoryRef, MemoryStore};
 use crate::{
-    encode_hex, opcode, EvmWord, Hex, StepSnapshot, StorageChange, TraceStep, Word, WordError,
+    encode_hex, opcode, EvmWord, Hex, MemoryWriteError, StepSnapshot, StorageChange, TraceStep,
+    Word, WordError,
 };
 
 /// Every this many steps, a step stores its whole stack, so that reading a word never
@@ -114,7 +115,9 @@ pub struct StepRecord {
     pub gas_cost: u64,
     pub depth: u64,
     pub error: Option<String>,
-    /// The memory the step starts with, in full; `None` keeps the previous step's.
+    /// The memory the step starts with, in full. `None` leaves it to the frame being
+    /// recorded with [`StepTable::write_memory`], or keeps the previous step's when none
+    /// is.
     pub memory: Option<Bytes>,
     /// The storage the backend reports for the step; `None` keeps the previous step's.
     pub storage: Option<Arc<BTreeMap<String, String>>>,
@@ -462,6 +465,7 @@ impl StepTable {
 
         let memory = match record.memory {
             Some(memory) => self.memories.snapshot(memory),
+            None if self.memories.recording() => self.memories.current(),
             None => self.memory.last().unwrap_or(MemoryRef::NONE),
         };
         self.memory.push(memory);
@@ -480,6 +484,37 @@ impl StepTable {
         if let Some(return_data) = record.return_data {
             self.change_return_data(index, Some(return_data));
         }
+    }
+
+    /// Starts recording the memory of a new frame, empty, as a call or a creation starts
+    /// one: the steps appended from now on have it, as written with
+    /// [`StepTable::write_memory`].
+    pub fn start_memory_frame(&mut self) {
+        self.memories.start_frame();
+    }
+
+    /// Stops recording the innermost frame's memory, as its call returns; the steps
+    /// appended from now on have its caller's again.
+    pub fn end_memory_frame(&mut self) {
+        self.memories.end_frame();
+    }
+
+    /// Records that the step appended last wrote `data` at `offset` of its frame's
+    /// memory, which is `size` bytes long afterwards; a write without data records memory
+    /// growing. The steps appended after it see the write: a step's memory is the memory
+    /// it starts with.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MemoryWriteError`] when the write ends past `size` or `size` is smaller
+    /// than the memory was. Nothing is recorded then.
+    pub fn write_memory(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        size: u64,
+    ) -> Result<(), MemoryWriteError> {
+        self.memories.write(offset, data, size)
     }
 
     /// Starts a run of `storage` at `index`, the step appended last, unless it is the
@@ -791,7 +826,8 @@ impl<'a> StepView<'a> {
     }
 
     /// The memory the step starts with; `None` when the backend did not record memory.
-    /// The bytes are shared with the trace.
+    /// The bytes are shared with the trace when it holds them in full, and rebuilt from
+    /// the writes before the step otherwise.
     #[must_use]
     pub fn memory(&self) -> Option<Bytes> {
         self.table.memories.read(self.table.memory.get(self.index))
@@ -1349,5 +1385,43 @@ mod tests {
         assert_eq!(table, StepTable::from(steps));
         table.truncate(0);
         assert!(table.is_empty() && table.first().is_none());
+    }
+
+    #[test]
+    fn memory_recorded_write_by_write() {
+        let record = |pc| StepRecord {
+            pc,
+            op: opcode::MSTORE,
+            depth: 1,
+            ..StepRecord::default()
+        };
+        let mut table = StepTable::new();
+        table.append(record(0), []);
+        assert_eq!(table.step(0).memory(), None);
+        table.start_memory_frame();
+        table.append(record(1), []);
+        table.write_memory(0, &[7; 32], 32).expect("write");
+        table.append(record(2), []);
+        table.start_memory_frame();
+        table.append(record(3), []);
+        table.end_memory_frame();
+        table.write_memory(32, &[], 64).expect("grow");
+        table.append(record(4), []);
+        let memories = table
+            .iter()
+            .map(|step| step.memory().map(|memory| memory.to_vec()))
+            .collect::<Vec<_>>();
+        let mut grown = vec![7; 32];
+        grown.resize(64, 0);
+        assert_eq!(
+            memories,
+            [
+                None,
+                Some(Vec::new()),
+                Some(vec![7; 32]),
+                Some(Vec::new()),
+                Some(grown)
+            ]
+        );
     }
 }

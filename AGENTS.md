@@ -648,6 +648,18 @@ Beyond the rule:
   back, with or without a `0x` prefix; memory that is not hex is refused when it is read,
   from a trace file or a node's `structLogs`, rather than shown as something it is not.
   Use `soldb_core::encode_hex` where a view needs hex, and only for what it shows.
+- **An embedder records memory as writes.** A producer that has every step's memory in
+  full, as a node's `structLogs`, the replay inspector and a trace file do, hands it over
+  per step and the table keeps one image per change. An embedder that runs the
+  interpreter itself calls `StepTable::start_memory_frame` and `end_memory_frame` as calls
+  start and return, and `write_memory` after each step that wrote memory or grew it, and
+  never copies memory at all: the table keeps the writes per frame plus an image whenever
+  the bytes written since the last one reach the size of memory, and `StepView::memory`
+  rebuilds a step's memory from the image before it, with a cache so that stepping
+  forward applies only the writes in between. The recorder has to know every instruction
+  that writes memory; check what it rebuilds against the interpreter's memory in debug
+  builds. A 3,000-element memory array recorded in full peaks at 193 MB; recorded as
+  writes, at 5 MB.
 - **PC-to-source lookups should be indexed, not scanned.** Build the PC map once per
   contract (`build_pc_to_instruction_map`) and reuse it; a linear scan per step turns a
   trace walk quadratic.

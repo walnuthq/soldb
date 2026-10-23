@@ -31,6 +31,7 @@ pub mod opcode;
 mod table;
 mod word;
 
+pub use memory::MemoryWriteError;
 pub use table::{Stack, StepError, StepRecord, StepTable, StepView, Steps, STACK_CHECKPOINT};
 pub use word::{EvmWord, WordError};
 
