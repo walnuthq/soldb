@@ -1504,15 +1504,16 @@ impl StepMap {
         let structured = |contract: Option<usize>| {
             contract.is_some_and(|index| !contracts[index].functions.is_empty())
         };
-        let mut function_follows = std::collections::HashSet::<u32>::new();
+        // Frame ids are dense from zero, so a flag per id stands in for a set of them.
+        let mut function_follows = vec![false; next_frame_id as usize];
         let mut epilogue = vec![false; framed.len()];
         for (index, step) in framed.iter().enumerate().rev() {
             match step.location.map(|location| location.function) {
                 Some(Some(_)) => {
-                    function_follows.insert(step.frame_id);
+                    function_follows[step.frame_id as usize] = true;
                 }
                 Some(None) if structured(step.contract) => {
-                    epilogue[index] = !function_follows.contains(&step.frame_id);
+                    epilogue[index] = !function_follows[step.frame_id as usize];
                 }
                 _ => {}
             }
