@@ -534,11 +534,14 @@ impl StepTable {
     /// return data the step already has.
     fn change_return_data(&mut self, index: usize, return_data: Option<Arc<str>>) {
         let return_data = return_data.filter(|data| !data.is_empty());
-        let current = self
-            .return_data
-            .last()
-            .and_then(|(_, data)| data.as_deref());
-        if current != return_data.as_deref() {
+        let current = self.return_data.last().and_then(|(_, data)| data.as_ref());
+        // Producers share one buffer between the steps that did not change it, so the
+        // pointers decide most comparisons without reading the text.
+        let unchanged = match (current, &return_data) {
+            (Some(current), Some(data)) => Arc::ptr_eq(current, data) || current == data,
+            (current, data) => current.is_none() && data.is_none(),
+        };
+        if !unchanged {
             set_sparse(&mut self.return_data, index, return_data);
         }
     }
