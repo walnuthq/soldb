@@ -806,21 +806,60 @@ const DECLARATION_KEYWORDS: [&str; 5] =
 #[must_use]
 pub fn parse_source_functions(source_id: u64, source: &str) -> Vec<SourceFunction> {
     let mut functions = Vec::new();
-    for keyword in DECLARATION_KEYWORDS {
-        collect_declarations(source_id, source, keyword, &mut functions);
+    let found = keyword_positions(source, DECLARATION_KEYWORDS);
+    for (keyword, positions) in DECLARATION_KEYWORDS.into_iter().zip(&found) {
+        collect_declarations(source_id, source, keyword, positions, &mut functions);
     }
     functions.sort_by_key(|function| function.declaration_start);
     functions
+}
+
+/// Where each of `keywords` stands as a word of its own in `source`, in order, as
+/// [`find_solidity_keyword`] finds them one by one: found in one pass over the source
+/// rather than one search for every occurrence of every keyword.
+fn keyword_positions<const N: usize>(source: &str, keywords: [&str; N]) -> [Vec<usize>; N] {
+    let mut found = std::array::from_fn(|_| Vec::new());
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !is_identifier_byte(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+        let word = &bytes[start..index];
+        for (keyword, positions) in keywords.iter().zip(found.iter_mut()) {
+            if word == keyword.as_bytes() {
+                positions.push(start);
+            }
+        }
+    }
+    found
 }
 
 fn collect_declarations(
     source_id: u64,
     source: &str,
     keyword: &str,
+    positions: &[usize],
     functions: &mut Vec<SourceFunction>,
 ) {
     let named = matches!(keyword, "function" | "modifier");
     let mut cursor = 0;
+    let mut next = 0;
+    // The next occurrence of the keyword at or after the cursor, which only moves on.
+    let mut find = |cursor: usize| {
+        while positions.get(next).is_some_and(|at| *at < cursor) {
+            next += 1;
+        }
+        positions.get(next).copied()
+    };
     // Declarations are found in order, so each one's line is counted on from the last.
     let mut counted = (0, 1);
     let mut line_of = |offset: usize| {
@@ -832,7 +871,7 @@ fn collect_declarations(
         counted = (offset, line + newlines);
         line + newlines
     };
-    while let Some(keyword_start) = find_solidity_keyword(source, keyword, cursor) {
+    while let Some(keyword_start) = find(cursor) {
         let mut index = skip_ascii_whitespace(source, keyword_start + keyword.len());
         let name = if named {
             let Some((name, name_end)) = parse_identifier(source, index) else {
@@ -1555,6 +1594,25 @@ mod tests {
             (params[1].ty.as_str(), params[1].name.as_str()),
             ("address", "arg1")
         );
+    }
+
+    #[test]
+    fn finds_keywords_in_one_pass_as_one_by_one() {
+        let source = "function f() {} // function in a comment\n\
+            contract C { function functionX() {} function_ _function 1function function1\n\
+            modifier m() { _; } \"receive\" fallback() receive() constructor() é function\n\
+            x.receive(y); functionfunction function";
+        let found = super::keyword_positions(source, super::DECLARATION_KEYWORDS);
+        for (keyword, positions) in super::DECLARATION_KEYWORDS.into_iter().zip(&found) {
+            let mut one_by_one = Vec::new();
+            let mut cursor = 0;
+            while let Some(at) = super::find_solidity_keyword(source, keyword, cursor) {
+                one_by_one.push(at);
+                cursor = at + 1;
+            }
+            assert_eq!(*positions, one_by_one, "{keyword}");
+        }
+        assert_eq!(found[0].len(), 5);
     }
 
     #[test]
