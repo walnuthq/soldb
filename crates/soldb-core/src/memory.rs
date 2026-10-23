@@ -169,9 +169,13 @@ impl MemoryStore {
             self.frames.len() - 1
         });
         let frame_entries = &mut self.frames[frame];
-        let unchanged = match frame_entries.entries.last() {
-            Some(Entry::Image(last)) => {
-                same_buffer(last, &memory) || (last.len() == memory.len() && *last == memory)
+        let unchanged = match frame_entries.entries.last_mut() {
+            Some(Entry::Image(last)) if same_buffer(last, &memory) => true,
+            Some(Entry::Image(last)) if *last == memory => {
+                // Keep the producer's latest buffer so its following shared snapshots
+                // compare by pointer rather than comparing the same bytes again.
+                *last = memory.clone();
+                true
             }
             _ => false,
         };
