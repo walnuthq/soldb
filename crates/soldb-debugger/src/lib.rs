@@ -48,8 +48,8 @@ pub use state::{
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
     Frame, FunctionId, InferredVariable, JumpMarker, LineKey, LocalsStatus, ResolvedFunction,
-    ResolvedLine, SourceListing, StepLocation, StepMap, VariableKind, INFERRED_LOCALS_NOTE,
-    INFERRED_LOCALS_WARNING,
+    ResolvedLine, SourceCache, SourceListing, StepLocation, StepMap, VariableKind,
+    INFERRED_LOCALS_NOTE, INFERRED_LOCALS_WARNING,
 };
 pub use types::{SourceTypes, StructMember};
 
@@ -821,6 +821,17 @@ fn collect_declarations(
 ) {
     let named = matches!(keyword, "function" | "modifier");
     let mut cursor = 0;
+    // Declarations are found in order, so each one's line is counted on from the last.
+    let mut counted = (0, 1);
+    let mut line_of = |offset: usize| {
+        let (from, line) = if offset < counted.0 { (0, 1) } else { counted };
+        let newlines = source.as_bytes()[from..offset]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count() as u64;
+        counted = (offset, line + newlines);
+        line + newlines
+    };
     while let Some(keyword_start) = find_solidity_keyword(source, keyword, cursor) {
         let mut index = skip_ascii_whitespace(source, keyword_start + keyword.len());
         let name = if named {
@@ -883,11 +894,7 @@ fn collect_declarations(
             name: name.to_owned(),
             params,
             declaration_start: keyword_start as u64,
-            declaration_line: source[..keyword_start]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count() as u64
-                + 1,
+            declaration_line: line_of(keyword_start),
             body_start: body_start as u64,
             body_end: body_end as u64,
             returns,

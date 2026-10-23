@@ -146,6 +146,14 @@ impl SourceTypes {
         self.scopes.extend(scopes);
     }
 
+    /// Adds the declarations `other` holds, as adding its sources again would.
+    pub(crate) fn extend_from(&mut self, other: &Self) {
+        self.structs.extend_from_slice(&other.structs);
+        self.enums.extend_from_slice(&other.enums);
+        self.value_types.extend_from_slice(&other.value_types);
+        self.scopes.extend_from_slice(&other.scopes);
+    }
+
     /// Whether any declaration was found.
     #[must_use]
     pub fn is_empty(&self) -> bool {

@@ -31,6 +31,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use soldb_core::{opcode, EvmWord, StepView, TransactionTrace};
 use soldb_ethdebug::{
@@ -183,6 +184,45 @@ pub enum JumpMarker {
     Return,
 }
 
+/// What stepping reads from the source text: its functions, type declarations, and
+/// line starts. Contracts compiled together share most of their sources, so a host that
+/// prepares several of them passes one cache to
+/// [`ContractDebugInfo::with_source_cache`] and each source is read once.
+#[derive(Debug, Default)]
+pub struct SourceCache {
+    /// The sources read so far, by id; the same id can name different text in
+    /// different compilations.
+    sources: HashMap<u64, Vec<Arc<ReadSource>>>,
+}
+
+#[derive(Debug)]
+struct ReadSource {
+    text: String,
+    functions: Vec<SourceFunction>,
+    types: SourceTypes,
+    line_starts: Vec<usize>,
+}
+
+impl SourceCache {
+    /// Source `source_id` with `text`, read now unless it was before.
+    fn read(&mut self, source_id: u64, text: &str) -> Arc<ReadSource> {
+        let read = self.sources.entry(source_id).or_default();
+        if let Some(source) = read.iter().find(|source| source.text == text) {
+            return Arc::clone(source);
+        }
+        let mut types = SourceTypes::default();
+        types.add_source(source_id, text);
+        let source = Arc::new(ReadSource {
+            text: text.to_owned(),
+            functions: parse_source_functions(source_id, text),
+            types,
+            line_starts: line_starts(text),
+        });
+        read.push(Arc::clone(&source));
+        source
+    }
+}
+
 impl ContractDebugInfo {
     /// Prepares one contract's debug info. Functions are parsed from the source text,
     /// which serves ETHDebug and legacy source maps alike: both attach byte ranges of the
@@ -194,17 +234,40 @@ impl ContractDebugInfo {
         info: EthdebugInfo,
         source_contents: BTreeMap<u64, String>,
     ) -> Self {
-        let functions = source_contents
+        Self::with_source_cache(
+            address,
+            name,
+            info,
+            source_contents,
+            &mut SourceCache::default(),
+        )
+    }
+
+    /// Prepares one contract's debug info as [`ContractDebugInfo::new`] does, reading
+    /// each source through `cache` so that the contracts sharing it read it once.
+    #[must_use]
+    pub fn with_source_cache(
+        address: Option<&str>,
+        name: &str,
+        info: EthdebugInfo,
+        source_contents: BTreeMap<u64, String>,
+        cache: &mut SourceCache,
+    ) -> Self {
+        let read = source_contents
             .iter()
-            .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
+            .map(|(source_id, text)| (*source_id, cache.read(*source_id, text)))
+            .collect::<Vec<_>>();
+        let functions = read
+            .iter()
+            .flat_map(|(_, source)| source.functions.iter().cloned())
             .collect::<Vec<SourceFunction>>();
         let mut types = SourceTypes::default();
-        for (source_id, source) in &source_contents {
-            types.add_source(*source_id, source);
+        for (_, source) in &read {
+            types.extend_from(&source.types);
         }
-        let line_starts = source_contents
+        let line_starts = read
             .iter()
-            .map(|(source_id, source)| (*source_id, line_starts(source)))
+            .map(|(source_id, source)| (*source_id, source.line_starts.clone()))
             .collect();
         let pc_index = PcIndex::new(&info.instructions);
         let locations = info
@@ -268,6 +331,21 @@ impl ContractDebugInfo {
         jumpdests: &[bool],
         function_entries: &HashMap<u64, usize>,
     ) -> Vec<InstructionFacts> {
+        // The function a span is in is one of its own source's, and the instructions of a
+        // statement share its span, so each span's function is found once among them.
+        let mut by_source = HashMap::<u64, Vec<usize>>::new();
+        for (index, function) in self.functions.iter().enumerate() {
+            by_source.entry(function.source_id).or_default().push(index);
+        }
+        let mut found = HashMap::<(u64, u64), Option<usize>>::new();
+        let mut function_for = |location: &SourceLocation| {
+            *found
+                .entry((location.source_id, location.offset))
+                .or_insert_with(|| {
+                    let candidates = by_source.get(&location.source_id)?;
+                    narrowest_function(&self.functions, candidates, location.offset)
+                })
+        };
         self.info
             .instructions
             .iter()
@@ -277,9 +355,7 @@ impl ContractDebugInfo {
                 line: location
                     .as_ref()
                     .and_then(|location| self.line_of(location.source_id, location.offset)),
-                function: location
-                    .as_ref()
-                    .and_then(|location| self.function_for_location(location)),
+                function: location.as_ref().and_then(&mut function_for),
                 entry: function_entries.get(&instruction.offset).copied(),
                 marker: jump_marker(instruction),
                 jumpdest: *jumpdest,
@@ -408,18 +484,10 @@ impl ContractDebugInfo {
     /// The narrowest parsed function whose declaration contains the span.
     #[must_use]
     pub fn function_for_location(&self, location: &SourceLocation) -> Option<usize> {
-        self.functions
-            .iter()
-            .enumerate()
-            .filter(|(_, function)| {
-                function.source_id == location.source_id
-                    && function.declaration_start <= location.offset
-                    && location.offset <= function.body_end
-            })
-            .min_by_key(|(_, function)| {
-                function.body_end.saturating_sub(function.declaration_start)
-            })
-            .map(|(index, _)| index)
+        let candidates = (0..self.functions.len())
+            .filter(|index| self.functions[*index].source_id == location.source_id)
+            .collect::<Vec<_>>();
+        narrowest_function(&self.functions, &candidates, location.offset)
     }
 
     #[must_use]
@@ -494,6 +562,26 @@ pub fn source_path_matches(source_path: &str, requested: &str) -> bool {
         || ends_with_path(source_path, requested)
         || ends_with_path(requested, source_path)
         || (!requested.is_empty() && file_name(source_path) == file_name(requested))
+}
+
+/// The narrowest of the `candidates` among `functions` whose declaration contains
+/// `offset`; the first of them when several are as narrow.
+fn narrowest_function(
+    functions: &[SourceFunction],
+    candidates: &[usize],
+    offset: u64,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|index| {
+            let function = &functions[*index];
+            function.declaration_start <= offset && offset <= function.body_end
+        })
+        .min_by_key(|index| {
+            let function = &functions[*index];
+            function.body_end.saturating_sub(function.declaration_start)
+        })
 }
 
 fn line_starts(source: &str) -> Vec<usize> {
@@ -2909,7 +2997,8 @@ mod tests {
 
     use super::{
         address_from_word, normalize_address, ArgumentLayout, ArgumentOrder, ContractDebugInfo,
-        InferredVariable, JumpMarker, LineKey, LocalsStatus, StepInfo, StepMap, VariableKind,
+        InferredVariable, JumpMarker, LineKey, LocalsStatus, SourceCache, StepInfo, StepMap,
+        VariableKind,
     };
 
     // Two functions; `outer` calls `inner` internally. Line numbers are one-based.
@@ -4558,6 +4647,38 @@ contract P {
         );
         assert_eq!(map.next_source(3), Some(6));
         assert_eq!(map.finish(3), Some(7));
+    }
+
+    #[test]
+    fn contracts_sharing_a_source_read_it_once() {
+        let built = contract(Some("0xabcd"));
+        let mut cache = SourceCache::default();
+        let mut through_cache = || {
+            ContractDebugInfo::with_source_cache(
+                Some("0xabcd"),
+                "C",
+                built.info.clone(),
+                built.source_contents.clone(),
+                &mut cache,
+            )
+        };
+        let first = through_cache();
+        let second = through_cache();
+        assert_eq!(first, built);
+        assert_eq!(second, built);
+        assert_eq!(cache.sources[&0].len(), 1);
+
+        // The same id with other text, as another compilation numbers its sources, is
+        // read on its own.
+        let other = ContractDebugInfo::with_source_cache(
+            None,
+            "D",
+            built.info.clone(),
+            BTreeMap::from([(0, "contract D { function g() public {} }".to_owned())]),
+            &mut cache,
+        );
+        assert_eq!(other.functions[0].name, "g");
+        assert_eq!(cache.sources[&0].len(), 2);
     }
 
     #[test]
