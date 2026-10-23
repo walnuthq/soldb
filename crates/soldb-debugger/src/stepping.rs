@@ -222,20 +222,17 @@ impl ContractDebugInfo {
         // The earliest `JUMPDEST` at each span start, in one pass, so that finding a
         // function's entry point is one lookup and not a scan of every instruction.
         let mut earliest_jumpdests = HashMap::<(u64, u64), u64>::new();
-        for (pc, location) in info
-            .instructions
-            .iter()
-            .zip(&locations)
-            .zip(&jumpdests)
-            .filter(|(_, jumpdest)| **jumpdest)
-            .filter_map(|((instruction, location), _)| {
-                Some((instruction.offset, location.as_ref()?))
-            })
-        {
+        for (index, instruction) in info.instructions.iter().enumerate() {
+            if !jumpdests[index] {
+                continue;
+            }
+            let Some(location) = &locations[index] else {
+                continue;
+            };
             let earliest = earliest_jumpdests
                 .entry((location.source_id, location.offset))
-                .or_insert(pc);
-            *earliest = (*earliest).min(pc);
+                .or_insert(instruction.offset);
+            *earliest = (*earliest).min(instruction.offset);
         }
         // A later function with the same entry point replaces an earlier one.
         let function_entries = functions
