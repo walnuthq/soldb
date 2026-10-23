@@ -734,17 +734,24 @@ struct StepInfo {
 
 /// The line of the nearest step at each frame depth, for a walk over the steps in one
 /// direction. A step hides every deeper depth from the steps after it; a step without a
-/// line does not hide the line at its own depth.
-#[derive(Debug, Default)]
-struct NearestLines {
+/// line does not hide the line at its own depth. A line is anything that stands for one:
+/// its key, or the index of the step it is the line of.
+#[derive(Debug)]
+struct NearestLines<T> {
     /// Depths with a line, shallowest first. A depth that is missing has none.
-    lines: Vec<(u32, LineKey)>,
+    lines: Vec<(u32, T)>,
 }
 
-impl NearestLines {
+impl<T> Default for NearestLines<T> {
+    fn default() -> Self {
+        Self { lines: Vec::new() }
+    }
+}
+
+impl<T: Copy> NearestLines<T> {
     /// Walks past a step and returns the line of the nearest step before it at the same
     /// depth, or `None` when a shallower step or no step at that depth comes first.
-    fn visit(&mut self, depth: u32, key: Option<LineKey>) -> Option<LineKey> {
+    fn visit(&mut self, depth: u32, key: Option<T>) -> Option<T> {
         while self.lines.last().is_some_and(|(level, _)| *level > depth) {
             self.lines.pop();
         }
@@ -2037,17 +2044,21 @@ impl StepMap {
     /// One pass in each direction finds every step's neighbours, so deep recursion does
     /// not make each step search the frames it calls.
     fn smooth_single_step_excursions(steps: &mut [StepInfo]) {
+        // The step after each one with its line, as an index: the forward pass reads its
+        // key before changing anything after it.
         let mut after = vec![None; steps.len()];
         let mut lines = NearestLines::default();
         for (index, step) in steps.iter().enumerate().rev() {
-            after[index] = lines.visit(step.frame_depth, step.key);
+            let own = step.key.and_then(|_| u32::try_from(index).ok());
+            after[index] = lines.visit(step.frame_depth, own);
             // A step that starts a root ends the search of the steps before it.
             if step.starts_root {
                 lines.clear();
             }
         }
         let mut lines = NearestLines::default();
-        for (step, after) in steps.iter_mut().zip(after) {
+        for (index, after) in after.into_iter().enumerate() {
+            let step = &steps[index];
             if step.starts_root {
                 lines.clear();
             }
@@ -2055,8 +2066,9 @@ impl StepMap {
             let Some(key) = step.key else {
                 continue;
             };
+            let after = after.and_then(|after| steps[after as usize].key);
             if before.is_some() && before == after && before != Some(key) {
-                step.key = before;
+                steps[index].key = before;
             }
         }
     }
@@ -2064,22 +2076,37 @@ impl StepMap {
     /// Marks the steps that begin a run of one line at their depth. Deeper frames and
     /// steps without a line do not end a run.
     fn mark_line_starts(&mut self) {
-        let mut last_key_at_or_below = Vec::<Option<LineKey>>::new();
+        // The key of the last step at or below each depth seen since the root started, as
+        // runs of depths sharing one: a step sets its depth and every deeper one, which is
+        // one run, so each step pushes and pops at most once.
+        let mut runs = Vec::<(usize, Option<LineKey>)>::new();
+        let mut depths = 0;
         for step in &mut self.steps {
             if step.starts_root {
-                last_key_at_or_below.clear();
+                runs.clear();
+                depths = 0;
             }
             let depth = step.frame_depth as usize;
-            if last_key_at_or_below.len() <= depth {
-                last_key_at_or_below.resize(depth + 1, None);
+            if depths <= depth {
+                // Depths first reached now have no key yet.
+                if runs.last().is_none_or(|(_, key)| key.is_some()) {
+                    runs.push((depths, None));
+                }
+                depths = depth + 1;
             }
             let Some(key) = step.key else {
                 step.line_start = false;
                 continue;
             };
-            step.line_start = last_key_at_or_below[depth] != Some(key);
-            for entry in last_key_at_or_below.iter_mut().skip(depth) {
-                *entry = Some(key);
+            while runs.last().is_some_and(|(from, _)| *from > depth) {
+                runs.pop();
+            }
+            let last = runs.last_mut().expect("a run starts at depth zero");
+            step.line_start = last.1 != Some(key);
+            if last.0 == depth {
+                last.1 = Some(key);
+            } else {
+                runs.push((depth, Some(key)));
             }
         }
     }
@@ -3025,8 +3052,8 @@ mod tests {
 
     use super::{
         address_from_word, normalize_address, ArgumentLayout, ArgumentOrder, ContractDebugInfo,
-        InferredVariable, JumpMarker, LineKey, LocalsStatus, SourceCache, StepInfo, StepMap,
-        VariableKind,
+        InferredVariable, JumpMarker, LineKey, LocalsStatus, NearestLines, SourceCache, StepInfo,
+        StepMap, VariableKind,
     };
 
     // Two functions; `outer` calls `inner` internally. Line numbers are one-based.
@@ -4675,6 +4702,101 @@ contract P {
         );
         assert_eq!(map.next_source(3), Some(6));
         assert_eq!(map.finish(3), Some(7));
+    }
+
+    /// Random steps over a few depths, lines, and top-level calls.
+    fn random_steps(seed: u64, count: usize) -> Vec<StepInfo> {
+        let mut state = seed;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        (0..count)
+            .map(|_| {
+                let line = next(5);
+                StepInfo {
+                    location: None,
+                    generated: false,
+                    key: (line > 0).then_some(LineKey {
+                        contract: 0,
+                        source_id: 0,
+                        line,
+                    }),
+                    contract: None,
+                    address: None,
+                    storage: None,
+                    evm_depth: 0,
+                    starts_root: next(40) == 0,
+                    frame_depth: next(6) as u32,
+                    frame_entry: false,
+                    line_start: false,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_passes_match_their_definitions() {
+        for seed in 0..200 {
+            let steps = random_steps(seed, 300);
+
+            // Smoothing, as it was done with every step's next line held in full.
+            let mut smoothed = steps.clone();
+            StepMap::smooth_single_step_excursions(&mut smoothed);
+            let mut expected = steps.clone();
+            let mut after = vec![None; expected.len()];
+            let mut lines = NearestLines::default();
+            for (index, step) in expected.iter().enumerate().rev() {
+                after[index] = lines.visit(step.frame_depth, step.key);
+                if step.starts_root {
+                    lines.clear();
+                }
+            }
+            let mut lines = NearestLines::default();
+            for (step, after) in expected.iter_mut().zip(after) {
+                if step.starts_root {
+                    lines.clear();
+                }
+                let before = lines.visit(step.frame_depth, step.key);
+                let Some(key) = step.key else {
+                    continue;
+                };
+                if before.is_some() && before == after && before != Some(key) {
+                    step.key = before;
+                }
+            }
+            assert_eq!(smoothed, expected, "smoothing, seed {seed}");
+
+            // Line starts: a step starts its line unless the last step at or below its
+            // depth since that depth was first reached in the root had the same line.
+            let mut map = StepMap::new(&trace(Vec::new()), Vec::new());
+            map.steps = steps.clone();
+            map.mark_line_starts();
+            let mut last = Vec::<Option<LineKey>>::new();
+            for (index, step) in steps.iter().enumerate() {
+                if step.starts_root {
+                    last.clear();
+                }
+                let depth = step.frame_depth as usize;
+                if last.len() <= depth {
+                    last.resize(depth + 1, None);
+                }
+                let Some(key) = step.key else {
+                    assert!(!map.steps[index].line_start, "seed {seed} step {index}");
+                    continue;
+                };
+                assert_eq!(
+                    map.steps[index].line_start,
+                    last[depth] != Some(key),
+                    "line start, seed {seed} step {index}"
+                );
+                for entry in last.iter_mut().skip(depth) {
+                    *entry = Some(key);
+                }
+            }
+        }
     }
 
     #[test]
