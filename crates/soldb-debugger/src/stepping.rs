@@ -332,19 +332,22 @@ impl ContractDebugInfo {
         jumpdests: &[bool],
         function_entries: &FxHashMap<u64, usize>,
     ) -> Vec<InstructionFacts> {
-        // The function a span is in is one of its own source's, and the instructions of a
-        // statement share its span, so each span's function is found once among them.
+        // The function a span is in is one of its own source's.
         let mut by_source = FxHashMap::<u64, Vec<usize>>::default();
         for (index, function) in self.functions.iter().enumerate() {
             by_source.entry(function.source_id).or_default().push(index);
         }
-        let mut found = FxHashMap::<(u64, u64), Option<usize>>::default();
-        let mut function_for = |location: &SourceLocation| {
+        // The instructions of a statement share its span, so each span start's line and
+        // function are found once.
+        let mut found = FxHashMap::<(u64, u64), (Option<u64>, Option<usize>)>::default();
+        let mut line_and_function = |location: &SourceLocation| {
             *found
                 .entry((location.source_id, location.offset))
                 .or_insert_with(|| {
-                    let candidates = by_source.get(&location.source_id)?;
-                    narrowest_function(&self.functions, candidates, location.offset)
+                    let function = by_source.get(&location.source_id).and_then(|candidates| {
+                        narrowest_function(&self.functions, candidates, location.offset)
+                    });
+                    (self.line_of(location.source_id, location.offset), function)
                 })
         };
         self.info
@@ -352,15 +355,18 @@ impl ContractDebugInfo {
             .iter()
             .zip(locations)
             .zip(jumpdests)
-            .map(|((instruction, location), jumpdest)| InstructionFacts {
-                line: location
+            .map(|((instruction, location), jumpdest)| {
+                let (line, function) = location
                     .as_ref()
-                    .and_then(|location| self.line_of(location.source_id, location.offset)),
-                function: location.as_ref().and_then(&mut function_for),
-                entry: function_entries.get(&instruction.offset).copied(),
-                marker: jump_marker(instruction),
-                jumpdest: *jumpdest,
-                location,
+                    .map_or((None, None), &mut line_and_function);
+                InstructionFacts {
+                    line,
+                    function,
+                    entry: function_entries.get(&instruction.offset).copied(),
+                    marker: jump_marker(instruction),
+                    jumpdest: *jumpdest,
+                    location,
+                }
             })
             .collect()
     }
