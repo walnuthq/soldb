@@ -877,6 +877,20 @@ struct FrameVariables {
     /// own — its parameters are the caller's expressions, its results the caller's
     /// temporaries.
     inlined: bool,
+    /// What `layout` was computed from, so a step that changes none of it reuses the
+    /// layout instead of building it again.
+    layout_inputs: LayoutInputs,
+}
+
+/// Everything a frame's layout depends on besides its function: the slots placed so far
+/// and which locals are in scope. Two steps with the same inputs have the same layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LayoutInputs {
+    params_base: Option<usize>,
+    returns: Vec<Option<usize>>,
+    locals_base: Option<usize>,
+    /// Per local of the function, whether it was in scope.
+    in_scope: Vec<bool>,
 }
 
 impl FrameVariables {
@@ -893,6 +907,7 @@ impl FrameVariables {
             layout: None,
             modifier_slots,
             inlined: false,
+            layout_inputs: LayoutInputs::default(),
         }
     }
 
@@ -975,6 +990,24 @@ impl FrameVariables {
         // Parameters a reservation just placed place the rest.
         self.place_from_parameters(function);
 
+        // The layout is a function of its inputs, so unchanged inputs give the layout
+        // computed last. In a loop that is almost every step.
+        let inputs = &self.layout_inputs;
+        if let Some(id) = self.layout {
+            if inputs.params_base == self.params_base
+                && inputs.locals_base == self.locals_base
+                && inputs.returns == self.returns
+                && inputs.in_scope.len() == function.locals.len()
+                && function
+                    .locals
+                    .iter()
+                    .zip(&inputs.in_scope)
+                    .all(|(local, in_scope)| local.scope.contains(span.start) == *in_scope)
+            {
+                return id;
+            }
+        }
+
         let mut layout = Vec::new();
         if let Some(base) = self.params_base {
             let mut slot = base;
@@ -1023,6 +1056,17 @@ impl FrameVariables {
             }
         };
         self.layout = Some(id);
+        let inputs = &mut self.layout_inputs;
+        inputs.params_base = self.params_base;
+        inputs.returns.clone_from(&self.returns);
+        inputs.locals_base = self.locals_base;
+        inputs.in_scope.clear();
+        inputs.in_scope.extend(
+            function
+                .locals
+                .iter()
+                .map(|local| local.scope.contains(span.start)),
+        );
         id
     }
 }
