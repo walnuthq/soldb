@@ -29,10 +29,12 @@
 //!
 //! Everything here is a search over the recording. Nothing re-executes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
-use soldb_core::{TransactionTrace, Word as StackWord};
+use rustc_hash::FxHashMap;
+use soldb_core::{opcode, EvmWord, StepView, TransactionTrace};
 use soldb_ethdebug::{
     function_selector, parse_path, CodeGenerator, EthdebugInfo, FunctionExit, Instruction,
     PathSegment, SourceLocation, StorageLayout,
@@ -58,8 +60,6 @@ variable locations";
 pub const INFERRED_LOCALS_NOTE: &str = "values can be wrong under the optimizer, and a \
 variable whose frame could not be placed shows as unavailable; ETHDebug variable \
 information will replace this once compilers emit it";
-
-const CALL_OPCODES: [&str; 4] = ["CALL", "CALLCODE", "DELEGATECALL", "STATICCALL"];
 
 /// One contract's debug information, prepared for stepping: the ETHDebug metadata, the
 /// source text, the functions parsed from it, and the indexes that make per-step lookups
@@ -119,7 +119,7 @@ struct PcIndex {
     /// instruction starts.
     dense: Vec<Option<NonZeroU32>>,
     /// Offsets past `dense`.
-    sparse: HashMap<u64, usize>,
+    sparse: FxHashMap<u64, usize>,
 }
 
 impl PcIndex {
@@ -137,7 +137,7 @@ impl PcIndex {
             .max()
             .map_or(0, |offset| offset + 1);
         let mut dense = vec![None; dense_len];
-        let mut sparse = HashMap::new();
+        let mut sparse = FxHashMap::default();
         for (index, instruction) in instructions.iter().enumerate() {
             let slot = usize::try_from(instruction.offset)
                 .ok()
@@ -185,6 +185,45 @@ pub enum JumpMarker {
     Return,
 }
 
+/// What stepping reads from the source text: its functions, type declarations, and
+/// line starts. Contracts compiled together share most of their sources, so a host that
+/// prepares several of them passes one cache to
+/// [`ContractDebugInfo::with_source_cache`] and each source is read once.
+#[derive(Debug, Default)]
+pub struct SourceCache {
+    /// The sources read so far, by id; the same id can name different text in
+    /// different compilations.
+    sources: FxHashMap<u64, Vec<Arc<ReadSource>>>,
+}
+
+#[derive(Debug)]
+struct ReadSource {
+    text: String,
+    functions: Vec<SourceFunction>,
+    types: SourceTypes,
+    line_starts: Vec<usize>,
+}
+
+impl SourceCache {
+    /// Source `source_id` with `text`, read now unless it was before.
+    fn read(&mut self, source_id: u64, text: &str) -> Arc<ReadSource> {
+        let read = self.sources.entry(source_id).or_default();
+        if let Some(source) = read.iter().find(|source| source.text == text) {
+            return Arc::clone(source);
+        }
+        let mut types = SourceTypes::default();
+        types.add_source(source_id, text);
+        let source = Arc::new(ReadSource {
+            text: text.to_owned(),
+            functions: parse_source_functions(source_id, text),
+            types,
+            line_starts: line_starts(text),
+        });
+        read.push(Arc::clone(&source));
+        source
+    }
+}
+
 impl ContractDebugInfo {
     /// Prepares one contract's debug info. Functions are parsed from the source text,
     /// which serves ETHDebug and legacy source maps alike: both attach byte ranges of the
@@ -196,17 +235,40 @@ impl ContractDebugInfo {
         info: EthdebugInfo,
         source_contents: BTreeMap<u64, String>,
     ) -> Self {
-        let functions = source_contents
+        Self::with_source_cache(
+            address,
+            name,
+            info,
+            source_contents,
+            &mut SourceCache::default(),
+        )
+    }
+
+    /// Prepares one contract's debug info as [`ContractDebugInfo::new`] does, reading
+    /// each source through `cache` so that the contracts sharing it read it once.
+    #[must_use]
+    pub fn with_source_cache(
+        address: Option<&str>,
+        name: &str,
+        info: EthdebugInfo,
+        source_contents: BTreeMap<u64, String>,
+        cache: &mut SourceCache,
+    ) -> Self {
+        let read = source_contents
             .iter()
-            .flat_map(|(source_id, source)| parse_source_functions(*source_id, source))
+            .map(|(source_id, text)| (*source_id, cache.read(*source_id, text)))
+            .collect::<Vec<_>>();
+        let functions = read
+            .iter()
+            .flat_map(|(_, source)| source.functions.iter().cloned())
             .collect::<Vec<SourceFunction>>();
         let mut types = SourceTypes::default();
-        for (source_id, source) in &source_contents {
-            types.add_source(*source_id, source);
+        for (_, source) in &read {
+            types.extend_from(&source.types);
         }
-        let line_starts = source_contents
+        let line_starts = read
             .iter()
-            .map(|(source_id, source)| (*source_id, line_starts(source)))
+            .map(|(source_id, source)| (*source_id, source.line_starts.clone()))
             .collect();
         let pc_index = PcIndex::new(&info.instructions);
         let locations = info
@@ -221,7 +283,7 @@ impl ContractDebugInfo {
             .collect::<Vec<_>>();
         // The earliest `JUMPDEST` at each span start, in one pass, so that finding a
         // function's entry point is one lookup and not a scan of every instruction.
-        let mut earliest_jumpdests = HashMap::<(u64, u64), u64>::new();
+        let mut earliest_jumpdests = FxHashMap::<(u64, u64), u64>::default();
         for (index, instruction) in info.instructions.iter().enumerate() {
             if !jumpdests[index] {
                 continue;
@@ -243,7 +305,7 @@ impl ContractDebugInfo {
                     .get(&(function.source_id, function.declaration_start))
                     .map(|pc| (*pc, function_index))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<FxHashMap<_, _>>();
         let mut contract = Self {
             address: address.map(normalize_address),
             name: name.to_owned(),
@@ -268,24 +330,43 @@ impl ContractDebugInfo {
         &self,
         locations: Vec<Option<SourceLocation>>,
         jumpdests: &[bool],
-        function_entries: &HashMap<u64, usize>,
+        function_entries: &FxHashMap<u64, usize>,
     ) -> Vec<InstructionFacts> {
+        // The function a span is in is one of its own source's.
+        let mut by_source = FxHashMap::<u64, Vec<usize>>::default();
+        for (index, function) in self.functions.iter().enumerate() {
+            by_source.entry(function.source_id).or_default().push(index);
+        }
+        // The instructions of a statement share its span, so each span start's line and
+        // function are found once.
+        let mut found = FxHashMap::<(u64, u64), (Option<u64>, Option<usize>)>::default();
+        let mut line_and_function = |location: &SourceLocation| {
+            *found
+                .entry((location.source_id, location.offset))
+                .or_insert_with(|| {
+                    let function = by_source.get(&location.source_id).and_then(|candidates| {
+                        narrowest_function(&self.functions, candidates, location.offset)
+                    });
+                    (self.line_of(location.source_id, location.offset), function)
+                })
+        };
         self.info
             .instructions
             .iter()
             .zip(locations)
             .zip(jumpdests)
-            .map(|((instruction, location), jumpdest)| InstructionFacts {
-                line: location
+            .map(|((instruction, location), jumpdest)| {
+                let (line, function) = location
                     .as_ref()
-                    .and_then(|location| self.line_of(location.source_id, location.offset)),
-                function: location
-                    .as_ref()
-                    .and_then(|location| self.function_for_location(location)),
-                entry: function_entries.get(&instruction.offset).copied(),
-                marker: jump_marker(instruction),
-                jumpdest: *jumpdest,
-                location,
+                    .map_or((None, None), &mut line_and_function);
+                InstructionFacts {
+                    line,
+                    function,
+                    entry: function_entries.get(&instruction.offset).copied(),
+                    marker: jump_marker(instruction),
+                    jumpdest: *jumpdest,
+                    location,
+                }
             })
             .collect()
     }
@@ -410,18 +491,10 @@ impl ContractDebugInfo {
     /// The narrowest parsed function whose declaration contains the span.
     #[must_use]
     pub fn function_for_location(&self, location: &SourceLocation) -> Option<usize> {
-        self.functions
-            .iter()
-            .enumerate()
-            .filter(|(_, function)| {
-                function.source_id == location.source_id
-                    && function.declaration_start <= location.offset
-                    && location.offset <= function.body_end
-            })
-            .min_by_key(|(_, function)| {
-                function.body_end.saturating_sub(function.declaration_start)
-            })
-            .map(|(index, _)| index)
+        let candidates = (0..self.functions.len())
+            .filter(|index| self.functions[*index].source_id == location.source_id)
+            .collect::<Vec<_>>();
+        narrowest_function(&self.functions, &candidates, location.offset)
     }
 
     #[must_use]
@@ -496,6 +569,26 @@ pub fn source_path_matches(source_path: &str, requested: &str) -> bool {
         || ends_with_path(source_path, requested)
         || ends_with_path(requested, source_path)
         || (!requested.is_empty() && file_name(source_path) == file_name(requested))
+}
+
+/// The narrowest of the `candidates` among `functions` whose declaration contains
+/// `offset`; the first of them when several are as narrow.
+fn narrowest_function(
+    functions: &[SourceFunction],
+    candidates: &[usize],
+    offset: u64,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|index| {
+            let function = &functions[*index];
+            function.declaration_start <= offset && offset <= function.body_end
+        })
+        .min_by_key(|index| {
+            let function = &functions[*index];
+            function.body_end.saturating_sub(function.declaration_start)
+        })
 }
 
 fn line_starts(source: &str) -> Vec<usize> {
@@ -647,17 +740,24 @@ struct StepInfo {
 
 /// The line of the nearest step at each frame depth, for a walk over the steps in one
 /// direction. A step hides every deeper depth from the steps after it; a step without a
-/// line does not hide the line at its own depth.
-#[derive(Debug, Default)]
-struct NearestLines {
+/// line does not hide the line at its own depth. A line is anything that stands for one:
+/// its key, or the index of the step it is the line of.
+#[derive(Debug)]
+struct NearestLines<T> {
     /// Depths with a line, shallowest first. A depth that is missing has none.
-    lines: Vec<(u32, LineKey)>,
+    lines: Vec<(u32, T)>,
 }
 
-impl NearestLines {
+impl<T> Default for NearestLines<T> {
+    fn default() -> Self {
+        Self { lines: Vec::new() }
+    }
+}
+
+impl<T: Copy> NearestLines<T> {
     /// Walks past a step and returns the line of the nearest step before it at the same
     /// depth, or `None` when a shallower step or no step at that depth comes first.
-    fn visit(&mut self, depth: u32, key: Option<LineKey>) -> Option<LineKey> {
+    fn visit(&mut self, depth: u32, key: Option<T>) -> Option<T> {
         while self.lines.last().is_some_and(|(level, _)| *level > depth) {
             self.lines.pop();
         }
@@ -804,6 +904,7 @@ struct EvmFrame {
 }
 
 /// What is known about an EVM frame as it is entered.
+#[derive(Clone)]
 struct FrameEntered {
     /// The address whose code the frame runs; `None` when nothing recorded it, or for a
     /// creation whose address the backend did not report.
@@ -814,47 +915,49 @@ struct FrameEntered {
 }
 
 impl FrameEntered {
-    /// The call or creation the backend recorded as entered at `step`, when it recorded
-    /// calls at all. A call that ran no steps, such as one to a precompile, ends at the
-    /// step it started and is not a frame in the trace.
-    fn recorded(trace: &TransactionTrace, step: usize) -> Option<Self> {
-        let spans_steps = |entry: Option<usize>, exit: Option<usize>| {
-            entry == Some(step) && exit.is_none_or(|exit| exit > step)
+    /// The calls and creations the backend recorded, by the step each was entered at,
+    /// so that entering a frame finds its record without searching them all. A call that
+    /// ran no steps, such as one to a precompile, ends at the step it started and is not a
+    /// frame in the trace; of two records entered at one step, a call is taken before a
+    /// creation and an earlier record before a later one.
+    fn recorded(trace: &TransactionTrace) -> FxHashMap<usize, Self> {
+        let entered = |entry: Option<usize>, exit: Option<usize>| {
+            entry.filter(|entry| exit.is_none_or(|exit| exit > *entry))
         };
         let artifacts = &trace.artifacts;
-        if let Some(call) = artifacts
-            .calls
-            .iter()
-            .find(|call| spans_steps(call.entry_step, call.exit_step))
-        {
-            return Some(Self {
-                address: Some(call.bytecode_address.clone()),
-                environment: CodeEnvironment::Call,
-                delegated: matches!(call.call_type.as_str(), "DELEGATECALL" | "CALLCODE"),
-            });
+        let mut recorded = FxHashMap::default();
+        for call in &artifacts.calls {
+            if let Some(step) = entered(call.entry_step, call.exit_step) {
+                recorded.entry(step).or_insert_with(|| Self {
+                    address: Some(call.bytecode_address.clone()),
+                    environment: CodeEnvironment::Call,
+                    delegated: matches!(call.call_type.as_str(), "DELEGATECALL" | "CALLCODE"),
+                });
+            }
         }
-        let creation = artifacts
-            .creations
-            .iter()
-            .find(|creation| spans_steps(creation.entry_step, creation.exit_step))?;
-        Some(Self {
-            address: creation.address.clone(),
-            environment: CodeEnvironment::Create,
-            delegated: false,
-        })
+        for creation in &artifacts.creations {
+            if let Some(step) = entered(creation.entry_step, creation.exit_step) {
+                recorded.entry(step).or_insert_with(|| Self {
+                    address: creation.address.clone(),
+                    environment: CodeEnvironment::Create,
+                    delegated: false,
+                });
+            }
+        }
+        recorded
     }
 
     /// What the call instruction at `caller` says about the frame it entered.
     fn from_call(trace: &TransactionTrace, caller: Option<usize>) -> Self {
-        let op = caller.map(|caller| &*trace.steps[caller].op);
+        let op = caller.map(|caller| trace.steps.step(caller).op());
         Self {
-            address: caller.and_then(|caller| call_target(&trace.steps[caller])),
-            environment: if matches!(op, Some("CREATE" | "CREATE2")) {
+            address: caller.and_then(|caller| call_target(trace.steps.step(caller))),
+            environment: if matches!(op, Some(opcode::CREATE | opcode::CREATE2)) {
                 CodeEnvironment::Create
             } else {
                 CodeEnvironment::Call
             },
-            delegated: matches!(op, Some("DELEGATECALL" | "CALLCODE")),
+            delegated: matches!(op, Some(opcode::DELEGATECALL | opcode::CALLCODE)),
         }
     }
 }
@@ -915,6 +1018,12 @@ struct FrameVariables {
     /// What `layout` was computed from, so a step that changes none of it reuses the
     /// layout instead of building it again.
     layout_inputs: LayoutInputs,
+    /// The stack slots the function's parameters take, counted once from their types
+    /// rather than at every step.
+    param_slots: usize,
+    /// The span and stack height of the step last followed.
+    last_span: Option<ByteRange>,
+    last_height: usize,
 }
 
 /// Everything a frame's layout depends on besides its function: the slots placed so far
@@ -943,6 +1052,9 @@ impl FrameVariables {
             modifier_slots,
             inlined: false,
             layout_inputs: LayoutInputs::default(),
+            param_slots: parameter_slots(&function.params),
+            last_span: None,
+            last_height: 0,
         }
     }
 
@@ -952,7 +1064,7 @@ impl FrameVariables {
         let Some(base) = self.params_base else {
             return;
         };
-        let returns_base = base + parameter_slots(&function.params);
+        let returns_base = base + self.param_slots;
         for (index, slot) in self.returns.iter_mut().enumerate() {
             slot.get_or_insert(returns_base + index);
         }
@@ -972,12 +1084,45 @@ impl FrameVariables {
         height: usize,
         layouts: &mut Vec<Vec<InferredVariable>>,
     ) -> u32 {
+        // Following a step only places what is not placed yet, from its span, so a step
+        // of the span the last one had places nothing more and has its layout, unless
+        // something else placed a slot since. The height only matters while the locals
+        // are not placed: a local the span declares is placed below it.
+        if !self.inlined
+            && self.last_span == Some(span)
+            && (self.locals_base.is_some() || self.last_height == height)
+        {
+            if let Some(id) = self.layout {
+                let inputs = &self.layout_inputs;
+                if inputs.params_base == self.params_base
+                    && inputs.locals_base == self.locals_base
+                    && inputs.returns == self.returns
+                {
+                    self.last_height = height;
+                    return id;
+                }
+            }
+        }
+        let id = self.track_span(function, span, height, layouts);
+        self.last_span = Some(span);
+        self.last_height = height;
+        id
+    }
+
+    /// [`FrameVariables::track`] for a step whose layout is worked out again.
+    fn track_span(
+        &mut self,
+        function: &SourceFunction,
+        span: ByteRange,
+        height: usize,
+        layouts: &mut Vec<Vec<InferredVariable>>,
+    ) -> u32 {
         if self.inlined {
             self.layout = Some(INLINED_LAYOUT);
             return INLINED_LAYOUT;
         }
         let length = span.end - span.start;
-        let param_slots = parameter_slots(&function.params);
+        let param_slots = self.param_slots;
         // Known parameters place everything else before any instruction is read.
         self.place_from_parameters(function);
         // The body's first instruction runs right above whatever was reserved before it:
@@ -1145,11 +1290,11 @@ pub(crate) fn calldata_for_step<'a>(
 
 /// The calldata of the frame executing `step`, given its top-level call's input.
 fn frame_calldata<'a>(trace: &'a TransactionTrace, step: usize, root_input: &'a str) -> &'a str {
-    let root_depth = trace.steps.first().map_or(0, |first| first.depth);
+    let root_depth = trace.steps.first().map_or(0, |first| first.depth());
     let depth = trace
         .steps
         .get(step)
-        .map_or(root_depth, |current| current.depth);
+        .map_or(root_depth, |current| current.depth());
     if depth == root_depth {
         return root_input;
     }
@@ -1243,11 +1388,16 @@ fn locals_support(contract: &ContractDebugInfo, evidence: Evidence) -> Result<()
 struct InternalFrame {
     /// The frames active in this EVM frame, innermost last.
     functions: Vec<FrameEntry>,
+    /// How many of `functions` are functions rather than helper placeholders.
+    named: usize,
+    /// How many functions the EVM frames below this one have active, which cannot
+    /// change while this one runs.
+    named_below: usize,
     /// The last real statement executed in this frame, which generated code belongs to.
     statement: Option<LocationRef>,
     /// The variables of frames that were left without returning, by function: a modifier
     /// hands over to the body it wraps and resumes after it with its slots still there.
-    remembered: HashMap<usize, FrameVariables>,
+    remembered: FxHashMap<usize, FrameVariables>,
 }
 
 impl InternalFrame {
@@ -1271,6 +1421,29 @@ impl InternalFrame {
             return_pc,
             variables,
         });
+        self.named += 1;
+    }
+
+    /// Leaves the innermost function or placeholder.
+    fn pop(&mut self) {
+        if self
+            .functions
+            .pop()
+            .is_some_and(|entry| entry.function.is_some())
+        {
+            self.named -= 1;
+        }
+    }
+
+    /// Leaves every function and placeholder.
+    fn clear(&mut self) {
+        self.functions.clear();
+        self.named = 0;
+    }
+
+    /// The functions active in this EVM frame and the ones below it.
+    fn depth(&self) -> usize {
+        self.named_below + self.named
     }
 
     fn push_placeholder(&mut self) {
@@ -1312,8 +1485,8 @@ fn place_at_entry_landing(
     let Some(declared) = contract.functions.get(function) else {
         return;
     };
-    let at_declaration =
-        contract.is_jumpdest(trace.steps[index].pc) && own.offset == declared.declaration_start;
+    let at_declaration = contract.is_jumpdest(trace.steps.step(index).pc())
+        && own.offset == declared.declaration_start;
     let from_dispatcher =
         !from_call || (index > 0 && framed_declaration(trace, contract, index - 1, declared));
     if !at_declaration || !from_dispatcher {
@@ -1330,9 +1503,9 @@ fn place_at_entry_landing(
     if variables.params_base.is_some() || variables.body_seen {
         return;
     }
-    let stack = trace.steps[index].snapshot_ref().stack;
+    let stack = trace.steps.step(index).stack().to_vec();
     let calldata = frame_calldata(trace, index, root_input);
-    if argument_evidence(declared, calldata, stack) == Evidence::Contradicted {
+    if argument_evidence(declared, calldata, &stack) == Evidence::Contradicted {
         return;
     }
     variables.params_base = height.checked_sub(parameter_slots(&declared.params));
@@ -1346,15 +1519,13 @@ fn framed_declaration(
     index: usize,
     function: &SourceFunction,
 ) -> bool {
-    if &*trace.steps[index].op != "JUMP" {
+    let step = trace.steps.step(index);
+    if step.op() != opcode::JUMP {
         return false;
     }
-    contract
-        .location_at_pc(trace.steps[index].pc)
-        .is_some_and(|location| {
-            location.source_id == function.source_id
-                && location.offset == function.declaration_start
-        })
+    contract.location_at_pc(step.pc()).is_some_and(|location| {
+        location.source_id == function.source_id && location.offset == function.declaration_start
+    })
 }
 
 /// The slot of the first parameter of the modifier `function`, from the placed function
@@ -1412,7 +1583,7 @@ impl StepMap {
 
     fn build(trace: &TransactionTrace, contracts: Vec<ContractDebugInfo>, smooth: bool) -> Self {
         let mut addresses = Vec::<String>::new();
-        let mut address_index = HashMap::<String, usize>::new();
+        let mut address_index = FxHashMap::<String, usize>::default();
         let mut intern = |address: &str| -> usize {
             let address = normalize_address(address);
             *address_index.entry(address.clone()).or_insert_with(|| {
@@ -1448,15 +1619,16 @@ impl StepMap {
             };
 
         // Pass 1: EVM frames, executing addresses, and each step's own span.
-        let root_depth = trace.steps.first().map_or(0, |step| step.depth);
+        let root_depth = trace.steps.first().map_or(0, |step| step.depth());
         let mut next_frame_id = 0_u32;
         let mut evm_frames = Vec::<EvmFrame>::new();
         let mut upcoming_roots = roots.iter().enumerate().peekable();
         let mut current_root = 0;
         let mut reverted = Vec::new();
         let mut framed = Vec::with_capacity(trace.steps.len());
+        let recorded = FrameEntered::recorded(trace);
         for (index, step) in trace.steps.iter().enumerate() {
-            let evm_depth = step.depth.saturating_sub(root_depth) as usize;
+            let evm_depth = step.depth().saturating_sub(root_depth) as usize;
             if let Some((position, root)) =
                 upcoming_roots.next_if(|(_, root)| root.entry_step == index)
             {
@@ -1488,8 +1660,10 @@ impl StepMap {
                 let call = (evm_frames.len() == evm_depth)
                     .then(|| index.checked_sub(1))
                     .flatten();
-                let entered = FrameEntered::recorded(trace, index)
+                let entered = recorded
+                    .get(&index)
                     .filter(|_| evm_frames.len() == evm_depth)
+                    .cloned()
                     .unwrap_or_else(|| FrameEntered::from_call(trace, call));
                 let address = entered.address.as_deref().map(&mut intern);
                 // A `DELEGATECALL` or `CALLCODE` runs the callee's code against the
@@ -1508,7 +1682,7 @@ impl StepMap {
                 });
                 next_frame_id += 1;
             }
-            if &*step.op == "REVERT" || step.error.is_some() {
+            if step.op() == opcode::REVERT || step.error().is_some() {
                 let entry_step = evm_frames
                     .last()
                     .expect("the root frame is never popped")
@@ -1518,7 +1692,7 @@ impl StepMap {
             let frame = evm_frames.last().expect("the root frame is never popped");
             let facts = frame
                 .contract
-                .and_then(|index| contracts[index].facts_at_pc(step.pc));
+                .and_then(|index| contracts[index].facts_at_pc(step.pc()));
             let location = frame.contract.zip(facts).and_then(|(contract, facts)| {
                 let location = facts.location.as_ref()?;
                 Some(LocationRef {
@@ -1581,7 +1755,7 @@ impl StepMap {
         let mut variable_layouts = Vec::<Vec<InferredVariable>>::new();
         let mut step_variables = Vec::with_capacity(framed.len());
         for (index, step) in framed.iter().enumerate() {
-            let height = trace.steps[index].snapshot_ref().stack.len();
+            let height = trace.steps.step(index).stack().len();
             // Variables are tracked for a frame whose contract keeps them at fixed slots.
             // A frame entered by a jump from inside another function has its parameters
             // on top of the stack at entry, which places them; a public function entered
@@ -1593,7 +1767,7 @@ impl StepMap {
                 let function = contract.functions.get(function)?;
                 let landed_from_function = index > 0
                     && framed[index - 1].frame_id == step.frame_id
-                    && &*trace.steps[index - 1].op == "JUMP"
+                    && trace.steps.step(index - 1).op() == opcode::JUMP
                     && framed[index - 1]
                         .location
                         .is_some_and(|location| location.function.is_some());
@@ -1614,7 +1788,11 @@ impl StepMap {
             let root_input = roots[step.root].input(trace);
             internal.truncate(if new_root { evm_depth } else { evm_depth + 1 });
             while internal.len() <= evm_depth {
-                internal.push(InternalFrame::default());
+                let named_below = internal.last().map_or(0, InternalFrame::depth);
+                internal.push(InternalFrame {
+                    named_below,
+                    ..InternalFrame::default()
+                });
                 frame_entry = true;
             }
             let frame = internal.last_mut().expect("the root frame is never popped");
@@ -1623,7 +1801,7 @@ impl StepMap {
             // marker, or landing on a function's entry point, says whether it was a call.
             let landed_by_jump = index > 0
                 && framed[index - 1].frame_id == step.frame_id
-                && &*trace.steps[index - 1].op == "JUMP";
+                && trace.steps.step(index - 1).op() == opcode::JUMP;
             // Whether the previous step ran another function's own code in this EVM
             // frame, as opposed to the dispatcher's.
             let from_function_code = index > 0
@@ -1644,15 +1822,11 @@ impl StepMap {
             // call. A marked call is resolved once the landing's function is known.
             let mut pending_call = false;
             if landed_by_jump {
-                let pc = trace.steps[index].pc;
+                let pc = trace.steps.step(index).pc();
                 match previous_marker {
                     JumpMarker::Call => pending_call = true,
-                    JumpMarker::Return => {
-                        frame.functions.pop();
-                    }
-                    JumpMarker::None if frame.returns_to(pc) => {
-                        frame.functions.pop();
-                    }
+                    JumpMarker::Return => frame.pop(),
+                    JumpMarker::None if frame.returns_to(pc) => frame.pop(),
                     JumpMarker::None => {}
                 }
             }
@@ -1664,9 +1838,8 @@ impl StepMap {
                 }
                 let contract = &contracts[step.contract?];
                 let arguments = contract.functions.get(function)?.params.len();
-                let stack = trace.steps[index - 1].snapshot_ref().stack;
-                let word = stack.get(stack.len().checked_sub(2 + arguments)?)?;
-                let pc = u64::from_str_radix(word.trim_start_matches("0x"), 16).ok()?;
+                let word = trace.steps.step(index - 1).stack().peek(1 + arguments)?;
+                let pc = word.to_u64()?;
                 contract.is_jumpdest(pc).then_some(pc)
             };
             let (location, key) = match step.location {
@@ -1731,6 +1904,10 @@ impl StepMap {
                                 Some(position) => {
                                     // A modifier handing over to the body keeps its slots;
                                     // remember them for when it resumes.
+                                    frame.named -= frame.functions[position + 1..]
+                                        .iter()
+                                        .filter(|entry| entry.function.is_some())
+                                        .count();
                                     for left in frame.functions.drain(position + 1..) {
                                         if let (Some(function), Some(variables)) =
                                             (left.function, left.variables)
@@ -1777,7 +1954,7 @@ impl StepMap {
                         (Some(own), Some(own.key))
                     }
                     None if epilogue[index] => {
-                        frame.functions.clear();
+                        frame.clear();
                         frame.statement = None;
                         (Some(own), None)
                     }
@@ -1867,16 +2044,7 @@ impl StepMap {
                 }
             };
             step_variables.push(layout.unwrap_or(NO_LAYOUT));
-            let internal_total = internal
-                .iter()
-                .map(|frame| {
-                    frame
-                        .functions
-                        .iter()
-                        .filter(|entry| entry.function.is_some())
-                        .count()
-                })
-                .sum::<usize>();
+            let internal_total = internal.last().map_or(0, InternalFrame::depth);
             steps.push(StepInfo {
                 location,
                 generated,
@@ -1890,7 +2058,7 @@ impl StepMap {
                 frame_entry,
                 line_start: false,
             });
-            pcs.push(trace.steps[index].pc);
+            pcs.push(trace.steps.step(index).pc());
         }
 
         let mut map = Self {
@@ -1920,17 +2088,21 @@ impl StepMap {
     /// One pass in each direction finds every step's neighbours, so deep recursion does
     /// not make each step search the frames it calls.
     fn smooth_single_step_excursions(steps: &mut [StepInfo]) {
+        // The step after each one with its line, as an index: the forward pass reads its
+        // key before changing anything after it.
         let mut after = vec![None; steps.len()];
         let mut lines = NearestLines::default();
         for (index, step) in steps.iter().enumerate().rev() {
-            after[index] = lines.visit(step.frame_depth, step.key);
+            let own = step.key.and_then(|_| u32::try_from(index).ok());
+            after[index] = lines.visit(step.frame_depth, own);
             // A step that starts a root ends the search of the steps before it.
             if step.starts_root {
                 lines.clear();
             }
         }
         let mut lines = NearestLines::default();
-        for (step, after) in steps.iter_mut().zip(after) {
+        for (index, after) in after.into_iter().enumerate() {
+            let step = &steps[index];
             if step.starts_root {
                 lines.clear();
             }
@@ -1938,8 +2110,9 @@ impl StepMap {
             let Some(key) = step.key else {
                 continue;
             };
+            let after = after.and_then(|after| steps[after as usize].key);
             if before.is_some() && before == after && before != Some(key) {
-                step.key = before;
+                steps[index].key = before;
             }
         }
     }
@@ -1947,22 +2120,37 @@ impl StepMap {
     /// Marks the steps that begin a run of one line at their depth. Deeper frames and
     /// steps without a line do not end a run.
     fn mark_line_starts(&mut self) {
-        let mut last_key_at_or_below = Vec::<Option<LineKey>>::new();
+        // The key of the last step at or below each depth seen since the root started, as
+        // runs of depths sharing one: a step sets its depth and every deeper one, which is
+        // one run, so each step pushes and pops at most once.
+        let mut runs = Vec::<(usize, Option<LineKey>)>::new();
+        let mut depths = 0;
         for step in &mut self.steps {
             if step.starts_root {
-                last_key_at_or_below.clear();
+                runs.clear();
+                depths = 0;
             }
             let depth = step.frame_depth as usize;
-            if last_key_at_or_below.len() <= depth {
-                last_key_at_or_below.resize(depth + 1, None);
+            if depths <= depth {
+                // Depths first reached now have no key yet.
+                if runs.last().is_none_or(|(_, key)| key.is_some()) {
+                    runs.push((depths, None));
+                }
+                depths = depth + 1;
             }
             let Some(key) = step.key else {
                 step.line_start = false;
                 continue;
             };
-            step.line_start = last_key_at_or_below[depth] != Some(key);
-            for entry in last_key_at_or_below.iter_mut().skip(depth) {
-                *entry = Some(key);
+            while runs.last().is_some_and(|(from, _)| *from > depth) {
+                runs.pop();
+            }
+            let last = runs.last_mut().expect("a run starts at depth zero");
+            step.line_start = last.1 != Some(key);
+            if last.0 == depth {
+                last.1 = Some(key);
+            } else {
+                runs.push((depth, Some(key)));
             }
         }
     }
@@ -2186,13 +2374,10 @@ impl StepMap {
             .rev()
             .find(|variable| variable.name == *name)?;
         let contract = self.contract_at_step(step)?;
-        let snapshot = trace
-            .steps
-            .get(step)
-            .map(soldb_core::TraceStep::snapshot_ref);
-        let stack = snapshot.map_or(&[][..], |snapshot| snapshot.stack);
+        let view = trace.steps.get(step);
+        let stack = view.map(|view| view.stack().to_vec()).unwrap_or_default();
         let reader = ValueReader {
-            memory: snapshot.and_then(|snapshot| snapshot.memory),
+            memory: view.and_then(|view| view.memory()),
             calldata: self.calldata_at(trace, step),
             storage: words,
             layout: contract.storage_layout.as_ref(),
@@ -2209,7 +2394,11 @@ impl StepMap {
                 "`{name}` is in scope but its stack slot is above the stack here"
             )));
         };
-        let stack_words = stack_words.iter().map(|word| &**word).collect::<Vec<_>>();
+        let stack_words = stack_words
+            .iter()
+            .map(EvmWord::to_string)
+            .collect::<Vec<_>>();
+        let stack_words = stack_words.iter().map(String::as_str).collect::<Vec<_>>();
         let mut place = match reader.root(&variable.ty, &stack_words) {
             Ok(place) => place,
             Err(shown) if segments.len() == 1 => {
@@ -2252,13 +2441,10 @@ impl StepMap {
         let Some(contract) = self.contract_at_step(step) else {
             return Vec::new();
         };
-        let snapshot = trace
-            .steps
-            .get(step)
-            .map(soldb_core::TraceStep::snapshot_ref);
-        let stack = snapshot.map_or(&[][..], |snapshot| snapshot.stack);
+        let view = trace.steps.get(step);
+        let stack = view.map(|view| view.stack().to_vec()).unwrap_or_default();
         let reader = ValueReader {
-            memory: snapshot.and_then(|snapshot| snapshot.memory),
+            memory: view.and_then(|view| view.memory()),
             calldata: self.calldata_at(trace, step),
             storage: words,
             layout: contract.storage_layout.as_ref(),
@@ -2276,9 +2462,12 @@ impl StepMap {
                 let words = variable
                     .slot
                     .and_then(|slot| stack.get(slot..slot + variable.words))
-                    .map(|words| words.iter().map(|word| &**word).collect::<Vec<_>>());
+                    .map(|words| words.iter().map(EvmWord::to_string).collect::<Vec<_>>());
                 let value = match words {
-                    Some(words) => reader.variable(&variable.ty, &words),
+                    Some(words) => {
+                        let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+                        reader.variable(&variable.ty, &words)
+                    }
                     None => unavailable(),
                 };
                 DebugVariable {
@@ -2732,7 +2921,7 @@ fn prove_argument_layouts(
     }
     // The calldata each EVM frame was entered with: the transaction's input at the root,
     // and the recorded input of a call for a nested frame.
-    let mut calldata_by_entry = HashMap::<usize, &str>::new();
+    let mut calldata_by_entry = FxHashMap::<usize, &str>::default();
     calldata_by_entry.insert(0, trace.input_data.as_str());
     for call in &trace.artifacts.calls {
         if let Some(entry_step) = call.entry_step {
@@ -2741,7 +2930,7 @@ fn prove_argument_layouts(
     }
 
     let mut examined = std::collections::HashSet::<u32>::new();
-    let mut frame_calldata = HashMap::<u32, &str>::new();
+    let mut frame_calldata = FxHashMap::<u32, &str>::default();
     for (index, step) in framed.iter().enumerate() {
         let entered = index == 0 || framed[index - 1].frame_id != step.frame_id;
         if entered {
@@ -2763,8 +2952,8 @@ fn prove_argument_layouts(
         let Some(function) = contracts[contract_index].functions.get(function_index) else {
             continue;
         };
-        let stack = trace.steps[index].snapshot_ref().stack;
-        let observed = argument_evidence(function, calldata, stack);
+        let stack = trace.steps.step(index).stack().to_vec();
+        let observed = argument_evidence(function, calldata, &stack);
         evidence[contract_index] = evidence[contract_index].merge(observed);
     }
     evidence
@@ -2777,7 +2966,7 @@ fn prove_argument_layouts(
 /// reference parameter is a calldata offset in one and a memory pointer in the other —
 /// and that is enough as long as one of them sits at a different depth under the two
 /// orders.
-fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[StackWord]) -> Evidence {
+fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[EvmWord]) -> Evidence {
     let count = function.params.len();
     if count == 0 || stack.len() < count {
         return Evidence::Unknown;
@@ -2828,7 +3017,7 @@ fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[StackWo
     let matches = |order: ArgumentOrder| {
         checkable.iter().all(|index| {
             let candidate = &stack[order.word_index(*index, count, stack.len())];
-            normalize_word(candidate) == expected[*index]
+            hex_bytes(candidate.as_bytes()) == expected[*index]
         })
     };
     // A position at the same depth under both orders proves nothing about the order.
@@ -2862,25 +3051,17 @@ fn canonical_value_type(ty: &str) -> String {
     }
 }
 
-/// A stack word as 64 lowercase hex digits, however the backend spelled it.
-fn normalize_word(word: &str) -> String {
-    let digits = word.trim_start_matches("0x").trim_start_matches('0');
-    format!("{:0>64}", digits.to_ascii_lowercase())
-}
-
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The code address a call instruction targets, read off its stack.
 #[must_use]
-pub fn call_target(step: &soldb_core::TraceStep) -> Option<String> {
-    if !CALL_OPCODES.contains(&&*step.op) {
+pub fn call_target(step: StepView<'_>) -> Option<String> {
+    if !opcode::is_call(step.op()) {
         return None;
     }
-    let stack = step.snapshot_ref().stack;
-    let word = stack.get(stack.len().checked_sub(2)?)?;
-    address_from_word(word)
+    address_from_word(&step.stack().peek(1)?.to_string())
 }
 
 /// The address in the low 20 bytes of a stack word, or `None` for the zero address or a
@@ -2909,13 +3090,14 @@ mod tests {
         function_selector, source_range, CodeGenerator, EthdebugInfo, Instruction,
     };
 
-    use soldb_core::Word as StackWord;
+    use soldb_core::{EvmWord, Word as StackWord};
 
     use crate::FrameState;
 
     use super::{
         address_from_word, normalize_address, ArgumentLayout, ArgumentOrder, ContractDebugInfo,
-        InferredVariable, JumpMarker, LineKey, LocalsStatus, StepInfo, StepMap, VariableKind,
+        InferredVariable, JumpMarker, LineKey, LocalsStatus, NearestLines, SourceCache, StepInfo,
+        StepMap, VariableKind,
     };
 
     // Two functions; `outer` calls `inner` internally. Line numbers are one-based.
@@ -3015,7 +3197,7 @@ contract C {
             backend: None,
             capabilities: Default::default(),
             artifacts: Default::default(),
-            steps,
+            steps: steps.into(),
         }
     }
 
@@ -3075,6 +3257,14 @@ contract P {
         )
     }
 
+    /// A stack as the words a table holds.
+    fn evm_words(stack: &[StackWord]) -> Vec<EvmWord> {
+        stack
+            .iter()
+            .map(|word| EvmWord::parse(word).expect("test word"))
+            .collect()
+    }
+
     fn word_of(value: &str) -> StackWord {
         StackWord::from(format!("0x{:0>64}", value.trim_start_matches("0x")).as_str())
     }
@@ -3129,7 +3319,7 @@ contract P {
         let arguments = map.frame_arguments(
             inner,
             FrameState {
-                stack: &first_on_top,
+                stack: &evm_words(&first_on_top),
                 memory: None,
             },
         );
@@ -3156,7 +3346,7 @@ contract P {
         let arguments = map.frame_arguments(
             frames.first().expect("frame"),
             FrameState {
-                stack: &last_on_top,
+                stack: &evm_words(&last_on_top),
                 memory: None,
             },
         );
@@ -3177,7 +3367,7 @@ contract P {
             .frame_arguments(
                 frames.first().expect("frame"),
                 FrameState {
-                    stack: &first_on_top,
+                    stack: &evm_words(&first_on_top),
                     memory: None
                 }
             )
@@ -3193,7 +3383,7 @@ contract P {
             .frame_arguments(
                 frames.first().expect("frame"),
                 FrameState {
-                    stack: &first_on_top,
+                    stack: &evm_words(&first_on_top),
                     memory: None
                 }
             )
@@ -3216,8 +3406,10 @@ contract P {
             &amount[2..]
         );
         let stack = [word_of("2a"), amount.clone()];
-        trace.steps[2].snapshot =
+        let mut steps = trace.steps.to_steps();
+        steps[2].snapshot =
             StepSnapshot::new(stack.to_vec(), None, BTreeMap::new(), BTreeMap::new());
+        trace.steps = steps.into();
         let map = StepMap::new(&trace, vec![contract(None)]);
         assert_eq!(map.argument_layout(0), Some(ArgumentLayout::TopWords));
         let frames = map.frames(3);
@@ -3228,7 +3420,7 @@ contract P {
         let arguments = map.frame_arguments(
             outer,
             FrameState {
-                stack: &stack,
+                stack: &evm_words(&stack),
                 memory: None,
             },
         );
@@ -4556,6 +4748,133 @@ contract P {
         assert_eq!(map.finish(3), Some(7));
     }
 
+    /// Random steps over a few depths, lines, and top-level calls.
+    fn random_steps(seed: u64, count: usize) -> Vec<StepInfo> {
+        let mut state = seed;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        (0..count)
+            .map(|_| {
+                let line = next(5);
+                StepInfo {
+                    location: None,
+                    generated: false,
+                    key: (line > 0).then_some(LineKey {
+                        contract: 0,
+                        source_id: 0,
+                        line,
+                    }),
+                    contract: None,
+                    address: None,
+                    storage: None,
+                    evm_depth: 0,
+                    starts_root: next(40) == 0,
+                    frame_depth: next(6) as u32,
+                    frame_entry: false,
+                    line_start: false,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_passes_match_their_definitions() {
+        for seed in 0..200 {
+            let steps = random_steps(seed, 300);
+
+            // Smoothing, as it was done with every step's next line held in full.
+            let mut smoothed = steps.clone();
+            StepMap::smooth_single_step_excursions(&mut smoothed);
+            let mut expected = steps.clone();
+            let mut after = vec![None; expected.len()];
+            let mut lines = NearestLines::default();
+            for (index, step) in expected.iter().enumerate().rev() {
+                after[index] = lines.visit(step.frame_depth, step.key);
+                if step.starts_root {
+                    lines.clear();
+                }
+            }
+            let mut lines = NearestLines::default();
+            for (step, after) in expected.iter_mut().zip(after) {
+                if step.starts_root {
+                    lines.clear();
+                }
+                let before = lines.visit(step.frame_depth, step.key);
+                let Some(key) = step.key else {
+                    continue;
+                };
+                if before.is_some() && before == after && before != Some(key) {
+                    step.key = before;
+                }
+            }
+            assert_eq!(smoothed, expected, "smoothing, seed {seed}");
+
+            // Line starts: a step starts its line unless the last step at or below its
+            // depth since that depth was first reached in the root had the same line.
+            let mut map = StepMap::new(&trace(Vec::new()), Vec::new());
+            map.steps = steps.clone();
+            map.mark_line_starts();
+            let mut last = Vec::<Option<LineKey>>::new();
+            for (index, step) in steps.iter().enumerate() {
+                if step.starts_root {
+                    last.clear();
+                }
+                let depth = step.frame_depth as usize;
+                if last.len() <= depth {
+                    last.resize(depth + 1, None);
+                }
+                let Some(key) = step.key else {
+                    assert!(!map.steps[index].line_start, "seed {seed} step {index}");
+                    continue;
+                };
+                assert_eq!(
+                    map.steps[index].line_start,
+                    last[depth] != Some(key),
+                    "line start, seed {seed} step {index}"
+                );
+                for entry in last.iter_mut().skip(depth) {
+                    *entry = Some(key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contracts_sharing_a_source_read_it_once() {
+        let built = contract(Some("0xabcd"));
+        let mut cache = SourceCache::default();
+        let mut through_cache = || {
+            ContractDebugInfo::with_source_cache(
+                Some("0xabcd"),
+                "C",
+                built.info.clone(),
+                built.source_contents.clone(),
+                &mut cache,
+            )
+        };
+        let first = through_cache();
+        let second = through_cache();
+        assert_eq!(first, built);
+        assert_eq!(second, built);
+        assert_eq!(cache.sources[&0].len(), 1);
+
+        // The same id with other text, as another compilation numbers its sources, is
+        // read on its own.
+        let other = ContractDebugInfo::with_source_cache(
+            None,
+            "D",
+            built.info.clone(),
+            BTreeMap::from([(0, "contract D { function g() public {} }".to_owned())]),
+            &mut cache,
+        );
+        assert_eq!(other.functions[0].name, "g");
+        assert_eq!(cache.sources[&0].len(), 2);
+    }
+
     #[test]
     fn contract_info_indexes_lines_and_functions() {
         let contract = contract(Some("0xABCD"));
@@ -4810,7 +5129,7 @@ contract D {
     /// (steps 11 to 21).
     fn two_roots() -> TransactionTrace {
         let mut trace = outer_calls_inner();
-        let again = trace.steps.clone();
+        let again = trace.steps.to_steps();
         trace.steps.extend(again);
         let mut first = call(0, 0, 11, "CALL", ROOT);
         first.input = "0x01".to_owned();
@@ -4874,7 +5193,7 @@ contract D {
         let mut trace = outer_calls_inner();
         trace.steps.truncate(10);
         trace.steps.push(step(10, 1, "JUMP", &[]));
-        trace.steps.extend(outer_calls_inner().steps);
+        trace.steps.extend(outer_calls_inner().steps.to_steps());
         trace.artifacts.calls = vec![call(0, 0, 11, "CALL", ROOT), call(1, 11, 22, "CALL", ROOT)];
         let map = StepMap::new(&trace, vec![contract(Some(ROOT))]);
         assert_eq!(map.line_key(10), map.line_key(13));

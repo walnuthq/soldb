@@ -111,7 +111,7 @@ pub(crate) fn sample_transaction_trace(output: &str) -> TransactionTrace {
         backend: Some(output.to_owned()),
         capabilities: TraceCapabilities::default(),
         artifacts: TraceArtifacts::default(),
-        steps: Vec::new(),
+        steps: Default::default(),
     }
 }
 

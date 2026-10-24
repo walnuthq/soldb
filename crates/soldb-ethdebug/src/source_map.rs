@@ -8,6 +8,7 @@
 //! This is a fallback path. ETHDebug is the primary source of debug information and
 //! carries strictly more of it; prefer it whenever the compiler can produce it.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use soldb_core::{SoldbError, SoldbResult};
 
 use crate::opcodes;
 use crate::storage_layout::StorageLayout;
-use crate::{source_range, EthdebugInfo, Instruction};
+use crate::{EthdebugInfo, Instruction, SourceLocation, SourceMapContext, SourceMapJump};
 
 /// The bytecode environment described by a legacy source map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,11 +284,11 @@ fn source_map_program_from_combined(
         let Some(entry) = source_map.get(instruction_index) else {
             break;
         };
-        instructions.push(Instruction::new(
+        instructions.push(Instruction::from_source_map(
             u64::try_from(pc).map_err(|_| {
                 SoldbError::Message("program counter does not fit in `u64`".to_owned())
             })?,
-            &opcode_mnemonic(bytecode[pc]),
+            opcode_mnemonic(bytecode[pc]),
             source_context(
                 entry,
                 sources.len(),
@@ -438,42 +439,38 @@ fn decode_hex_digit(digit: u8) -> Option<u8> {
     }
 }
 
-fn opcode_mnemonic(opcode: u8) -> String {
-    opcodes::mnemonic(opcode).map_or_else(|| format!("UNKNOWN(0x{opcode:02x})"), str::to_owned)
+fn opcode_mnemonic(opcode: u8) -> Cow<'static, str> {
+    opcodes::mnemonic(opcode).map_or_else(
+        || Cow::Owned(format!("UNKNOWN(0x{opcode:02x})")),
+        Cow::Borrowed,
+    )
 }
 
-/// The ETHDebug-shaped context of one legacy entry: its source range, and the jump
-/// markers ETHDebug defines (`invoke` for a jump into a function, `return` for a jump
-/// out of one) when the map's jump type carries them. Generated code has no range but
-/// may still jump.
+/// The context of one legacy entry: its source range, and the jump markers ETHDebug
+/// defines (`invoke` for a jump into a function, `return` for a jump out of one) when the
+/// map's jump type carries them. Generated code has no range but may still jump.
 fn source_context(
     entry: &SourceMapEntry,
     source_count: usize,
     source_contents: &BTreeMap<u64, String>,
     instruction_index: usize,
     contract_name: &str,
-) -> SoldbResult<Option<Value>> {
-    let mut context = serde_json::Map::new();
-    context.insert("modifierDepth".to_owned(), json!(entry.modifier_depth));
-    if let Some(code) = source_code(
-        entry,
-        source_count,
-        source_contents,
-        instruction_index,
-        contract_name,
-    )? {
-        context.insert("code".to_owned(), code);
-    }
-    match entry.jump_type.as_str() {
-        "i" => {
-            context.insert("invoke".to_owned(), json!({}));
-        }
-        "o" => {
-            context.insert("return".to_owned(), json!({}));
-        }
-        _ => {}
-    }
-    Ok(Some(Value::Object(context)))
+) -> SoldbResult<SourceMapContext> {
+    Ok(SourceMapContext {
+        code: source_code(
+            entry,
+            source_count,
+            source_contents,
+            instruction_index,
+            contract_name,
+        )?,
+        jump: match entry.jump_type.as_str() {
+            "i" => SourceMapJump::Into,
+            "o" => SourceMapJump::Out,
+            _ => SourceMapJump::Regular,
+        },
+        modifier_depth: entry.modifier_depth,
+    })
 }
 
 /// The `code` part of an entry's context: the source range it maps to, if any.
@@ -483,7 +480,7 @@ fn source_code(
     source_contents: &BTreeMap<u64, String>,
     instruction_index: usize,
     contract_name: &str,
-) -> SoldbResult<Option<Value>> {
+) -> SoldbResult<Option<SourceLocation>> {
     if entry.file_index < 0 {
         return Ok(None);
     }
@@ -536,7 +533,11 @@ fn source_code(
         }
     }
 
-    Ok(Some(source_range(source_id, offset, length)))
+    Ok(Some(SourceLocation {
+        source_id,
+        offset,
+        length,
+    }))
 }
 
 fn read_source(

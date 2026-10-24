@@ -146,9 +146,9 @@ fn root_entry(
     if exit.is_some_and(|exit| exit <= entry) {
         return None;
     }
-    let root_depth = trace.steps.first().map_or(0, |step| step.depth);
+    let root_depth = trace.steps.first().map_or(0, |step| step.depth());
     let step = trace.steps.get(entry)?;
-    (step.depth == root_depth).then_some(entry)
+    (step.depth() == root_depth).then_some(entry)
 }
 
 /// Fails when two top-level calls start at one step, which no execution produces.

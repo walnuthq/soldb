@@ -733,9 +733,9 @@ mod tests {
             Some(21_000)
         );
         assert_eq!(trace.steps.len(), 3);
-        assert_eq!(&*trace.steps[0].op, "PUSH1");
+        assert_eq!(trace.steps.step(0).mnemonic(), "PUSH1");
         assert_eq!(
-            trace.steps[1].snapshot_ref().memory,
+            trace.steps.step(1).memory().as_deref(),
             Some(&[0xaa, 0xbb][..])
         );
     }
@@ -798,7 +798,7 @@ mod tests {
 
         assert_eq!(trace.tx_hash.as_deref(), Some("0xabc"));
         assert_eq!(trace.steps.len(), 3);
-        assert_eq!(&*trace.steps[0].op, "PUSH1");
+        assert_eq!(trace.steps.step(0).mnemonic(), "PUSH1");
     }
 
     #[test]
@@ -830,7 +830,7 @@ mod tests {
             trace.artifacts.gas.as_ref().map(|gas| gas.used),
             Some(42_000)
         );
-        assert_eq!(&*trace.steps[1].op, "CALLDATASIZE");
+        assert_eq!(trace.steps.step(1).mnemonic(), "CALLDATASIZE");
     }
 
     #[test]
