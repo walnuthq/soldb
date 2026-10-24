@@ -482,7 +482,8 @@ mod tests {
                 storage: None,
                 error: None,
                 snapshot: Default::default(),
-            }],
+            }]
+            .into(),
         };
 
         let programs = load_programs(&args, &trace).expect("load legacy profile program");

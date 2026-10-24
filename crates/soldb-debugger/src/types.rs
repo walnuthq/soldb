@@ -146,6 +146,14 @@ impl SourceTypes {
         self.scopes.extend(scopes);
     }
 
+    /// Adds the declarations `other` holds, as adding its sources again would.
+    pub(crate) fn extend_from(&mut self, other: &Self) {
+        self.structs.extend_from_slice(&other.structs);
+        self.enums.extend_from_slice(&other.enums);
+        self.value_types.extend_from_slice(&other.value_types);
+        self.scopes.extend_from_slice(&other.scopes);
+    }
+
     /// Whether any declaration was found.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -351,7 +359,13 @@ fn find_keyword(
 ) -> Option<usize> {
     let mut cursor = start;
     while let Some(at) = find_solidity_keyword(source, keyword, cursor) {
-        if code.iter().any(|(from, to)| *from <= at && at < *to) {
+        // The ranges are in order and apart, so the one that could hold `at` is the last
+        // that starts at or before it.
+        let before = code.partition_point(|(from, _)| *from <= at);
+        if before
+            .checked_sub(1)
+            .is_some_and(|range| at < code[range].1)
+        {
             return Some(at);
         }
         cursor = at + keyword.len();

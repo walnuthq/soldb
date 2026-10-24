@@ -407,7 +407,7 @@ impl View {
         for instruction in &contract.info.instructions {
             let mnemonic = instruction.mnemonic().unwrap_or("?").to_owned();
             let arguments = instruction.arguments().join(" ");
-            let current = instruction.offset == step.pc;
+            let current = instruction.offset == step.pc();
             let style = if current {
                 Style::default()
                     .add_modifier(Modifier::BOLD)

@@ -15,7 +15,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
-use soldb_core::{SoldbError, SoldbResult, TraceStep, TransactionTrace};
+use soldb_core::{opcode, SoldbError, SoldbResult, StepView, TransactionTrace};
 use soldb_debugger::{ContractDebugInfo, SourceFunction, StepMap};
 use soldb_ethdebug::{EthdebugInfo, FunctionExit, FunctionIdentity, SourceLocation};
 
@@ -430,7 +430,7 @@ pub fn profile_transaction(
         .as_deref()
         .or(trace.contract_address.as_deref());
     let root_program = lookup_program(root_address, root_environment, programs, &program_lookup);
-    let root_depth = trace.steps.first().map_or(0, |step| step.depth);
+    let root_depth = trace.steps.first().map_or(0, |step| step.depth());
     let root_label = root_program.map_or_else(
         || {
             root_address.map_or_else(
@@ -481,15 +481,15 @@ pub fn profile_transaction(
         let gas_cost = own_gas_cost(step, next);
         step_metrics.add(gas_cost, "total step gas")?;
         opcodes
-            .entry(&*step.op)
+            .entry(step.mnemonic())
             .or_default()
             .add(gas_cost, "opcode gas")?;
 
-        let active_frame = frame_cursor.current_index(&frames, step.depth);
+        let active_frame = frame_cursor.current_index(&frames, step.depth());
         let program_index = active_frame
             .and_then(|frame| frames[frame].program)
             .or_else(|| {
-                (active_frame.is_none() && step.depth == root_depth)
+                (active_frame.is_none() && step.depth() == root_depth)
                     .then_some(root_program)
                     .flatten()
             });
@@ -500,7 +500,7 @@ pub fn profile_transaction(
                     program: None,
                     function_path: 0,
                     source: None,
-                    unmapped_depth: Some(step.depth),
+                    unmapped_depth: Some(step.depth()),
                 })
                 .or_default()
                 .add(gas_cost, "folded-stack gas")?;
@@ -508,14 +508,14 @@ pub fn profile_transaction(
         };
 
         let program = &programs[program_index];
-        let context = program.pc_contexts.get(&step.pc).filter(|context| {
+        let context = program.pc_contexts.get(&step.pc()).filter(|context| {
             context
                 .opcode
                 .as_deref()
-                .is_none_or(|opcode| opcode.eq_ignore_ascii_case(&step.op))
+                .is_none_or(|opcode| opcode.eq_ignore_ascii_case(step.mnemonic()))
         });
         let function_frame = active_frame.map_or(
-            FunctionFrameKey::Root(step.depth),
+            FunctionFrameKey::Root(step.depth()),
             FunctionFrameKey::External,
         );
         let invoked = function_stacks
@@ -569,11 +569,11 @@ pub fn profile_transaction(
         let hotspot = hotspots
             .entry(HotspotKey {
                 program: program_index,
-                pc: step.pc,
+                pc: step.pc(),
                 source,
             })
             .or_insert_with(|| HotspotMetrics {
-                opcode: &step.op,
+                opcode: step.mnemonic(),
                 context_matches: context.is_some(),
                 function,
                 functions_agree: true,
@@ -678,34 +678,35 @@ pub fn profile_transaction(
 /// The callee starts with the forwarded gas plus any stipend, and the stipend comes back to the
 /// caller unless spent, so the whole `next.gas` comes off. A call with no steps lost `step.gas -
 /// next.gas`.
-fn own_gas_cost(step: &TraceStep, next: Option<&TraceStep>) -> u64 {
-    let base_cost = match &*step.op {
-        "CALL" | "CALLCODE" | "DELEGATECALL" | "STATICCALL" => 0,
-        "CREATE" | "CREATE2" => CREATE_GAS,
-        _ => return step.gas_cost,
+fn own_gas_cost(step: StepView<'_>, next: Option<StepView<'_>>) -> u64 {
+    let gas_cost = step.gas_cost();
+    let base_cost = match step.op() {
+        opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL => 0,
+        opcode::CREATE | opcode::CREATE2 => CREATE_GAS,
+        _ => return gas_cost,
     };
-    if step.error.is_some() {
-        return step.gas_cost;
+    if step.error().is_some() {
+        return gas_cost;
     }
     let Some(next) = next else {
-        return step.gas_cost;
+        return gas_cost;
     };
     // Deeper than one frame when the callee ran no steps but called on, as a cheatcode does.
-    if next.depth > step.depth {
+    if next.depth() > step.depth() {
         // geth leaves a creation's forwarded gas out of its `gas_cost`, so less than the base
         // cost would remain.
-        let Some(own) = step.gas_cost.checked_sub(next.gas) else {
-            return step.gas_cost;
+        let Some(own) = gas_cost.checked_sub(next.gas()) else {
+            return gas_cost;
         };
-        return if own >= base_cost { own } else { step.gas_cost };
+        return if own >= base_cost { own } else { gas_cost };
     }
-    if next.depth == step.depth {
-        let Some(lost) = step.gas.checked_sub(next.gas) else {
-            return step.gas_cost;
+    if next.depth() == step.depth() {
+        let Some(lost) = step.gas().checked_sub(next.gas()) else {
+            return gas_cost;
         };
-        return lost.min(step.gas_cost);
+        return lost.min(gas_cost);
     }
-    step.gas_cost
+    gas_cost
 }
 
 #[derive(Debug, Clone)]
@@ -2153,7 +2154,7 @@ mod tests {
                 ..TraceCapabilities::default()
             },
             artifacts: TraceArtifacts::default(),
-            steps,
+            steps: steps.into(),
         }
     }
 

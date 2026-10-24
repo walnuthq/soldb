@@ -396,7 +396,7 @@ mod tests {
         assert!(inner.capabilities.gas_details);
         assert_eq!(inner.steps.len(), 3);
         assert_eq!(
-            inner.steps[1].snapshot_ref().memory,
+            inner.steps.step(1).memory().as_deref(),
             Some(&[0xaa, 0xbb][..])
         );
         assert_eq!(trace.step_count(), 3);

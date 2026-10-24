@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use soldb_core::{encode_hex, StepSnapshot, TraceStep, TransactionTrace, Word as StackWord};
+use soldb_core::{encode_hex, Bytes, EvmWord, StepSnapshot, StepView, TransactionTrace};
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
 use crate::decode::ValueReader;
@@ -48,8 +48,8 @@ pub use state::{
 pub use stepping::{
     address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
     Frame, FunctionId, InferredVariable, JumpMarker, LineKey, LocalsStatus, ResolvedFunction,
-    ResolvedLine, SourceListing, StepLocation, StepMap, VariableKind, INFERRED_LOCALS_NOTE,
-    INFERRED_LOCALS_WARNING,
+    ResolvedLine, SourceCache, SourceListing, StepLocation, StepMap, VariableKind,
+    INFERRED_LOCALS_NOTE, INFERRED_LOCALS_WARNING,
 };
 pub use types::{SourceTypes, StructMember};
 
@@ -109,14 +109,14 @@ impl DebugSession {
         let step = self.trace.steps.get(step_index)?;
         Some(DebugStep {
             index: step_index,
-            pc: step.pc,
-            op: step.op.to_string(),
-            gas: step.gas,
-            gas_cost: step.gas_cost,
-            depth: step.depth,
-            source: self.source_span(step.pc),
-            function: self.function_at_pc(step.pc).cloned(),
-            snapshot: step.normalized_snapshot(),
+            pc: step.pc(),
+            op: step.mnemonic().to_owned(),
+            gas: step.gas(),
+            gas_cost: step.gas_cost(),
+            depth: step.depth(),
+            source: self.source_span(step.pc()),
+            function: self.function_at_pc(step.pc()).cloned(),
+            snapshot: step.to_trace_step().snapshot,
             variables: self.variables_at_step(step_index),
         })
     }
@@ -352,7 +352,7 @@ pub fn variables_for_step(
     let Some(step) = trace.steps.get(step_index) else {
         return Vec::new();
     };
-    let variables = ethdebug.variables_at_pc(step.pc);
+    let variables = ethdebug.variables_at_pc(step.pc());
     if variables.is_empty() {
         return Vec::new();
     }
@@ -365,7 +365,11 @@ pub fn variables_for_step(
         .collect()
 }
 
-fn decode_variable(step: &TraceStep, calldata: &str, variable: &VariableLocation) -> DebugVariable {
+fn decode_variable(
+    step: StepView<'_>,
+    calldata: &str,
+    variable: &VariableLocation,
+) -> DebugVariable {
     let raw = raw_value_for_location(step, calldata, variable);
     let value = raw.map_or_else(
         || DebugValue {
@@ -387,20 +391,19 @@ fn decode_variable(step: &TraceStep, calldata: &str, variable: &VariableLocation
 }
 
 fn raw_value_for_location(
-    step: &TraceStep,
+    step: StepView<'_>,
     calldata: &str,
     variable: &VariableLocation,
 ) -> Option<String> {
-    let snapshot = step.snapshot_ref();
     match variable.location_type.as_str() {
-        "stack" => snapshot
-            .stack
-            .get(variable.offset as usize)
-            .map(|value| normalize_hex(value)),
-        "memory" => memory_word(snapshot.memory?, usize::try_from(variable.offset).ok()?)
+        "stack" => step
+            .stack()
+            .get(usize::try_from(variable.offset).ok()?)
+            .map(|value| normalize_hex(&value.to_string())),
+        "memory" => memory_word(&step.memory()?, usize::try_from(variable.offset).ok()?)
             .map(|word| format!("0x{}", encode_hex(&word))),
         "calldata" => word_from_hex_bytes(calldata, variable.offset as usize),
-        "storage" => storage_value(snapshot.storage, variable.offset),
+        "storage" => storage_value(step.storage(), variable.offset),
         _ => None,
     }
 }
@@ -495,11 +498,12 @@ impl ArgumentOrder {
 
 /// What a frame's arguments are read from: the stack at its entry point, and the memory
 /// a pointer among them refers into.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FrameState<'a> {
-    pub stack: &'a [StackWord],
+    /// The stack at the entry step, bottom first.
+    pub stack: &'a [EvmWord],
     /// Memory at the entry step, when the backend captured it.
-    pub memory: Option<&'a [u8]>,
+    pub memory: Option<Bytes>,
 }
 
 /// The arguments a function was entered with, read off the stack at its entry point.
@@ -535,11 +539,11 @@ pub fn decode_arguments(
         .iter()
         .enumerate()
         .map(|(index, param)| {
-            let word = &stack[order.word_index(index, params.len(), stack.len())];
+            let word = stack[order.word_index(index, params.len(), stack.len())].to_string();
             FrameArgument {
                 name: param.name.clone(),
                 ty: param.ty.clone(),
-                value: argument_value(param, word, state.memory, types, scope),
+                value: argument_value(param, &word, state.memory.clone(), types, scope),
             }
         })
         .collect()
@@ -548,7 +552,7 @@ pub fn decode_arguments(
 fn argument_value(
     param: &SourceParam,
     word: &str,
-    memory: Option<&[u8]>,
+    memory: Option<Bytes>,
     types: &SourceTypes,
     scope: Option<&str>,
 ) -> DebugValue {
@@ -802,22 +806,72 @@ const DECLARATION_KEYWORDS: [&str; 5] =
 #[must_use]
 pub fn parse_source_functions(source_id: u64, source: &str) -> Vec<SourceFunction> {
     let mut functions = Vec::new();
-    for keyword in DECLARATION_KEYWORDS {
-        collect_declarations(source_id, source, keyword, &mut functions);
+    let found = keyword_positions(source, DECLARATION_KEYWORDS);
+    for (keyword, positions) in DECLARATION_KEYWORDS.into_iter().zip(&found) {
+        collect_declarations(source_id, source, keyword, positions, &mut functions);
     }
     functions.sort_by_key(|function| function.declaration_start);
     functions
+}
+
+/// Where each of `keywords` stands as a word of its own in `source`, in order, as
+/// [`find_solidity_keyword`] finds them one by one: found in one pass over the source
+/// rather than one search for every occurrence of every keyword.
+fn keyword_positions<const N: usize>(source: &str, keywords: [&str; N]) -> [Vec<usize>; N] {
+    let mut found = std::array::from_fn(|_| Vec::new());
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !is_identifier_byte(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+        let word = &bytes[start..index];
+        for (keyword, positions) in keywords.iter().zip(found.iter_mut()) {
+            if word == keyword.as_bytes() {
+                positions.push(start);
+            }
+        }
+    }
+    found
 }
 
 fn collect_declarations(
     source_id: u64,
     source: &str,
     keyword: &str,
+    positions: &[usize],
     functions: &mut Vec<SourceFunction>,
 ) {
     let named = matches!(keyword, "function" | "modifier");
     let mut cursor = 0;
-    while let Some(keyword_start) = find_solidity_keyword(source, keyword, cursor) {
+    let mut next = 0;
+    // The next occurrence of the keyword at or after the cursor, which only moves on.
+    let mut find = |cursor: usize| {
+        while positions.get(next).is_some_and(|at| *at < cursor) {
+            next += 1;
+        }
+        positions.get(next).copied()
+    };
+    // Declarations are found in order, so each one's line is counted on from the last.
+    let mut counted = (0, 1);
+    let mut line_of = |offset: usize| {
+        let (from, line) = if offset < counted.0 { (0, 1) } else { counted };
+        let newlines = source.as_bytes()[from..offset]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count() as u64;
+        counted = (offset, line + newlines);
+        line + newlines
+    };
+    while let Some(keyword_start) = find(cursor) {
         let mut index = skip_ascii_whitespace(source, keyword_start + keyword.len());
         let name = if named {
             let Some((name, name_end)) = parse_identifier(source, index) else {
@@ -879,11 +933,7 @@ fn collect_declarations(
             name: name.to_owned(),
             params,
             declaration_start: keyword_start as u64,
-            declaration_line: source[..keyword_start]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count() as u64
-                + 1,
+            declaration_line: line_of(keyword_start),
             body_start: body_start as u64,
             body_end: body_end as u64,
             returns,
@@ -1300,7 +1350,7 @@ mod tests {
             error: None,
         };
         let mut trace = sample_trace();
-        trace.steps.push(trace.steps[0].clone());
+        trace.steps.push(trace.steps.step(0).to_trace_step());
         let second_input = format!(
             "0x12345678{:0>64}",
             "2222222222222222222222222222222222222222"
@@ -1547,6 +1597,25 @@ mod tests {
     }
 
     #[test]
+    fn finds_keywords_in_one_pass_as_one_by_one() {
+        let source = "function f() {} // function in a comment\n\
+            contract C { function functionX() {} function_ _function 1function function1\n\
+            modifier m() { _; } \"receive\" fallback() receive() constructor() é function\n\
+            x.receive(y); functionfunction function";
+        let found = super::keyword_positions(source, super::DECLARATION_KEYWORDS);
+        for (keyword, positions) in super::DECLARATION_KEYWORDS.into_iter().zip(&found) {
+            let mut one_by_one = Vec::new();
+            let mut cursor = 0;
+            while let Some(at) = super::find_solidity_keyword(source, keyword, cursor) {
+                one_by_one.push(at);
+                cursor = at + 1;
+            }
+            assert_eq!(*positions, one_by_one, "{keyword}");
+        }
+        assert_eq!(found[0].len(), 5);
+    }
+
+    #[test]
     fn stripping_comments_leaves_declaration_offsets_alone() {
         // Only the text between the parentheses is stripped, so the offsets the PC
         // mapping reads still point into the original source.
@@ -1588,7 +1657,8 @@ mod tests {
                 storage: Some(BTreeMap::from([("0x0".to_owned(), "0x2a".to_owned())])),
                 error: None,
                 snapshot: Default::default(),
-            }],
+            }]
+            .into(),
         }
     }
     /// Solidity memory: a `string` is a length then its bytes; an array is a length then
@@ -1614,7 +1684,7 @@ mod tests {
         ]);
         let types = super::SourceTypes::default();
         let reader = super::ValueReader {
-            memory: Some(&memory),
+            memory: Some(soldb_core::Bytes::from(memory)),
             calldata: "",
             storage: None,
             layout: None,

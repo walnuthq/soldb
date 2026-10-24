@@ -720,7 +720,14 @@ impl DapServer {
             .map(|(index, frame)| {
                 let step_name = trace.steps.get(frame.step).map_or_else(
                     || format!("step {}", frame.step),
-                    |step| format!("step {}: {} @ pc {}", frame.step, step.op, step.pc),
+                    |step| {
+                        format!(
+                            "step {}: {} @ pc {}",
+                            frame.step,
+                            step.mnemonic(),
+                            step.pc()
+                        )
+                    },
                 );
                 let arguments = if frame.arguments.is_empty() {
                     String::new()
@@ -839,12 +846,11 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        step.snapshot_ref()
-            .stack
+        step.stack()
             .iter()
             .enumerate()
             .map(|(index, value)| {
-                json!({"name": format!("stack[{index}]"), "value": value, "variablesReference": 0})
+                json!({"name": format!("stack[{index}]"), "value": value.to_string(), "variablesReference": 0})
             })
             .collect()
     }
@@ -853,7 +859,7 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        let Some(memory) = step.snapshot_ref().memory else {
+        let Some(memory) = step.memory() else {
             return Vec::new();
         };
         if memory.is_empty() {
@@ -877,7 +883,7 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        let Some(data) = step.snapshot_ref().return_data else {
+        let Some(data) = step.return_data() else {
             return Vec::new();
         };
         let digits = data.chars().collect::<Vec<_>>();
@@ -898,13 +904,12 @@ impl DapServer {
         let Some(step) = self.debugger.current_step_data() else {
             return Vec::new();
         };
-        let snapshot = step.snapshot_ref();
-        let mut variables = snapshot
-            .storage
+        let mut variables = step
+            .storage()
             .iter()
             .map(|(slot, value)| json!({"name": slot, "value": value, "variablesReference": 0}))
             .collect::<Vec<_>>();
-        variables.extend(snapshot.storage_diff.iter().map(|(slot, change)| {
+        variables.extend(step.storage_diff().iter().map(|(slot, change)| {
             json!({
                 "name": format!("{slot} diff"),
                 "value": format!(
@@ -923,11 +928,11 @@ impl DapServer {
             return Vec::new();
         };
         vec![
-            json!({"name": "pc", "value": step.pc.to_string(), "variablesReference": 0}),
-            json!({"name": "op", "value": step.op, "variablesReference": 0}),
-            json!({"name": "gas", "value": step.gas.to_string(), "variablesReference": 0}),
-            json!({"name": "gasCost", "value": step.gas_cost.to_string(), "variablesReference": 0}),
-            json!({"name": "depth", "value": step.depth.to_string(), "variablesReference": 0}),
+            json!({"name": "pc", "value": step.pc().to_string(), "variablesReference": 0}),
+            json!({"name": "op", "value": step.mnemonic(), "variablesReference": 0}),
+            json!({"name": "gas", "value": step.gas().to_string(), "variablesReference": 0}),
+            json!({"name": "gasCost", "value": step.gas_cost().to_string(), "variablesReference": 0}),
+            json!({"name": "depth", "value": step.depth().to_string(), "variablesReference": 0}),
         ]
     }
 
@@ -936,11 +941,11 @@ impl DapServer {
             return "<no trace>".to_owned();
         };
         match expression.trim() {
-            "pc" => step.pc.to_string(),
-            "op" => step.op.to_string(),
-            "gas" => step.gas.to_string(),
-            "gasCost" | "gas_cost" => step.gas_cost.to_string(),
-            "depth" => step.depth.to_string(),
+            "pc" => step.pc().to_string(),
+            "op" => step.mnemonic().to_owned(),
+            "gas" => step.gas().to_string(),
+            "gasCost" | "gas_cost" => step.gas_cost().to_string(),
+            "depth" => step.depth().to_string(),
             expression if expression.starts_with("stack[") && expression.ends_with(']') => {
                 let index = expression
                     .trim_start_matches("stack[")
@@ -948,20 +953,14 @@ impl DapServer {
                     .parse::<usize>()
                     .ok();
                 index
-                    .and_then(|index| {
-                        step.snapshot_ref()
-                            .stack
-                            .get(index)
-                            .map(|word| word.to_string())
-                    })
+                    .and_then(|index| step.stack().get(index).map(|word| word.to_string()))
                     .unwrap_or_else(|| "<unavailable>".to_owned())
             }
             expression if expression.starts_with("storage[") && expression.ends_with(']') => {
                 let slot = expression
                     .trim_start_matches("storage[")
                     .trim_end_matches(']');
-                step.snapshot_ref()
-                    .storage
+                step.storage()
                     .get(slot)
                     .cloned()
                     .unwrap_or_else(|| "<unavailable>".to_owned())
@@ -1227,7 +1226,8 @@ mod tests {
     fn the_return_data_scope_lists_the_buffer_in_words() {
         let mut trace = sample_trace();
         let data = format!("{:0>64}{:0>64}", "2a", "1");
-        trace.steps[0] = TraceStep::new(
+        let mut steps = trace.steps.to_steps();
+        steps[0] = TraceStep::new(
             0,
             "RETURNDATASIZE".into(),
             100,
@@ -1242,6 +1242,7 @@ mod tests {
             )
             .with_return_data(Some(data)),
         );
+        trace.steps = steps.into();
         let mut server = DapServer::with_session(trace, Vec::new(), &std::env::temp_dir())
             .expect("top-level calls must start at different steps");
         server.handle_message(&DapMessage::request(1, "launch", None));
@@ -1521,7 +1522,8 @@ mod tests {
             trace_step(0, 2, "PUSH1", &[]),
             trace_step(2, 2, "SSTORE", &[]),
             trace_step(3, 1, "STOP", &[]),
-        ];
+        ]
+        .into();
 
         let mut server = DapServer::new();
         let both = DapMessage::request(
@@ -1637,7 +1639,8 @@ mod tests {
             trace_step(0, 2, "PUSH1", &[]),
             trace_step(2, 2, "SSTORE", &[]),
             trace_step(3, 1, "STOP", &[]),
-        ];
+        ]
+        .into();
 
         let root = temp.join("project");
         let mut server = DapServer::with_session(trace, contracts, &root)
@@ -1901,7 +1904,8 @@ mod tests {
                     error: None,
                     snapshot: Default::default(),
                 },
-            ],
+            ]
+            .into(),
         }
     }
 

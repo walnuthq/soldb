@@ -9,6 +9,7 @@
 //! generated for it. Callers that resolve a source line to a program counter must rank
 //! candidates accordingly rather than taking the first intersecting span.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -36,12 +37,68 @@ pub enum FunctionExit {
     Revert,
 }
 
+/// One instruction of a program and what the compiler says about it.
+///
+/// It reads and writes as an ETHDebug program lists it: its `offset`, an `operation`
+/// naming the mnemonic, and a `context`. A legacy source map says the same few things
+/// about every instruction, so one made from a source map holds them as plain values
+/// (see [`Instruction::from_source_map`]) rather than as the JSON objects they stand
+/// for, which cost a dozen allocations an instruction to build, read, and drop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "InstructionJson", into = "InstructionJson")]
 pub struct Instruction {
     pub offset: u64,
-    pub operation: Value,
+    operation: Operation,
+    context: Option<Context>,
+}
+
+/// An instruction as an ETHDebug program writes it.
+#[derive(Serialize, Deserialize)]
+struct InstructionJson {
+    offset: u64,
+    operation: Value,
     #[serde(default)]
-    pub context: Option<Value>,
+    context: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Operation {
+    /// An operation that says nothing but its mnemonic.
+    Mnemonic(Cow<'static, str>),
+    /// Any other operation, as the program wrote it.
+    Json(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Context {
+    /// A context saying only what a legacy source map does.
+    SourceMap(SourceMapContext),
+    /// Any other context, as the program wrote it.
+    Json(Value),
+}
+
+/// What a legacy source map says about one instruction, as the ETHDebug context
+/// `{"modifierDepth": .., "code": .., "invoke" | "return": {}}` says it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceMapContext {
+    /// The source range the instruction was generated from; generated code has none.
+    pub code: Option<SourceLocation>,
+    /// The jump the instruction makes.
+    pub jump: SourceMapJump,
+    /// How many modifiers deep the instruction runs.
+    pub modifier_depth: i64,
+}
+
+/// The jump a legacy source map says an instruction makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SourceMapJump {
+    /// An ordinary jump, or none: `-`.
+    #[default]
+    Regular,
+    /// Into a function: `i`, the ETHDebug `invoke` context.
+    Into,
+    /// Out of a function: `o`, the ETHDebug `return` context.
+    Out,
 }
 
 impl Instruction {
@@ -51,44 +108,65 @@ impl Instruction {
     pub fn new(offset: u64, mnemonic: &str, context: Option<Value>) -> Self {
         Self {
             offset,
-            operation: json!({"mnemonic": mnemonic}),
-            context,
+            operation: Operation::Mnemonic(Cow::Owned(mnemonic.to_owned())),
+            context: context.map(Context::from_json),
+        }
+    }
+
+    /// An instruction at program counter `offset` that runs `mnemonic`, as a legacy
+    /// source map describes it.
+    #[must_use]
+    pub fn from_source_map(
+        offset: u64,
+        mnemonic: impl Into<Cow<'static, str>>,
+        context: SourceMapContext,
+    ) -> Self {
+        Self {
+            offset,
+            operation: Operation::Mnemonic(mnemonic.into()),
+            context: Some(Context::SourceMap(context)),
         }
     }
 
     #[must_use]
     pub fn mnemonic(&self) -> Option<&str> {
-        self.operation
-            .get("mnemonic")
-            .and_then(serde_json::Value::as_str)
+        match &self.operation {
+            Operation::Mnemonic(mnemonic) => Some(mnemonic),
+            Operation::Json(operation) => operation.get("mnemonic").and_then(Value::as_str),
+        }
     }
 
     #[must_use]
     pub fn arguments(&self) -> Vec<&str> {
-        self.operation
+        let Operation::Json(operation) = &self.operation else {
+            return Vec::new();
+        };
+        operation
             .get("arguments")
-            .and_then(serde_json::Value::as_array)
-            .map(|arguments| {
-                arguments
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect()
-            })
+            .and_then(Value::as_array)
+            .map(|arguments| arguments.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default()
     }
 
     #[must_use]
     pub fn source_location(&self) -> Option<SourceLocation> {
-        let mut locations = self.source_locations();
-        (locations.len() == 1).then(|| locations.remove(0))
+        match &self.context {
+            Some(Context::SourceMap(context)) => context.code.clone(),
+            _ => {
+                let mut locations = self.source_locations();
+                (locations.len() == 1).then(|| locations.remove(0))
+            }
+        }
     }
 
     /// Returns every source alternative attached to this instruction.
     #[must_use]
     pub fn source_locations(&self) -> Vec<SourceLocation> {
         let mut locations = Vec::new();
-        if let Some(context) = &self.context {
-            collect_source_locations(context, &mut locations);
+        match &self.context {
+            Some(Context::SourceMap(context)) => locations.extend(context.code.clone()),
+            Some(Context::Json(context)) => collect_source_locations(context, &mut locations),
+            None => {}
         }
         locations
     }
@@ -97,8 +175,16 @@ impl Instruction {
     #[must_use]
     pub fn function_invocations(&self) -> Vec<FunctionIdentity> {
         let mut functions = Vec::new();
-        if let Some(context) = &self.context {
-            collect_function_invocations(context, &mut functions);
+        match &self.context {
+            Some(Context::SourceMap(context)) if context.jump == SourceMapJump::Into => {
+                functions.push(FunctionIdentity {
+                    identifier: None,
+                    declaration: None,
+                    activation: None,
+                });
+            }
+            Some(Context::Json(context)) => collect_function_invocations(context, &mut functions),
+            _ => {}
         }
         functions
     }
@@ -106,21 +192,145 @@ impl Instruction {
     /// Returns the function exit attached to this instruction.
     #[must_use]
     pub fn function_exit(&self) -> Option<FunctionExit> {
-        let context = self.context.as_ref()?;
-        if context.get("return").is_some() {
-            Some(FunctionExit::Return)
-        } else if context.get("revert").is_some() {
-            Some(FunctionExit::Revert)
-        } else {
-            None
+        match self.context.as_ref()? {
+            Context::SourceMap(context) => {
+                (context.jump == SourceMapJump::Out).then_some(FunctionExit::Return)
+            }
+            Context::Json(context) => {
+                if context.get("return").is_some() {
+                    Some(FunctionExit::Return)
+                } else if context.get("revert").is_some() {
+                    Some(FunctionExit::Revert)
+                } else {
+                    None
+                }
+            }
         }
     }
 
     /// Legacy source-map modifier depth, when this instruction was adapted from one.
     #[must_use]
     pub fn modifier_depth(&self) -> Option<i64> {
-        self.context.as_ref()?.get("modifierDepth")?.as_i64()
+        match self.context.as_ref()? {
+            Context::SourceMap(context) => Some(context.modifier_depth),
+            Context::Json(context) => context.get("modifierDepth")?.as_i64(),
+        }
     }
+}
+
+impl From<InstructionJson> for Instruction {
+    fn from(instruction: InstructionJson) -> Self {
+        Self {
+            offset: instruction.offset,
+            operation: Operation::from_json(instruction.operation),
+            context: instruction.context.map(Context::from_json),
+        }
+    }
+}
+
+impl From<Instruction> for InstructionJson {
+    fn from(instruction: Instruction) -> Self {
+        Self {
+            offset: instruction.offset,
+            operation: match instruction.operation {
+                Operation::Mnemonic(mnemonic) => json!({"mnemonic": mnemonic}),
+                Operation::Json(operation) => operation,
+            },
+            context: instruction.context.map(|context| match context {
+                Context::SourceMap(context) => context.to_json(),
+                Context::Json(context) => context,
+            }),
+        }
+    }
+}
+
+impl Operation {
+    /// Keeps an operation that names only its mnemonic as the mnemonic, so an
+    /// instruction reads back equal to the one written.
+    fn from_json(operation: Value) -> Self {
+        if let Value::Object(fields) = &operation {
+            if let (1, Some(Value::String(mnemonic))) = (fields.len(), fields.get("mnemonic")) {
+                return Self::Mnemonic(Cow::Owned(mnemonic.clone()));
+            }
+        }
+        Self::Json(operation)
+    }
+}
+
+impl Context {
+    /// Keeps a context that says only what a legacy source map does as values, so an
+    /// instruction reads back equal to the one written.
+    fn from_json(context: Value) -> Self {
+        SourceMapContext::from_json(&context).map_or(Self::Json(context), Self::SourceMap)
+    }
+}
+
+impl SourceMapContext {
+    fn from_json(context: &Value) -> Option<Self> {
+        let fields = context.as_object()?;
+        let modifier_depth = fields.get("modifierDepth")?.as_i64()?;
+        let mut code = None;
+        let mut jump = SourceMapJump::Regular;
+        for (key, value) in fields {
+            match key.as_str() {
+                "modifierDepth" => {}
+                "code" => code = Some(source_range_of(value)?),
+                "invoke" | "return" if empty_object(value) && jump == SourceMapJump::Regular => {
+                    jump = if key == "invoke" {
+                        SourceMapJump::Into
+                    } else {
+                        SourceMapJump::Out
+                    };
+                }
+                _ => return None,
+            }
+        }
+        Some(Self {
+            code,
+            jump,
+            modifier_depth,
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        let mut context = serde_json::Map::new();
+        context.insert("modifierDepth".to_owned(), json!(self.modifier_depth));
+        if let Some(code) = &self.code {
+            context.insert(
+                "code".to_owned(),
+                source_range(code.source_id, code.offset, code.length),
+            );
+        }
+        match self.jump {
+            SourceMapJump::Regular => {}
+            SourceMapJump::Into => {
+                context.insert("invoke".to_owned(), json!({}));
+            }
+            SourceMapJump::Out => {
+                context.insert("return".to_owned(), json!({}));
+            }
+        }
+        Value::Object(context)
+    }
+}
+
+/// The source location `value` holds, when it is exactly what [`source_range`] writes.
+fn source_range_of(value: &Value) -> Option<SourceLocation> {
+    let fields = value.as_object()?;
+    let source = fields.get("source")?.as_object()?;
+    let range = fields.get("range")?.as_object()?;
+    if fields.len() != 2 || source.len() != 1 || range.len() != 2 {
+        return None;
+    }
+    Some(SourceLocation {
+        source_id: source.get("id")?.as_u64()?,
+        offset: range.get("offset")?.as_u64()?,
+        length: range.get("length")?.as_u64()?,
+    })
+}
+
+fn empty_object(value: &Value) -> bool {
+    value.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
 fn collect_source_locations(context: &Value, locations: &mut Vec<SourceLocation>) {
@@ -511,7 +721,7 @@ mod tests {
     use super::{
         parse_compilation_sources, parse_ethdebug_spec, parse_multi_contract_spec,
         parse_single_contract_spec, parse_variable_locations, read_compilation_source,
-        EthdebugInfo, Instruction,
+        EthdebugInfo, FunctionExit, Instruction, SourceLocation, SourceMapContext, SourceMapJump,
     };
     use serde_json::json;
 
@@ -673,6 +883,89 @@ mod tests {
         assert_eq!(source_location.source_id, 7);
         assert_eq!(source_location.offset, 20);
         assert_eq!(source_location.length, 4);
+    }
+
+    #[test]
+    fn source_map_instructions_read_and_write_as_their_json() {
+        let code = SourceLocation {
+            source_id: 3,
+            offset: 40,
+            length: 9,
+        };
+        let typed = Instruction::from_source_map(
+            7,
+            "JUMP",
+            SourceMapContext {
+                code: Some(code.clone()),
+                jump: SourceMapJump::Into,
+                modifier_depth: 1,
+            },
+        );
+        let json = json!({
+            "offset": 7,
+            "operation": {"mnemonic": "JUMP"},
+            "context": {
+                "modifierDepth": 1,
+                "code": {"source": {"id": 3}, "range": {"offset": 40, "length": 9}},
+                "invoke": {}
+            }
+        });
+        assert_eq!(serde_json::to_value(&typed).expect("json"), json);
+        let read: Instruction = serde_json::from_value(json.clone()).expect("instruction");
+        assert_eq!(read, typed);
+        let context = json.get("context").cloned();
+        assert_eq!(Instruction::new(7, "JUMP", context), typed);
+
+        assert_eq!(typed.mnemonic(), Some("JUMP"));
+        assert!(typed.arguments().is_empty());
+        assert_eq!(typed.source_location(), Some(code.clone()));
+        assert_eq!(typed.source_locations(), [code]);
+        assert_eq!(typed.function_invocations().len(), 1);
+        assert_eq!(typed.function_exit(), None);
+        assert_eq!(typed.modifier_depth(), Some(1));
+
+        let generated = Instruction::from_source_map(
+            8,
+            "JUMP",
+            SourceMapContext {
+                code: None,
+                jump: SourceMapJump::Out,
+                modifier_depth: 0,
+            },
+        );
+        assert_eq!(generated.source_location(), None);
+        assert!(generated.function_invocations().is_empty());
+        assert_eq!(generated.function_exit(), Some(FunctionExit::Return));
+        assert_eq!(
+            serde_json::to_value(&generated).expect("json")["context"],
+            json!({"modifierDepth": 0, "return": {}})
+        );
+    }
+
+    #[test]
+    fn keeps_contexts_a_source_map_cannot_say_as_written() {
+        for context in [
+            // No modifier depth, or anything a source map does not say.
+            json!({"code": {"source": {"id": 1}, "range": {"offset": 0, "length": 1}}}),
+            json!({"modifierDepth": 0, "remark": "x"}),
+            json!({"modifierDepth": 0, "invoke": {"identifier": "f"}}),
+            json!({"modifierDepth": 0, "invoke": {}, "return": {}}),
+            json!({"modifierDepth": 0, "code": {"source": {"id": 1, "path": "a.sol"},
+                "range": {"offset": 0, "length": 1}}}),
+        ] {
+            let instruction = Instruction::new(0, "STOP", Some(context.clone()));
+            let written = serde_json::to_value(&instruction).expect("json");
+            assert_eq!(written["context"], context);
+        }
+        let push: Instruction = serde_json::from_value(json!({
+            "offset": 0,
+            "operation": {"mnemonic": "PUSH1", "arguments": ["0x01"]}
+        }))
+        .expect("instruction");
+        assert_eq!(
+            serde_json::to_value(&push).expect("json")["operation"],
+            json!({"mnemonic": "PUSH1", "arguments": ["0x01"]})
+        );
     }
 
     #[test]

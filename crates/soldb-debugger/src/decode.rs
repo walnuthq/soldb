@@ -15,6 +15,7 @@
 //! backend did not capture, a slot the frame never touched, a struct whose declaration
 //! is not in the loaded sources.
 
+use soldb_core::Bytes;
 use soldb_ethdebug::{
     decode_value, parse_word, word_hex, PathSegment, StorageEncoding, StorageLayout, StorageRef,
     Word,
@@ -34,10 +35,10 @@ const MAX_DEPTH: usize = 3;
 const SHOWN_ELEMENTS: usize = 8;
 
 /// The data a step offers to read values from.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ValueReader<'a> {
     /// Memory, when the backend captured it.
-    pub memory: Option<&'a [u8]>,
+    pub memory: Option<Bytes>,
     /// The calldata of the executing frame.
     pub calldata: &'a str,
     /// The storage words known at the step, for storage pointers.
@@ -212,7 +213,7 @@ impl<'a> ValueReader<'a> {
                             "index {index} is out of range; `{path}` has {length} bytes"
                         ));
                     }
-                    let memory = self.memory.ok_or_else(|| no_memory(path))?;
+                    let memory = self.memory.as_deref().ok_or_else(|| no_memory(path))?;
                     let byte = memory_bytes(memory, pointer + 32 + index, 1)
                         .ok_or_else(|| beyond_memory(path))?;
                     let mut word = [0_u8; 32];
@@ -389,7 +390,7 @@ impl<'a> ValueReader<'a> {
             Place::Word { word, ty } => self.value_word(&word_hex(word), ty),
             Place::Memory { pointer, ty } => {
                 let raw = Some(format!("{pointer:#x}"));
-                let display = match self.memory {
+                let display = match &self.memory {
                     Some(_) => self.read_memory(*pointer, ty, 0).unwrap_or_else(|| {
                         format!("<{ty} in memory at {pointer:#x}, beyond what this step captured>")
                     }),
@@ -434,7 +435,7 @@ impl<'a> ValueReader<'a> {
                 Ok(Value::Word(*word, ty.starts_with("int")))
             }
             Place::Memory { pointer, ty } if ty == "string" || ty == "bytes" => {
-                let memory = self.memory.ok_or_else(|| no_memory(path))?;
+                let memory = self.memory.as_deref().ok_or_else(|| no_memory(path))?;
                 let bytes = word_as_usize(
                     &memory_word(memory, *pointer).ok_or_else(|| beyond_memory(path))?,
                 )
@@ -555,7 +556,7 @@ impl<'a> ValueReader<'a> {
     /// `string`, or `None` for a type without a length.
     fn memory_length(&self, pointer: usize, ty: &str) -> Result<Option<usize>, String> {
         if ty == "bytes" || ty == "string" || ty.ends_with("[]") {
-            let memory = self.memory.ok_or_else(|| no_memory(ty))?;
+            let memory = self.memory.as_deref().ok_or_else(|| no_memory(ty))?;
             let word = memory_word(memory, pointer).ok_or_else(|| beyond_memory(ty))?;
             return Ok(Some(
                 word_as_usize(&word).ok_or_else(|| format!("`{ty}` has an unreadable length"))?,
@@ -566,7 +567,7 @@ impl<'a> ValueReader<'a> {
 
     /// The `index`th word from `base` in memory.
     fn memory_word_at(&self, base: usize, index: usize, path: &str) -> Result<Word, String> {
-        let memory = self.memory.ok_or_else(|| no_memory(path))?;
+        let memory = self.memory.as_deref().ok_or_else(|| no_memory(path))?;
         base.checked_add(index.saturating_mul(32))
             .and_then(|offset| memory_word(memory, offset))
             .ok_or_else(|| beyond_memory(path))
@@ -614,7 +615,7 @@ impl<'a> ValueReader<'a> {
     /// A value at `pointer` of memory, or `None` when the capture does not reach it or
     /// the type is not one memory holds.
     pub(crate) fn read_memory(&self, pointer: usize, ty: &str, depth: usize) -> Option<String> {
-        let memory = self.memory?;
+        let memory = self.memory.as_deref()?;
         if depth > MAX_DEPTH {
             return Some(format!("<{ty} at {pointer:#x}>"));
         }
@@ -957,6 +958,7 @@ fn unreadable(word: &str) -> DebugValue {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use soldb_core::Bytes;
     use soldb_ethdebug::{parse_path, StorageLayout};
 
     use super::{split_location, unqualified, Place, ValueReader};
@@ -979,7 +981,7 @@ contract Shop {
 
     fn reader<'a>(memory: Option<&'a [u8]>, types: &'a SourceTypes) -> ValueReader<'a> {
         ValueReader {
-            memory,
+            memory: memory.map(Bytes::copy_from_slice),
             calldata: "0x",
             storage: None,
             layout: None,
@@ -1083,7 +1085,7 @@ contract Shop {
         );
         let nested = soldb_core::decode_hex(&nested).expect("test memory is hex");
         let reader = ValueReader {
-            memory: Some(&nested),
+            memory: Some(Bytes::from(nested)),
             ..reader
         };
         assert_eq!(
@@ -1093,7 +1095,7 @@ contract Shop {
         // Without memory the pointer is shown as such.
         let blind = ValueReader {
             memory: None,
-            ..reader
+            ..reader.clone()
         };
         let value = blind.variable("Item memory", &["0x80"]);
         assert_eq!(value.status, DebugValueStatus::Raw);

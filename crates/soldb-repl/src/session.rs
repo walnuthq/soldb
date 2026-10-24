@@ -251,8 +251,7 @@ impl Session {
             .and_then(|map| map.executing_address(self.state.current_step))
             .map(str::to_owned);
         let stack = (self.state.display_mode == DisplayMode::Assembly).then(|| {
-            step.snapshot_ref()
-                .stack
+            step.stack()
                 .iter()
                 .rev()
                 .map(|word| word.to_string())
@@ -262,9 +261,9 @@ impl Session {
             reason,
             step: self.state.current_step,
             last_step: self.state.step_count().saturating_sub(1),
-            pc: step.pc,
-            op: step.op.to_string(),
-            gas: step.gas,
+            pc: step.pc(),
+            op: step.mnemonic().to_owned(),
+            gas: step.gas(),
             location,
             address,
             has_source: self.state.has_source(),
@@ -378,7 +377,7 @@ impl Session {
         let Some(step) = self.state.current_step_data() else {
             return message(Level::Warning, "No trace loaded.");
         };
-        let Some(memory) = step.snapshot_ref().memory else {
+        let Some(memory) = step.memory() else {
             let captured = self
                 .state
                 .trace()
@@ -443,7 +442,7 @@ impl Session {
             .map(|words| words.known())
             .unwrap_or_default();
         // The slots this step itself changed, so a stop at an `SSTORE` shows what moved.
-        let changed = step.snapshot_ref().storage_diff;
+        let changed = step.storage_diff();
         let slots = known
             .into_iter()
             .map(|(slot, value)| {
@@ -520,7 +519,7 @@ impl Session {
                 "Return data is not in this trace; the backend did not record it per step.",
             );
         }
-        let data = step.snapshot_ref().return_data.unwrap_or_default();
+        let data = step.return_data().unwrap_or_default();
         Output::ReturnData {
             bytes: data.len() / 2,
             data: format!("0x{data}"),
@@ -552,8 +551,7 @@ impl Session {
             return message(Level::Warning, "No trace loaded.");
         };
         let words = step
-            .snapshot_ref()
-            .stack
+            .stack()
             .iter()
             .map(|word| word.to_string())
             .collect::<Vec<_>>();
@@ -567,7 +565,7 @@ impl Session {
         let Some(step) = self.state.current_step_data() else {
             return message(Level::Warning, "Cannot read variables: no trace is loaded");
         };
-        let pc = step.pc;
+        let pc = step.pc();
         // No contract sources loaded at all: the same "load debug info" answer `list`
         // gives, rather than a per-step "no variables here".
         let no_metadata = self.state.step_map().is_none_or(|map| {
