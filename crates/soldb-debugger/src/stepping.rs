@@ -718,13 +718,8 @@ struct StepInfo {
     /// The line the step counts as for stepping and breakpoints. `None` for steps without
     /// source and for the dispatcher, which belongs to no line a user steps through.
     key: Option<LineKey>,
-    /// Which contract's code this step executes, when known.
-    contract: Option<usize>,
-    /// Index into the address table, when the executing address is known.
-    address: Option<usize>,
-    /// Index into the address table of the account whose storage this step reads and
-    /// writes: the executing address, or the caller's for a `DELEGATECALL`.
-    storage: Option<usize>,
+    /// The EVM frame that owns this step's contract and address context.
+    frame_id: u32,
     /// EVM depth, zero at the root.
     evm_depth: u32,
     /// True when this step starts a top-level call after the first.
@@ -785,6 +780,8 @@ impl<T: Copy> NearestLines<T> {
 pub struct StepMap {
     contracts: Vec<ContractDebugInfo>,
     steps: Vec<StepInfo>,
+    /// Contract and address context once per EVM frame, shared by all its steps.
+    evm_frames: Vec<EvmFrame>,
     addresses: Vec<String>,
     pcs: Vec<u64>,
     /// Every EVM frame that reverted, as the step it was entered at and the step it
@@ -883,9 +880,6 @@ struct FramedStep {
     frame_id: u32,
     /// Index into the top-level calls of the one this step belongs to.
     root: usize,
-    contract: Option<usize>,
-    address: Option<usize>,
-    storage: Option<usize>,
     location: Option<LocationRef>,
     /// The function this step's program counter is the entry point of.
     entry: Option<usize>,
@@ -893,8 +887,8 @@ struct FramedStep {
     marker: JumpMarker,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EvmFrame {
-    id: u32,
     contract: Option<usize>,
     address: Option<usize>,
     /// The account whose storage the frame reads and writes.
@@ -1620,8 +1614,8 @@ impl StepMap {
 
         // Pass 1: EVM frames, executing addresses, and each step's own span.
         let root_depth = trace.steps.first().map_or(0, |step| step.depth());
-        let mut next_frame_id = 0_u32;
         let mut evm_frames = Vec::<EvmFrame>::new();
+        let mut active_frames = Vec::<u32>::new();
         let mut upcoming_roots = roots.iter().enumerate().peekable();
         let mut current_root = 0;
         let mut reverted = Vec::new();
@@ -1641,55 +1635,54 @@ impl StepMap {
                 };
                 let root_address = root.address(trace);
                 let address = root_address.map(&mut intern);
-                evm_frames.clear();
+                active_frames.clear();
+                active_frames.push(evm_frames.len() as u32);
                 evm_frames.push(EvmFrame {
-                    id: next_frame_id,
                     contract: contract_for(root_address, environment, true),
                     address,
                     storage: address,
                     entry_step: index,
                 });
-                next_frame_id += 1;
             }
-            evm_frames.truncate(evm_depth + 1);
-            while evm_frames.len() <= evm_depth {
+            active_frames.truncate(evm_depth + 1);
+            while active_frames.len() <= evm_depth {
                 // A new EVM frame. The backend's record of the call or creation entered at
                 // this step names the code it runs; without one, the callee's code address
                 // is on the caller's stack at the call instruction, the step before this
                 // one, and a `CREATE` leaves no address there at all.
-                let call = (evm_frames.len() == evm_depth)
+                let call = (active_frames.len() == evm_depth)
                     .then(|| index.checked_sub(1))
                     .flatten();
                 let entered = recorded
                     .get(&index)
-                    .filter(|_| evm_frames.len() == evm_depth)
+                    .filter(|_| active_frames.len() == evm_depth)
                     .cloned()
                     .unwrap_or_else(|| FrameEntered::from_call(trace, call));
                 let address = entered.address.as_deref().map(&mut intern);
                 // A `DELEGATECALL` or `CALLCODE` runs the callee's code against the
                 // caller's storage; every other call has the callee's own.
                 let storage = if entered.delegated {
-                    evm_frames.last().and_then(|frame| frame.storage)
+                    active_frames
+                        .last()
+                        .and_then(|id| evm_frames[*id as usize].storage)
                 } else {
                     address
                 };
+                active_frames.push(evm_frames.len() as u32);
                 evm_frames.push(EvmFrame {
-                    id: next_frame_id,
                     contract: contract_for(entered.address.as_deref(), entered.environment, false),
                     address,
                     storage,
                     entry_step: index,
                 });
-                next_frame_id += 1;
             }
+            let frame_id = *active_frames
+                .last()
+                .expect("the root frame is never popped");
+            let frame = &evm_frames[frame_id as usize];
             if step.op() == opcode::REVERT || step.error().is_some() {
-                let entry_step = evm_frames
-                    .last()
-                    .expect("the root frame is never popped")
-                    .entry_step;
-                reverted.push((entry_step, index));
+                reverted.push((frame.entry_step, index));
             }
-            let frame = evm_frames.last().expect("the root frame is never popped");
             let facts = frame
                 .contract
                 .and_then(|index| contracts[index].facts_at_pc(step.pc()));
@@ -1708,11 +1701,8 @@ impl StepMap {
             });
             framed.push(FramedStep {
                 evm_depth: evm_depth as u32,
-                frame_id: frame.id,
+                frame_id,
                 root: current_root,
-                contract: frame.contract,
-                address: frame.address,
-                storage: frame.storage,
                 location,
                 entry: facts.and_then(|facts| facts.entry),
                 marker: facts.map_or(JumpMarker::None, |facts| facts.marker),
@@ -1726,21 +1716,21 @@ impl StepMap {
             contract.is_some_and(|index| !contracts[index].functions.is_empty())
         };
         // Frame ids are dense from zero, so a flag per id stands in for a set of them.
-        let mut function_follows = vec![false; next_frame_id as usize];
+        let mut function_follows = vec![false; evm_frames.len()];
         let mut epilogue = vec![false; framed.len()];
         for (index, step) in framed.iter().enumerate().rev() {
             match step.location.map(|location| location.function) {
                 Some(Some(_)) => {
                     function_follows[step.frame_id as usize] = true;
                 }
-                Some(None) if structured(step.contract) => {
+                Some(None) if structured(evm_frames[step.frame_id as usize].contract) => {
                     epilogue[index] = !function_follows[step.frame_id as usize];
                 }
                 _ => {}
             }
         }
 
-        let argument_layouts = prove_argument_layouts(trace, &contracts, &framed);
+        let argument_layouts = prove_argument_layouts(trace, &contracts, &framed, &evm_frames);
         let locals_support = contracts
             .iter()
             .zip(&argument_layouts)
@@ -1761,7 +1751,7 @@ impl StepMap {
             // on top of the stack at entry, which places them; a public function entered
             // from the dispatcher is placed later, by its first reservation.
             let frame_variables = |function: usize| -> Option<FrameVariables> {
-                let contract_index = step.contract?;
+                let contract_index = evm_frames[step.frame_id as usize].contract?;
                 locals_support[contract_index].ok()?;
                 let contract = &contracts[contract_index];
                 let function = contract.functions.get(function)?;
@@ -1780,7 +1770,9 @@ impl StepMap {
                     modifier_slots(contract, function, function.modifiers.len()),
                 ))
             };
-            let contract_info = step.contract.map(|index| &contracts[index]);
+            let contract_info = evm_frames[step.frame_id as usize]
+                .contract
+                .map(|index| &contracts[index]);
             let evm_depth = step.evm_depth as usize;
             let mut frame_entry = false;
             // A new top-level call starts with no functions.
@@ -1815,7 +1807,7 @@ impl StepMap {
             } else {
                 JumpMarker::None
             };
-            let structured = structured(step.contract);
+            let structured = structured(evm_frames[step.frame_id as usize].contract);
             let mut generated = false;
             // A return pops whatever the matching call pushed, wherever it lands: the
             // artifact marks it, or the jump lands on the return address recorded at the
@@ -1836,7 +1828,7 @@ impl StepMap {
                 if !landed_by_jump {
                     return None;
                 }
-                let contract = &contracts[step.contract?];
+                let contract = &contracts[evm_frames[step.frame_id as usize].contract?];
                 let arguments = contract.functions.get(function)?.params.len();
                 let word = trace.steps.step(index - 1).stack().peek(1 + arguments)?;
                 let pc = word.to_u64()?;
@@ -1978,7 +1970,9 @@ impl StepMap {
             // the function's own code, inherited by any other step.
             let layout = {
                 let frame = internal.last_mut().expect("the root frame is never popped");
-                let contract = step.contract.map(|index| &contracts[index]);
+                let contract = evm_frames[step.frame_id as usize]
+                    .contract
+                    .map(|index| &contracts[index]);
                 let active = frame
                     .functions
                     .iter()
@@ -2049,9 +2043,7 @@ impl StepMap {
                 location,
                 generated,
                 key,
-                contract: step.contract,
-                address: step.address,
-                storage: step.storage,
+                frame_id: step.frame_id,
                 evm_depth: step.evm_depth,
                 starts_root: new_root,
                 frame_depth: (evm_depth + internal_total) as u32,
@@ -2064,6 +2056,7 @@ impl StepMap {
         let mut map = Self {
             contracts,
             steps,
+            evm_frames,
             addresses,
             pcs,
             reverted,
@@ -2163,7 +2156,8 @@ impl StepMap {
     /// The contract whose code the step executes, when its debug info was loaded.
     #[must_use]
     pub fn contract_at_step(&self, step: usize) -> Option<&ContractDebugInfo> {
-        self.contracts.get(self.steps.get(step)?.contract?)
+        self.contracts
+            .get(self.evm_frames[self.steps.get(step)?.frame_id as usize].contract?)
     }
 
     #[must_use]
@@ -2211,7 +2205,7 @@ impl StepMap {
     /// The address whose code the step executes, when it could be determined.
     #[must_use]
     pub fn executing_address(&self, step: usize) -> Option<&str> {
-        let index = self.steps.get(step)?.address?;
+        let index = self.evm_frames[self.steps.get(step)?.frame_id as usize].address?;
         self.addresses.get(index).map(String::as_str)
     }
 
@@ -2226,7 +2220,7 @@ impl StepMap {
     /// An opaque identifier for that account, for indexing storage by context.
     #[must_use]
     pub fn storage_context_index(&self, step: usize) -> Option<usize> {
-        self.steps.get(step)?.storage
+        self.evm_frames[self.steps.get(step)?.frame_id as usize].storage
     }
 
     /// Every EVM frame that reverted, as the step it was entered at and the step it
@@ -2258,7 +2252,7 @@ impl StepMap {
         let Some(info) = self.steps.get(step) else {
             return LocalsStatus::Unavailable("the step is outside the trace");
         };
-        let Some(contract) = info.contract else {
+        let Some(contract) = self.evm_frames[info.frame_id as usize].contract else {
             return LocalsStatus::Unavailable(
                 "no sources matched the contract executing at this step",
             );
@@ -2289,7 +2283,9 @@ impl StepMap {
     /// type name written in that function resolves.
     pub(crate) fn scope_at_step(&self, step: usize) -> Option<&str> {
         let info = self.steps.get(step)?;
-        let contract = self.contracts.get(info.contract?)?;
+        let contract = self
+            .contracts
+            .get(self.evm_frames[info.frame_id as usize].contract?)?;
         let function = contract.functions.get(info.location?.function?)?;
         contract
             .types
@@ -2829,17 +2825,18 @@ impl StepMap {
             .rev()
             .map(|(depth, record)| {
                 let info = self.steps[record.last_step];
+                let context = &self.evm_frames[info.frame_id as usize];
                 let location = info
                     .location
                     .and_then(|location| self.describe(&location, info.generated));
                 Frame {
                     depth: depth as u32,
                     external: record.external,
-                    address: info
+                    address: context
                         .address
                         .and_then(|index| self.addresses.get(index))
                         .cloned(),
-                    contract_name: info
+                    contract_name: context
                         .contract
                         .and_then(|index| self.contracts.get(index))
                         .map(|contract| contract.name.clone()),
@@ -2914,6 +2911,7 @@ fn prove_argument_layouts(
     trace: &TransactionTrace,
     contracts: &[ContractDebugInfo],
     framed: &[FramedStep],
+    evm_frames: &[EvmFrame],
 ) -> Vec<Evidence> {
     let mut evidence = vec![Evidence::Unknown; contracts.len()];
     if contracts.is_empty() || framed.is_empty() {
@@ -2938,7 +2936,9 @@ fn prove_argument_layouts(
                 frame_calldata.insert(step.frame_id, calldata);
             }
         }
-        let (Some(contract_index), Some(function_index)) = (step.contract, step.entry) else {
+        let (Some(contract_index), Some(function_index)) =
+            (evm_frames[step.frame_id as usize].contract, step.entry)
+        else {
             continue;
         };
         // Only the first function entered in an EVM frame: a later one was called from
@@ -4768,9 +4768,7 @@ contract P {
                         source_id: 0,
                         line,
                     }),
-                    contract: None,
-                    address: None,
-                    storage: None,
+                    frame_id: 0,
                     evm_depth: 0,
                     starts_root: next(40) == 0,
                     frame_depth: next(6) as u32,
@@ -5231,9 +5229,7 @@ contract D {
             location: None,
             generated: false,
             key: line.and_then(key),
-            contract: None,
-            address: None,
-            storage: None,
+            frame_id: 0,
             evm_depth: 0,
             starts_root,
             frame_depth: depth,
