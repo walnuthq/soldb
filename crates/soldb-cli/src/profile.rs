@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use soldb_core::{SoldbError, SoldbResult, TransactionTrace};
 use soldb_ethdebug::SourceMapEnvironment;
-use soldb_profiler::{profile_transaction, ProfileProgram, ProfileReport, ProgramEnvironment};
+use soldb_profiler::{
+    profile_root, profile_transaction, ProfileProgram, ProfileReport, ProgramEnvironment,
+    RootSelector, ROOT_KINDS,
+};
 
 use crate::{
     bold, dim, error_color, function_color, info, number_color, opcode_color, print_json,
@@ -38,6 +41,11 @@ pub(crate) struct ProfileArgs {
     contracts: Option<String>,
     #[arg(long, short = 'r', default_value = "http://localhost:8545")]
     rpc: String,
+    /// Profile one top-level call instead of all of them: its number in the `Top-level calls`
+    /// table, from 0, or a kind.
+    /// [kinds: deployment, setup, execution]
+    #[arg(long, value_name = "KIND|INDEX", value_parser = parse_root_selector)]
+    root: Option<RootSelector>,
     #[arg(long, default_value_t = 20)]
     top: usize,
     #[arg(long)]
@@ -61,7 +69,10 @@ pub(crate) fn command(args: &ProfileArgs) -> SoldbResult<()> {
 fn command_inner(args: &ProfileArgs) -> SoldbResult<()> {
     let trace = load_trace(args)?;
     let programs = load_programs(args, &trace)?;
-    let report = profile_transaction(&trace, &programs)?;
+    let report = match &args.root {
+        Some(selector) => profile_root(&trace, &programs, selector)?,
+        None => profile_transaction(&trace, &programs)?,
+    };
 
     if let Some(path) = &args.folded {
         write_folded(&report, path)?;
@@ -82,6 +93,20 @@ fn command_inner(args: &ProfileArgs) -> SoldbResult<()> {
         }
     }
     Ok(())
+}
+
+/// A number picks a call by position; anything else must be one of `ROOT_KINDS`.
+fn parse_root_selector(value: &str) -> Result<RootSelector, String> {
+    if let Ok(index) = value.parse() {
+        return Ok(RootSelector::Index(index));
+    }
+    if ROOT_KINDS.contains(&value) {
+        return Ok(RootSelector::Kind(value.to_owned()));
+    }
+    Err(format!(
+        "unknown top-level call kind `{value}`\nexpected a number or one of {}",
+        ROOT_KINDS.map(|kind| format!("`{kind}`")).join(", ")
+    ))
 }
 
 fn load_trace(args: &ProfileArgs) -> SoldbResult<TransactionTrace> {
@@ -211,6 +236,9 @@ fn print_report(report: &ProfileReport, top: usize) {
         println!("{} {backend}", info("Backend:"));
     }
     println!("{} {}", info("Status:"), profile_status(report));
+    if let Some(root) = &report.root {
+        println!("{} {root}", info("Top-level calls profiled:"));
+    }
     println!(
         "{} {}",
         info("Transaction gas used:"),
@@ -220,7 +248,7 @@ fn print_report(report: &ProfileReport, top: usize) {
         "{} {} across {} steps",
         info("Traced instruction gas:"),
         number_color(report.totals.step_gas),
-        number_color(report.transaction.steps)
+        number_color(report.totals.steps)
     );
     println!(
         "{} {} ({})",
@@ -247,6 +275,7 @@ fn print_report(report: &ProfileReport, top: usize) {
         percent(report.totals.unmapped_gas, report.totals.step_gas)
     );
 
+    print_roots(report);
     print_contracts(report, top);
     print_functions(report, top);
     print_source_lines(report, top);
@@ -259,6 +288,44 @@ fn profile_status(report: &ProfileReport) -> String {
         success("SUCCESS")
     } else {
         error_color("REVERTED")
+    }
+}
+
+/// Every top-level call, for a trace with several, such as a Foundry test's.
+fn print_roots(report: &ProfileReport) {
+    if report.roots.len() < 2 {
+        return;
+    }
+    let total = report
+        .roots
+        .iter()
+        .fold(0_u64, |total, root| total.saturating_add(root.gas));
+    println!();
+    println!("{}", bold("Top-level calls"));
+    println!("{}", separator(72));
+    for (index, root) in report.roots.iter().enumerate() {
+        let kind = root
+            .kind
+            .as_deref()
+            .map(|kind| format!("[{kind}] "))
+            .unwrap_or_default();
+        let function = root
+            .function
+            .as_deref()
+            .map(|function| format!(" {}", function_color(function)))
+            .unwrap_or_default();
+        let line = format!(
+            "{:>12} {:>7} {:>8}  #{index} {kind}{}{function}",
+            number_color(root.gas),
+            percent(root.gas, total),
+            number_color(root.hits),
+            function_color(&root.target)
+        );
+        if root.profiled {
+            println!("{line}");
+        } else {
+            println!("{line} {}", dim("(not profiled)"));
+        }
     }
 }
 
@@ -403,8 +470,22 @@ mod tests {
     use serde_json::json;
     use soldb_core::{TraceStep, TransactionTrace};
 
-    use super::{load_programs, percent, truncate_text, ProfileArgs};
+    use soldb_profiler::RootSelector;
+
+    use super::{load_programs, parse_root_selector, percent, truncate_text, ProfileArgs};
     use crate::TraceBackendArg;
+
+    #[test]
+    fn root_selector_takes_a_number_or_a_known_kind() {
+        assert_eq!(parse_root_selector("2"), Ok(RootSelector::Index(2)));
+        assert_eq!(
+            parse_root_selector("setup"),
+            Ok(RootSelector::Kind("setup".to_owned()))
+        );
+        let error = parse_root_selector("test").expect_err("not a kind");
+        assert!(error.starts_with("unknown top-level call kind `test`"));
+        assert!(error.ends_with("`deployment`, `setup`, `execution`"));
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -451,6 +532,7 @@ mod tests {
             source_path: Vec::new(),
             contracts: None,
             rpc: String::new(),
+            root: None,
             top: 20,
             json: false,
             folded: None,

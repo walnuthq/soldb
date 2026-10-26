@@ -21,7 +21,6 @@ use soldb_core::{encode_hex, Bytes, EvmWord, StepSnapshot, StepView, Transaction
 use soldb_ethdebug::{decode_value, parse_word, EthdebugInfo, VariableLocation, Word};
 
 use crate::decode::ValueReader;
-use crate::roots::root_calls;
 use crate::stepping::calldata_for_step;
 
 pub mod condition;
@@ -39,7 +38,7 @@ pub use debug_diff::{
     DebugDifference, DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent,
     DebugTraceSummary,
 };
-pub use roots::check_root_calls;
+pub use roots::{check_root_calls, root_calls, RootCall, RootRecord};
 pub use soldb_ethdebug::{CodeGenerator, StorageLayout};
 pub use state::{
     short_hex, state_value, state_variables, CachedChain, ChainRead, ChainStorage, StateSource,

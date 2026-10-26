@@ -83,6 +83,35 @@ construct a transaction trace directly from its local executor and call
 `soldb_profiler::profile_transaction`, without starting Anvil or parsing CLI
 output.
 
+## Several top-level calls
+
+A Foundry test's trace holds several top-level calls one after another: the
+deployment, `setUp`, and the test. Without `--root` they are profiled together,
+as one transaction.
+
+`--root <KIND|INDEX>` profiles only the top-level calls of a kind, or the call
+at a number. The kinds are `deployment`, `setup`, and `execution`. Selecting
+`execution` keeps the test's own gas apart from its setup:
+
+```console
+soldb profile --trace-file trace.json \
+  --ethdebug-dir <address>:<contract>:out \
+  --root execution
+```
+
+A trace that does not record kinds, such as a `forge test --debug --dump`
+bundle, has no kinds to select, and selects a call by its number instead: `--root 2`.
+A number works on any trace.
+
+Every table and total then covers only those calls. `Top-level calls` lists all
+of them, numbered from `#0`, with their gas and the first function each entered,
+such as `setUp`, and marks the rest `(not profiled)`. Folded stacks start with the
+call they belong to: its kind when the trace records one, such as
+`[setup] CounterTest [0x…]`, and its number otherwise, such as
+`#1 CounterTest [0x…]`. A kind no call has, or a number
+past the last call, is an error that says what the trace has. Library callers
+use `soldb_profiler::profile_root` with a `RootSelector`.
+
 ## Flame graphs
 
 Write standard folded stacks or a self-contained interactive SVG:
