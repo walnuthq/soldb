@@ -2262,6 +2262,7 @@ impl TraceSourceIndex {
             program.source_contents,
         )
         .with_code_generator(Some(code_generator))
+        .with_code_hash(spec.code_hash.as_deref())
         .with_storage_layout(program.storage_layout)
         .with_transient_storage_layout(program.transient_storage_layout);
         Ok(Some(Self {
@@ -3069,6 +3070,8 @@ struct ResolvedContractSpec {
     debug_dir: PathBuf,
     /// Where to look for the sources the artifacts name, from `--source-path`.
     source_paths: Vec<PathBuf>,
+    /// The hash of the code the artifacts describe, when the mapping file names it.
+    code_hash: Option<String>,
 }
 
 /// Loads ETHDebug metadata for a contract spec, reporting a failure instead of hiding it.
@@ -3167,6 +3170,7 @@ fn resolve_ethdebug_spec(spec_text: &str) -> SoldbResult<Vec<ResolvedContractSpe
             name,
             debug_dir: PathBuf::from(spec.path),
             source_paths: Vec::new(),
+            code_hash: None,
         }]);
     }
 
@@ -3192,6 +3196,7 @@ fn resolve_ethdebug_spec(spec_text: &str) -> SoldbResult<Vec<ResolvedContractSpe
                 name: infer_contract_name_from_dir(&path).unwrap_or_else(|| "Unknown".to_owned()),
                 debug_dir: path,
                 source_paths: Vec::new(),
+                code_hash: None,
             }]);
         }
     }
@@ -3250,6 +3255,7 @@ fn parse_contract_mapping_array(
             name: contract.name,
             debug_dir: contract.debug_dir,
             source_paths: Vec::new(),
+            code_hash: contract.code_hash,
         });
     }
     Ok(specs)
@@ -3269,6 +3275,7 @@ fn parse_deployment_value(
             name: contract.to_owned(),
             debug_dir: base_dir.to_path_buf(),
             source_paths: Vec::new(),
+            code_hash: None,
         }]);
     }
 
@@ -3287,6 +3294,7 @@ fn parse_deployment_value(
                 name: name.clone(),
                 debug_dir: find_debug_dir_for_contract(base_dir, name),
                 source_paths: Vec::new(),
+                code_hash: None,
             })
         })
         .collect())
@@ -3316,6 +3324,7 @@ fn infer_contract_specs_from_dir(path: &Path) -> SoldbResult<Vec<ResolvedContrac
         name,
         debug_dir: path.to_path_buf(),
         source_paths: Vec::new(),
+        code_hash: None,
     }])
 }
 
@@ -3990,6 +3999,7 @@ contract Counter {
             name: "Counter".to_owned(),
             debug_dir: dir,
             source_paths: Vec::new(),
+            code_hash: None,
         };
         let calldata = encode_function_call("set(uint256)", &["4".to_owned()]).expect("calldata");
         let trace = transaction_trace(
@@ -4052,6 +4062,7 @@ contract Counter {
             name: "Counter".to_owned(),
             debug_dir: dir,
             source_paths: Vec::new(),
+            code_hash: None,
         };
 
         let index = TraceSourceIndex::load(&spec).expect("load legacy source map");
@@ -4132,6 +4143,7 @@ contract Counter {
             name: "Token".to_owned(),
             debug_dir: abi_dir,
             source_paths: Vec::new(),
+            code_hash: None,
         };
         let calldata = encode_function_call(
             "transfer(address,uint256)",
@@ -4174,6 +4186,7 @@ contract Counter {
             name: "Legacy".to_owned(),
             debug_dir: combined_dir,
             source_paths: Vec::new(),
+            code_hash: None,
         };
         let raw = encode_function_call("set(string)", &["hi".to_owned()]).expect("calldata");
         let descriptor = abi_descriptor_for_calldata(&legacy, &raw).expect("combined descriptor");
@@ -4351,6 +4364,7 @@ contract Counter {
             name: "Legacy".to_owned(),
             debug_dir: dir.clone(),
             source_paths: Vec::new(),
+            code_hash: None,
         };
         let metadata = trace_debug_metadata(&spec);
         assert!(metadata.is_legacy);

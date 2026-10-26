@@ -1722,6 +1722,7 @@ where
             output: None,
             success: None,
             error: None,
+            code_hash: None,
         });
         self.call_stack.push(id);
         self.record_journal_changes(context);
@@ -1761,6 +1762,7 @@ where
             output: None,
             success: None,
             error: None,
+            code_hash: None,
         });
         self.create_stack.push(id);
         self.record_journal_changes(context);

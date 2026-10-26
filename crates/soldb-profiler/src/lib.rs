@@ -1690,6 +1690,7 @@ mod tests {
             output: Some("0x".to_owned()),
             success: Some(true),
             error: None,
+            code_hash: None,
         });
 
         let report = profile_transaction(&trace, &[root, child]).expect("profile");
@@ -1754,6 +1755,7 @@ mod tests {
             output: Some("0x".to_owned()),
             success: Some(true),
             error: None,
+            code_hash: None,
         });
 
         let report = profile_transaction(&trace, &[root]).expect("profile");
@@ -1826,6 +1828,7 @@ mod tests {
             output: Some("0x".to_owned()),
             success: Some(true),
             error: None,
+            code_hash: None,
         });
 
         let report = profile_transaction(&nested, &[root, creation]).expect("nested creation");

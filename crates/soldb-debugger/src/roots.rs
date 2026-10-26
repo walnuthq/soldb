@@ -52,6 +52,24 @@ impl RootCall {
         }
     }
 
+    /// The hash of the code the call runs, when the backend recorded it.
+    #[must_use]
+    pub fn code_hash<'a>(&self, trace: &'a TransactionTrace) -> Option<&'a str> {
+        match self.record {
+            RootRecord::Trace => None,
+            RootRecord::Call(index) => trace
+                .artifacts
+                .calls
+                .get(index)
+                .and_then(|call| call.code_hash.as_deref()),
+            RootRecord::Creation(index) => trace
+                .artifacts
+                .creations
+                .get(index)
+                .and_then(|creation| creation.code_hash.as_deref()),
+        }
+    }
+
     /// Whether the call runs creation code.
     #[must_use]
     pub fn creation(&self, trace: &TransactionTrace) -> bool {
@@ -224,6 +242,7 @@ mod tests {
             output: None,
             success: Some(true),
             error: None,
+            code_hash: None,
         }
     }
 
@@ -299,6 +318,7 @@ mod tests {
             output: None,
             success: Some(true),
             error: None,
+            code_hash: None,
         });
         let roots = root_calls(&trace);
         assert_eq!(roots.len(), 2);

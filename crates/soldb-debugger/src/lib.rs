@@ -1348,6 +1348,7 @@ mod tests {
             output: None,
             success: Some(true),
             error: None,
+            code_hash: None,
         };
         let mut trace = sample_trace();
         trace.steps.push(trace.steps.step(0).to_trace_step());

@@ -630,6 +630,10 @@ pub struct ExecutionCall {
     pub output: Option<String>,
     pub success: Option<bool>,
     pub error: Option<String>,
+    /// The keccak-256 hash of the code the frame runs, when the backend knows it. It tells
+    /// apart programs that run at one address, such as code replaced by a test cheatcode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -651,6 +655,10 @@ pub struct ContractCreation {
     pub output: Option<String>,
     pub success: Option<bool>,
     pub error: Option<String>,
+    /// The keccak-256 hash of the code the frame runs, when the backend knows it. It tells
+    /// apart programs that run at one address, such as code replaced by a test cheatcode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

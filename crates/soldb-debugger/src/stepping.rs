@@ -68,6 +68,10 @@ information will replace this once compilers emit it";
 pub struct ContractDebugInfo {
     /// The deployed address this info describes, lowercase, when known.
     pub address: Option<String>,
+    /// The keccak-256 hash of the code this info describes, lowercase, when known. A frame
+    /// that records the hash of the code it runs only takes info with the same hash, so two
+    /// programs run at one address map to their own sources.
+    pub code_hash: Option<String>,
     pub name: String,
     pub info: EthdebugInfo,
     pub source_contents: BTreeMap<u64, String>,
@@ -308,6 +312,7 @@ impl ContractDebugInfo {
             .collect::<FxHashMap<_, _>>();
         let mut contract = Self {
             address: address.map(normalize_address),
+            code_hash: None,
             name: name.to_owned(),
             info,
             source_contents,
@@ -380,6 +385,14 @@ impl ContractDebugInfo {
     #[must_use]
     pub const fn with_code_generator(mut self, code_generator: Option<CodeGenerator>) -> Self {
         self.code_generator = code_generator;
+        self
+    }
+
+    /// Records the hash of the code this info describes, so frames that record the hash
+    /// of the code they run only map through matching info.
+    #[must_use]
+    pub fn with_code_hash(mut self, code_hash: Option<&str>) -> Self {
+        self.code_hash = code_hash.map(normalize_address);
         self
     }
 
@@ -909,6 +922,8 @@ struct FrameEntered {
     /// The address whose code the frame runs; `None` when nothing recorded it, or for a
     /// creation whose address the backend did not report.
     address: Option<String>,
+    /// The hash of the code the frame runs, when the backend recorded it.
+    code_hash: Option<String>,
     environment: CodeEnvironment,
     /// Whether the frame runs against its caller's storage.
     delegated: bool,
@@ -930,6 +945,7 @@ impl FrameEntered {
             if let Some(step) = entered(call.entry_step, call.exit_step) {
                 recorded.entry(step).or_insert_with(|| Self {
                     address: Some(call.bytecode_address.clone()),
+                    code_hash: call.code_hash.clone(),
                     environment: CodeEnvironment::Call,
                     delegated: matches!(call.call_type.as_str(), "DELEGATECALL" | "CALLCODE"),
                 });
@@ -939,6 +955,7 @@ impl FrameEntered {
             if let Some(step) = entered(creation.entry_step, creation.exit_step) {
                 recorded.entry(step).or_insert_with(|| Self {
                     address: creation.address.clone(),
+                    code_hash: creation.code_hash.clone(),
                     environment: CodeEnvironment::Create,
                     delegated: false,
                 });
@@ -952,6 +969,7 @@ impl FrameEntered {
         let op = caller.map(|caller| trace.steps.step(caller).op());
         Self {
             address: caller.and_then(|caller| call_target(trace.steps.step(caller))),
+            code_hash: None,
             environment: if matches!(op, Some(opcode::CREATE | opcode::CREATE2)) {
                 CodeEnvironment::Create
             } else {
@@ -1598,25 +1616,32 @@ impl StepMap {
         // and is used as before.
         let roots = root_calls(trace);
         let single_root = roots.len() == 1;
-        let contract_for =
-            |address: Option<&str>, environment: CodeEnvironment, root: bool| -> Option<usize> {
-                let address = address.map(normalize_address);
-                if let Some(address) = &address {
-                    let mut at_address = contracts
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, contract)| contract.address.as_deref() == Some(address));
-                    let exact = at_address.clone().find(|(_, contract)| {
-                        contract
-                            .code_environment()
-                            .is_none_or(|candidate| candidate == environment)
-                    });
-                    if let Some((index, _)) = exact.or_else(|| at_address.next()) {
-                        return Some(index);
-                    }
+        let contract_for = |address: Option<&str>,
+                            code_hash: Option<&str>,
+                            environment: CodeEnvironment,
+                            root: bool|
+         -> Option<usize> {
+            let address = address.map(normalize_address);
+            let code_hash = code_hash.map(normalize_address);
+            if let Some(address) = &address {
+                // When both name the code they describe, it must be the same code.
+                let mut at_address = contracts.iter().enumerate().filter(|(_, contract)| {
+                    contract.address.as_deref() == Some(address)
+                        && (code_hash.is_none()
+                            || contract.code_hash.is_none()
+                            || contract.code_hash == code_hash)
+                });
+                let exact = at_address.clone().find(|(_, contract)| {
+                    contract
+                        .code_environment()
+                        .is_none_or(|candidate| candidate == environment)
+                });
+                if let Some((index, _)) = exact.or_else(|| at_address.next()) {
+                    return Some(index);
                 }
-                (root && single_root && contracts.len() == 1).then_some(0)
-            };
+            }
+            (root && single_root && contracts.len() == 1).then_some(0)
+        };
 
         // Pass 1: EVM frames, executing addresses, and each step's own span.
         let root_depth = trace.steps.first().map_or(0, |step| step.depth());
@@ -1640,11 +1665,12 @@ impl StepMap {
                     CodeEnvironment::Call
                 };
                 let root_address = root.address(trace);
+                let root_code_hash = root.code_hash(trace);
                 let address = root_address.map(&mut intern);
                 evm_frames.clear();
                 evm_frames.push(EvmFrame {
                     id: next_frame_id,
-                    contract: contract_for(root_address, environment, true),
+                    contract: contract_for(root_address, root_code_hash, environment, true),
                     address,
                     storage: address,
                     entry_step: index,
@@ -1675,7 +1701,12 @@ impl StepMap {
                 };
                 evm_frames.push(EvmFrame {
                     id: next_frame_id,
-                    contract: contract_for(entered.address.as_deref(), entered.environment, false),
+                    contract: contract_for(
+                        entered.address.as_deref(),
+                        entered.code_hash.as_deref(),
+                        entered.environment,
+                        false,
+                    ),
                     address,
                     storage,
                     entry_step: index,
@@ -3685,6 +3716,7 @@ contract P {
             output: None,
             success: Some(address.is_some()),
             error: None,
+            code_hash: None,
         }
     }
 
@@ -3712,7 +3744,42 @@ contract P {
             output: None,
             success: Some(true),
             error: None,
+            code_hash: None,
         }
+    }
+
+    #[test]
+    fn frames_map_through_the_program_with_their_code_hash() {
+        // Two programs run at one address, as after a test replaces the code there; each
+        // call records the hash of the code it runs.
+        let word = format!("0x{:0>64}", CREATED.trim_start_matches("0x"));
+        let call_created = ["0x0", "0x0", "0x0", "0x0", "0x0", word.as_str(), "0x0"];
+        let mut trace = trace(vec![
+            step(0, 1, "PUSH1", &[]),
+            step(12, 1, "CALL", &call_created),
+            step(21, 2, "ADD", &[]),
+            step(13, 1, "CALL", &call_created),
+            step(21, 2, "ADD", &[]),
+            step(14, 1, "CALL", &call_created),
+            step(21, 2, "ADD", &[]),
+            step(30, 1, "STOP", &[]),
+        ]);
+        let mut first = call(0, 2, 3, "CALL", CREATED);
+        first.code_hash = Some("0x01".to_owned());
+        let mut second = call(1, 4, 5, "CALL", CREATED);
+        second.code_hash = Some("0x02".to_owned());
+        // A call that records no hash maps through the first program at the address.
+        let third = call(2, 6, 7, "CALL", CREATED);
+        trace.artifacts.calls = vec![first, second, third];
+        let mut original = program(CREATED, "call", &[(21, "x += 1;")]);
+        original.code_hash = Some("0x01".to_owned());
+        let mut replaced = program(CREATED, "call", &[(21, "b = 0;")]);
+        replaced.code_hash = Some("0x02".to_owned());
+        let map = StepMap::new(&trace, vec![contract(Some(ROOT)), original, replaced]);
+        let line = |step| map.line_key(step).map(|key| (key.contract, key.line));
+        assert_eq!(line(2), Some((1, 8)));
+        assert_eq!(line(4), Some((2, 5)));
+        assert_eq!(line(6), Some((1, 8)));
     }
 
     /// The root creates a contract, then calls it: steps 2 and 3 run the creation code,
