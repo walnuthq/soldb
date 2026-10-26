@@ -132,11 +132,11 @@ fn load_programs(args: &ProfileArgs, trace: &TransactionTrace) -> SoldbResult<Ve
                 .address
                 .clone()
                 .or_else(|| single_spec.then(|| trace.to_addr.clone()).flatten());
-            programs.push(ProfileProgram::new(
-                address,
-                index.debug.info,
-                index.debug.source_contents,
-            )?);
+            // A mapping file's code hash describes the deployed code.
+            programs.push(
+                ProfileProgram::new(address, index.debug.info, index.debug.source_contents)?
+                    .with_code_hash(spec.code_hash.as_deref()),
+            );
             loaded = true;
         }
         if let Some(index) =

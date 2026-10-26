@@ -46,6 +46,9 @@ impl ProgramEnvironment {
 #[derive(Debug)]
 pub struct ProfileProgram {
     address: Option<String>,
+    /// The keccak-256 hash of the code the program describes, when known; it tells apart
+    /// programs run at one address.
+    code_hash: Option<String>,
     contract_name: String,
     environment: ProgramEnvironment,
     debug: ContractDebugInfo,
@@ -131,6 +134,7 @@ impl ProfileProgram {
 
         Ok(Self {
             address,
+            code_hash: None,
             contract_name,
             environment,
             debug,
@@ -144,6 +148,20 @@ impl ProfileProgram {
     #[must_use]
     pub fn address(&self) -> Option<&str> {
         self.address.as_deref()
+    }
+
+    /// Records the hash of the code this program describes, so frames that record the hash
+    /// of the code they run only map through matching programs.
+    #[must_use]
+    pub fn with_code_hash(mut self, code_hash: Option<&str>) -> Self {
+        self.code_hash = code_hash.map(normalize_address);
+        self.debug = self.debug.with_code_hash(code_hash);
+        self
+    }
+
+    #[must_use]
+    pub fn code_hash(&self) -> Option<&str> {
+        self.code_hash.as_deref()
     }
 
     #[must_use]
@@ -429,7 +447,13 @@ pub fn profile_transaction(
         .to_addr
         .as_deref()
         .or(trace.contract_address.as_deref());
-    let root_program = lookup_program(root_address, root_environment, programs, &program_lookup);
+    let root_program = lookup_program(
+        root_address,
+        None,
+        root_environment,
+        programs,
+        &program_lookup,
+    );
     let root_depth = trace.steps.first().map_or(0, |step| step.depth());
     let root_label = root_program.map_or_else(
         || {
@@ -829,6 +853,7 @@ impl Metrics {
 struct ProgramKey {
     address: String,
     environment: ProgramEnvironment,
+    code_hash: Option<String>,
 }
 
 fn build_program_lookup(programs: &[ProfileProgram]) -> SoldbResult<HashMap<ProgramKey, usize>> {
@@ -840,6 +865,7 @@ fn build_program_lookup(programs: &[ProfileProgram]) -> SoldbResult<HashMap<Prog
         let key = ProgramKey {
             address: address.clone(),
             environment: program.environment,
+            code_hash: program.code_hash.clone(),
         };
         if lookup.insert(key, index).is_some() {
             return Err(SoldbError::Message(format!(
@@ -851,18 +877,40 @@ fn build_program_lookup(programs: &[ProfileProgram]) -> SoldbResult<HashMap<Prog
     Ok(lookup)
 }
 
+/// The program a frame at `address` runs. A frame that records `code_hash` takes the program
+/// with that hash, else one without a hash; a frame without one takes the program without a
+/// hash, else the only program at the address.
 fn lookup_program(
     address: Option<&str>,
+    code_hash: Option<&str>,
     environment: ProgramEnvironment,
     programs: &[ProfileProgram],
     lookup: &HashMap<ProgramKey, usize>,
 ) -> Option<usize> {
     if let Some(address) = address {
-        let key = ProgramKey {
-            address: normalize_address(address),
+        let address = normalize_address(address);
+        let key = |code_hash: Option<String>| ProgramKey {
+            address: address.clone(),
             environment,
+            code_hash,
         };
-        return lookup.get(&key).copied();
+        if let Some(code_hash) = code_hash {
+            if let Some(index) = lookup.get(&key(Some(normalize_address(code_hash)))) {
+                return Some(*index);
+            }
+        }
+        if let Some(index) = lookup.get(&key(None)) {
+            return Some(*index);
+        }
+        if code_hash.is_some() {
+            return None;
+        }
+        let mut at_address = programs.iter().enumerate().filter(|(_, program)| {
+            program.environment == environment
+                && program.address.as_deref() == Some(address.as_str())
+        });
+        let candidate = at_address.next().map(|(index, _)| index)?;
+        return at_address.next().is_none().then_some(candidate);
     }
 
     let mut candidates = programs
@@ -894,6 +942,7 @@ fn build_execution_frames(
         (entry < exit && entry < step_count).then(|| {
             let program = lookup_program(
                 Some(&call.bytecode_address),
+                call.code_hash.as_deref(),
                 ProgramEnvironment::Call,
                 programs,
                 lookup,
@@ -917,6 +966,7 @@ fn build_execution_frames(
         (entry < exit && entry < step_count).then(|| {
             let program = lookup_program(
                 creation.address.as_deref(),
+                creation.code_hash.as_deref(),
                 ProgramEnvironment::Create,
                 programs,
                 lookup,
@@ -1702,6 +1752,78 @@ mod tests {
             .frames
             .iter()
             .any(|frame| frame.contains("CALL Child"))));
+    }
+
+    #[test]
+    fn maps_programs_at_one_address_by_code_hash() {
+        // Two programs run at 0x2, as after a test replaces the code there.
+        let root = program(
+            Some("0x1"),
+            "Root",
+            "call",
+            "contract Root { function run() external {} }",
+            &[(0, "CALL", 16)],
+        );
+        let original = program(
+            Some("0x2"),
+            "Original",
+            "call",
+            "contract Original { function work() external {} }",
+            &[(0, "SLOAD", 20)],
+        )
+        .with_code_hash(Some("0x0A"));
+        let replaced = program(
+            Some("0x2"),
+            "Replaced",
+            "call",
+            "contract Replaced { function work() external {} }",
+            &[(0, "SSTORE", 20)],
+        )
+        .with_code_hash(Some("0x0b"));
+        let mut trace = trace(
+            Some("0x1"),
+            vec![
+                step(0, "CALL", 10, 0),
+                step(0, "SLOAD", 100, 1),
+                step(0, "CALL", 10, 0),
+                step(0, "SSTORE", 200, 1),
+                step(0, "STOP", 0, 0),
+            ],
+        );
+        trace.capabilities.call_trace = true;
+        for (id, entry_step, code_hash) in [(0, 1, "0x0a"), (1, 3, "0x0B")] {
+            trace.artifacts.calls.push(ExecutionCall {
+                id,
+                parent_id: None,
+                depth: 1,
+                entry_step: Some(entry_step),
+                exit_step: Some(entry_step + 1),
+                call_type: "CALL".to_owned(),
+                from: "0x1".to_owned(),
+                to: "0x2".to_owned(),
+                bytecode_address: "0x2".to_owned(),
+                value: "0".to_owned(),
+                input: "0x".to_owned(),
+                gas_limit: 100_000,
+                gas_used: Some(100),
+                output: Some("0x".to_owned()),
+                success: Some(true),
+                error: None,
+                code_hash: Some(code_hash.to_owned()),
+            });
+        }
+
+        let report = profile_transaction(&trace, &[root, original, replaced]).expect("profile");
+
+        let gas = |name: &str| {
+            report
+                .contracts
+                .iter()
+                .find(|contract| contract.contract == name)
+                .map(|contract| contract.gas)
+        };
+        assert_eq!(gas("Original"), Some(100));
+        assert_eq!(gas("Replaced"), Some(200));
     }
 
     #[test]
