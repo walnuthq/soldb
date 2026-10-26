@@ -1094,8 +1094,11 @@ fn frame_error(error: DapFrameError) -> SoldbError {
 fn load_mapped_sources(path: &Path) -> SoldbResult<Vec<LoadedSource>> {
     let mut sources = Vec::new();
     for contract in load_contract_mapping(path)? {
-        let source =
+        let mut source =
             LoadedSource::load(&contract.debug_dir, &contract.name, Some(&contract.address))?;
+        source.contract = source
+            .contract
+            .with_code_hash(contract.code_hash.as_deref());
         sources.push(source);
     }
     if sources.is_empty() {

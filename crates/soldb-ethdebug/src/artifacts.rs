@@ -377,9 +377,13 @@ pub struct ContractMapping {
     pub address: String,
     pub name: String,
     pub debug_dir: PathBuf,
+    /// The keccak-256 hash of the code the artifacts describe, when the file names it, so
+    /// that two programs run at one address keep their own artifacts.
+    pub code_hash: Option<String>,
 }
 
-/// Reads a contract mapping file, `{"contracts": [{"address", "name", "debug_dir"}]}`.
+/// Reads a contract mapping file, `{"contracts": [{"address", "name", "debug_dir"}]}`,
+/// where an entry may also name its `code_hash`.
 pub fn load_contract_mapping(path: &Path) -> SoldbResult<Vec<ContractMapping>> {
     let value = read_json_file(path)?;
     parse_contract_mapping(path, &value)
@@ -416,10 +420,15 @@ pub fn parse_contract_mapping(path: &Path, value: &Value) -> SoldbResult<Vec<Con
             } else {
                 base_dir.join(debug_dir)
             };
+            let code_hash = contract
+                .get("code_hash")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             Some(ContractMapping {
                 address,
                 name,
                 debug_dir,
+                code_hash,
             })
         })
         .collect())
