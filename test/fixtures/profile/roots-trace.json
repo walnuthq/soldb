@@ -1,0 +1,118 @@
+{
+  "tx_hash": null,
+  "from_addr": "0x0000000000000000000000000000000000000001",
+  "to_addr": "0x000000000000000000000000000000000000cafe",
+  "value": "0",
+  "input_data": "0x",
+  "gas_used": 11,
+  "output": "0x",
+  "success": true,
+  "error": null,
+  "debug_trace_available": true,
+  "contract_address": null,
+  "backend": "replay",
+  "capabilities": {
+    "opcode_steps": true,
+    "stack": false,
+    "memory": false,
+    "storage": false,
+    "storage_diff": false,
+    "call_trace": true,
+    "contract_creation": false,
+    "logs": false,
+    "revert_data": false,
+    "gas_details": true,
+    "account_changes": false,
+    "notes": []
+  },
+  "artifacts": {
+    "calls": [
+      {
+        "id": 0,
+        "parent_id": null,
+        "depth": 1,
+        "entry_step": 0,
+        "exit_step": 1,
+        "call_type": "CALL",
+        "from": "0x0000000000000000000000000000000000000001",
+        "to": "0x000000000000000000000000000000000000cafe",
+        "bytecode_address": "0x000000000000000000000000000000000000cafe",
+        "value": "0",
+        "input": "0x",
+        "gas_limit": 1000,
+        "gas_used": null,
+        "output": "0x",
+        "success": true,
+        "error": null
+      },
+      {
+        "id": 1,
+        "parent_id": null,
+        "depth": 1,
+        "entry_step": 1,
+        "exit_step": 3,
+        "call_type": "CALL",
+        "from": "0x0000000000000000000000000000000000000001",
+        "to": "0x000000000000000000000000000000000000cafe",
+        "bytecode_address": "0x000000000000000000000000000000000000cafe",
+        "value": "0",
+        "input": "0x",
+        "gas_limit": 1000,
+        "gas_used": null,
+        "output": "0x",
+        "success": true,
+        "error": null
+      }
+    ],
+    "creations": [],
+    "logs": [],
+    "account_changes": [],
+    "gas": null,
+    "revert_data": null,
+    "root_kinds": [
+      {
+        "entry_step": 0,
+        "kind": "setup"
+      },
+      {
+        "entry_step": 1,
+        "kind": "execution"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "pc": 0,
+      "op": "PUSH1",
+      "gas": 1000,
+      "gas_cost": 3,
+      "depth": 1,
+      "stack": [],
+      "memory": null,
+      "storage": null,
+      "error": null
+    },
+    {
+      "pc": 0,
+      "op": "PUSH1",
+      "gas": 1000,
+      "gas_cost": 3,
+      "depth": 1,
+      "stack": [],
+      "memory": null,
+      "storage": null,
+      "error": null
+    },
+    {
+      "pc": 2,
+      "op": "ADD",
+      "gas": 997,
+      "gas_cost": 5,
+      "depth": 1,
+      "stack": [],
+      "memory": null,
+      "storage": null,
+      "error": null
+    }
+  ]
+}
