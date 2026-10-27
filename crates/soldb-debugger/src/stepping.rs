@@ -1631,12 +1631,20 @@ impl StepMap {
                             || contract.code_hash.is_none()
                             || contract.code_hash == code_hash)
                 });
-                let exact = at_address.clone().find(|(_, contract)| {
+                let mut exact = at_address.clone().filter(|(_, contract)| {
                     contract
                         .code_environment()
                         .is_none_or(|candidate| candidate == environment)
                 });
-                if let Some((index, _)) = exact.or_else(|| at_address.next()) {
+                let matching_hash = code_hash.as_ref().and_then(|hash| {
+                    exact
+                        .clone()
+                        .find(|(_, contract)| contract.code_hash.as_ref() == Some(hash))
+                });
+                if let Some((index, _)) = matching_hash
+                    .or_else(|| exact.next())
+                    .or_else(|| at_address.next())
+                {
                     return Some(index);
                 }
             }
@@ -3780,6 +3788,53 @@ contract P {
         assert_eq!(line(2), Some((1, 8)));
         assert_eq!(line(4), Some((2, 5)));
         assert_eq!(line(6), Some((1, 8)));
+    }
+
+    #[test]
+    fn frame_prefers_matching_code_hash_over_legacy_mapping() {
+        let word = format!("0x{:0>64}", CREATED.trim_start_matches("0x"));
+        let call_created = ["0x0", "0x0", "0x0", "0x0", "0x0", word.as_str(), "0x0"];
+        let mut trace = trace(vec![
+            step(0, 1, "PUSH1", &[]),
+            step(12, 1, "CALL", &call_created),
+            step(21, 2, "ADD", &[]),
+            step(30, 1, "STOP", &[]),
+        ]);
+        let mut call = call(0, 2, 3, "CALL", CREATED);
+        call.code_hash = Some("0x02".to_owned());
+        trace.artifacts.calls = vec![call];
+
+        let legacy = program(CREATED, "call", &[(21, "x += 1;")]);
+        let mut matching = program(CREATED, "call", &[(21, "b = 0;")]);
+        matching.code_hash = Some("0x02".to_owned());
+
+        let map = StepMap::new(
+            &trace,
+            vec![contract(Some(ROOT)), legacy.clone(), matching.clone()],
+        );
+        assert_eq!(
+            map.line_key(2).map(|key| (key.contract, key.line)),
+            Some((2, 5))
+        );
+
+        // With no matching hash, keep the un-hashed program as a legacy fallback.
+        trace.artifacts.calls[0].code_hash = Some("0x03".to_owned());
+        let map = StepMap::new(
+            &trace,
+            vec![contract(Some(ROOT)), legacy.clone(), matching.clone()],
+        );
+        assert_eq!(
+            map.line_key(2).map(|key| (key.contract, key.line)),
+            Some((1, 8))
+        );
+
+        // A frame without a hash still uses the first program at the address.
+        trace.artifacts.calls[0].code_hash = None;
+        let map = StepMap::new(&trace, vec![contract(Some(ROOT)), legacy, matching]);
+        assert_eq!(
+            map.line_key(2).map(|key| (key.contract, key.line)),
+            Some((1, 8))
+        );
     }
 
     /// The root creates a contract, then calls it: steps 2 and 3 run the creation code,
