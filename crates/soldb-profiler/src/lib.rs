@@ -2457,6 +2457,7 @@ mod tests {
             output: Some("0x".to_owned()),
             success: Some(true),
             error: None,
+            code_hash: None,
         }
     }
 
