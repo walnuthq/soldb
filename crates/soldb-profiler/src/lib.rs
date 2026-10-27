@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use soldb_core::{opcode, SoldbError, SoldbResult, StepView, TransactionTrace};
-use soldb_debugger::{ContractDebugInfo, SourceFunction, StepMap};
+use soldb_debugger::{
+    check_root_calls, root_calls, ContractDebugInfo, RootCall, RootRecord, SourceFunction, StepMap,
+};
 use soldb_ethdebug::{EthdebugInfo, FunctionExit, FunctionIdentity, SourceLocation};
 
 const PROFILE_SCHEMA_VERSION: u32 = 1;
@@ -299,7 +301,14 @@ impl ProfileFunction {
 pub struct ProfileReport {
     pub schema_version: u32,
     pub transaction: ProfileTransaction,
+    /// The kind of top-level call profiled, when only those were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
     pub totals: ProfileTotals,
+    /// Every top-level call, in execution order, whether profiled or not. Empty unless a
+    /// selector picked calls.
+    #[serde(default)]
+    pub roots: Vec<RootProfile>,
     pub contracts: Vec<ContractProfile>,
     pub functions: Vec<FunctionProfile>,
     pub source_lines: Vec<SourceLineProfile>,
@@ -345,6 +354,9 @@ pub struct ProfileTransaction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileTotals {
+    /// Steps profiled.
+    #[serde(default)]
+    pub steps: u64,
     /// Sum of the gas each opcode step spent itself; a call's forwarded gas is not counted.
     pub step_gas: u64,
     /// Step gas assigned to a known creation or runtime program.
@@ -355,6 +367,24 @@ pub struct ProfileTotals {
     pub unmapped_gas: u64,
     /// Program gas whose instruction carries no source range.
     pub sourceless_gas: u64,
+}
+
+/// One top-level call: Foundry's deployment, `setUp` and test each are one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootProfile {
+    /// What the call is, when the trace says, such as `setup`.
+    pub kind: Option<String>,
+    /// The program the call runs, or its address when no program is loaded for it.
+    pub target: String,
+    /// The first function the call entered, such as `setUp`.
+    #[serde(default)]
+    pub function: Option<String>,
+    pub entry_step: u64,
+    pub gas: u64,
+    pub hits: u64,
+    /// Whether the call's steps are in the rest of the report.
+    pub profiled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,33 +467,81 @@ pub fn profile_transaction(
     trace: &TransactionTrace,
     programs: &[ProfileProgram],
 ) -> SoldbResult<ProfileReport> {
+    profile(trace, programs, None)
+}
+
+/// The kinds a trace names its top-level calls with, in execution order.
+pub const ROOT_KINDS: [&str; 3] = ["deployment", "setup", "execution"];
+
+/// Which top-level calls a profile covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootSelector {
+    /// Every call of this kind, such as Foundry's `execution`.
+    Kind(String),
+    /// The call at this position in execution order, from 0, for a trace that names no kinds.
+    Index(usize),
+}
+
+impl RootSelector {
+    fn selects(&self, index: usize, root: &RootCall) -> bool {
+        match self {
+            Self::Kind(kind) => root.kind.as_deref() == Some(kind.as_str()),
+            Self::Index(selected) => *selected == index,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Kind(kind) => kind.clone(),
+            Self::Index(index) => format!("#{index}"),
+        }
+    }
+}
+
+/// Profiles only the top-level calls `selector` picks.
+pub fn profile_root(
+    trace: &TransactionTrace,
+    programs: &[ProfileProgram],
+    selector: &RootSelector,
+) -> SoldbResult<ProfileReport> {
+    profile(trace, programs, Some(selector))
+}
+
+fn profile(
+    trace: &TransactionTrace,
+    programs: &[ProfileProgram],
+    selector: Option<&RootSelector>,
+) -> SoldbResult<ProfileReport> {
+    if selector.is_some() {
+        check_root_calls(trace)?;
+    }
     let program_lookup = build_program_lookup(programs)?;
-    let root_environment = if trace.to_addr.is_some() {
-        ProgramEnvironment::Call
-    } else {
-        ProgramEnvironment::Create
-    };
-    let root_address = trace
-        .to_addr
-        .as_deref()
-        .or(trace.contract_address.as_deref());
-    let root_program = lookup_program(
-        root_address,
-        None,
-        root_environment,
-        programs,
-        &program_lookup,
-    );
+    let root_calls = root_calls(trace);
+    let mut roots = root_calls
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            let profiled = selector.is_none_or(|selector| selector.selects(index, root));
+            ProfileRoot::new(trace, root, programs, &program_lookup, profiled)
+        })
+        .collect::<Vec<_>>();
+    if let Some(selector) = selector {
+        if !roots.iter().any(|root| root.profiled) {
+            return Err(unselected_root(&roots, selector));
+        }
+    }
+    let several_roots = roots.len() > 1;
+    for (index, root) in roots.iter_mut().enumerate() {
+        // Without a selection the calls are not told apart, as in a single-call trace.
+        root.label = if selector.is_some() {
+            root.label(index, several_roots)
+        } else {
+            root.target.clone()
+        };
+    }
+    let mut root_metrics = vec![Metrics::default(); roots.len()];
+    let mut root = 0;
     let root_depth = trace.steps.first().map_or(0, |step| step.depth());
-    let root_label = root_program.map_or_else(
-        || {
-            root_address.map_or_else(
-                || "transaction".to_owned(),
-                |address| format!("contract {}", normalize_address(address)),
-            )
-        },
-        |program| program_label(&programs[program]),
-    );
 
     let frames = build_execution_frames(trace, programs, &program_lookup);
     // Names the functions a program's own contexts leave anonymous or unmarked.
@@ -474,6 +552,15 @@ pub fn profile_transaction(
             .map(|program| program.debug.clone())
             .collect(),
     );
+    for index in 0..roots.len() {
+        if selector.is_none() {
+            break;
+        }
+        let end = roots
+            .get(index + 1)
+            .map_or(trace.steps.len(), |next| next.entry_step);
+        roots[index].function = entry_function(trace, &step_map, programs, &roots[index], end);
+    }
     let events = build_frame_events(&frames);
     let mut frame_cursor = FrameCursor::new(events);
     let mut paths = vec![Vec::new()];
@@ -501,8 +588,19 @@ pub fn profile_transaction(
             current_path = paths.len() - 1;
         }
 
+        while root_calls
+            .get(root + 1)
+            .is_some_and(|next| next.entry_step <= step_index)
+        {
+            root += 1;
+        }
+
         let next = trace.steps.get(step_index + 1);
         let gas_cost = own_gas_cost(step, next);
+        root_metrics[root].add(gas_cost, "top-level call gas")?;
+        if !roots[root].profiled {
+            continue;
+        }
         step_metrics.add(gas_cost, "total step gas")?;
         opcodes
             .entry(step.mnemonic())
@@ -514,12 +612,13 @@ pub fn profile_transaction(
             .and_then(|frame| frames[frame].program)
             .or_else(|| {
                 (active_frame.is_none() && step.depth() == root_depth)
-                    .then_some(root_program)
+                    .then_some(roots[root].program)
                     .flatten()
             });
         let Some(program_index) = program_index else {
             folded
                 .entry(FoldedKey {
+                    root,
                     path: current_path,
                     program: None,
                     function_path: 0,
@@ -539,7 +638,7 @@ pub fn profile_transaction(
                 .is_none_or(|opcode| opcode.eq_ignore_ascii_case(step.mnemonic()))
         });
         let function_frame = active_frame.map_or(
-            FunctionFrameKey::Root(step.depth()),
+            FunctionFrameKey::Root(root, step.depth()),
             FunctionFrameKey::External,
         );
         let invoked = function_stacks
@@ -609,6 +708,7 @@ pub fn profile_transaction(
 
         folded
             .entry(FoldedKey {
+                root,
                 path: current_path,
                 program: Some(program_index),
                 function_path,
@@ -650,15 +750,7 @@ pub fn profile_transaction(
     let source_line_rows = source_line_rows(programs, source_lines);
     let opcode_rows = opcode_rows(opcodes);
     let hotspot_rows = hotspot_rows(programs, hotspots);
-    let folded_stacks = folded_rows(
-        programs,
-        &frames,
-        &paths,
-        &function_paths,
-        &root_label,
-        root_program,
-        folded,
-    )?;
+    let folded_stacks = folded_rows(programs, &frames, &paths, &function_paths, &roots, folded)?;
     let unmapped_gas = step_metrics
         .gas
         .checked_sub(program_metrics.gas)
@@ -681,12 +773,19 @@ pub fn profile_transaction(
                 SoldbError::Message("profile step count does not fit in `u64`".to_owned())
             })?,
         },
+        root: selector.map(RootSelector::describe),
         totals: ProfileTotals {
+            steps: step_metrics.hits,
             step_gas: step_metrics.gas,
             program_gas: program_metrics.gas,
             source_gas: source_metrics.gas,
             unmapped_gas,
             sourceless_gas,
+        },
+        roots: if selector.is_some() {
+            root_rows(&roots, &root_metrics)?
+        } else {
+            Vec::new()
         },
         contracts: contract_rows,
         functions: function_rows,
@@ -921,6 +1020,142 @@ fn lookup_program(
     candidates.next().is_none().then_some(candidate)
 }
 
+/// A top-level call: the program it runs and whether it is profiled.
+#[derive(Debug)]
+struct ProfileRoot {
+    entry_step: usize,
+    kind: Option<String>,
+    program: Option<usize>,
+    target: String,
+    /// The first function the call entered.
+    function: Option<String>,
+    /// How folded stacks name the call.
+    label: String,
+    profiled: bool,
+}
+
+impl ProfileRoot {
+    fn new(
+        trace: &TransactionTrace,
+        root: &RootCall,
+        programs: &[ProfileProgram],
+        lookup: &HashMap<ProgramKey, usize>,
+        profiled: bool,
+    ) -> Self {
+        // The trace's own root runs creation code whenever it names no callee.
+        let creation = match root.record {
+            RootRecord::Trace => trace.to_addr.is_none(),
+            RootRecord::Call(_) | RootRecord::Creation(_) => root.creation(trace),
+        };
+        let environment = if creation {
+            ProgramEnvironment::Create
+        } else {
+            ProgramEnvironment::Call
+        };
+        let address = root.address(trace);
+        let program = lookup_program(
+            address,
+            root.code_hash(trace),
+            environment,
+            programs,
+            lookup,
+        );
+        let target = program.map_or_else(
+            || {
+                address.map_or_else(
+                    || "transaction".to_owned(),
+                    |address| format!("contract {}", normalize_address(address)),
+                )
+            },
+            |program| program_label(&programs[program]),
+        );
+        Self {
+            entry_step: root.entry_step,
+            kind: root.kind.clone(),
+            program,
+            target,
+            function: None,
+            label: String::new(),
+            profiled,
+        }
+    }
+
+    /// The call's kind, or its position when the trace names no kind and has several, so
+    /// that two calls into one contract stay apart in a flame graph.
+    fn label(&self, index: usize, several: bool) -> String {
+        match (&self.kind, several) {
+            (Some(kind), _) => format!("[{kind}] {}", self.target),
+            (None, true) => format!("#{index} {}", self.target),
+            (None, false) => self.target.clone(),
+        }
+    }
+}
+
+/// The first function the debugger places a step of the call's own frame in.
+fn entry_function(
+    trace: &TransactionTrace,
+    step_map: &StepMap,
+    programs: &[ProfileProgram],
+    root: &ProfileRoot,
+    end: usize,
+) -> Option<String> {
+    let program_index = root.program?;
+    let program = &programs[program_index];
+    let root_depth = trace.steps.get(root.entry_step)?.depth();
+    let function = (root.entry_step..end).find_map(|step| {
+        if trace.steps.get(step)?.depth() != root_depth {
+            return None;
+        }
+        program.traced_function(step_map, step, program_index)
+    })?;
+    Some(program.functions[function].name().to_owned())
+}
+
+/// The error for a selector that picks no top-level call.
+fn unselected_root(roots: &[ProfileRoot], selector: &RootSelector) -> SoldbError {
+    match selector {
+        RootSelector::Kind(kind) => unknown_root_kind(roots, kind),
+        RootSelector::Index(index) => {
+            let detail = match roots.len() {
+                1 => "the trace has one top-level call, #0".to_owned(),
+                count => format!(
+                    "the trace has {count} top-level calls, #0 to #{}",
+                    count - 1
+                ),
+            };
+            SoldbError::Message(format!("no top-level call #{index}\n{detail}"))
+        }
+    }
+}
+
+/// The error for a `kind` no top-level call has, naming the kinds the trace has.
+fn unknown_root_kind(roots: &[ProfileRoot], kind: &str) -> SoldbError {
+    let mut kinds = Vec::new();
+    for root in roots {
+        let Some(root_kind) = root.kind.as_deref() else {
+            continue;
+        };
+        if !kinds.contains(&root_kind) {
+            kinds.push(root_kind);
+        }
+    }
+    let detail = if kinds.is_empty() {
+        let numbers = match roots.len() {
+            0 | 1 => "#0".to_owned(),
+            count => format!("#0 to #{}", count - 1),
+        };
+        format!("the trace does not say what its top-level calls are; select one by its number, {numbers}")
+    } else {
+        let kinds = kinds
+            .iter()
+            .map(|kind| format!("`{kind}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("the trace's top-level calls are {kinds}")
+    };
+    SoldbError::Message(format!("no top-level call of kind `{kind}`\n{detail}"))
+}
+
 #[derive(Debug)]
 struct ExecutionFrame {
     entry: usize,
@@ -1070,7 +1305,8 @@ impl FrameCursor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FunctionFrameKey {
-    Root(u64),
+    /// A step outside every recorded call: its top-level call and depth.
+    Root(usize, u64),
     External(usize),
 }
 
@@ -1130,11 +1366,32 @@ struct FlameSourceKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FoldedKey {
+    root: usize,
     path: usize,
     program: Option<usize>,
     function_path: usize,
     source: Option<FlameSourceKey>,
     unmapped_depth: Option<u64>,
+}
+
+fn root_rows(roots: &[ProfileRoot], metrics: &[Metrics]) -> SoldbResult<Vec<RootProfile>> {
+    roots
+        .iter()
+        .zip(metrics)
+        .map(|(root, metrics)| {
+            Ok(RootProfile {
+                kind: root.kind.clone(),
+                target: root.target.clone(),
+                function: root.function.clone(),
+                entry_step: u64::try_from(root.entry_step).map_err(|_| {
+                    SoldbError::Message("profile step index does not fit in `u64`".to_owned())
+                })?,
+                gas: metrics.gas,
+                hits: metrics.hits,
+                profiled: root.profiled,
+            })
+        })
+        .collect()
 }
 
 fn contract_rows(
@@ -1321,13 +1578,14 @@ fn folded_rows(
     frames: &[ExecutionFrame],
     paths: &[Vec<usize>],
     function_paths: &[Vec<usize>],
-    root_label: &str,
-    root_program: Option<usize>,
+    roots: &[ProfileRoot],
     metrics: HashMap<FoldedKey, Metrics>,
 ) -> SoldbResult<Vec<FoldedStack>> {
     let mut merged = BTreeMap::<Vec<String>, Metrics>::new();
     for (key, metrics) in metrics {
-        let mut labels = vec![root_label.to_owned()];
+        let root = &roots[key.root];
+        let root_program = root.program;
+        let mut labels = vec![root.label.clone()];
         if let Some(path) = paths.get(key.path) {
             labels.extend(
                 path.iter()
@@ -1437,12 +1695,12 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{
-        ContractCreation, ExecutionCall, StepSnapshot, TraceArtifacts, TraceCapabilities,
+        ContractCreation, ExecutionCall, RootKind, StepSnapshot, TraceArtifacts, TraceCapabilities,
         TraceStep, TransactionTrace,
     };
     use soldb_ethdebug::{source_range, EthdebugInfo, Instruction};
 
-    use super::{profile_transaction, ProfileProgram, ProfileReport};
+    use super::{profile_root, profile_transaction, ProfileProgram, ProfileReport, RootSelector};
 
     #[test]
     fn attributes_gas_to_source_functions_and_opcodes() {
@@ -1888,13 +2146,117 @@ mod tests {
     }
 
     #[test]
+    fn profiles_every_call_alike_without_a_selector() {
+        let report = profile_transaction(&foundry_trace(), &[foundry_program()]).expect("profile");
+
+        assert!(report.roots.is_empty());
+        assert_eq!(report.root, None);
+        assert_eq!(report.totals.step_gas, 108);
+        let folded = report.folded_text();
+        assert!(folded.starts_with("CounterTest [0xaa];CALL CounterTest [0xaa];"));
+        assert!(!folded.contains("[setup]"));
+    }
+
+    #[test]
+    fn profiles_only_the_top_level_calls_of_a_kind() {
+        let report = profile_root(
+            &foundry_trace(),
+            &[foundry_program()],
+            &RootSelector::Kind("execution".to_owned()),
+        )
+        .expect("profile execution");
+
+        assert_eq!(report.root.as_deref(), Some("execution"));
+        assert_eq!(report.totals.steps, 2);
+        assert_eq!(report.totals.step_gas, 105);
+        assert_eq!(report.opcodes.len(), 2);
+        assert!(report.opcodes.iter().all(|row| row.opcode != "PUSH1"));
+        let folded = report.folded_text();
+        assert!(!folded.contains("[setup]"));
+        assert!(folded.contains("[execution] CounterTest [0xaa];CALL CounterTest [0xaa];"));
+        assert_eq!(report.roots[0].target, "CounterTest [0xaa]");
+        let profiled = report
+            .roots
+            .iter()
+            .map(|root| root.profiled)
+            .collect::<Vec<_>>();
+        assert_eq!(profiled, vec![false, true]);
+    }
+
+    #[test]
+    fn rejects_a_top_level_call_kind_the_trace_lacks() {
+        let error = profile_root(
+            &foundry_trace(),
+            &[foundry_program()],
+            &RootSelector::Kind("deployment".to_owned()),
+        )
+        .expect_err("no deployment");
+        assert_eq!(
+            error.to_string(),
+            "no top-level call of kind `deployment`\n\
+             the trace's top-level calls are `setup`, `execution`"
+        );
+
+        let trace = trace(Some("0xaa"), vec![step(0, "STOP", 0, 0)]);
+        let error = profile_root(&trace, &[], &RootSelector::Kind("setup".to_owned()))
+            .expect_err("no kinds");
+        assert!(error.to_string().ends_with(
+            "the trace does not say what its top-level calls are; select one by its number, #0"
+        ));
+    }
+
+    #[test]
+    fn tells_apart_top_level_calls_the_trace_does_not_name() {
+        let mut trace = foundry_trace();
+        trace.artifacts.root_kinds.clear();
+        let program = program_with_function(
+            Some("0xaa"),
+            "CounterTest",
+            "call",
+            "contract CounterTest { function test() external {} }",
+            &[(0, "PUSH1", 23), (2, "ADD", 32), (3, "SLOAD", 33)],
+            "test",
+        );
+
+        let report = profile_root(&trace, &[program], &RootSelector::Index(1))
+            .expect("profile the second call");
+
+        assert_eq!(report.root.as_deref(), Some("#1"));
+        assert_eq!(report.totals.step_gas, 105);
+        assert_eq!(report.roots[1].function.as_deref(), Some("test"));
+        assert!(report.roots[1].kind.is_none());
+        assert!(report
+            .folded_text()
+            .starts_with("#1 CounterTest [0xaa];CALL CounterTest [0xaa];"));
+    }
+
+    #[test]
+    fn rejects_a_top_level_call_index_past_the_last() {
+        let error =
+            profile_root(&foundry_trace(), &[], &RootSelector::Index(2)).expect_err("two calls");
+        assert_eq!(
+            error.to_string(),
+            "no top-level call #2\nthe trace has 2 top-level calls, #0 to #1"
+        );
+    }
+
+    #[test]
+    fn rejects_selecting_in_a_trace_with_two_top_level_calls_at_one_step() {
+        let mut trace = foundry_trace();
+        trace.artifacts.calls.push(root_call(1, 1, 3, "0xbb"));
+        let error =
+            profile_root(&trace, &[], &RootSelector::Index(0)).expect_err("two roots at step 1");
+        assert!(error.to_string().starts_with("invalid trace"));
+    }
+
+    #[test]
     fn rejects_gas_overflow() {
         let trace = trace(
             Some("0x1"),
             vec![step(0, "ADD", u64::MAX, 0), step(1, "ADD", 1, 0)],
         );
         let error = profile_transaction(&trace, &[]).expect_err("overflow");
-        assert!(error.to_string().contains("total step gas overflow"));
+        assert!(error.to_string().contains("top-level call gas overflow"));
     }
 
     #[test]
@@ -2163,6 +2525,62 @@ mod tests {
         assert!(report.source_lines.is_empty());
         assert_eq!(report.hotspots[0].source, None);
         assert!(report.folded_text().contains("Counter Unsafe Name"));
+    }
+
+    /// `setUp` and a test, each a top-level call into the test contract at `0xaa`.
+    fn foundry_trace() -> TransactionTrace {
+        let mut trace = trace(
+            Some("0xaa"),
+            vec![
+                step(0, "PUSH1", 3, 1),
+                step(2, "ADD", 5, 1),
+                step(3, "SLOAD", 100, 1),
+            ],
+        );
+        trace.artifacts.calls = vec![root_call(0, 0, 1, "0xaa"), root_call(1, 1, 3, "0xaa")];
+        trace.artifacts.root_kinds = vec![
+            RootKind {
+                entry_step: 0,
+                kind: "setup".to_owned(),
+            },
+            RootKind {
+                entry_step: 1,
+                kind: "execution".to_owned(),
+            },
+        ];
+        trace
+    }
+
+    fn foundry_program() -> ProfileProgram {
+        program(
+            Some("0xaa"),
+            "CounterTest",
+            "call",
+            "contract CounterTest { function test() external {} }",
+            &[(0, "PUSH1", 23), (2, "ADD", 32), (3, "SLOAD", 33)],
+        )
+    }
+
+    fn root_call(id: usize, entry: usize, exit: usize, address: &str) -> ExecutionCall {
+        ExecutionCall {
+            id,
+            parent_id: None,
+            depth: 1,
+            entry_step: Some(entry),
+            exit_step: Some(exit),
+            call_type: "CALL".to_owned(),
+            from: "0x1".to_owned(),
+            to: address.to_owned(),
+            bytecode_address: address.to_owned(),
+            value: "0".to_owned(),
+            input: "0x".to_owned(),
+            gas_limit: 100_000,
+            gas_used: None,
+            output: Some("0x".to_owned()),
+            success: Some(true),
+            error: None,
+            code_hash: None,
+        }
     }
 
     fn program(

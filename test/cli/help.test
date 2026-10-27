@@ -36,6 +36,7 @@
 # PROFILE-DAG: --json
 # PROFILE-DAG: --folded
 # PROFILE-DAG: --flamegraph
+# PROFILE-DAG: --root <KIND|INDEX>
 
 # DEBUG-DIFF-DAG: Usage:
 # DEBUG-DIFF-DAG: --reference-trace-file

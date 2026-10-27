@@ -1,0 +1,36 @@
+# Profile one kind of top-level call in a trace with several, as a Foundry test records
+# REQUIRES: soldb
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/roots-trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --folded %t.folded 2>&1 | FileCheck %s --check-prefix=ALL
+# RUN: FileCheck %s --check-prefix=FOLDED < %t.folded
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/roots-trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --root execution 2>&1 | FileCheck %s --check-prefix=EXECUTION
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/roots-trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --root execution --json | jq -c '{root, steps: .totals.steps, stepGas: .totals.stepGas, roots: [.roots[] | "\(.kind) \(.gas) \(.profiled)"]}' | FileCheck %s --check-prefix=JSON
+# RUN: %soldb profile --trace-file %{project_root}/test/fixtures/profile/roots-trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --root 1 2>&1 | FileCheck %s --check-prefix=INDEX
+# RUN: not %soldb profile --trace-file %{project_root}/test/fixtures/profile/roots-trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --root 2 2>&1 | FileCheck %s --check-prefix=PAST
+# RUN: not %soldb profile --trace-file %{project_root}/test/fixtures/profile/roots-trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --root deployment 2>&1 | FileCheck %s --check-prefix=UNKNOWN
+# RUN: not %soldb profile --trace-file %{project_root}/test/fixtures/profile/roots-trace.json --ethdebug-dir 0x000000000000000000000000000000000000cafe:Counter:%{project_root}/test/fixtures/profile --root test 2>&1 | FileCheck %s --check-prefix=BADKIND
+
+# ALL-NOT: Top-level calls
+# ALL: Traced instruction gas: 11 across 3 steps
+
+# FOLDED-NOT: [setup]
+# FOLDED: Counter [0x000000000000000000000000000000000000cafe];CALL Counter
+
+# EXECUTION: Top-level calls profiled: execution
+# EXECUTION: Traced instruction gas: 8 across 2 steps
+# EXECUTION: #0 [setup] Counter {{.*}} (not profiled)
+# EXECUTION-NOT: (not profiled)
+# EXECUTION: Opcodes
+
+# JSON: {"root":"execution","steps":2,"stepGas":8,"roots":["setup 3 false","execution 8 true"]}
+
+# INDEX: Top-level calls profiled: #1
+# INDEX: Traced instruction gas: 8 across 2 steps
+
+# PAST: error: no top-level call #2
+# PAST-NEXT: the trace has 2 top-level calls, #0 to #1
+
+# UNKNOWN: error: no top-level call of kind `deployment`
+# UNKNOWN-NEXT: the trace's top-level calls are `setup`, `execution`
+
+# BADKIND: unknown top-level call kind `test`
+# BADKIND-NEXT: expected a number or one of `deployment`, `setup`, `execution`
