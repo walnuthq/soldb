@@ -271,13 +271,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "info",
         aliases: &["i"],
-        usage: "info breakpoints|storage|transient|resources [--json]",
+        usage: "info breakpoints|storage|transient|resources",
         summary: "the breakpoints, the storage or transient storage known here, or the loaded debug resources",
         details: &[
-            "info breakpoints (i b)  every breakpoint with its number",
-            "info storage            every storage slot known at this step",
-            "info transient          every transient storage slot known at this step",
-            "info resources          the contracts whose sources are loaded, as text or JSON",
+            "info breakpoints (i b)   every breakpoint with its number",
+            "info storage             every storage slot known at this step",
+            "info transient           every transient storage slot known at this step",
+            "info resources [--json]  the contracts whose sources are loaded, as text or JSON",
         ],
         group: CommandGroup::Breakpoints,
     },
@@ -629,6 +629,42 @@ fn parse_source_line_number(input: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{command_spec, CommandGroup, DebuggerCommand, COMMANDS};
+
+    #[test]
+    fn every_info_form_in_help_parses() {
+        // Each shown form, with and without a trailing `[--json]`; in the usage line the flag
+        // applies to every `|` alternative.
+        fn expand(form: &str) -> Vec<String> {
+            let (form, json) = match form.strip_suffix(" [--json]") {
+                Some(plain) => (plain, true),
+                None => (form, false),
+            };
+            let (head, alternatives) = form.split_once(' ').expect("info and a subcommand");
+            alternatives
+                .split('|')
+                .flat_map(|alternative| {
+                    let plain = format!("{head} {alternative}");
+                    let flagged = json.then(|| format!("{plain} --json"));
+                    std::iter::once(plain).chain(flagged)
+                })
+                .collect()
+        }
+
+        let info = command_spec("info").expect("info is a command");
+        let mut forms = expand(info.usage);
+        for line in info.details {
+            let (form, _) = line.split_once("  ").expect("a form, then what it does");
+            forms.extend(expand(
+                form.split(" (").next().expect("the form before its alias"),
+            ));
+        }
+        for form in forms {
+            assert!(
+                !matches!(DebuggerCommand::parse(&form), DebuggerCommand::Unknown(_)),
+                "`help info` shows `{form}`, which does not parse"
+            );
+        }
+    }
 
     #[test]
     fn every_command_is_named_once_and_parses_by_each_alias() {
