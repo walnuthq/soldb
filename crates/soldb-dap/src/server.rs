@@ -1067,15 +1067,16 @@ fn string_arg(args: &Value, keys: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The source a `setBreakpoints` request is for, as the editor names it. The whole path is
+/// kept: two files can share a name, and the debugger matches the path against the sources.
 fn source_key(source: Option<&Value>) -> Option<String> {
     let source = source?;
-    if let Some(path) = source.get("path").and_then(Value::as_str) {
-        return Some(normalize_source_key(path));
-    }
-    if let Some(name) = source.get("name").and_then(Value::as_str) {
-        return Some(normalize_source_key(name));
-    }
-    source.as_str().map(normalize_source_key)
+    source
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| source.get("name").and_then(Value::as_str))
+        .or_else(|| source.as_str())
+        .map(str::to_owned)
 }
 
 fn normalize_source_key(input: &str) -> String {
@@ -1695,12 +1696,25 @@ mod tests {
     /// One contract's source and ETHDebug artifacts in `dir`: two instructions, both
     /// mapped to `statement`, the second of them `op`.
     fn write_contract(dir: &std::path::Path, name: &str, source: &str, statement: &str, op: &str) {
-        std::fs::create_dir_all(dir).expect("create contract dir");
-        std::fs::write(dir.join(format!("{name}.sol")), source).expect("write source");
+        write_contract_at(dir, name, &format!("{name}.sol"), source, statement, op);
+    }
+
+    /// Like [`write_contract`], with the source at `path` under `dir`, as the compiler
+    /// recorded it.
+    fn write_contract_at(
+        dir: &std::path::Path,
+        name: &str,
+        path: &str,
+        source: &str,
+        statement: &str,
+        op: &str,
+    ) {
+        let file = dir.join(path);
+        std::fs::create_dir_all(file.parent().expect("source dir")).expect("create contract dir");
+        std::fs::write(&file, source).expect("write source");
         std::fs::write(
             dir.join("ethdebug.json"),
-            json!({"compilation": {"sources": [{"id": 0, "path": format!("{name}.sol")}]}})
-                .to_string(),
+            json!({"compilation": {"sources": [{"id": 0, "path": path}]}}).to_string(),
         )
         .expect("write metadata");
         let offset = source.find(statement).expect("statement in source");
@@ -1714,6 +1728,99 @@ mod tests {
             program.to_string(),
         )
         .expect("write runtime");
+    }
+
+    #[test]
+    fn breakpoint_stops_only_in_the_file_with_that_path() {
+        let temp = temp_dir("soldb-dap-same-name");
+        let vault = "0xaaaa000000000000000000000000000000000001";
+        let mock = "0xbbbb000000000000000000000000000000000002";
+        // Two sources named `Vault.sol`, each with a statement on line 3.
+        write_contract_at(
+            &temp.join("vault"),
+            "Vault",
+            "src/Vault.sol",
+            "contract Vault {\n  function run() public {\n    mock.add();\n  }\n}\n",
+            "mock.add();",
+            "CALL",
+        );
+        write_contract_at(
+            &temp.join("mock"),
+            "MockVault",
+            "test/mocks/Vault.sol",
+            "contract MockVault {\n  function add() public {\n    calls = 1;\n  }\n}\n",
+            "calls = 1;",
+            "SSTORE",
+        );
+        let mapping = temp.join("contracts.json");
+        std::fs::write(
+            &mapping,
+            json!({"contracts": [
+                {"address": vault, "name": "Vault", "debug_dir": "vault"},
+                {"address": mock, "name": "MockVault", "debug_dir": "mock"}
+            ]})
+            .to_string(),
+        )
+        .expect("write mapping");
+        let mock_word = format!("0x{:0>64}", mock.trim_start_matches("0x"));
+        let call_stack = ["0x0", "0x0", "0x0", "0x0", "0x0", mock_word.as_str(), "0x0"];
+        let mut trace = sample_trace();
+        trace.to_addr = Some(vault.to_owned());
+        trace.steps = vec![
+            trace_step(0, 1, "PUSH1", &[]),
+            trace_step(2, 1, "CALL", &call_stack),
+            trace_step(0, 2, "PUSH1", &[]),
+            trace_step(2, 2, "SSTORE", &[]),
+            trace_step(3, 1, "STOP", &[]),
+        ]
+        .into();
+
+        // An editor sends absolute paths; each must stop only in its own file.
+        for (file, other) in [
+            ("vault/src/Vault.sol", "mock/test/mocks/Vault.sol"),
+            ("mock/test/mocks/Vault.sol", "vault/src/Vault.sol"),
+        ] {
+            let mut server = DapServer::new();
+            let launch = DapMessage::request(
+                1,
+                "launch",
+                Some(json!({"trace": trace, "contracts": mapping.display().to_string()})),
+            );
+            assert_eq!(server.handle_message(&launch)[0].success, Some(true));
+            let path = temp.join(file).display().to_string();
+            let other_path = temp.join(other).display().to_string();
+            for (seq, source) in [(2, &other_path), (3, &path)] {
+                let lines = if source == &path {
+                    json!([{"line": 3}])
+                } else {
+                    json!([])
+                };
+                let set = DapMessage::request(
+                    seq,
+                    "setBreakpoints",
+                    Some(json!({"source": {"path": source}, "breakpoints": lines})),
+                );
+                assert_eq!(server.handle_message(&set)[0].success, Some(true));
+            }
+
+            // Run to the end, then back to the start: every stop must be in `file`. The
+            // session starts on line 3 of `src/Vault.sol`, so that one is reached going back.
+            let mut stops = Vec::new();
+            for (seq, command) in [(4, "continue"), (5, "continue"), (6, "reverseContinue")] {
+                let messages = server.handle_message(&DapMessage::request(seq, command, None));
+                if messages[1].body.as_ref().expect("body")["reason"] != "breakpoint" {
+                    continue;
+                }
+                let frames = server.handle_message(&DapMessage::request(seq, "stackTrace", None));
+                let top = &frames[0].body.as_ref().expect("body")["stackFrames"][0];
+                stops.push(top["source"]["path"].as_str().expect("path").to_owned());
+            }
+            assert!(!stops.is_empty(), "no stop for a breakpoint on {file}");
+            assert!(
+                stops.iter().all(|stop| *stop == path),
+                "a breakpoint on {file} stopped in {stops:?}"
+            );
+        }
     }
 
     fn trace_step(pc: u64, depth: u64, op: &str, stack: &[&str]) -> TraceStep {

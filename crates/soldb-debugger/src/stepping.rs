@@ -568,6 +568,16 @@ pub fn normalize_address(value: &str) -> String {
 /// compiler recorded relative ones), or just the file name.
 #[must_use]
 pub fn source_path_matches(source_path: &str, requested: &str) -> bool {
+    fn file_name(path: &str) -> &str {
+        path.rsplit('/').next().unwrap_or(path)
+    }
+    source_path_matches_by_path(source_path, requested)
+        || (!requested.is_empty() && file_name(source_path) == file_name(requested))
+}
+
+/// Whether a source path matches by more than its file name: the whole path, or a trailing
+/// part of either.
+fn source_path_matches_by_path(source_path: &str, requested: &str) -> bool {
     fn ends_with_path(longer: &str, shorter: &str) -> bool {
         longer.ends_with(shorter)
             && longer
@@ -575,13 +585,9 @@ pub fn source_path_matches(source_path: &str, requested: &str) -> bool {
                 .get(longer.len() - shorter.len() - 1)
                 .is_none_or(|byte| *byte == b'/')
     }
-    fn file_name(path: &str) -> &str {
-        path.rsplit('/').next().unwrap_or(path)
-    }
     source_path == requested
         || ends_with_path(source_path, requested)
         || ends_with_path(requested, source_path)
-        || (!requested.is_empty() && file_name(source_path) == file_name(requested))
 }
 
 /// The narrowest of the `candidates` among `functions` whose declaration contains
@@ -2729,12 +2735,25 @@ impl StepMap {
     /// line must be unambiguous across the loaded sources.
     pub fn resolve_line(&self, file: Option<&str>, line: u64) -> Result<Vec<ResolvedLine>, String> {
         let mut sources = Vec::<(usize, u64, String)>::new();
+        // Sources whose path matches only by file name are used when no source matches by
+        // path, so `src/Vault.sol` does not also stop in `test/mocks/Vault.sol`.
+        let mut by_name = Vec::<(usize, u64, String)>::new();
         for (contract_index, contract) in self.contracts.iter().enumerate() {
             for (source_id, path) in &contract.info.sources {
-                if file.is_none_or(|file| source_path_matches(path, file)) {
-                    sources.push((contract_index, *source_id, path.clone()));
+                match file {
+                    None => sources.push((contract_index, *source_id, path.clone())),
+                    Some(file) if source_path_matches_by_path(path, file) => {
+                        sources.push((contract_index, *source_id, path.clone()));
+                    }
+                    Some(file) if source_path_matches(path, file) => {
+                        by_name.push((contract_index, *source_id, path.clone()));
+                    }
+                    Some(_) => {}
                 }
             }
+        }
+        if sources.is_empty() {
+            sources = by_name;
         }
         if sources.is_empty() {
             return Err(match file {
