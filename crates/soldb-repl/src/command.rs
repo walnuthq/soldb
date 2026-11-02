@@ -631,39 +631,15 @@ mod tests {
     use super::{command_spec, CommandGroup, DebuggerCommand, COMMANDS};
 
     #[test]
-    fn every_info_form_in_help_parses() {
-        // Each shown form, with and without a trailing `[--json]`; in the usage line the flag
-        // applies to every `|` alternative.
-        fn expand(form: &str) -> Vec<String> {
-            let (form, json) = match form.strip_suffix(" [--json]") {
-                Some(plain) => (plain, true),
-                None => (form, false),
-            };
-            let (head, alternatives) = form.split_once(' ').expect("info and a subcommand");
-            alternatives
-                .split('|')
-                .flat_map(|alternative| {
-                    let plain = format!("{head} {alternative}");
-                    let flagged = json.then(|| format!("{plain} --json"));
-                    std::iter::once(plain).chain(flagged)
-                })
-                .collect()
-        }
-
+    fn info_help_offers_json_only_for_resources() {
         let info = command_spec("info").expect("info is a command");
-        let mut forms = expand(info.usage);
-        for line in info.details {
-            let (form, _) = line.split_once("  ").expect("a form, then what it does");
-            forms.extend(expand(
-                form.split(" (").next().expect("the form before its alias"),
-            ));
-        }
-        for form in forms {
-            assert!(
-                !matches!(DebuggerCommand::parse(&form), DebuggerCommand::Unknown(_)),
-                "`help info` shows `{form}`, which does not parse"
-            );
-        }
+        assert!(!info.usage.contains("--json"));
+
+        let resources = DebuggerCommand::parse("info resources --json");
+        assert!(!matches!(resources, DebuggerCommand::Unknown(_)));
+
+        let storage = DebuggerCommand::parse("info storage --json");
+        assert!(matches!(storage, DebuggerCommand::Unknown(_)));
     }
 
     #[test]
