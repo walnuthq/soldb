@@ -1304,6 +1304,7 @@ mod tests {
             json!({"~nope": []}),
             json!({"~read": "~that"}),
             json!({"$$yulLocal": "x"}),
+            json!({"~~yulLocal": "x"}),
         ] {
             assert!(Expression::parse(&bad).is_err(), "{bad} should not parse");
         }
