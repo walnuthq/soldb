@@ -1,0 +1,16 @@
+# Compile and execute the layout fixture with the selected solc, then load the new
+# pointer IDs through the CLI. The Rust layouts integration tests decode recorded
+# snapshots from this source through the templates, without a node or compiler.
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-layout-templates, optimization-none
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: cd %S/../../fixtures/ethdebug-layouts && %solc Layouts.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime --ethdebug-resources --storage-layout --bin --abi -o %t > %t/compile.stdout 2> %t/compile.stderr
+# RUN: jq -r .calldata %S/../../fixtures/ethdebug-layouts/snapshot.json | xargs %soldb run %t/Layouts.bin --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Layouts:%t --source-path %S/../../fixtures/ethdebug-layouts --save-trace %t/trace.json --json -x 'info resources --json' --batch --raw-data > %t/session.json
+# RUN: %soldb info resources --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Layouts:%t --json > %t/resources.json
+# RUN: jq -c '.contracts[0].resources | [.pointers["storage-t_uint16"].expect, .pointers["transient-t_uint16"].expect, .pointers["memory-t_uint16"].expect, .pointers["calldata-t_uint16"].expect] | map(join(" "))' %t/resources.json | FileCheck %s --check-prefix=LAYOUTS
+# LAYOUTS: ["slot offset","slot offset","offset","offset"]
+
+# The returned record agrees with the pinned execution. The first word holds a memory
+# address, so compare the ABI-encoded record after that word, not the allocation address.
+# RUN: jq -c --slurpfile expected %S/../../fixtures/ethdebug-layouts/snapshot.json '[.success, .output[66:] == $expected[0].output[66:]]' %t/trace.json | FileCheck %s --check-prefix=RESULT
+# RESULT: [true,true]

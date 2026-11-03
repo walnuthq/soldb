@@ -3,12 +3,10 @@
 //! `ethdebug_resources.json` carries, next to the compilation, a `types` table with one
 //! ethdebug/format/type document per type the compiler describes, keyed by the type
 //! identifier the storage layout uses too (`t_uint256`, `t_mapping$_t_address_$_t_uint256_$`),
-//! and a `pointers` table with one ethdebug/format/pointer/template per struct, array and
-//! mapping type a state variable has or is composed of, keyed by the same identifier:
-//! how a value of the type is laid out from a base slot, which the template expects as
-//! `slot`; a mapping's template expects `key` as well and locates one entry. Value types
-//! have no template, they are single regions wherever they occur, and where a state
-//! variable starts is what the storage layout and the program-level context say. solc
+//! and a `pointers` table of ethdebug/format/pointer/template documents. Pointer IDs are
+//! independent of type IDs: storage, transient, memory and calldata layouts of the same
+//! type have distinct templates. The variable's pointer selects and binds its template;
+//! a type document alone does not identify a layout. solc
 //! fills both tables from 0.8.38; earlier releases write empty tables, which parse to
 //! empty tables here, and a debugger then reads state variables through the storage
 //! layout as before.
@@ -197,11 +195,18 @@ impl Resources {
         dangling
     }
 
-    /// The template of a struct, array or mapping type, by the identifier the type table
-    /// uses; `None` for a value type, whose values are single regions.
+    /// Looks up a pointer template by its own ID, not by a type ID. A type may have
+    /// several templates describing different layouts.
+    #[must_use]
+    pub fn pointer_template(&self, pointer_id: &str) -> Option<&PointerTemplate> {
+        self.pointers.get(pointer_id)
+    }
+
+    /// Looks up an older table's template keyed by type ID. Use `pointer_template`
+    /// with the pointer ID from the debug info for layout-qualified tables.
     #[must_use]
     pub fn template_for_type(&self, type_id: &str) -> Option<&PointerTemplate> {
-        self.pointers.get(type_id)
+        self.pointer_template(type_id)
     }
 
     /// The Solidity-like spelling of a type, such as `mapping(address => uint256)`.
@@ -509,6 +514,9 @@ impl Resources {
                 .name
                 .as_deref()
                 .map_or_else(Vec::new, |name| name.split('-').collect::<Vec<_>>());
+            if path == ["value"] && root.is_value_type() {
+                path.clear();
+            }
             let document = match self.type_at_path(root, &path) {
                 Some(document) => document,
                 None if is_bookkeeping(&path) => continue,
@@ -1318,13 +1326,13 @@ mod tests {
     }
 
     #[test]
-    fn every_composed_layout_type_has_a_template_and_no_value_type_does() {
+    fn legacy_tables_have_templates_only_for_composed_types() {
         let resources = fixture();
         let layout = layout();
         for variable in &layout.variables {
             let type_id = escaped(&variable.type_id);
             let document = resources.type_document(&type_id).expect(&type_id);
-            let template = resources.template_for_type(&type_id);
+            let template = resources.pointer_template(&type_id);
             match document {
                 TypeDocument::Mapping { .. } => {
                     assert_eq!(
@@ -1366,7 +1374,7 @@ mod tests {
         let layout = layout();
         for variable in &layout.variables {
             let type_id = escaped(&variable.type_id);
-            let Some(template) = resources.template_for_type(&type_id) else {
+            let Some(template) = resources.pointer_template(&type_id) else {
                 continue;
             };
             // A zero word at the slot makes a dynamic array empty and a string short.
@@ -1393,7 +1401,7 @@ mod tests {
         let layout = layout();
         let nested = layout.variable("nested").expect("nested");
         let outer = resources
-            .template_for_type(&escaped(&nested.type_id))
+            .pointer_template(&escaped(&nested.type_id))
             .expect("outer template");
         let key = parse_word("0x000000000000000000000000abababababababababababababababababababab")
             .expect("key");
@@ -1413,7 +1421,7 @@ mod tests {
         assert_eq!(regions[0].slot, Some(inner_slot));
         assert_eq!((regions[0].offset, regions[0].length), (0, 32));
         let inner = resources
-            .template_for_type("t_mapping$_t_uint256_$_t_bool_$")
+            .pointer_template("t_mapping$_t_uint256_$_t_bool_$")
             .expect("inner template");
         let regions = dereference(
             inner,
@@ -1430,14 +1438,17 @@ mod tests {
     }
 
     #[test]
-    fn templates_are_keyed_by_type() {
+    fn legacy_pointer_ids_remain_readable() {
         let resources = fixture();
-        let point = resources
+        assert!(resources
             .template_for_type("t_struct$_Point_$12_storage")
+            .is_some());
+        let point = resources
+            .pointer_template("t_struct$_Point_$12_storage")
             .expect("Point");
         assert_eq!(point.expect, vec!["slot".to_owned()]);
-        assert!(resources.template_for_type("t_uint256").is_none());
-        assert!(resources.template_for_type("t_enum$_Color_$7").is_none());
+        assert!(resources.pointer_template("t_uint256").is_none());
+        assert!(resources.pointer_template("t_enum$_Color_$7").is_none());
         // The same identifier keys the type document.
         assert!(resources
             .type_document("t_struct$_Point_$12_storage")

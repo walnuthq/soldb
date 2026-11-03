@@ -235,6 +235,52 @@ mod tests {
     }
 
     #[test]
+    fn layout_templates_read_recorded_memory_and_calldata() {
+        let tables = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../test/fixtures/ethdebug-layouts/ethdebug_resources.json"
+        ))
+        .unwrap();
+        let snapshot = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../../test/fixtures/ethdebug-layouts/snapshot.json"
+        ))
+        .unwrap();
+        let resources = Resources::parse(&tables).unwrap();
+        let type_id = tables["types"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, document)| document["definition"]["name"] == "Record")
+            .unwrap()
+            .0;
+        let output = decode_hex(snapshot["output"].as_str().unwrap()).unwrap();
+        let memory_base = u64::from_be_bytes(output[24..32].try_into().unwrap());
+        let variables = [("memory", memory_base), ("calldata", 36)].map(|(layout, offset)| {
+            json!({"identifier": layout, "type": {"id": type_id}, "pointer": {
+                "define": {"offset": offset}, "in": {"template": format!("{layout}-{type_id}")}
+            }})
+        });
+        let program = json!({"instructions": [{"offset": 9, "operation": {"mnemonic": "MSTORE"},
+            "context": {"variables": variables}}]});
+        let info = EthdebugInfo::from_artifacts("Layouts", "call", &tables, &program).unwrap();
+        let mut trace = make_trace(vec![
+            step(9, 1, &[], None),
+            step(
+                10,
+                1,
+                &[],
+                Some(snapshot["memory"].as_str().unwrap().to_owned()),
+            ),
+        ]);
+        trace.input_data = snapshot["calldata"].as_str().unwrap().to_owned();
+        let variables = variables_for_step_at(&trace, &info, Some(&resources), 1);
+        assert_eq!(variables.len(), 2);
+        assert_eq!(variables[0].value, variables[1].value);
+        assert_eq!(variables[0].value.status, DebugValueStatus::Decoded);
+        assert_eq!(variables[0].value.display,
+            "{ point: { x: 7, y: -3 }, values: [11, 513], text: \"hello\", tag: 0x12345678, price: 42, color: Color.Green, callback: 0x1111111111111111111111111111111111111111abcdef01 }");
+    }
+
+    #[test]
     fn structured_postconditions_follow_taken_jumps() {
         let tables = json!({"types": {"u": {"kind": "uint", "bits": 256}, "b": {"kind": "bytes"}}, "pointers": {}});
         let resources = Resources::parse(&tables).unwrap();
