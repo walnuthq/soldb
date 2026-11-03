@@ -3,7 +3,7 @@
 # REQUIRES: soldb, compiler-solc, solc-ethdebug-resource-tables, optimization-none
 # RUN: rm -rf %t
 # RUN: mkdir -p %t
-# RUN: cd %S/../../fixtures/ethdebug-function-types && %solc FunctionTypes.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime --ethdebug-resources -o %t > %t/compile.stdout 2> %t/compile.stderr
+# RUN: cd %S/../../fixtures/ethdebug-function-types && %solc FunctionTypes.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime --ethdebug-resources --ethdebug-compilation -o %t > %t/compile.stdout 2> %t/compile.stderr
 # RUN: %soldb info resources --ethdebug-dir 0x1:FunctionTypes:%t --json > %t/resources.json
 # RUN: jq -c '.contracts[0].resources as $resources | $resources.types | to_entries[] | select(.value.kind == "function") | [.key, ($resources.types[.value.contains.parameters.type.id].contains | map(.type.id)), (if .value.contains | has("returns") then $resources.types[.value.contains.returns.type.id].contains | map(.type.id) else null end)]' %t/resources.json | FileCheck %s --check-prefix=SIGNATURE
 # SIGNATURE-DAG: ["t_function_external_nonpayable$__$returns$__$",[],null]

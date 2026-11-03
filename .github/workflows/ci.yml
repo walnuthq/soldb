@@ -360,7 +360,7 @@ jobs:
           # variable locations, so record whether this build emits them yet.
           out="$(mktemp -d)"
           "$SOLC_PATH" --via-ir --debug-info ethdebug,ast-id --experimental \
-            --ethdebug-program --ethdebug-program-runtime --ethdebug-resources \
+            --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --ethdebug-compilation \
             --bin --abi --overwrite -o "$out" examples/Counter.sol > /dev/null 2>&1 \
             || "$SOLC_PATH" --via-ir --debug-info ethdebug,ast-id \
               --ethdebug --ethdebug-runtime \

@@ -32,10 +32,10 @@ use soldb_debugger::{
     SourceFunction, SourceParam,
 };
 use soldb_ethdebug::{
-    encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-    function_selector, load_debug_program_with_sources, parse_contract_mapping,
-    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, EventRegistry,
-    SourceMapEnvironment,
+    encode_function_call, find_ethdebug_metadata, function_selector,
+    load_debug_program_with_sources, load_ethdebug_metadata, parse_contract_mapping,
+    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, EthdebugMetadata,
+    EventRegistry, SourceMapEnvironment,
 };
 use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
 use soldb_rpc::{RpcLog, TraceBackend};
@@ -861,6 +861,8 @@ struct InfoResourcesContractJson {
     name: String,
     debug_dir: String,
     resources: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compilation: Option<serde_json::Value>,
 }
 
 fn info_resources_command(args: &InfoResourcesArgs) -> SoldbResult<()> {
@@ -878,11 +880,13 @@ fn info_resources_command(args: &InfoResourcesArgs) -> SoldbResult<()> {
     let contracts = specs
         .iter()
         .map(|spec| {
+            let metadata = ethdebug_metadata_for_spec(spec)?;
             Ok(InfoResourcesContractJson {
                 address: spec.address.clone(),
                 name: spec.name.clone(),
                 debug_dir: spec.debug_dir.display().to_string(),
-                resources: ethdebug_resources_for_spec(spec)?,
+                resources: metadata.resources,
+                compilation: metadata.compilation,
             })
         })
         .collect::<SoldbResult<Vec<_>>>()?;
@@ -903,8 +907,8 @@ fn print_info_resources(contracts: &[InfoResourcesContractJson]) {
         }
         println!("Debug directory: {}", contract.debug_dir);
         if let Some(compiler) = contract
-            .resources
-            .get("compilation")
+            .compilation
+            .as_ref()
             .and_then(|compilation| compilation.get("compiler"))
         {
             let name = compiler
@@ -918,12 +922,15 @@ fn print_info_resources(contracts: &[InfoResourcesContractJson]) {
             println!("Compiler: {name} {version}");
         }
         let source_count = contract
-            .resources
-            .get("compilation")
+            .compilation
+            .as_ref()
             .and_then(|compilation| compilation.get("sources"))
             .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        println!("Sources: {source_count}");
+            .map(Vec::len);
+        match source_count {
+            Some(count) => println!("Sources: {count}"),
+            None => println!("Sources: unavailable (no compilation record)"),
+        }
         println!();
     }
 }
@@ -1894,6 +1901,7 @@ fn print_debugger_resources(source_index: &TraceSourceIndex, json_output: bool) 
         name: source_index.spec.name.clone(),
         debug_dir: source_index.spec.debug_dir.display().to_string(),
         resources: source_index.resources.clone(),
+        compilation: Some(source_index.debug.info.compilation.clone()),
     };
     if json_output {
         print_json(&InfoResourcesJson {
@@ -3407,13 +3415,15 @@ fn read_json_file(path: &Path) -> SoldbResult<serde_json::Value> {
     })
 }
 
-fn ethdebug_resources_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<serde_json::Value> {
-    if let Some(path) = find_ethdebug_metadata(&spec.debug_dir) {
-        let metadata = read_json_file(&path)?;
-        return ethdebug_resources_from_metadata(&path, &metadata);
+fn ethdebug_metadata_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<EthdebugMetadata> {
+    if let Some(metadata) = load_ethdebug_metadata(&spec.debug_dir)? {
+        return Ok(metadata);
     }
 
-    TraceSourceIndex::load(spec).map(|index| index.resources)
+    TraceSourceIndex::load(spec).map(|index| EthdebugMetadata {
+        resources: index.resources,
+        compilation: Some(index.debug.info.compilation),
+    })
 }
 
 fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::path::PathBuf> {
@@ -3476,14 +3486,12 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
         };
     }
 
-    let compiler = find_ethdebug_metadata(&spec.debug_dir)
-        .and_then(|ethdebug_json| read_json_file(&ethdebug_json).ok())
-        .and_then(|value| {
-            value
-                .get("compilation")
-                .and_then(|compilation| compilation.get("compiler"))
-                .cloned()
-        });
+    // Artifact load errors are reported by load_source_index; this is only the heading.
+    let compiler = load_ethdebug_metadata(&spec.debug_dir)
+        .ok()
+        .flatten()
+        .and_then(|metadata| metadata.compilation)
+        .and_then(|compilation| compilation.get("compiler").cloned());
     let compiler_name = compiler
         .as_ref()
         .and_then(|compiler| compiler.get("name"))
@@ -3623,17 +3631,20 @@ fn simulation_source_file(args: &SimulationView, contract_name: &str) -> Option<
     .into_iter()
     .find(|spec| spec.name == contract_name)
     .and_then(|spec| {
-        let ethdebug = find_ethdebug_metadata(&spec.debug_dir)?;
-        read_json_file(&ethdebug).ok().and_then(|value| {
-            value
-                .get("compilation")
-                .and_then(|compilation| compilation.get("sources"))
-                .and_then(serde_json::Value::as_array)
-                .and_then(|sources| sources.first())
-                .and_then(|source| source.get("path"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+        // Artifact load errors are reported by load_source_index; this is only the heading.
+        load_ethdebug_metadata(&spec.debug_dir)
+            .ok()
+            .flatten()
+            .and_then(|metadata| metadata.compilation)
+            .and_then(|compilation| {
+                compilation
+                    .get("sources")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|sources| sources.first())
+                    .and_then(|source| source.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
     })
 }
 

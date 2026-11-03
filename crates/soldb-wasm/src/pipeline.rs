@@ -39,11 +39,15 @@ pub struct ContractArtifacts {
     /// The parsed global ETHDebug resource file: `ethdebug.json` from older compilers,
     /// `ethdebug_resources.json` from modern ones.
     pub metadata: Value,
+    /// The separate `ethdebug_compilation.json`. Older artifacts can leave this out
+    /// and keep the compilation record in `metadata`.
+    #[serde(default)]
+    pub compilation: Option<Value>,
     /// The parsed program artifact the trace executed, normally
     /// `<name>_ethdebug-runtime.json`.
     pub program: Value,
     /// Source id to file contents. Ids left out fall back to the sources embedded in
-    /// `metadata`, when the compiler inlined them.
+    /// the compilation record, when the compiler inlined them.
     #[serde(default)]
     pub sources: BTreeMap<u64, String>,
     /// The contract ABI, copied into the web document when present.
@@ -197,13 +201,19 @@ fn load_artifacts(artifacts: ContractArtifacts) -> SoldbResult<LoadedArtifacts> 
     let ContractArtifacts {
         name,
         metadata,
+        compilation,
         program,
         mut sources,
         abi: _,
         address,
         storage_layout,
     } = artifacts;
-    let info = EthdebugInfo::from_artifacts(&name, "runtime", &metadata, &program)?;
+    let info = EthdebugInfo::from_artifacts(
+        &name,
+        "runtime",
+        compilation.as_ref().unwrap_or(&metadata),
+        &program,
+    )?;
     let resources = Resources::parse(&metadata).ok();
     let storage_layout = storage_layout
         .as_ref()
@@ -871,6 +881,24 @@ mod tests {
         trace
             .attach_ethdebug(&artifacts(true, None).to_string())
             .expect("attach");
+
+        assert_eq!(trace.session().source_contents[&0], SOURCE);
+        assert_eq!(step_at(&trace, 1).source.map(|span| span.line), Some(5));
+    }
+
+    #[test]
+    fn attaching_ethdebug_reads_a_separate_compilation() {
+        let mut trace = trace();
+        let mut input = artifacts(true, None);
+        let compilation = input["metadata"]
+            .as_object_mut()
+            .expect("metadata")
+            .remove("compilation")
+            .expect("compilation");
+        input["compilation"] = compilation;
+        trace
+            .attach_ethdebug(&input.to_string())
+            .expect("attach separate artifacts");
 
         assert_eq!(trace.session().source_contents[&0], SOURCE);
         assert_eq!(step_at(&trace, 1).source.map(|span| span.line), Some(5));

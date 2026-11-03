@@ -342,9 +342,11 @@ Artifacts produced per contract in the output directory:
 - `<Contract>_ethdebug-runtime.json` — runtime debug info; this is what PC-to-source
   mapping uses for an ordinary call.
 - `ethdebug.json` (legacy) / `ethdebug_resources.json` (modern) — the global resource
-  file listing sources. A compile removes whichever of the two it did not write, because
-  a directory holding both — one compiler's output on top of another's — gives a loader
-  no way to tell which describes the programs next to them.
+  file holding type and pointer tables. Older outputs also embed compilation here.
+- `ethdebug_compilation.json` — the compilation record, including compiler details,
+  source paths and contents. Newer compilers emit it only with `--ethdebug-compilation`.
+  A compile removes global metadata files it did not write, because files left by a
+  previous compiler may describe different programs.
 - `<Contract>.abi`, `<Contract>.bin` — ABI and bytecode.
 
 ### Compiler Channels
@@ -406,7 +408,8 @@ variable in its program-level context, which `test/compiler/resources/context.te
 
 **solc flag drift is a real, tested compatibility surface.** Older compilers accept
 `--ethdebug --ethdebug-runtime`; solc dropped those around 0.8.32 in favor of
-`--experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources`.
+`--experimental --ethdebug-program --ethdebug-program-runtime`, with
+`--ethdebug-resources --ethdebug-compilation` for the global records.
 `CompilerConfig::compile_with_ethdebug` tries the legacy flags and falls back on the
 modern ones *only* when solc reports an unrecognised option, deliberately avoiding a
 hardcoded version cutoff. CI runs the whole lit suite twice, once per flag generation

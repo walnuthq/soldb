@@ -121,14 +121,17 @@ its steps carry source spans and variables:
 {
   "name": "Counter",
   "metadata": { "...": "the parsed ethdebug.json or ethdebug_resources.json" },
+  "compilation": { "...": "the parsed ethdebug_compilation.json" },
   "program": { "...": "the parsed Counter_ethdebug-runtime.json" },
   "sources": { "0": "pragma solidity ^0.8.0; ..." },
   "abi": [ { "type": "function", "name": "increment", "...": "..." } ]
 }
 ```
 
-`name`, `metadata`, and `program` are required. `sources` maps ETHDebug source ids to
-file contents; any id it leaves out falls back to the source the compilation metadata
+`name`, `metadata`, and `program` are required. `compilation` holds the separate
+compilation record; older compilers embed it in `metadata`, so it can be omitted for
+those artifacts. `sources` maps ETHDebug source ids to file contents; any id it leaves
+out falls back to the source the compilation metadata
 embeds, when the compiler inlined it. `abi` is accepted but not required for stepping.
 `address` is where the contract is deployed, whose code holds its immutables; without it,
 the account whose storage a step runs in is used. `storageLayout` is the parsed
@@ -188,6 +191,7 @@ const trace = Trace.fromTransaction(
 const counter = {
   name: "Counter",
   metadata: JSON.parse(await file("out/ethdebug_resources.json")),
+  compilation: JSON.parse(await file("out/ethdebug_compilation.json")),
   program: JSON.parse(await file("out/Counter_ethdebug-runtime.json")),
   sources: { 0: await file("Counter.sol") },
   abi: JSON.parse(await file("out/Counter.abi")),

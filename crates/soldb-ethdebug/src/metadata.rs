@@ -543,8 +543,8 @@ pub struct EthdebugInfo {
 impl EthdebugInfo {
     /// Builds the debug info for one contract from already-parsed ETHDebug artifacts.
     ///
-    /// `metadata` is the global resource file (`ethdebug.json` from older compilers,
-    /// `ethdebug_resources.json` from modern ones) and `program` is the contract's
+    /// `metadata` is the compilation record (`ethdebug_compilation.json`), or an older
+    /// resource file with an embedded `compilation`, and `program` is the contract's
     /// program artifact (`<Contract>_ethdebug.json` for creation code,
     /// `<Contract>_ethdebug-runtime.json` for runtime code). Nothing is read from disk
     /// here, so the CLI, the DAP server, and any host that receives the artifacts as
