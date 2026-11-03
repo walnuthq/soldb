@@ -568,11 +568,16 @@ pub fn normalize_address(value: &str) -> String {
 /// compiler recorded relative ones), or just the file name.
 #[must_use]
 pub fn source_path_matches(source_path: &str, requested: &str) -> bool {
+    source_path_matches_by_path(source_path, requested)
+        || source_file_names_match(source_path, requested)
+}
+
+/// Whether a source path and a requested path end in the same file name.
+fn source_file_names_match(source_path: &str, requested: &str) -> bool {
     fn file_name(path: &str) -> &str {
         path.rsplit('/').next().unwrap_or(path)
     }
-    source_path_matches_by_path(source_path, requested)
-        || (!requested.is_empty() && file_name(source_path) == file_name(requested))
+    !requested.is_empty() && file_name(source_path) == file_name(requested)
 }
 
 /// Whether a source path matches by more than its file name: the whole path, or a trailing
@@ -2740,15 +2745,15 @@ impl StepMap {
         let mut by_name = Vec::<(usize, u64, String)>::new();
         for (contract_index, contract) in self.contracts.iter().enumerate() {
             for (source_id, path) in &contract.info.sources {
-                match file {
-                    None => sources.push((contract_index, *source_id, path.clone())),
-                    Some(file) if source_path_matches_by_path(path, file) => {
-                        sources.push((contract_index, *source_id, path.clone()));
-                    }
-                    Some(file) if source_path_matches(path, file) => {
-                        by_name.push((contract_index, *source_id, path.clone()));
-                    }
-                    Some(_) => {}
+                let source = (contract_index, *source_id, path.clone());
+                let Some(file) = file else {
+                    sources.push(source);
+                    continue;
+                };
+                if source_path_matches_by_path(path, file) {
+                    sources.push(source);
+                } else if source_file_names_match(path, file) {
+                    by_name.push(source);
                 }
             }
         }
@@ -3855,6 +3860,35 @@ contract P {
         assert!(frames[1].external);
         assert_eq!(frames[1].address.as_deref(), Some(CREATED));
         assert_eq!(map.frame_depth(4), Some(1));
+    }
+
+    #[test]
+    fn a_line_resolves_by_path_before_file_name() {
+        let mut real = contract(Some(ROOT));
+        real.info.sources = BTreeMap::from([(0, "src/Vault.sol".to_owned())]);
+        let mut mock = contract(Some(CREATED));
+        mock.info.sources = BTreeMap::from([(0, "test/mocks/Vault.sol".to_owned())]);
+        let map = StepMap::new(&outer_calls_inner(), vec![real, mock]);
+        let paths = |file: &str| {
+            map.resolve_line(Some(file), 4)
+                .expect(file)
+                .into_iter()
+                .map(|line| line.path)
+                .collect::<Vec<_>>()
+        };
+        // A file name, or a path that matches neither source by path, falls back to every
+        // source with that file name.
+        assert_eq!(
+            paths("Vault.sol"),
+            ["src/Vault.sol", "test/mocks/Vault.sol"]
+        );
+        assert_eq!(
+            paths("/elsewhere/Vault.sol"),
+            ["src/Vault.sol", "test/mocks/Vault.sol"]
+        );
+        // A path that matches one source by path resolves only there.
+        assert_eq!(paths("mocks/Vault.sol"), ["test/mocks/Vault.sol"]);
+        assert_eq!(paths("src/Vault.sol"), ["src/Vault.sol"]);
     }
 
     #[test]
