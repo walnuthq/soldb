@@ -211,7 +211,7 @@ jobs:
             exit 1
           fi
 
-          RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh
+          RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh -v
 
   lit-solc-develop:
     # Forward-looking compatibility run against the Solidity development branch, where
@@ -418,7 +418,7 @@ jobs:
             sleep 1
           done
 
-          RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh
+          RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh -v
 
   solar-main:
     # Like solc develop, this is an upstream compatibility signal, not a release gate.

@@ -678,10 +678,23 @@ impl Session {
             .as_ref()
             .zip(self.state.current_contract())
             .and_then(|(words, contract)| context_state_variables(contract, words));
+        let transient = match (transient_layout, transient_words.as_ref()) {
+            (Some(layout), Some(words)) => state_variables(layout, words)
+                .iter()
+                .map(transient_info)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
         let state = match (context_state, layout, words.as_ref()) {
             (Some(variables), _, _) => StateInfo::Variables {
                 variables: variables
                     .iter()
+                    // A context may include transient variables too. Their values
+                    // come from the transient tape and are already listed separately.
+                    .filter(|variable| {
+                        !variable.in_transient_storage
+                            || !transient.iter().any(|entry| entry.name == variable.name)
+                    })
                     .map(|variable| state_info(variable, chain_label))
                     .collect(),
             },
@@ -694,13 +707,6 @@ impl Session {
             },
             (None, Some(_), None) => StateInfo::NoStorage,
             (None, None, _) => StateInfo::NoLayout,
-        };
-        let transient = match (transient_layout, transient_words.as_ref()) {
-            (Some(layout), Some(words)) => state_variables(layout, words)
-                .iter()
-                .map(transient_info)
-                .collect(),
-            _ => Vec::new(),
         };
         Output::Variables {
             warning,

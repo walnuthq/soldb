@@ -1935,6 +1935,68 @@ contract C {
             .collect::<Vec<_>>();
         assert_eq!(shown, [("count", "7"), ("locked", "false")]);
 
+        // Newer compilers also list these in the program context. The transient
+        // layout supplies their values; do not show an unavailable copy in State.
+        let resources = json!({
+            "types": {
+                "t_uint256": {"kind": "uint", "bits": 256},
+                "t_bool": {"kind": "bool"}
+            },
+            "pointers": {
+                "transient-bool": {
+                    "expect": [],
+                    "for": {"location": "transient", "slot": 1, "offset": 31, "length": 1}
+                }
+            }
+        });
+        let program = json!({"context": {"variables": [
+            {"identifier": "count", "type": {"id": "t_uint256"},
+             "pointer": {"location": "storage", "slot": 0, "offset": 0, "length": 32}},
+            {"identifier": "count", "type": {"id": "t_uint256"},
+             "pointer": {"location": "transient", "slot": 0, "offset": 0, "length": 32}},
+            {"identifier": "locked", "type": {"id": "t_bool"},
+             "pointer": {"template": "transient-bool"}}
+        ]}});
+        let info =
+            soldb_ethdebug::EthdebugInfo::from_artifacts("Counter", "call", &resources, &program)
+                .expect("context");
+        let contracts = session
+            .state()
+            .step_map()
+            .expect("map")
+            .contracts()
+            .iter()
+            .cloned()
+            .map(|mut contract| {
+                contract.info.state_variables = info.state_variables.clone();
+                contract.resources =
+                    Some(soldb_ethdebug::Resources::parse(&resources).expect("resources"));
+                contract
+            })
+            .collect();
+        session.state_mut().attach_debug_info(contracts);
+        let [Output::Variables {
+            state, transient, ..
+        }] = &session.execute(DebuggerCommand::Vars)[..]
+        else {
+            panic!("vars with program context");
+        };
+        let StateInfo::Variables { variables } = state else {
+            panic!("state variables");
+        };
+        assert_eq!(
+            variables.len(),
+            1,
+            "keep a persistent variable with the same name"
+        );
+        assert_eq!(variables[0].name, "count");
+        assert_eq!(variables[0].place.as_deref(), Some("slot 0x0"));
+        let shown = transient
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(shown, [("count", "7"), ("locked", "false")]);
+
         // A trace recorded without it says so.
         let mut state = DebuggerState::new();
         state

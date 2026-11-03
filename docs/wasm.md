@@ -400,6 +400,10 @@ against a local `anvil`; `make wasm-live-test` runs it for you.
 tripwires for a dependency creeping in, not targets; raise one deliberately, in the same
 change that explains the growth.
 
+The lean budget is 625,000 bytes. Type/pointer parsing and program-context state
+decoding bring it to about 610 KB with Rust 1.99.1. The replay
+budget remains 1,250,000 bytes.
+
 Where the bytes go, from a build with symbol names kept:
 
 - In the lean package, about a third is `serde_json` deserializing the trace, RPC, and
