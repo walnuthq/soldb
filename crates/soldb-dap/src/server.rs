@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use soldb_core::{encode_hex, SoldbError, SoldbResult, TransactionTrace};
-use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo, StepLocation};
+use soldb_debugger::{
+    CachedChain, ChainRead, ChainStorage, CodeRead, ContractDebugInfo, StepLocation,
+};
 use soldb_ethdebug::{load_contract_mapping, load_debug_program, SourceMapEnvironment};
 use soldb_repl::{
     BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
@@ -79,6 +81,17 @@ fn chain_before_transaction(rpc_url: &str, tx_hash: &str) -> Option<ChainReader>
     let number = u64::from_str_radix(block.trim_start_matches("0x"), 16).ok()?;
     let parent = number.checked_sub(1)?;
     let block = format!("0x{parent:x}");
+    // Immutables live in the deployed code, read at the same block as the storage.
+    let read_code: CodeRead = {
+        let rpc_url = rpc_url.to_owned();
+        let block = block.clone();
+        Box::new(move |address: &str| {
+            soldb_rpc::code_at(&rpc_url, address, &block)
+                .ok()
+                .as_deref()
+                .and_then(soldb_debugger::code_from_hex)
+        })
+    };
     let rpc_url = rpc_url.to_owned();
     let read: ChainRead = Box::new(move |address: &str, slot: &[u8; 32]| {
         let value =
@@ -86,10 +99,13 @@ fn chain_before_transaction(rpc_url: &str, tx_hash: &str) -> Option<ChainReader>
                 .ok()?;
         soldb_ethdebug::parse_word(&value).ok()
     });
-    Some(CachedChain::new(
-        format!("the chain at block {parent}, before this transaction's block"),
-        read,
-    ))
+    Some(
+        CachedChain::new(
+            format!("the chain at block {parent}, before this transaction's block"),
+            read,
+        )
+        .with_code(read_code),
+    )
 }
 
 /// A source breakpoint as the editor sent it.
@@ -813,20 +829,37 @@ impl DapServer {
     }
 
     /// Every state variable of the contract executing at the current step, read through
-    /// its storage layout, followed by its `transient` ones.
+    /// its program context or storage layout, followed by its `transient` ones.
     fn state_variables(&self) -> Vec<Value> {
         let mut variables = Vec::new();
         let words = self
             .debugger
             .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage));
-        if let (Some(layout), Some(words)) = (self.debugger.storage_layout(), words) {
-            variables.extend(soldb_debugger::state_variables(layout, &words));
+        if let Some(words) = words {
+            if let Some(context_variables) = self
+                .debugger
+                .current_contract()
+                .and_then(|contract| soldb_debugger::context_state_variables(contract, &words))
+            {
+                variables.extend(context_variables);
+            } else if let Some(layout) = self.debugger.storage_layout() {
+                variables.extend(soldb_debugger::state_variables(layout, &words));
+            }
         }
         if let (Some(layout), Some(words)) = (
             self.debugger.transient_storage_layout(),
             self.debugger.transient_words(),
         ) {
-            variables.extend(soldb_debugger::state_variables(layout, &words));
+            for variable in soldb_debugger::state_variables(layout, &words) {
+                if let Some(existing) = variables
+                    .iter_mut()
+                    .find(|existing| existing.name == variable.name)
+                {
+                    *existing = variable;
+                } else {
+                    variables.push(variable);
+                }
+            }
         }
         variables
             .into_iter()
@@ -1125,13 +1158,16 @@ impl LoadedSource {
             })?;
         let name = program.info.contract_name.clone();
         let code_generator = program.code_generator();
+        // Tables a debugger cannot read leave the state to the storage layout.
+        let resources = program.resources_tables().ok();
         Ok(Self {
             root: root.to_path_buf(),
             source_files: program.source_files,
             contract: ContractDebugInfo::new(address, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
                 .with_storage_layout(program.storage_layout)
-                .with_transient_storage_layout(program.transient_storage_layout),
+                .with_transient_storage_layout(program.transient_storage_layout)
+                .with_resources(resources),
         })
     }
 }

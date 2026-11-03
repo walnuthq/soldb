@@ -516,10 +516,13 @@ DAP server as a `Return Data` scope.
 Both commands need the session to be started with
 `--ethdebug-dir <address>:<contract>:<dir>`, and they read two things from it.
 
-*Local* variables come from the ETHDebug variable information for the current program
-counter, shared with the DAP server's variables view, when the artifact carries any. A
-compiler only reports them if it emits `context.variables` in its ETHDebug output, and no
-compiler release does yet.
+*Local* variables come from compiler-reported ETHDebug records when the artifact carries
+them, shared with the DAP server's variables view. Structured `context.variables` use
+the type and pointer resources, including named lexical scopes and inlined instances.
+Their pointers describe the state after an instruction: at a trace stop we use the
+context of the actual previously executed instruction, including taken jumps. Missing
+locations or uncaptured machine state are unavailable. Older location records retain
+their input-state interpretation.
 
 Without them, soldb reads locals off the stack for code from solc's legacy pipeline. That
 code generator keeps every parameter, return parameter, and local at a fixed stack slot:
@@ -562,8 +565,17 @@ before it, and the body's locals start above all of them; a modifier resumed aft
 `_` keeps the slots it had. The variables of `try ... returns (...)` and `catch (...)`
 clauses belong to their clause blocks like any other local.
 
-A variable's word is the value for a value type and a pointer for a reference type, and
-the pointer is followed through the layout the language fixes for its data location:
+When ETHDebug provides type and pointer tables, a structured variable's pointer selects
+its layout template by pointer ID. The same type can have distinct storage, transient,
+memory and calldata templates. We bind the base slot or byte address from the variable's
+location record, then follow the template, including nested memory pointers and ABI
+offsets in calldata. We do not select a layout from a type ID alone. Scalar templates
+also describe padding and packed storage offsets; unavailable bytes remain unavailable.
+These tables do not supply missing variable locations or liveness information.
+
+For source-map-based decoding, a variable's word is the value for a value type and a
+pointer for a reference type. The pointer is followed through the layout the language
+fixes for its data location:
 
 ```text
 soldb> vars

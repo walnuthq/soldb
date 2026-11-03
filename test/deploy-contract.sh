@@ -184,6 +184,7 @@ if [ "$USE_ETHDEBUG" = true ] && [ $COMPILE_EXIT_CODE -ne 0 ] && grep -q "unreco
         --ethdebug-program
         --ethdebug-program-runtime
         --ethdebug-resources
+        --ethdebug-compilation
         --bin
         --abi
         --storage-layout

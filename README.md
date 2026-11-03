@@ -103,8 +103,11 @@ anvil --steps-tracing
 Compile with ETHDebug. Solidity 0.8.32 and later:
 
 ```bash
-solc --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --bin --abi --overwrite -o out examples/Counter.sol
+solc --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --ethdebug-compilation --bin --abi --overwrite -o out examples/Counter.sol
 ```
+
+Keep `ethdebug_compilation.json` next to the program and resource files. It supplies
+the compiler details and sources; older compilers embed that record in resources.
 
 Solidity 0.8.29 to 0.8.31 (later versions reject `--ethdebug` as an unrecognised option):
 

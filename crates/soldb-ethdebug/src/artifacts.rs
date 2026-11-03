@@ -1,8 +1,9 @@
 //! Finding and loading one contract's debug artifacts from a directory.
 //!
 //! An output directory holds the global resource file (`ethdebug.json` from older
-//! compilers, `ethdebug_resources.json` from modern ones), one program artifact per
-//! contract and environment (`<Contract>_ethdebug.json` for creation code,
+//! compilers, `ethdebug_resources.json` from modern ones), a compilation record
+//! (`ethdebug_compilation.json`, or embedded in older resource files), one program artifact
+//! per contract and environment (`<Contract>_ethdebug.json` for creation code,
 //! `<Contract>_ethdebug-runtime.json` for runtime code), and, for compilers that predate
 //! ETHDebug, a `combined.json` with legacy source maps. [`load_debug_program`] is the one
 //! path through all of that: ETHDebug first, the legacy map as a fallback, and the
@@ -19,6 +20,7 @@ use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
 use crate::metadata::{read_compilation_source, EthdebugInfo};
+use crate::resources::Resources;
 use crate::source_map::{load_source_map_program_with_sources, SourceMapEnvironment};
 use crate::storage_layout::StorageLayout;
 
@@ -39,7 +41,7 @@ pub enum CodeGenerator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugProgram {
     pub info: EthdebugInfo,
-    /// The ETHDebug resources record: the compilation, types, and pointers.
+    /// The ETHDebug resources record: types and pointers, plus compilation on older compilers.
     pub resources: Value,
     /// Source text by source id, for every source that could be read.
     pub source_contents: BTreeMap<u64, String>,
@@ -57,6 +59,15 @@ pub struct DebugProgram {
 }
 
 impl DebugProgram {
+    /// The type and pointer tables of the resources, parsed. A compiler that does not
+    /// fill them yet gives empty tables; tables that do not follow the schemas are an
+    /// error, reported when a frontend first needs them rather than when the program is
+    /// loaded, so that a program whose resources a debugger cannot read entirely still
+    /// steps through its code.
+    pub fn resources_tables(&self) -> SoldbResult<Resources> {
+        Resources::parse(&self.resources)
+    }
+
     /// The code generator the program came from. A legacy `srcmap` is taken to come from
     /// the legacy pipeline, which is the only one that emits nothing else; ETHDebug comes
     /// from solc's via-IR pipeline or from a compiler built on IR.
@@ -233,10 +244,15 @@ pub fn read_json_file(path: &Path) -> SoldbResult<Value> {
 }
 
 /// The resources record of an ETHDebug metadata file: its `resources` entry when it has
-/// one, otherwise one assembled from the compilation, types, and pointers it carries.
+/// one, the standalone tables otherwise, or one assembled from older embedded records.
 pub fn ethdebug_resources_from_metadata(path: &Path, metadata: &Value) -> SoldbResult<Value> {
     if let Some(resources) = metadata.get("resources") {
         return Ok(resources.clone());
+    }
+    if metadata.get("compilation").is_none()
+        && (metadata.get("types").is_some() || metadata.get("pointers").is_some())
+    {
+        return Ok(metadata.clone());
     }
 
     let Some(compilation) = metadata.get("compilation") else {
@@ -250,6 +266,45 @@ pub fn ethdebug_resources_from_metadata(path: &Path, metadata: &Value) -> SoldbR
         "compilation": compilation,
         "types": metadata.get("types").cloned().unwrap_or_else(|| json!({})),
         "pointers": metadata.get("pointers").cloned().unwrap_or_else(|| json!({})),
+    }))
+}
+
+/// The resource tables and the compilation record loaded from an artifact directory.
+/// Older compilers embed the compilation in resources; newer ones write it separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EthdebugMetadata {
+    pub resources: Value,
+    pub compilation: Option<Value>,
+}
+
+/// Loads the resource tables and compilation record from the global artifact files.
+/// Uses an embedded compilation when present, ignoring separate files left by another compiler.
+pub fn load_ethdebug_metadata(root: &Path) -> SoldbResult<Option<EthdebugMetadata>> {
+    let Some(path) = find_ethdebug_metadata(root) else {
+        return Ok(None);
+    };
+    let metadata = read_json_file(&path)?;
+    let resources = ethdebug_resources_from_metadata(&path, &metadata)?;
+    let compilation = metadata
+        .get("compilation")
+        .or_else(|| resources.get("compilation"))
+        .cloned();
+    let compilation_path = root.join("ethdebug_compilation.json");
+    let compilation = if compilation.is_none() && compilation_path.exists() {
+        let record = read_json_file(&compilation_path)?;
+        if !record.get("sources").is_some_and(Value::is_array) {
+            return Err(SoldbError::Message(format!(
+                "ETHDebug compilation `{}` must contain a `sources` array",
+                compilation_path.display()
+            )));
+        }
+        Some(record)
+    } else {
+        compilation
+    };
+    Ok(Some(EthdebugMetadata {
+        resources,
+        compilation,
     }))
 }
 
@@ -284,28 +339,32 @@ pub fn load_debug_program_with_sources(
         SourceMapEnvironment::Runtime => "call",
     };
     if let Some(program_path) = find_program_ethdebug(root, contract_name, environment) {
-        let metadata_path = find_ethdebug_metadata(root).ok_or_else(|| {
+        let metadata = load_ethdebug_metadata(root)?.ok_or_else(|| {
             SoldbError::Message(format!(
                 "No ETHDebug metadata file (ethdebug.json or ethdebug_resources.json) found in {}",
                 root.display()
             ))
         })?;
-        let metadata = read_json_file(&metadata_path)?;
         let program = read_json_file(&program_path)?;
-        let resources = ethdebug_resources_from_metadata(&metadata_path, &metadata)?;
+        let compilation = metadata.compilation.ok_or_else(|| {
+            SoldbError::Message(format!(
+                "no ETHDebug compilation record in `{}`; compile with `--ethdebug-compilation` and keep `ethdebug_compilation.json` next to the program artifacts",
+                root.display()
+            ))
+        })?;
         let name = if contract_name.is_empty() {
             contract_name_from_program_path(&program_path, environment)
                 .unwrap_or_else(|| "Contract".to_owned())
         } else {
             contract_name.to_owned()
         };
-        let info = EthdebugInfo::from_artifacts(&name, environment_name, &metadata, &program)
+        let info = EthdebugInfo::from_artifacts(&name, environment_name, &compilation, &program)
             .map_err(|error| SoldbError::Message(format!("{}: {error}", program_path.display())))?;
         let storage_layout = load_storage_layout(root, &info.contract_name)?;
         let transient_storage_layout = load_transient_storage_layout(root, &info.contract_name)?;
         let mut program = DebugProgram {
             info,
-            resources,
+            resources: metadata.resources,
             source_contents: BTreeMap::new(),
             source_files: BTreeMap::new(),
             legacy: false,
@@ -444,7 +503,7 @@ mod tests {
 
     use super::{
         contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-        find_program_ethdebug, load_debug_program, load_storage_layout,
+        find_program_ethdebug, load_debug_program, load_ethdebug_metadata, load_storage_layout,
         load_transient_storage_layout, read_debug_source, read_json_file,
     };
     use crate::source_map::SourceMapEnvironment;
@@ -662,6 +721,94 @@ mod tests {
                 .expect("load")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn loads_separate_compilation_without_changing_resources() {
+        let dir = temp_dir("separate-compilation");
+        let resources =
+            json!({"types": {"t_uint256": {"kind": "uint", "bits": 256}}, "pointers": {}});
+        let source = "contract Counter { uint256 value; }";
+        let compilation = json!({
+            "id": "compilation-1",
+            "compiler": {"name": "solc", "version": "0.8.38"},
+            "sources": [{"id": 0, "path": "Counter.sol", "contents": source}]
+        });
+        fs::write(dir.join("ethdebug_resources.json"), resources.to_string()).expect("resources");
+        fs::write(
+            dir.join("ethdebug_compilation.json"),
+            compilation.to_string(),
+        )
+        .expect("compilation");
+        fs::write(
+            dir.join("Counter_ethdebug-runtime.json"),
+            json!({"instructions": []}).to_string(),
+        )
+        .expect("program");
+
+        let program = load_debug_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect("load")
+            .expect("present");
+        assert_eq!(program.resources, resources);
+        assert_eq!(program.info.compilation, compilation);
+        assert_eq!(program.info.sources[&0], "Counter.sol");
+        assert_eq!(program.source_contents[&0], source);
+        assert!(
+            program.source_files.is_empty(),
+            "no source file exists on disk"
+        );
+        assert!(program.missing_sources.is_empty());
+        assert!(program
+            .resources_tables()
+            .expect("tables")
+            .types
+            .contains_key("t_uint256"));
+
+        fs::remove_file(dir.join("ethdebug_compilation.json")).expect("remove compilation");
+        assert!(load_ethdebug_metadata(&dir)
+            .expect("resource tables alone")
+            .expect("present")
+            .compilation
+            .is_none());
+        let error = load_debug_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+            .expect_err("missing compilation");
+        assert!(
+            error.to_string().contains("--ethdebug-compilation"),
+            "{error}"
+        );
+
+        for invalid in ["not JSON", "{}", "[]", "{\"sources\":null}"] {
+            fs::write(dir.join("ethdebug_compilation.json"), invalid).expect("invalid compilation");
+            let error = load_debug_program(&dir, "Counter", SourceMapEnvironment::Runtime)
+                .expect_err("invalid compilation");
+            assert!(
+                error.to_string().contains("ethdebug_compilation.json"),
+                "{error}"
+            );
+        }
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn embedded_compilation_takes_precedence_over_a_separate_file() {
+        let dir = temp_dir("embedded-compilation");
+        let compilation = json!({"sources": [{"id": 0, "path": "Original.sol"}]});
+        for metadata in [
+            json!({"compilation": compilation}),
+            json!({"resources": {"types": {}, "pointers": {}}, "compilation": compilation}),
+        ] {
+            fs::write(dir.join("ethdebug_resources.json"), metadata.to_string()).expect("metadata");
+            fs::write(dir.join("ethdebug_compilation.json"), "unrelated file")
+                .expect("separate file");
+            assert_eq!(
+                load_ethdebug_metadata(&dir)
+                    .expect("load")
+                    .expect("present")
+                    .compilation,
+                Some(compilation.clone())
+            );
+        }
+        fs::remove_dir_all(&dir).expect("clean up");
     }
 
     #[test]

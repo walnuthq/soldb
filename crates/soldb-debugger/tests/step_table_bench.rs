@@ -67,6 +67,7 @@ fn contract() -> ContractDebugInfo {
         ],
         sources: BTreeMap::from([(0, "C.sol".to_owned())]),
         variable_locations: BTreeMap::new(),
+        state_variables: Vec::new(),
     };
     ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]))
 }

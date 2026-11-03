@@ -8,8 +8,8 @@
 
 use soldb_core::encode_hex;
 use soldb_debugger::{
-    state_value, state_variables, ChainStorage, DebugValueStatus, DebugVariable, StateSource,
-    StateVariable, StorageWords, INFERRED_LOCALS_WARNING,
+    context_state_variables, state_value, state_variables, ChainStorage, DebugValueStatus,
+    DebugVariable, KnownCode, StateSource, StateVariable, StorageWords, INFERRED_LOCALS_WARNING,
 };
 
 use crate::command::{command_spec, CommandGroup, COMMANDS};
@@ -38,6 +38,8 @@ pub const LISTING_RADIUS: u64 = 5;
 pub struct Session {
     state: DebuggerState,
     chain: Option<Box<dyn ChainStorage>>,
+    /// Deployed code the frontend has without a chain, such as a local deployment's.
+    known_code: Option<KnownCode>,
     locals_warning_shown: bool,
     arguments_warning_shown: bool,
 }
@@ -61,9 +63,18 @@ impl Session {
         Self {
             state,
             chain: None,
+            known_code: None,
             locals_warning_shown: false,
             arguments_warning_shown: false,
         }
+    }
+
+    /// Reads the deployed code of the contracts, which holds their immutables, from
+    /// `known_code` before asking the chain.
+    #[must_use]
+    pub fn with_known_code(mut self, known_code: Option<KnownCode>) -> Self {
+        self.known_code = known_code;
+        self
     }
 
     /// Reads storage slots the trace never touched from `chain`.
@@ -86,7 +97,9 @@ impl Session {
     /// trace never touched when a chain is attached.
     #[must_use]
     pub fn storage_words(&self) -> Option<StorageWords<'_>> {
-        self.state.storage_words_with_chain(self.chain.as_deref())
+        self.state
+            .storage_words_with_chain(self.chain.as_deref())
+            .map(|words| words.with_known_code(self.known_code.as_ref()))
     }
 
     /// What was loaded: the trace's size and the contracts with sources.
@@ -659,23 +672,41 @@ impl Session {
             };
         }
 
-        let state = match (layout, words.as_ref()) {
-            (Some(layout), _) if layout.variables.is_empty() => StateInfo::None,
-            (Some(layout), Some(words)) => StateInfo::Variables {
+        // The compiler's own description of the state, when it gives one; the storage
+        // layout otherwise.
+        let context_state = words
+            .as_ref()
+            .zip(self.state.current_contract())
+            .and_then(|(words, contract)| context_state_variables(contract, words));
+        let transient = match (transient_layout, transient_words.as_ref()) {
+            (Some(layout), Some(words)) => state_variables(layout, words)
+                .iter()
+                .map(transient_info)
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let state = match (context_state, layout, words.as_ref()) {
+            (Some(variables), _, _) => StateInfo::Variables {
+                variables: variables
+                    .iter()
+                    // A context may include transient variables too. Their values
+                    // come from the transient tape and are already listed separately.
+                    .filter(|variable| {
+                        !variable.in_transient_storage
+                            || !transient.iter().any(|entry| entry.name == variable.name)
+                    })
+                    .map(|variable| state_info(variable, chain_label))
+                    .collect(),
+            },
+            (None, Some(layout), _) if layout.variables.is_empty() => StateInfo::None,
+            (None, Some(layout), Some(words)) => StateInfo::Variables {
                 variables: state_variables(layout, words)
                     .iter()
                     .map(|variable| state_info(variable, chain_label))
                     .collect(),
             },
-            (Some(_), None) => StateInfo::NoStorage,
-            (None, _) => StateInfo::NoLayout,
-        };
-        let transient = match (transient_layout, transient_words.as_ref()) {
-            (Some(layout), Some(words)) => state_variables(layout, words)
-                .iter()
-                .map(transient_info)
-                .collect(),
-            _ => Vec::new(),
+            (None, Some(_), None) => StateInfo::NoStorage,
+            (None, None, _) => StateInfo::NoLayout,
         };
         Output::Variables {
             warning,
@@ -778,7 +809,9 @@ fn local_info(variable: &DebugVariable) -> VariableInfo {
 }
 
 fn state_info(variable: &StateVariable, chain_label: Option<&str>) -> VariableInfo {
-    let mut place = if variable.offset == 0 {
+    let mut place = if variable.in_code {
+        format!("code {}", variable.slot)
+    } else if variable.offset == 0 {
         format!("slot {}", variable.slot)
     } else {
         format!("slot {} + {}", variable.slot, variable.offset)

@@ -39,8 +39,8 @@ pub use session::{
     breakpoint_lines, Session, FRAME_ARGUMENTS_NOTE, FRAME_ARGUMENTS_WARNING, LISTING_RADIUS,
 };
 use soldb_debugger::{
-    call_target, check_root_calls, normalize_address, variables_for_step, ChainStorage, Condition,
-    ConditionContext, ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState,
+    call_target, check_root_calls, normalize_address, variables_for_step_at, ChainStorage,
+    Condition, ConditionContext, ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState,
     LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
     StorageLayout, StorageTape, StorageWords,
 };
@@ -343,11 +343,13 @@ impl DebuggerState {
     /// compiled with one.
     #[must_use]
     pub fn storage_layout(&self) -> Option<&StorageLayout> {
-        self.step_map
-            .as_ref()?
-            .contract_at_step(self.current_step)?
-            .storage_layout
-            .as_ref()
+        self.current_contract()?.storage_layout.as_ref()
+    }
+
+    /// The debug info of the contract executing at the current step.
+    #[must_use]
+    pub fn current_contract(&self) -> Option<&ContractDebugInfo> {
+        self.step_map.as_ref()?.contract_at_step(self.current_step)
     }
 
     /// The layout of the `transient` state variables of the contract executing at the
@@ -956,7 +958,12 @@ impl DebuggerState {
         };
         if contract.info.has_variable_locations() {
             return Ok(StepVariables {
-                variables: variables_for_step(trace, &contract.info, self.current_step),
+                variables: variables_for_step_at(
+                    trace,
+                    &contract.info,
+                    contract.resources.as_ref(),
+                    self.current_step,
+                ),
                 origin: VariablesOrigin::Ethdebug,
             });
         }
@@ -1806,6 +1813,7 @@ contract C {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
@@ -1921,6 +1929,68 @@ contract C {
             panic!("vars");
         };
         assert_eq!(*state, StateInfo::NoLayout);
+        let shown = transient
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(shown, [("count", "7"), ("locked", "false")]);
+
+        // Newer compilers also list these in the program context. The transient
+        // layout supplies their values; do not show an unavailable copy in State.
+        let resources = json!({
+            "types": {
+                "t_uint256": {"kind": "uint", "bits": 256},
+                "t_bool": {"kind": "bool"}
+            },
+            "pointers": {
+                "transient-bool": {
+                    "expect": [],
+                    "for": {"location": "transient", "slot": 1, "offset": 31, "length": 1}
+                }
+            }
+        });
+        let program = json!({"context": {"variables": [
+            {"identifier": "count", "type": {"id": "t_uint256"},
+             "pointer": {"location": "storage", "slot": 0, "offset": 0, "length": 32}},
+            {"identifier": "count", "type": {"id": "t_uint256"},
+             "pointer": {"location": "transient", "slot": 0, "offset": 0, "length": 32}},
+            {"identifier": "locked", "type": {"id": "t_bool"},
+             "pointer": {"template": "transient-bool"}}
+        ]}});
+        let info =
+            soldb_ethdebug::EthdebugInfo::from_artifacts("Counter", "call", &resources, &program)
+                .expect("context");
+        let contracts = session
+            .state()
+            .step_map()
+            .expect("map")
+            .contracts()
+            .iter()
+            .cloned()
+            .map(|mut contract| {
+                contract.info.state_variables = info.state_variables.clone();
+                contract.resources =
+                    Some(soldb_ethdebug::Resources::parse(&resources).expect("resources"));
+                contract
+            })
+            .collect();
+        session.state_mut().attach_debug_info(contracts);
+        let [Output::Variables {
+            state, transient, ..
+        }] = &session.execute(DebuggerCommand::Vars)[..]
+        else {
+            panic!("vars with program context");
+        };
+        let StateInfo::Variables { variables } = state else {
+            panic!("state variables");
+        };
+        assert_eq!(
+            variables.len(),
+            1,
+            "keep a persistent variable with the same name"
+        );
+        assert_eq!(variables[0].name, "count");
+        assert_eq!(variables[0].place.as_deref(), Some("slot 0x0"));
         let shown = transient
             .iter()
             .map(|variable| (variable.name.as_str(), variable.value.as_str()))
@@ -2207,6 +2277,7 @@ contract C {
                 ],
                 sources: BTreeMap::from([(0, "C.sol".to_owned())]),
                 variable_locations: BTreeMap::new(),
+                state_variables: Vec::new(),
             };
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]))
                 .with_code_generator(code_generator)
@@ -2349,6 +2420,7 @@ contract C {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]))

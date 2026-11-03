@@ -124,6 +124,21 @@ impl Trace {
         self.inner.step_json(index).map_err(js_error)
     }
 
+    /// Supplies the deployed code of `address`, as `eth_getCode` returns it, which holds
+    /// the values of the contract's immutables. Call it before `state`.
+    #[wasm_bindgen(js_name = provideCode)]
+    pub fn provide_code(&mut self, address: &str, code: &str) -> Result<(), JsError> {
+        self.inner.provide_code(address, code).map_err(js_error)
+    }
+
+    /// The attached contract's state at one step as JSON (see [`pipeline::StateDocument`]):
+    /// its state variables with their values, read through the pointers of the
+    /// program-level context when the compiler gave one, through the storage layout
+    /// otherwise. `undefined` past the end of the trace.
+    pub fn state(&self, index: usize) -> Result<Option<String>, JsError> {
+        self.inner.state_json(index).map_err(js_error)
+    }
+
     /// The trace's header as JSON (see [`pipeline::TraceSummary`]): hash, parties,
     /// gas, status, backend, capabilities, step count, and the attached debug info.
     pub fn summary(&self) -> Result<String, JsError> {

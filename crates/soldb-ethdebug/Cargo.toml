@@ -14,6 +14,8 @@ categories.workspace = true
 doctest = false
 
 [dependencies]
+# 256-bit arithmetic for pointer expressions; the same `U256` `soldb-evm` uses for wei.
+ruint = { version = "1.18", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 soldb-core.workspace = true

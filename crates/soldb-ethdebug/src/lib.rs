@@ -13,6 +13,10 @@
 //! - [`abi`] encodes calldata and parses function signatures, including tuples and
 //!   arrays, and carries the keccak-256 implementation used to derive selectors.
 //! - [`events`] decodes logs against event ABIs.
+//! - [`resources`] reads the type and pointer tables of the ETHDebug resources: what a
+//!   type looks like and where each state variable lives, as the compiler wrote them.
+//! - [`pointers`] dereferences those pointers against a recorded machine state into the
+//!   regions they name, and reads the bytes there.
 //!
 //! Everything decoded here comes from files or from chain data, so it is untrusted:
 //! offsets and lengths read out of an artifact or a log payload are validated rather
@@ -23,6 +27,8 @@ pub mod artifacts;
 pub mod events;
 pub mod metadata;
 pub mod opcodes;
+pub mod pointers;
+pub mod resources;
 pub mod source_map;
 pub mod storage_layout;
 
@@ -34,20 +40,26 @@ pub use abi::{
 pub use artifacts::{
     contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
     find_program_ethdebug, load_contract_mapping, load_debug_program,
-    load_debug_program_with_sources, load_storage_layout, load_transient_storage_layout,
-    parse_contract_mapping, read_debug_source, read_json_file, source_candidates, CodeGenerator,
-    ContractMapping, DebugProgram,
+    load_debug_program_with_sources, load_ethdebug_metadata, load_storage_layout,
+    load_transient_storage_layout, parse_contract_mapping, read_debug_source, read_json_file,
+    source_candidates, CodeGenerator, ContractMapping, DebugProgram, EthdebugMetadata,
 };
 pub use events::{
     event_signature, event_topic, parse_event_abis, DecodedEvent, DecodedEventArg, EventAbi,
     EventParam, EventRegistry, EventRegistryEntry,
 };
 pub use metadata::{
-    parse_compilation_sources, parse_ethdebug_spec, parse_multi_contract_spec,
-    parse_single_contract_spec, parse_variable_locations, read_compilation_source, source_range,
-    EthdebugInfo, EthdebugSpec, FunctionExit, FunctionIdentity, Instruction, SourceLocation,
-    SourceMapContext, SourceMapJump, VariableLocation,
+    parse_compilation_sources, parse_context_variables, parse_ethdebug_spec,
+    parse_multi_contract_spec, parse_single_contract_spec, parse_variable_locations,
+    read_compilation_source, source_range, ContextVariable, EthdebugInfo, EthdebugSpec,
+    FunctionExit, FunctionIdentity, Instruction, SourceLocation, SourceMapContext, SourceMapJump,
+    VariableLocation,
 };
+pub use pointers::{
+    dereference, dereference_pointer, is_identifier, read_region, Expression, Location, Machine,
+    Pointer, PointerTemplate, Property, Region, RegionPointer, StorageMachine, WordReader,
+};
+pub use resources::{Definition, Member, Resources, StateValue, TypeDocument, TypeReference};
 pub use source_map::{
     build_pc_to_instruction_map, is_legacy_compiler, load_source_map_program,
     load_source_map_program_with_sources, parse_srcmap, SourceMapEntry, SourceMapEnvironment,

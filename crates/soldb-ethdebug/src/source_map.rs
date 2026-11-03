@@ -326,6 +326,7 @@ fn source_map_program_from_combined(
         instructions,
         sources,
         variable_locations: BTreeMap::new(),
+        state_variables: Vec::new(),
     };
 
     let storage_layout = combined_layout(contract, "storage-layout", artifact_path, contract_key)?;

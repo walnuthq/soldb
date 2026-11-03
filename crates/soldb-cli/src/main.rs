@@ -28,13 +28,14 @@ use soldb_core::{
     encode_hex, opcode, EvmWord, ExecutionLog, SoldbResult, StepView, TransactionTrace,
 };
 use soldb_debugger::{
-    CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam,
+    code_from_hex, CachedChain, ChainRead, ChainStorage, CodeRead, ContractDebugInfo, KnownCode,
+    SourceFunction, SourceParam,
 };
 use soldb_ethdebug::{
-    encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-    function_selector, load_debug_program_with_sources, parse_contract_mapping,
-    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, EventRegistry,
-    SourceMapEnvironment,
+    encode_function_call, find_ethdebug_metadata, function_selector,
+    load_debug_program_with_sources, load_ethdebug_metadata, parse_contract_mapping,
+    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, EthdebugMetadata,
+    EventRegistry, SourceMapEnvironment,
 };
 use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
 use soldb_rpc::{RpcLog, TraceBackend};
@@ -497,6 +498,9 @@ struct SimulationView {
     /// its end state is exactly what the call started from. `None` when the call ran at a
     /// position inside a block, where neither that block nor its parent is that state.
     chain_block: Option<Option<u64>>,
+    /// The deployed code of a local run's contract, which holds its immutables: there is
+    /// no chain to read it from.
+    known_code: Option<KnownCode>,
 }
 
 impl SimulationView {
@@ -510,6 +514,7 @@ impl SimulationView {
                 .tx_index
                 .is_none_or(|index| index == 0)
                 .then_some(args.block),
+            known_code: None,
             contract_address: contract_address.to_owned(),
             function_signature: args.function_signature.clone(),
             function_args: args.function_args.clone(),
@@ -531,6 +536,7 @@ impl SimulationView {
             rpc_url: None,
             replayed_from: None,
             chain_block: None,
+            known_code: None,
             contract_address: contract_address.to_owned(),
             function_signature: args.function_signature.clone(),
             function_args: args.function_args.clone(),
@@ -563,6 +569,7 @@ impl SimulationView {
             rpc_url: None,
             replayed_from: Some(file.to_path_buf()),
             chain_block: None,
+            known_code: None,
             contract_address: request.to_addr.clone(),
             function_signature: None,
             function_args: Vec::new(),
@@ -854,6 +861,8 @@ struct InfoResourcesContractJson {
     name: String,
     debug_dir: String,
     resources: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compilation: Option<serde_json::Value>,
 }
 
 fn info_resources_command(args: &InfoResourcesArgs) -> SoldbResult<()> {
@@ -871,11 +880,13 @@ fn info_resources_command(args: &InfoResourcesArgs) -> SoldbResult<()> {
     let contracts = specs
         .iter()
         .map(|spec| {
+            let metadata = ethdebug_metadata_for_spec(spec)?;
             Ok(InfoResourcesContractJson {
                 address: spec.address.clone(),
                 name: spec.name.clone(),
                 debug_dir: spec.debug_dir.display().to_string(),
-                resources: ethdebug_resources_for_spec(spec)?,
+                resources: metadata.resources,
+                compilation: metadata.compilation,
             })
         })
         .collect::<SoldbResult<Vec<_>>>()?;
@@ -896,8 +907,8 @@ fn print_info_resources(contracts: &[InfoResourcesContractJson]) {
         }
         println!("Debug directory: {}", contract.debug_dir);
         if let Some(compiler) = contract
-            .resources
-            .get("compilation")
+            .compilation
+            .as_ref()
             .and_then(|compilation| compilation.get("compiler"))
         {
             let name = compiler
@@ -911,12 +922,15 @@ fn print_info_resources(contracts: &[InfoResourcesContractJson]) {
             println!("Compiler: {name} {version}");
         }
         let source_count = contract
-            .resources
-            .get("compilation")
+            .compilation
+            .as_ref()
             .and_then(|compilation| compilation.get("sources"))
             .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        println!("Sources: {source_count}");
+            .map(Vec::len);
+        match source_count {
+            Some(count) => println!("Sources: {count}"),
+            None => println!("Sources: unavailable (no compilation record)"),
+        }
         println!();
     }
 }
@@ -1123,7 +1137,13 @@ fn present_trace(view: &TraceView, trace: TransactionTrace) -> SoldbResult<()> {
     save_trace(view.save_trace.as_deref(), &trace)?;
     if view.session.wanted(view.interactive) {
         let source_indexes = interactive_trace_source_indexes(view, &trace);
-        run_debugger_session(trace, source_indexes, view.chain_storage(), &view.session)?;
+        run_debugger_session(
+            trace,
+            source_indexes,
+            view.chain_storage(),
+            None,
+            &view.session,
+        )?;
     } else if view.json {
         return Err(json_needs_session());
     } else if view.raw {
@@ -1255,7 +1275,13 @@ fn present_simulation(
             );
         }
         let source_indexes = interactive_simulation_source_indexes(view, contract_address);
-        run_debugger_session(trace, source_indexes, view.chain_storage(), &view.session)?;
+        run_debugger_session(
+            trace,
+            source_indexes,
+            view.chain_storage(),
+            view.known_code.clone(),
+            &view.session,
+        )?;
     } else if view.json {
         return Err(json_needs_session());
     } else if view.raw {
@@ -1320,6 +1346,13 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         chain = chain.with_storage(&contract_address, slot.trim(), value.trim())?;
     }
 
+    // The deployed code holds the values of the immutables: the bytes installed as they
+    // are, or what the constructor returned.
+    let mut deployed_code = if args.runtime {
+        code_from_hex(&bytecode)
+    } else {
+        None
+    };
     // Before saying the contract is there: a constructor that reverted leaves no code,
     // and the call would run against an empty account. The constructor runs again as the
     // call's prefix, which for a local run costs less than reporting a deployment that
@@ -1327,6 +1360,7 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
     if !args.runtime && !args.deploy {
         if let Some(deployment) = prefix.first() {
             let deployed = chain.deploy(deployment)?;
+            deployed_code = code_from_hex(&deployed.output);
             if !deployed.success {
                 let reason = deployed
                     .error
@@ -1346,7 +1380,8 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         }
     }
 
-    let view = SimulationView::for_run(args, &contract_address);
+    let mut view = SimulationView::for_run(args, &contract_address);
+    view.known_code = deployed_code.map(|code| KnownCode::default().with(&contract_address, code));
     let contract_name = simulate_contract_name(&view);
     if !args.json {
         let what = if args.runtime {
@@ -1653,6 +1688,17 @@ impl NodeStorage {
     }
 
     fn reader(rpc_url: &str, block: String, label: String) -> ChainReader {
+        // Immutables live in the deployed code, read at the same block as the storage.
+        let read_code: CodeRead = {
+            let rpc_url = rpc_url.to_owned();
+            let block = block.clone();
+            Box::new(move |address: &str| {
+                soldb_rpc::code_at(&rpc_url, address, &block)
+                    .ok()
+                    .as_deref()
+                    .and_then(code_from_hex)
+            })
+        };
         let rpc_url = rpc_url.to_owned();
         let read: ChainRead = Box::new(move |address: &str, slot: &[u8; 32]| {
             match soldb_rpc::storage_at(&rpc_url, address, &soldb_ethdebug::word_hex(slot), &block)
@@ -1668,7 +1714,7 @@ impl NodeStorage {
                 }
             }
         });
-        CachedChain::new(label, read)
+        CachedChain::new(label, read).with_code(read_code)
     }
 }
 
@@ -1731,6 +1777,7 @@ fn run_debugger_session(
     trace: TransactionTrace,
     source_indexes: Vec<TraceSourceIndex>,
     chain: Option<ChainReader>,
+    known_code: Option<KnownCode>,
     options: &SessionOptions,
 ) -> SoldbResult<()> {
     let mut state = DebuggerState::new();
@@ -1741,8 +1788,9 @@ fn run_debugger_session(
             .map(|index| index.debug.clone())
             .collect(),
     );
-    let mut session =
-        Session::new(state).with_chain(chain.map(|chain| Box::new(chain) as Box<dyn ChainStorage>));
+    let mut session = Session::new(state)
+        .with_chain(chain.map(|chain| Box::new(chain) as Box<dyn ChainStorage>))
+        .with_known_code(known_code);
     let renderer = Renderer::new(colors_enabled());
     let json = options.json;
     let terminal = io::stdin().is_terminal();
@@ -1853,6 +1901,7 @@ fn print_debugger_resources(source_index: &TraceSourceIndex, json_output: bool) 
         name: source_index.spec.name.clone(),
         debug_dir: source_index.spec.debug_dir.display().to_string(),
         resources: source_index.resources.clone(),
+        compilation: Some(source_index.debug.info.compilation.clone()),
     };
     if json_output {
         print_json(&InfoResourcesJson {
@@ -2255,6 +2304,8 @@ impl TraceSourceIndex {
             );
         }
         let code_generator = program.code_generator();
+        // Tables a debugger cannot read leave the state to the storage layout.
+        let resources_tables = program.resources_tables().ok();
         let debug = ContractDebugInfo::new(
             spec.address.as_deref(),
             &spec.name,
@@ -2264,7 +2315,8 @@ impl TraceSourceIndex {
         .with_code_generator(Some(code_generator))
         .with_code_hash(spec.code_hash.as_deref())
         .with_storage_layout(program.storage_layout)
-        .with_transient_storage_layout(program.transient_storage_layout);
+        .with_transient_storage_layout(program.transient_storage_layout)
+        .with_resources(resources_tables);
         Ok(Some(Self {
             spec: spec.clone(),
             resources: program.resources,
@@ -3363,13 +3415,15 @@ fn read_json_file(path: &Path) -> SoldbResult<serde_json::Value> {
     })
 }
 
-fn ethdebug_resources_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<serde_json::Value> {
-    if let Some(path) = find_ethdebug_metadata(&spec.debug_dir) {
-        let metadata = read_json_file(&path)?;
-        return ethdebug_resources_from_metadata(&path, &metadata);
+fn ethdebug_metadata_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<EthdebugMetadata> {
+    if let Some(metadata) = load_ethdebug_metadata(&spec.debug_dir)? {
+        return Ok(metadata);
     }
 
-    TraceSourceIndex::load(spec).map(|index| index.resources)
+    TraceSourceIndex::load(spec).map(|index| EthdebugMetadata {
+        resources: index.resources,
+        compilation: Some(index.debug.info.compilation),
+    })
 }
 
 fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::path::PathBuf> {
@@ -3432,14 +3486,12 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
         };
     }
 
-    let compiler = find_ethdebug_metadata(&spec.debug_dir)
-        .and_then(|ethdebug_json| read_json_file(&ethdebug_json).ok())
-        .and_then(|value| {
-            value
-                .get("compilation")
-                .and_then(|compilation| compilation.get("compiler"))
-                .cloned()
-        });
+    // Artifact load errors are reported by load_source_index; this is only the heading.
+    let compiler = load_ethdebug_metadata(&spec.debug_dir)
+        .ok()
+        .flatten()
+        .and_then(|metadata| metadata.compilation)
+        .and_then(|compilation| compilation.get("compiler").cloned());
     let compiler_name = compiler
         .as_ref()
         .and_then(|compiler| compiler.get("name"))
@@ -3579,17 +3631,20 @@ fn simulation_source_file(args: &SimulationView, contract_name: &str) -> Option<
     .into_iter()
     .find(|spec| spec.name == contract_name)
     .and_then(|spec| {
-        let ethdebug = find_ethdebug_metadata(&spec.debug_dir)?;
-        read_json_file(&ethdebug).ok().and_then(|value| {
-            value
-                .get("compilation")
-                .and_then(|compilation| compilation.get("sources"))
-                .and_then(serde_json::Value::as_array)
-                .and_then(|sources| sources.first())
-                .and_then(|source| source.get("path"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+        // Artifact load errors are reported by load_source_index; this is only the heading.
+        load_ethdebug_metadata(&spec.debug_dir)
+            .ok()
+            .flatten()
+            .and_then(|metadata| metadata.compilation)
+            .and_then(|compilation| {
+                compilation
+                    .get("sources")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|sources| sources.first())
+                    .and_then(|source| source.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
     })
 }
 
@@ -3856,6 +3911,7 @@ mod tests {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let debug =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, source.to_owned())]));
