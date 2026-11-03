@@ -565,8 +565,17 @@ before it, and the body's locals start above all of them; a modifier resumed aft
 `_` keeps the slots it had. The variables of `try ... returns (...)` and `catch (...)`
 clauses belong to their clause blocks like any other local.
 
-A variable's word is the value for a value type and a pointer for a reference type, and
-the pointer is followed through the layout the language fixes for its data location:
+When ETHDebug provides type and pointer tables, a structured variable's pointer selects
+its layout template by pointer ID. The same type can have distinct storage, transient,
+memory and calldata templates. We bind the base slot or byte address from the variable's
+location record, then follow the template, including nested memory pointers and ABI
+offsets in calldata. We do not select a layout from a type ID alone. Scalar templates
+also describe padding and packed storage offsets; unavailable bytes remain unavailable.
+These tables do not supply missing variable locations or liveness information.
+
+For source-map-based decoding, a variable's word is the value for a value type and a
+pointer for a reference type. The pointer is followed through the layout the language
+fixes for its data location:
 
 ```text
 soldb> vars

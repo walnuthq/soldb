@@ -308,7 +308,8 @@ the layout and the final values. From the ETHDebug program-context change on, so
 lists them in the program-level `context.variables` of each program, with the type by
 identifier into the resources' type table and a pointer: a region for a value type and
 for a mapping's base slot, a reference to the type's template in the resources' pointer
-table (keyed by the type identifier, expecting the base slot as `slot`) for a struct, an
+table (older tables use type IDs; newer tables use layout-qualified pointer IDs,
+expecting the base slot as `slot`) for a struct, an
 array, `bytes` or `string`; `EthdebugInfo::state_variables` carries that list and
 `Resources::read_variable` reads a variable through it. The frontends still go through
 the layout; switching them over, with the layout as the fallback, is the next step. A *memory* value is the same kind of fact: the layout of

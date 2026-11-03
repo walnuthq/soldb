@@ -4,8 +4,9 @@
 //! variable is a storage region at a slot, a packed one a byte range in it, a dynamic
 //! array a region for the length and a list of element regions at `keccak256(slot)`, a
 //! mapping entry a region whose slot hashes the key with the slot. The compiler writes
-//! them as templates, one per state variable, with the mapping keys as the parameters a
-//! debugger binds when it wants one entry.
+//! reusable templates per type and layout, with the base slot or byte address and any
+//! mapping key as parameters. Memory templates follow absolute reference pointers;
+//! calldata templates follow ABI offsets relative to their enclosing tuple or array.
 //!
 //! [`Pointer::parse`] and [`PointerTemplate::parse`] read what a compiler wrote and
 //! reject what does not follow the schema, since a pointer read loosely reads the wrong

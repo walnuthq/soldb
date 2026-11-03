@@ -103,6 +103,16 @@ def solc_emits_program_context(path):
     return any(variable.get("identifier") == "x" for variable in variables)
 
 
+def solc_emits_layout_templates(path):
+    """Whether pointer IDs distinguish scalar storage, transient, memory and calldata layouts."""
+    resources = probe(path, ["--experimental", "--ethdebug-resources"], "ethdebug_resources.json")
+    try:
+        return all(f"{layout}-t_uint256" in resources["pointers"]
+                   for layout in ("storage", "transient", "memory", "calldata"))
+    except (KeyError, TypeError):
+        return False
+
+
 # Unlike the live-node suite, missing prerequisites must fail configuration.
 soldb = require_tool("soldb", os.environ.get("SOLDB_BIN", root / "target/debug/soldb"))
 filecheck = require_tool("FileCheck", os.environ.get("FILECHECK", "FileCheck"))
@@ -145,6 +155,9 @@ if compiler in ("solc", "both"):
     if solc_emits_resource_tables(solc):
         config.available_features.add("solc-ethdebug-resource-tables")
         lit_config.note("solc fills the type and pointer tables of the resources")
+    if solc_emits_layout_templates(solc):
+        config.available_features.add("solc-ethdebug-layout-templates")
+        lit_config.note("solc emits layout-qualified pointer templates")
     if solc_emits_program_context(solc):
         config.available_features.add("solc-ethdebug-program-context")
         lit_config.note("solc lists the state variables in the program-level context")
