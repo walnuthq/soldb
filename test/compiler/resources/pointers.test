@@ -5,7 +5,7 @@
 # REQUIRES: soldb, compiler-solc, solc-ethdebug-resource-tables, optimization-none
 # RUN: rm -rf %t
 # RUN: mkdir -p %t
-# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime --ethdebug-resources --storage-layout --bin --abi -o %t > %t/compile.stdout 2> %t/compile.stderr
+# RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime --ethdebug-resources --ethdebug-compilation --storage-layout --bin --abi -o %t > %t/compile.stdout 2> %t/compile.stderr
 
 # Every pointer ID names a known type, with an optional layout prefix.
 # RUN: jq -c '. as $r | [.pointers | keys[] | sub("^(storage|transient|memory|calldata)-"; "") | . as $id | $r.types | has($id)] | [length >= 8, all]' %t/ethdebug_resources.json | FileCheck %s --check-prefix=NAMES

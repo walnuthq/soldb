@@ -342,9 +342,11 @@ Artifacts produced per contract in the output directory:
 - `<Contract>_ethdebug-runtime.json` — runtime debug info; this is what PC-to-source
   mapping uses for an ordinary call.
 - `ethdebug.json` (legacy) / `ethdebug_resources.json` (modern) — the global resource
-  file listing sources. A compile removes whichever of the two it did not write, because
-  a directory holding both — one compiler's output on top of another's — gives a loader
-  no way to tell which describes the programs next to them.
+  file holding type and pointer tables. Older outputs also embed compilation here.
+- `ethdebug_compilation.json` — the compilation record, including compiler details,
+  source paths and contents. Newer compilers emit it only with `--ethdebug-compilation`.
+  A compile removes global metadata files it did not write, because files left by a
+  previous compiler may describe different programs.
 - `<Contract>.abi`, `<Contract>.bin` — ABI and bytecode. The errors the ABI declares are
   what revert data is decoded against (`load_error_abis`, also reading a legacy
   `combined.json`); `Error(string)` and `Panic(uint256)` need no ABI.

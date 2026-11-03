@@ -779,7 +779,16 @@ mod tests {
         assert_eq!(program.info.compilation, compilation);
         assert_eq!(program.info.sources[&0], "Counter.sol");
         assert_eq!(program.source_contents[&0], source);
+        assert!(
+            program.source_files.is_empty(),
+            "no source file exists on disk"
+        );
         assert!(program.missing_sources.is_empty());
+        assert!(program
+            .resources_tables()
+            .expect("tables")
+            .types
+            .contains_key("t_uint256"));
 
         fs::remove_file(dir.join("ethdebug_compilation.json")).expect("remove compilation");
         assert!(load_ethdebug_metadata(&dir)

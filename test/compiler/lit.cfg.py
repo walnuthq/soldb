@@ -103,6 +103,15 @@ def solc_emits_program_context(path):
     return any(variable.get("identifier") == "x" for variable in variables)
 
 
+def solc_separates_compilation(path):
+    """Whether resources omit compilation and the compiler writes it separately."""
+    flags = ["--experimental", "--ethdebug-resources", "--ethdebug-compilation"]
+    resources = probe(path, flags, "ethdebug_resources.json")
+    compilation = probe(path, flags, "ethdebug_compilation.json")
+    return (isinstance(resources, dict) and "compilation" not in resources
+            and isinstance(compilation, dict) and isinstance(compilation.get("sources"), list))
+
+
 def solc_emits_layout_templates(path):
     """Whether pointer IDs distinguish scalar storage, transient, memory and calldata layouts."""
     resources = probe(path, ["--experimental", "--ethdebug-resources"], "ethdebug_resources.json")
@@ -146,12 +155,16 @@ if compiler in ("solar", "both"):
     config.available_features.add("compiler-solar")
 if compiler in ("solc", "both"):
     solc = require_tool("solc (set SOLC_PATH)", os.environ.get("SOLC_PATH", "solc"))
+    config.substitutions.append(("%{solc_path}", shlex.quote(solc)))
     config.substitutions.append(
         ("%solc", f"{shlex.quote(solc)} --evm-version=cancun {solc_optimization}")
     )
     config.available_features.add("compiler-solc")
     version = solc_version(solc)
     lit_config.note(f"solc {'.'.join(str(part) for part in version)} at {solc}")
+    if solc_separates_compilation(solc):
+        config.available_features.add("solc-ethdebug-separate-compilation")
+        lit_config.note("solc writes compilation separately from resources")
     if solc_emits_resource_tables(solc):
         config.available_features.add("solc-ethdebug-resource-tables")
         lit_config.note("solc fills the type and pointer tables of the resources")

@@ -1,0 +1,29 @@
+# Compile through the CLI and debug using only the output directory. The source file
+# is moved away so listings must come from ethdebug_compilation.json, not the filesystem.
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-separate-compilation, optimization-none
+# RUN: mkdir -p %t
+# RUN: cp %S/../../../examples/Counter.sol %t/Counter.sol
+# RUN: %soldb compile %t/Counter.sol --solc %{solc_path} --no-project -o %t/out --json > %t/compile.json
+# RUN: jq -c '.files | [(.ethdebug | endswith("ethdebug_resources.json")), (.ethdebug_compilation | endswith("ethdebug_compilation.json"))]' %t/compile.json | FileCheck %s --check-prefix=FILES
+# FILES: [true,true]
+
+# RUN: mv %t/Counter.sol %t/Counter.saved.sol
+# RUN: %soldb info resources --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Counter:%t/out --json > %t/resources.json
+# RUN: jq -c '.contracts[0] | [(.resources | has("compilation")), .compilation.compiler.name, (.compilation.sources | length), (.compilation.sources[0].contents | contains("count += 1"))]' %t/resources.json | FileCheck %s --check-prefix=METADATA
+# METADATA: [false,"solc",1,true]
+
+# RUN: %soldb info resources --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Counter:%t/out | FileCheck %s --check-prefix=INFO
+# INFO: Contract: Counter
+# INFO: Compiler: solc
+# INFO: Sources: 1
+
+# RUN: %soldb run %t/out/Counter.bin 'increment()' --ethdebug-dir 0x5fbdb2315678afecb367f032d93f642f64180aa3:Counter:%t/out -x 'info resources' -x 'break Counter.sol:8' -x continue -x list --batch > %t/session.out 2> %t/session.err
+# RUN: FileCheck %s --check-prefix=SESSION < %t/session.out
+# SESSION: Contract: Counter
+# SESSION: Sources loaded for: Counter
+# SESSION: Breakpoint #1 hit at step {{[0-9]+}}, {{.*}}Counter.sol:8
+# SESSION: =>     8 |         count += 1;
+# RUN: FileCheck %s --check-prefix=DIAGNOSTICS --allow-empty < %t/session.err
+# DIAGNOSTICS-NOT: could not
+# DIAGNOSTICS-NOT: unavailable
+# DIAGNOSTICS-NOT: Error

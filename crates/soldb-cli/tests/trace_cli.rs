@@ -462,6 +462,44 @@ fn info_resources_json_reads_ethdebug_resources() {
 }
 
 #[test]
+fn info_resources_reads_separate_compilation() {
+    let dir = temp_dir("info-resources-separate");
+    let resources = json!({"types": {}, "pointers": {}});
+    let compilation = json!({
+        "compiler": {"name": "solc", "version": "0.8.38+commit.test"},
+        "sources": [{"id": 0, "path": "Counter.sol", "contents": "contract Counter {}"}]
+    });
+    fs::write(dir.join("ethdebug_resources.json"), resources.to_string()).expect("resources");
+    fs::write(
+        dir.join("ethdebug_compilation.json"),
+        compilation.to_string(),
+    )
+    .expect("compilation");
+    let spec = format!("0x2:Counter:{}", dir.display());
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args(["info", "resources", "--ethdebug-dir", &spec, "--json"])
+        .output()
+        .expect("info resources");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(value["contracts"][0]["resources"], resources);
+    assert_eq!(value["contracts"][0]["compilation"], compilation);
+
+    fs::remove_file(dir.join("ethdebug_compilation.json")).expect("remove compilation");
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args(["info", "resources", "--ethdebug-dir", &spec])
+        .output()
+        .expect("resources without compilation");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("Sources: unavailable (no compilation record)"));
+}
+
+#[test]
 fn trace_raw_prints_instruction_table() {
     let rpc_url = start_rpc_server(3);
     let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
