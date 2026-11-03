@@ -195,6 +195,8 @@ pub struct StateVariable {
     /// Whether the value is in the deployed code, as an immutable's is, rather than in
     /// storage.
     pub in_code: bool,
+    /// Whether the value is in transient storage rather than persistent storage.
+    pub in_transient_storage: bool,
     pub value: DebugValue,
     /// Whether the value came from the recording or from the chain.
     pub source: StateSource,
@@ -701,6 +703,9 @@ pub fn context_state_variables(
                 slot,
                 offset,
                 in_code,
+                in_transient_storage: first_region
+                    .as_ref()
+                    .is_some_and(|region| region.location == Location::Transient),
                 value,
                 source: if from_chain.get() {
                     StateSource::Chain
@@ -899,6 +904,7 @@ fn read(layout: &StorageLayout, words: &StorageWords<'_>, reference: &StorageRef
         slot: short_hex(&reference.slot),
         offset: reference.offset,
         in_code: false,
+        in_transient_storage: words.tape.space == Space::Transient,
         value,
         source: if from_chain.get() {
             StateSource::Chain
