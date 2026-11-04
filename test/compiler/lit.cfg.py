@@ -36,6 +36,19 @@ config.environment["NO_COLOR"] = "1"
 PROBE_SOURCE = (
     "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\ncontract Probe { uint256 x; }\n"
 )
+LAYOUT_PROBE_SOURCE = """// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.28;
+contract Probe {
+    uint256 stored;
+    uint256 transient temporary;
+    function inspect(uint256[] memory memoryValues, uint256[] calldata calldataValues)
+        external pure
+    {
+        memoryValues;
+        calldataValues;
+    }
+}
+"""
 
 
 def require_tool(name, value):
@@ -54,12 +67,12 @@ def solc_version(path):
     return tuple(int(part) for part in match.groups())
 
 
-def probe(path, flags, artifact):
-    """The JSON `artifact` the compiler writes for a contract with one `uint256` state
-    variable `x` when given `flags`, or `None` when it writes none."""
+def probe(path, flags, artifact, source_code=PROBE_SOURCE):
+    """The JSON `artifact` the compiler writes for `source_code` with `flags`, or
+    `None` when it writes none."""
     with tempfile.TemporaryDirectory() as directory:
         source = Path(directory) / "Probe.sol"
-        source.write_text(PROBE_SOURCE)
+        source.write_text(source_code)
         result = subprocess.run(
             [path, "--evm-version=cancun", *flags, "-o", directory, str(source)],
             capture_output=True, text=True, check=False, cwd=directory,
@@ -114,7 +127,10 @@ def solc_separates_compilation(path):
 
 def solc_emits_layout_templates(path):
     """Whether pointer IDs distinguish scalar storage, transient, memory and calldata layouts."""
-    resources = probe(path, ["--experimental", "--ethdebug-resources"], "ethdebug_resources.json")
+    resources = probe(
+        path, ["--experimental", "--ethdebug-resources"], "ethdebug_resources.json",
+        LAYOUT_PROBE_SOURCE,
+    )
     try:
         return all(f"{layout}-t_uint256" in resources["pointers"]
                    for layout in ("storage", "transient", "memory", "calldata"))
