@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use soldb_core::{SoldbError, SoldbResult};
+use soldb_core::{encode_hex, SoldbError, SoldbResult};
+
+use crate::opcodes;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceLocation {
@@ -63,8 +65,12 @@ struct InstructionJson {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Operation {
-    /// An operation that says nothing but its mnemonic.
-    Mnemonic(Cow<'static, str>),
+    /// An operation that says nothing but its mnemonic and, for a `PUSH`, the one
+    /// argument that is its immediate value.
+    Mnemonic {
+        mnemonic: Cow<'static, str>,
+        argument: Option<String>,
+    },
     /// Any other operation, as the program wrote it.
     Json(Value),
 }
@@ -108,7 +114,10 @@ impl Instruction {
     pub fn new(offset: u64, mnemonic: &str, context: Option<Value>) -> Self {
         Self {
             offset,
-            operation: Operation::Mnemonic(Cow::Owned(mnemonic.to_owned())),
+            operation: Operation::Mnemonic {
+                mnemonic: Cow::Owned(mnemonic.to_owned()),
+                argument: None,
+            },
             context: context.map(Context::from_json),
         }
     }
@@ -123,23 +132,55 @@ impl Instruction {
     ) -> Self {
         Self {
             offset,
-            operation: Operation::Mnemonic(mnemonic.into()),
+            operation: Operation::Mnemonic {
+                mnemonic: mnemonic.into(),
+                argument: None,
+            },
             context: Some(Context::SourceMap(context)),
         }
+    }
+
+    /// The instruction at program counter `pc` of legacy `bytecode`, as a legacy source
+    /// map describes it: named from its byte, and for a `PUSH` with the value it pushes
+    /// as its argument, the way ETHDebug writes it. A `PUSH` cut short by the end of the
+    /// code pushes zeros for the bytes that are missing, so its argument does too.
+    /// `None` when `pc` is past the end of `bytecode`.
+    #[must_use]
+    pub fn from_bytecode(bytecode: &[u8], pc: usize, context: SourceMapContext) -> Option<Self> {
+        let opcode = *bytecode.get(pc)?;
+        let size = opcodes::immediate_size(opcode);
+        let argument = (size > 0).then(|| {
+            let mut immediate = vec![0; size];
+            let present = bytecode.get(pc + 1..).unwrap_or_default();
+            let present = &present[..present.len().min(size)];
+            immediate[..present.len()].copy_from_slice(present);
+            format!("0x{}", encode_hex(&immediate))
+        });
+        Some(Self {
+            offset: pc as u64,
+            operation: Operation::Mnemonic {
+                mnemonic: opcode_mnemonic(opcode),
+                argument,
+            },
+            context: Some(Context::SourceMap(context)),
+        })
     }
 
     #[must_use]
     pub fn mnemonic(&self) -> Option<&str> {
         match &self.operation {
-            Operation::Mnemonic(mnemonic) => Some(mnemonic),
+            Operation::Mnemonic { mnemonic, .. } => Some(mnemonic),
             Operation::Json(operation) => operation.get("mnemonic").and_then(Value::as_str),
         }
     }
 
     #[must_use]
     pub fn arguments(&self) -> Vec<&str> {
-        let Operation::Json(operation) = &self.operation else {
-            return Vec::new();
+        let operation = match &self.operation {
+            Operation::Mnemonic { argument, .. } => {
+                return argument.iter().map(String::as_str).collect()
+            }
+            Operation::Json(operation) => operation,
         };
         operation
             .get("arguments")
@@ -233,7 +274,14 @@ impl From<Instruction> for InstructionJson {
         Self {
             offset: instruction.offset,
             operation: match instruction.operation {
-                Operation::Mnemonic(mnemonic) => json!({"mnemonic": mnemonic}),
+                Operation::Mnemonic {
+                    mnemonic,
+                    argument: None,
+                } => json!({"mnemonic": mnemonic}),
+                Operation::Mnemonic {
+                    mnemonic,
+                    argument: Some(argument),
+                } => json!({"mnemonic": mnemonic, "arguments": [argument]}),
                 Operation::Json(operation) => operation,
             },
             context: instruction.context.map(|context| match context {
@@ -245,12 +293,25 @@ impl From<Instruction> for InstructionJson {
 }
 
 impl Operation {
-    /// Keeps an operation that names only its mnemonic as the mnemonic, so an
-    /// instruction reads back equal to the one written.
+    /// Keeps an operation that names only its mnemonic, and at most one argument, as
+    /// values, so an instruction reads back equal to the one written.
     fn from_json(operation: Value) -> Self {
         if let Value::Object(fields) = &operation {
-            if let (1, Some(Value::String(mnemonic))) = (fields.len(), fields.get("mnemonic")) {
-                return Self::Mnemonic(Cow::Owned(mnemonic.clone()));
+            if let Some(Value::String(mnemonic)) = fields.get("mnemonic") {
+                let argument = match (fields.len(), fields.get("arguments")) {
+                    (1, None) => Some(None),
+                    (2, Some(Value::Array(arguments))) => match arguments.as_slice() {
+                        [Value::String(argument)] => Some(Some(argument.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(argument) = argument {
+                    return Self::Mnemonic {
+                        mnemonic: Cow::Owned(mnemonic.clone()),
+                        argument,
+                    };
+                }
             }
         }
         Self::Json(operation)
@@ -714,6 +775,15 @@ fn get_string(value: &Value, key: &str, default: &str) -> String {
         .to_owned()
 }
 
+/// The mnemonic of `opcode`, named the way a trace records the same step; a byte that
+/// is no instruction says so.
+fn opcode_mnemonic(opcode: u8) -> Cow<'static, str> {
+    opcodes::mnemonic(opcode).map_or_else(
+        || Cow::Owned(format!("UNKNOWN(0x{opcode:02x})")),
+        Cow::Borrowed,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -939,6 +1009,51 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&generated).expect("json")["context"],
             json!({"modifierDepth": 0, "return": {}})
+        );
+    }
+
+    #[test]
+    fn decodes_bytecode_instructions_with_their_push_values() {
+        let context = || SourceMapContext {
+            code: None,
+            jump: SourceMapJump::Regular,
+            modifier_depth: 0,
+        };
+        // `PUSH2 0x0013`, `PUSH0`, `JUMPDEST`, an invalid byte, and a `PUSH4` the end of
+        // the code cuts short after two bytes.
+        let bytecode = [0x61, 0x00, 0x13, 0x5f, 0x5b, 0x0c, 0x63, 0xab, 0xcd];
+        let decoded = [0, 3, 4, 5, 6].map(|pc| {
+            let instruction = Instruction::from_bytecode(&bytecode, pc, context()).expect("pc");
+            assert_eq!(instruction.offset, pc as u64);
+            let mnemonic = instruction.mnemonic().expect("mnemonic").to_owned();
+            let arguments = instruction.arguments().join(" ");
+            (mnemonic, arguments)
+        });
+        assert_eq!(
+            decoded.map(|(mnemonic, arguments)| format!("{mnemonic} {arguments}")),
+            [
+                "PUSH2 0x0013",
+                "PUSH0 ",
+                "JUMPDEST ",
+                "UNKNOWN(0x0c) ",
+                "PUSH4 0xabcd0000",
+            ]
+        );
+        assert_eq!(
+            Instruction::from_bytecode(&bytecode, bytecode.len(), context()),
+            None
+        );
+
+        // A decoded `PUSH` writes its value the way ETHDebug does, and reads back equal.
+        let push = Instruction::from_bytecode(&bytecode, 0, context()).expect("pc");
+        let json = serde_json::to_value(&push).expect("json");
+        assert_eq!(
+            json["operation"],
+            json!({"mnemonic": "PUSH2", "arguments": ["0x0013"]})
+        );
+        assert_eq!(
+            serde_json::from_value::<Instruction>(json).expect("read"),
+            push
         );
     }
 
