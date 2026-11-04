@@ -271,13 +271,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "info",
         aliases: &["i"],
-        usage: "info breakpoints|storage|transient|resources [--json]",
+        usage: "info breakpoints|storage|transient|resources",
         summary: "the breakpoints, the storage or transient storage known here, or the loaded debug resources",
         details: &[
-            "info breakpoints (i b)  every breakpoint with its number",
-            "info storage            every storage slot known at this step",
-            "info transient          every transient storage slot known at this step",
-            "info resources          the contracts whose sources are loaded, as text or JSON",
+            "info breakpoints (i b)   every breakpoint with its number",
+            "info storage             every storage slot known at this step",
+            "info transient           every transient storage slot known at this step",
+            "info resources [--json]  the contracts whose sources are loaded, as text or JSON",
         ],
         group: CommandGroup::Breakpoints,
     },
@@ -629,6 +629,18 @@ fn parse_source_line_number(input: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{command_spec, CommandGroup, DebuggerCommand, COMMANDS};
+
+    #[test]
+    fn info_help_offers_json_only_for_resources() {
+        let info = command_spec("info").expect("info is a command");
+        assert!(!info.usage.contains("--json"));
+
+        let resources = DebuggerCommand::parse("info resources --json");
+        assert!(!matches!(resources, DebuggerCommand::Unknown(_)));
+
+        let storage = DebuggerCommand::parse("info storage --json");
+        assert!(matches!(storage, DebuggerCommand::Unknown(_)));
+    }
 
     #[test]
     fn every_command_is_named_once_and_parses_by_each_alias() {
