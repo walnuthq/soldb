@@ -396,6 +396,21 @@ impl ContractDebugInfo {
         self
     }
 
+    /// Adds only the types from `sources`. Functions, source text, and paths do not change, so
+    /// breakpoints do not stop in these files. Call it before `with_storage_layout`, because
+    /// that copies the enums from `types`.
+    #[must_use]
+    pub fn with_declaration_sources<'a>(
+        mut self,
+        sources: impl IntoIterator<Item = (u64, &'a str)>,
+        cache: &mut SourceCache,
+    ) -> Self {
+        for (source_id, text) in sources {
+            self.types.extend_from(&cache.read(source_id, text).types);
+        }
+        self
+    }
+
     /// Attaches the contract's storage layout, so state variables can be read by name.
     #[must_use]
     pub fn with_storage_layout(mut self, storage_layout: Option<StorageLayout>) -> Self {
@@ -5345,5 +5360,36 @@ contract D {
             .map(|step| step.key.map(|key| key.line))
             .collect::<Vec<_>>();
         assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn declaration_sources_add_types_but_no_functions_or_paths() {
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "call".to_owned(),
+            instructions: Vec::new(),
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let code = "contract C { function run() external {} }";
+        let mut cache = SourceCache::default();
+        let contract = ContractDebugInfo::with_source_cache(
+            None,
+            "C",
+            info,
+            BTreeMap::from([(0, code.to_owned())]),
+            &mut cache,
+        )
+        .with_declaration_sources(
+            [(
+                1,
+                "struct Params { bool flag; } interface I { function run() external; }",
+            )],
+            &mut cache,
+        );
+        assert!(contract.types.struct_members(Some("C"), "Params").is_some());
+        assert_eq!(contract.functions.len(), 1);
+        assert_eq!(contract.source_path(1), None);
     }
 }
