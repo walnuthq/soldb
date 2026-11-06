@@ -159,6 +159,26 @@ impl DapServer {
         Ok(server)
     }
 
+    /// Sets a breakpoint the host knows of before a client connects, such as a stop a test
+    /// placed in its code, and returns its number. The editor's `setBreakpoints` and
+    /// `setFunctionBreakpoints` replace only the breakpoints they set, so this one stays.
+    pub fn set_breakpoint(
+        &mut self,
+        target: &BreakpointTarget,
+        condition: Option<&str>,
+    ) -> SoldbResult<u32> {
+        match self
+            .debugger
+            .set_conditional_breakpoint_target(target, condition)
+        {
+            StepOutcome::BreakpointSet(breakpoint) => Ok(breakpoint.id),
+            StepOutcome::BreakpointError(message) => Err(SoldbError::Message(message)),
+            other => Err(SoldbError::Message(format!(
+                "the breakpoint was not set: {other:?}"
+            ))),
+        }
+    }
+
     /// Answers DAP requests read from `reader` on `writer` until the client disconnects
     /// or the input ends.
     pub fn serve<R: Read, W: Write>(&mut self, mut reader: R, mut writer: W) -> SoldbResult<()> {
@@ -1148,8 +1168,8 @@ mod tests {
     use crate::{decode_dap_frame, encode_dap_frame, DapMessage};
 
     use super::{
-        run_stdio_server, DapServer, LoadedSource, MEMORY_REF, RETURN_DATA_REF, STACK_REF,
-        STORAGE_REF,
+        run_stdio_server, BreakpointTarget, DapServer, LoadedSource, MEMORY_REF, RETURN_DATA_REF,
+        STACK_REF, STORAGE_REF,
     };
 
     #[test]
@@ -1265,6 +1285,42 @@ mod tests {
         assert_eq!(variables[0]["name"], "returndata[0x0]");
         assert_eq!(variables[0]["value"], format!("{:0>64}", "2a"));
         assert_eq!(variables[1]["name"], "returndata[0x20]");
+    }
+
+    #[test]
+    fn host_breakpoint_stops_and_survives_editor_breakpoints() {
+        let mut server = DapServer::with_session(sample_trace(), Vec::new(), &std::env::temp_dir())
+            .expect("top-level calls must start at different steps");
+        let id = server
+            .set_breakpoint(&BreakpointTarget::Pc(3), None)
+            .expect("a breakpoint on a program counter is set");
+        assert!(server
+            .set_breakpoint(&BreakpointTarget::Pc(3), Some("step >"))
+            .is_err());
+        server.handle_message(&DapMessage::request(1, "launch", None));
+
+        // The editor replaces its own breakpoints, not the host's.
+        let set_breakpoints = DapMessage::request(
+            2,
+            "setBreakpoints",
+            Some(json!({"source": {"path": "Other.sol"}, "breakpoints": []})),
+        );
+        assert_eq!(
+            server.handle_message(&set_breakpoints)[0].success,
+            Some(true)
+        );
+
+        let messages = server.handle_message(&DapMessage::request(3, "continue", None));
+        let stopped = messages[1].body.as_ref().expect("body");
+        assert_eq!(stopped["reason"], "breakpoint", "{stopped}");
+        let messages = server.handle_message(&DapMessage::request(4, "stackTrace", None));
+        let top = &messages[0].body.as_ref().expect("body")["stackFrames"][0];
+        assert!(
+            top["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with("pc 3")),
+            "breakpoint {id} stopped at {top}"
+        );
     }
 
     #[test]
