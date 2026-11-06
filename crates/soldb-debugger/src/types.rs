@@ -187,6 +187,102 @@ impl SourceTypes {
         .map(|decl| decl.members.as_slice())
     }
 
+    /// The members of struct `name`, with member types rewritten to resolve correctly from
+    /// `scope`. A member type is written relative to the contract that declares the struct, so
+    /// in `library Pool { struct Params { Inner inner; } }`, read from `contract Manager`,
+    /// `Inner` becomes `Pool.Inner`. A type that already means the same from `scope` is kept.
+    #[must_use]
+    pub(crate) fn members_seen_from(
+        &self,
+        scope: Option<&str>,
+        name: &str,
+    ) -> Option<Vec<StructMember>> {
+        let decl = self.resolve(
+            self.structs.iter(),
+            |decl| (&decl.name, decl.scope.as_deref()),
+            scope,
+            name,
+        )?;
+        Some(
+            decl.members
+                .iter()
+                .map(|member| StructMember {
+                    name: member.name.clone(),
+                    ty: self
+                        .qualified(decl.scope.as_deref(), scope, &member.ty)
+                        .unwrap_or_else(|| member.ty.clone()),
+                })
+                .collect(),
+        )
+    }
+
+    /// `ty` as written in `declared_in`, qualified so that it means the same from `scope`;
+    /// `None` when it already does or cannot be qualified (a file-level type).
+    fn qualified(
+        &self,
+        declared_in: Option<&str>,
+        scope: Option<&str>,
+        ty: &str,
+    ) -> Option<String> {
+        let (base, suffix) = ty.split_at(ty.find('[').unwrap_or(ty.len()));
+        if !is_identifier(base) {
+            return None;
+        }
+        let own = self.declaration_of(declared_in, base)?;
+        let owner = own.1?;
+        if self.declaration_of(scope, base) == Some(own) {
+            return None;
+        }
+        Some(format!("{owner}.{base}{suffix}"))
+    }
+
+    /// The kind and scope of the struct, enum, or value type `name` means from `scope`.
+    fn declaration_of(
+        &self,
+        scope: Option<&str>,
+        name: &str,
+    ) -> Option<(&'static str, Option<&str>)> {
+        if let Some(decl) = self.resolve(
+            self.structs.iter(),
+            |decl| (&decl.name, decl.scope.as_deref()),
+            scope,
+            name,
+        ) {
+            return Some(("struct", decl.scope.as_deref()));
+        }
+        if let Some(decl) = self.resolve(
+            self.enums.iter(),
+            |decl| (&decl.name, decl.scope.as_deref()),
+            scope,
+            name,
+        ) {
+            return Some(("enum", decl.scope.as_deref()));
+        }
+        self.resolve(
+            self.value_types.iter(),
+            |decl| (&decl.name, decl.scope.as_deref()),
+            scope,
+            name,
+        )
+        .map(|decl| ("value type", decl.scope.as_deref()))
+    }
+
+    /// Finds the struct that `name` means in `scope` and returns its storage layout label
+    /// without `struct `: `{contract}.{name}`, or only `{name}` at file level.
+    #[must_use]
+    pub(crate) fn struct_label(&self, scope: Option<&str>, name: &str) -> Option<String> {
+        let decl = self.resolve(
+            self.structs.iter(),
+            |decl| (&decl.name, decl.scope.as_deref()),
+            scope,
+            name,
+        )?;
+        Some(match &decl.scope {
+            Some(scope) => format!("{scope}.{}", decl.name),
+            None => decl.name.clone(),
+        })
+    }
+
     /// The variants of the enum `name` names, in declaration order.
     #[must_use]
     pub fn enum_variants(&self, scope: Option<&str>, name: &str) -> Option<&[String]> {
@@ -272,9 +368,10 @@ impl SourceTypes {
         seen
     }
 
-    /// Finds the declaration `name` refers to from `scope`. A qualified name must match
-    /// its scope; a bare name is looked up in `scope`, then in the contracts it inherits
-    /// from, then at file level, and failing all of those wherever it is declared.
+    /// Finds the declaration that `name` means in `scope`. For `Q.Name`, it looks in `Q`. For a
+    /// bare name, it looks in `scope`, then in its base contracts, then at file level. If
+    /// nothing is found, it uses the only declaration with this name, or returns `None`.
+    /// Without `scope`, it uses the file-level one, or else the first one.
     fn resolve<'a, T>(
         &'a self,
         declarations: impl Iterator<Item = &'a T> + Clone,
@@ -298,22 +395,26 @@ impl SourceTypes {
                 .copied()
                 .find(|declaration| key(declaration).1 == wanted)
         };
+        let only = || match candidates.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        };
         if let Some(qualifier) = qualifier {
-            // `A.Item` where the declaration is `B.Item`: the wrong scope, unless nothing
-            // better turns up.
-            return in_scope(Some(qualifier)).or_else(|| candidates.first().copied());
+            // `Q` can be an import alias. No declaration has an alias as its scope.
+            return in_scope(Some(qualifier)).or_else(only);
         }
-        if let Some(scope) = scope {
-            if let Some(found) = in_scope(Some(scope)) {
+        let Some(scope) = scope else {
+            return in_scope(None).or_else(|| candidates.first().copied());
+        };
+        if let Some(found) = in_scope(Some(scope)) {
+            return Some(found);
+        }
+        for base in self.bases(scope) {
+            if let Some(found) = in_scope(Some(base)) {
                 return Some(found);
             }
-            for base in self.bases(scope) {
-                if let Some(found) = in_scope(Some(base)) {
-                    return Some(found);
-                }
-            }
         }
-        in_scope(None).or_else(|| candidates.first().copied())
+        in_scope(None).or_else(only)
     }
 }
 
@@ -639,8 +740,9 @@ contract Outlet is Base, Math(1) {
         assert_eq!(width(Some("Base")).as_deref(), Some("uint16"));
         // `Outlet` declares none: its nearest base `Base` does.
         assert_eq!(width(Some("Outlet")).as_deref(), Some("uint16"));
-        // An unrelated contract falls back to the first declaration.
-        assert_eq!(width(Some("Other")).as_deref(), Some("uint256"));
+        // An unrelated contract cannot tell the three `Item`s apart.
+        assert_eq!(width(Some("Other")), None);
+        // Without a scope, the first declaration is used.
         assert_eq!(width(None).as_deref(), Some("uint256"));
         // A file-level type wins over another contract's for a bare name.
         assert_eq!(
@@ -654,6 +756,44 @@ contract Outlet is Base, Math(1) {
         assert_eq!(types.scope_at(0, offset), Some("Outlet"));
         assert_eq!(types.scope_at(0, 0), None);
         assert_eq!(types.scope_at(1, offset), None);
+    }
+
+    #[test]
+    fn a_bare_name_does_not_take_a_struct_from_elsewhere_when_several_exist() {
+        let mut types = SourceTypes::default();
+        types.add_source(
+            0,
+            "library Pool { struct Params { int256 amount; bool flag; } }",
+        );
+        let first = |types: &SourceTypes, scope| {
+            types
+                .struct_members(scope, "Params")
+                .map(|members| members[0].name.clone())
+        };
+        // The only declaration is still used, as a nested member type needs.
+        assert_eq!(first(&types, Some("Manager")).as_deref(), Some("amount"));
+
+        // A file-level struct is what the bare name means.
+        types.add_source(1, "struct Params { bool flag; int256 amount; }");
+        assert_eq!(first(&types, Some("Manager")).as_deref(), Some("flag"));
+        assert_eq!(first(&types, Some("Pool")).as_deref(), Some("amount"));
+
+        let mut types = SourceTypes::default();
+        types.add_source(0, "library A { struct State { uint256 a; } }");
+        types.add_source(1, "library B { struct State { uint256 b; } }");
+        assert!(types.struct_members(Some("Manager"), "State").is_none());
+        assert!(types.struct_members(Some("Manager"), "C.State").is_none());
+        assert_eq!(
+            types.struct_label(Some("B"), "State").as_deref(),
+            Some("B.State")
+        );
+        assert_eq!(types.struct_label(Some("Manager"), "State"), None);
+
+        // `Q` is not a declared scope, as an import alias is not; the only `Params` is used.
+        let mut types = SourceTypes::default();
+        types.add_source(0, "library Pool { struct Params { int256 amount; } }");
+        assert_eq!(first(&types, Some("Manager")).as_deref(), Some("amount"));
+        assert!(types.struct_members(Some("Manager"), "Q.Params").is_some());
     }
 
     #[test]

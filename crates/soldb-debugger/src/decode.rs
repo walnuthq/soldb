@@ -121,7 +121,7 @@ impl<'a> ValueReader<'a> {
                 let Some(layout) = self.layout else {
                     return Err(placeholder("; no storage layout is loaded"));
                 };
-                let Some(type_id) = storage_type_id(layout, base) else {
+                let Some(type_id) = storage_type_id(layout, self.types, self.scope, base) else {
                     return Err(placeholder("; the storage layout has no such type"));
                 };
                 Ok(Place::Storage {
@@ -182,10 +182,8 @@ impl<'a> ValueReader<'a> {
                         });
                     }
                 }
-                let Some(members) = self.types.struct_members(self.scope, &ty) else {
-                    return Err(format!(
-                        "`{path}` is a `{ty} memory`, which has no member `{member}`"
-                    ));
+                let Some(members) = self.types.members_seen_from(self.scope, &ty) else {
+                    return Err(self.no_member(path, &ty, "memory", member));
                 };
                 let Some((index, found)) = members
                     .iter()
@@ -352,10 +350,8 @@ impl<'a> ValueReader<'a> {
                 },
                 PathSegment::Member(member),
             ) => {
-                let Some(members) = self.types.struct_members(self.scope, &ty) else {
-                    return Err(format!(
-                        "`{path}` is a `{ty} calldata`, which has no member `{member}`"
-                    ));
+                let Some(members) = self.types.members_seen_from(self.scope, &ty) else {
+                    return Err(self.no_member(path, &ty, "calldata", member));
                 };
                 let Some((index, found)) = members
                     .iter()
@@ -392,7 +388,15 @@ impl<'a> ValueReader<'a> {
                 let raw = Some(format!("{pointer:#x}"));
                 let display = match &self.memory {
                     Some(_) => self.read_memory(*pointer, ty, 0).unwrap_or_else(|| {
-                        format!("<{ty} in memory at {pointer:#x}, beyond what this step captured>")
+                        if self.is_unresolved(ty) {
+                            format!(
+                                "<{ty} in memory at {pointer:#x}; its declaration could not be resolved>"
+                            )
+                        } else {
+                            format!(
+                                "<{ty} in memory at {pointer:#x}, beyond what this step captured>"
+                            )
+                        }
                     }),
                     None => {
                         format!("<{ty} in memory at {pointer:#x}; this backend captured no memory>")
@@ -547,6 +551,20 @@ impl<'a> ValueReader<'a> {
         ty
     }
 
+    /// True if `ty` is a type name, but no struct with this name is found from `scope`.
+    fn is_unresolved(&self, ty: &str) -> bool {
+        is_type_name(ty) && !self.types.is_struct(self.scope, ty)
+    }
+
+    /// The error for `path.member`. It says if the type is not found or the member is missing.
+    fn no_member(&self, path: &str, ty: &str, location: &str, member: &str) -> String {
+        if self.is_unresolved(ty) {
+            format!("`{path}` is a `{ty} {location}`, whose declaration could not be resolved")
+        } else {
+            format!("`{path}` is a `{ty} {location}`, which has no member `{member}`")
+        }
+    }
+
     /// Whether a value of `ty` lives behind a pointer rather than in its own word.
     fn is_reference(&self, ty: &str) -> bool {
         ty == "bytes" || ty == "string" || ty.ends_with(']') || self.types.is_struct(self.scope, ty)
@@ -649,7 +667,7 @@ impl<'a> ValueReader<'a> {
             }
             return Some(format!("[{}]", parts.join(", ")));
         }
-        if let Some(members) = self.types.struct_members(self.scope, ty) {
+        if let Some(members) = self.types.members_seen_from(self.scope, ty) {
             let mut parts = Vec::with_capacity(members.len());
             for (index, member) in members.iter().enumerate() {
                 let word = memory_word(memory, pointer.checked_add(index.checked_mul(32)?)?)?;
@@ -796,7 +814,7 @@ impl<'a> ValueReader<'a> {
                 status: DebugValueStatus::Decoded,
             };
         }
-        if let Some(members) = self.types.struct_members(self.scope, ty) {
+        if let Some(members) = self.types.members_seen_from(self.scope, ty) {
             if members.iter().any(|member| self.is_reference(&member.ty)) {
                 return placeholder;
             }
@@ -896,15 +914,31 @@ fn is_type_name(ty: &str) -> bool {
         && !matches!(ty, "bytes" | "string")
 }
 
-/// The storage layout's identifier for the type declared as `ty`, matched by label: the
-/// layout labels a struct `struct Shop.Item` where the declaration says `Item`.
-fn storage_type_id(layout: &StorageLayout, ty: &str) -> Option<String> {
+/// Finds the layout type id for `ty` in `scope`. A struct the sources declare is matched by its
+/// exact label only: the layout may lack it (a diamond storage pointer) and hold another struct
+/// of the same name. Anything else is matched by the only label equal without qualifiers.
+fn storage_type_id(
+    layout: &StorageLayout,
+    types: &SourceTypes,
+    scope: Option<&str>,
+    ty: &str,
+) -> Option<String> {
+    let (name, array) = ty.split_at(ty.find('[').unwrap_or(ty.len()));
+    if let Some(label) = types.struct_label(scope, name) {
+        let exact = format!("struct {label}{array}");
+        return layout
+            .types
+            .iter()
+            .find(|(_, candidate)| candidate.label == exact)
+            .map(|(id, _)| id.clone());
+    }
     let wanted = unqualified(ty);
-    layout
+    let mut matching = layout
         .types
         .iter()
-        .find(|(_, candidate)| unqualified(&candidate.label) == wanted)
-        .map(|(id, _)| id.clone())
+        .filter(|(_, candidate)| unqualified(&candidate.label) == wanted);
+    let (id, _) = matching.next()?;
+    matching.next().is_none().then(|| id.clone())
 }
 
 /// A type label without `struct`/`enum`/`contract` prefixes and contract qualifiers, so
@@ -1229,12 +1263,13 @@ contract Shop {
             }
         }))
         .expect("layout");
+        let types = SourceTypes::parse(SOURCE);
         assert_eq!(
-            super::storage_type_id(&layout, "Pair").as_deref(),
+            super::storage_type_id(&layout, &types, None, "Pair").as_deref(),
             Some("t_struct(Pair)5_storage")
         );
         assert_eq!(
-            super::storage_type_id(&layout, "Shop.Pair[]").as_deref(),
+            super::storage_type_id(&layout, &types, None, "Shop.Pair[]").as_deref(),
             Some("t_array(t_struct(Pair)5_storage)dyn_storage")
         );
         assert_eq!(unqualified("struct Shop.Pair[]"), "Pair[]");
@@ -1264,6 +1299,203 @@ contract Shop {
         assert_eq!(
             at(&reader, "Pair storage", &["0x5"], "p.c").unwrap_err(),
             "`struct Shop.Pair` has no member `c`; it has a, b"
+        );
+    }
+
+    #[test]
+    fn a_storage_pointer_uses_the_struct_of_the_library_that_declares_it() {
+        let layout = StorageLayout::parse(&json!({
+            "storage": [],
+            "types": {
+                "t_struct(State)1_storage": {"label": "struct A.State", "encoding": "inplace", "numberOfBytes": "128", "members": [
+                    {"label": "liquidity", "slot": "3", "offset": 0, "type": "t_uint128"}
+                ]},
+                "t_struct(State)2_storage": {"label": "struct B.State", "encoding": "inplace", "numberOfBytes": "64", "members": [
+                    {"label": "liquidity", "slot": "0", "offset": 0, "type": "t_uint128"}
+                ]},
+                "t_uint128": {"label": "uint128", "encoding": "inplace", "numberOfBytes": "16"}
+            }
+        }))
+        .expect("layout");
+        let mut types = SourceTypes::default();
+        types.add_source(0, "library A { struct State { uint256 a; } }");
+        types.add_source(1, "library B { struct State { uint128 liquidity; } }");
+        let id = |scope| super::storage_type_id(&layout, &types, scope, "State");
+        assert_eq!(id(Some("A")).as_deref(), Some("t_struct(State)1_storage"));
+        assert_eq!(id(Some("B")).as_deref(), Some("t_struct(State)2_storage"));
+        // Neither can be chosen from elsewhere.
+        assert_eq!(id(Some("Manager")), None);
+    }
+
+    #[test]
+    fn a_struct_the_layout_lacks_is_not_read_as_another_of_the_same_name() {
+        // `A.State` is a diamond storage pointer, so only `B.State` is in the layout.
+        let layout = StorageLayout::parse(&json!({
+            "storage": [],
+            "types": {
+                "t_struct(State)2_storage": {"label": "struct B.State", "encoding": "inplace", "numberOfBytes": "32", "members": [
+                    {"label": "b", "slot": "0", "offset": 0, "type": "t_uint256"}
+                ]},
+                "t_uint256": {"label": "uint256", "encoding": "inplace", "numberOfBytes": "32"}
+            }
+        }))
+        .expect("layout");
+        let mut types = SourceTypes::default();
+        types.add_source(0, "library A { struct State { uint256 a; } }");
+        types.add_source(1, "library B { struct State { uint256 b; } }");
+        assert_eq!(
+            super::storage_type_id(&layout, &types, Some("A"), "State"),
+            None
+        );
+        assert_eq!(
+            super::storage_type_id(&layout, &types, Some("B"), "State").as_deref(),
+            Some("t_struct(State)2_storage")
+        );
+    }
+
+    #[test]
+    fn a_member_type_resolves_where_its_struct_is_declared() {
+        let mut types = SourceTypes::default();
+        types.add_source(
+            0,
+            "library Pool { struct Inner { uint256 a; uint256 b; } struct Params { Inner inner; uint256 c; } }",
+        );
+        types.add_source(1, "library Other { struct Inner { bool x; } }");
+        // `Params` at 0x0: `inner` points to 0x80, `c` is 7; `Inner` at 0x80 is (5, 6).
+        let mut memory = [0_u8; 0xc0];
+        memory[31] = 0x80;
+        memory[63] = 7;
+        memory[0x80 + 31] = 5;
+        memory[0xa0 + 31] = 6;
+        let mut reader = reader(Some(&memory), &types);
+        reader.scope = Some("Manager");
+        assert_eq!(
+            reader.variable("Pool.Params memory", &["0x0"]).display,
+            "{ inner: { a: 5, b: 6 }, c: 7 }"
+        );
+        let show = |path: &str| {
+            at(&reader, "Pool.Params memory", &["0x0"], path)
+                .map(|place| reader.show(&place).display)
+        };
+        assert_eq!(show("p.inner").as_deref(), Ok("{ a: 5, b: 6 }"));
+        assert_eq!(show("p.inner.a").as_deref(), Ok("5"));
+        // From `Pool`, the bare name already means `Pool.Inner`, so it is left as written.
+        assert_eq!(
+            types
+                .members_seen_from(Some("Pool"), "Params")
+                .expect("Params")[0]
+                .ty,
+            "Inner"
+        );
+        assert_eq!(
+            types
+                .members_seen_from(Some("Manager"), "Pool.Params")
+                .expect("Params")[0]
+                .ty,
+            "Pool.Inner"
+        );
+    }
+
+    #[test]
+    fn a_struct_without_a_declaration_is_not_reported_as_missing_memory() {
+        let types = SourceTypes::parse(SOURCE);
+        let memory = [0_u8; 64];
+        let reader = reader(Some(&memory), &types);
+        assert_eq!(
+            reader.variable("Unknown memory", &["0x0"]).display,
+            "<Unknown in memory at 0x0; its declaration could not be resolved>"
+        );
+        assert_eq!(
+            at(&reader, "Unknown memory", &["0x0"], "p.a").unwrap_err(),
+            "`p` is a `Unknown memory`, whose declaration could not be resolved"
+        );
+        // A known type past the end of the capture is still reported as such.
+        assert_eq!(
+            reader.variable("Pair memory", &["0x40"]).display,
+            "<Pair in memory at 0x40, beyond what this step captured>"
+        );
+    }
+
+    #[test]
+    fn a_calldata_struct_without_a_declaration_says_so() {
+        let types = SourceTypes::parse(SOURCE);
+        let reader = reader(None, &types);
+        assert_eq!(
+            at(&reader, "Unknown calldata", &["0x0"], "p.a").unwrap_err(),
+            "`p` is a `Unknown calldata`, whose declaration could not be resolved"
+        );
+        assert_eq!(
+            at(&reader, "Pair calldata", &["0x0"], "p.c").unwrap_err(),
+            "`Pair` has no member `c`; it has a, b"
+        );
+    }
+
+    #[test]
+    fn array_enum_and_file_level_member_types_resolve_where_the_struct_is_declared() {
+        let mut types = SourceTypes::default();
+        types.add_source(
+            0,
+            "library Pool { enum Color { Red, Blue } struct Inner { uint256 a; } \
+             struct Params { Inner[2] inners; Color color; Shared shared; } }",
+        );
+        types.add_source(
+            1,
+            "library Other { struct Inner { bool x; } enum Color { Up } }",
+        );
+        types.add_source(2, "struct Shared { uint256 s; }");
+        let tys = types
+            .members_seen_from(Some("Manager"), "Pool.Params")
+            .expect("Params")
+            .into_iter()
+            .map(|member| member.ty)
+            .collect::<Vec<_>>();
+        // A file-level type has no contract to qualify it with and means the same anyway.
+        assert_eq!(tys, ["Pool.Inner[2]", "Pool.Color", "Shared"]);
+
+        // `Params` at 0x0: `inners` -> 0x80, `color` Blue, `shared` -> 0x100.
+        // `inners` at 0x80 holds pointers to 0xc0 (a = 5) and 0xe0 (a = 6); `Shared` is 9.
+        let mut memory = [0_u8; 0x120];
+        memory[31] = 0x80;
+        memory[63] = 1;
+        memory[0x40 + 30] = 0x01;
+        memory[0x80 + 31] = 0xc0;
+        memory[0xa0 + 31] = 0xe0;
+        memory[0xc0 + 31] = 5;
+        memory[0xe0 + 31] = 6;
+        memory[0x100 + 31] = 9;
+        let mut reader = reader(Some(&memory), &types);
+        reader.scope = Some("Manager");
+        assert_eq!(
+            reader.variable("Pool.Params memory", &["0x0"]).display,
+            "{ inners: [{ a: 5 }, { a: 6 }], color: Pool.Color.Blue, shared: { s: 9 } }"
+        );
+    }
+
+    #[test]
+    fn a_non_struct_type_is_found_in_the_layout_only_when_one_label_matches() {
+        let enum_type =
+            |label: &str| json!({"label": label, "encoding": "inplace", "numberOfBytes": "1"});
+        let types = SourceTypes::default();
+        let layout = StorageLayout::parse(&json!({
+            "storage": [],
+            "types": {"t_enum(Color)1": enum_type("enum A.Color")}
+        }))
+        .expect("layout");
+        assert_eq!(
+            super::storage_type_id(&layout, &types, Some("Manager"), "Color").as_deref(),
+            Some("t_enum(Color)1")
+        );
+        let layout = StorageLayout::parse(&json!({
+            "storage": [],
+            "types": {
+                "t_enum(Color)1": enum_type("enum A.Color"),
+                "t_enum(Color)2": enum_type("enum B.Color")
+            }
+        }))
+        .expect("layout");
+        assert_eq!(
+            super::storage_type_id(&layout, &types, Some("Manager"), "Color"),
+            None
         );
     }
 }
