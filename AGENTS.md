@@ -344,7 +344,8 @@ CI runs the lit suite against three compilers, for three different reasons:
 | solc 0.8.36 (pinned) | the modern `--experimental --ethdebug-program …` generation |
 | solc `develop`, built from source | where ETHDebug output changes first |
 
-A separate non-blocking `solar-main` job builds `paradigmxyz/solar@main` and
+A separate non-blocking `solar` job builds the Solar release named by `SOLAR_REF` in
+`.github/workflows/ci.yml` (`v0.3.0`; move it to each new release) and
 runs `lit test/compiler --param compiler=both` over CLI debug artifacts in local
 REVM. The solc jobs run the same files with `--param compiler=solc`, without
 requiring Solar. Use `--param compiler=solar` for Solar-only coverage. This
@@ -361,7 +362,7 @@ failures. Keep compilation and CLI assertions in the `.test` RUN lines. Use
 Solar's `--emit` and solc's `--combined-json` outputs directly; `jq` extracts
 ETHDebug program/resource files and selects named checkpoints. Do not add a
 Python compiler-preparation adapter. The Solar binary must support the debug
-output selectors; CI still tracks main and does not fall back to Standard JSON.
+output selectors; CI does not fall back to Standard JSON.
 See `docs/debug-diff.md` for local commands and retained reports.
 
 The `develop` job builds `argotorg/solidity@develop`, caches the binary by commit, and is
