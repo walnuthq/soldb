@@ -116,7 +116,8 @@ I/O.
 
 ## Shared Compiler Tests
 
-CI builds `paradigmxyz/solar` at `main` and exercises its CLI debug artifacts
+CI builds the `paradigmxyz/solar` release named by `SOLAR_REF` in
+`.github/workflows/ci.yml` and exercises its CLI debug artifacts
 through local REVM, debug comparisons, and both profiling formats. The solc CI
 jobs run the same test files against their selected compiler. One Solidity
 fixture and one `.test` file cover each behavior, with common FileCheck checks
@@ -185,11 +186,11 @@ pass, and a stop only one format reads is a failure in every mode. These are
 source-coverage checks, not a claim of exact function-frame, variable-location,
 or full span parity.
 
-The `solar-main-compatibility` artifact contains the exact Solar revision,
+The `solar-compatibility` artifact contains the exact Solar revision,
 compiler versions, CLI artifacts and diagnostics, REVM traces, comparison
 reports, profiles, SVGs, and lit results with the failing commands. Local output
 defaults to `target/compiler-lit/<compiler>/<optimization>`; change its parent with
-`--param output=/path/to/results`. CI still tracks main, so compiler fixes
-and the debug-output CLI must land there before its run becomes green.
+`--param output=/path/to/results`. CI uses a pinned release, so a compiler fix
+reaches it only when `SOLAR_REF` moves to a release that has it.
 This suite is separate from the solc-specific live-node tests and does not imply that
 `soldb compile --solc /path/to/solar` accepts Solar's CLI.

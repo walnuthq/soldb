@@ -385,33 +385,35 @@ jobs:
 
           RPC_URL=http://127.0.0.1:8545 ./test/run-tests.sh
 
-  solar-main:
-    # Like solc develop, this is an upstream compatibility signal, not a release gate.
+  solar:
+    # Pinned to a Solar release; move SOLAR_REF to the next release when it is out.
     # Keep real failures red and upload their reproducers; do not bless missing metadata.
-    name: debug and profile (Solar main)
+    name: debug and profile (Solar release)
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      SOLAR_REF: v0.3.0
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Check out Solar main
+      - name: Check out Solar ${{ env.SOLAR_REF }}
         uses: actions/checkout@v4
         with:
           repository: paradigmxyz/solar
-          ref: main
-          path: target/solar-main
+          ref: ${{ env.SOLAR_REF }}
+          path: target/solar
           persist-credentials: false
 
       - name: Record the exact compiler revision
         run: |
           mkdir -p target/solar-ci
-          git -C target/solar-main rev-parse HEAD | tee target/solar-ci/solar-commit.txt
-          echo "Solar main: $(cat target/solar-ci/solar-commit.txt)" >> "$GITHUB_STEP_SUMMARY"
+          git -C target/solar rev-parse HEAD | tee target/solar-ci/solar-commit.txt
+          echo "Solar $SOLAR_REF: $(cat target/solar-ci/solar-commit.txt)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-python@v5
         with:
@@ -439,11 +441,11 @@ jobs:
           echo "c8d35afdddc3cd2743ee88b8f25e0fecd16e2bdd5f2120f37e52cd9cc45ae0e6  $HOME/.local/bin/solc-0.8.36" | sha256sum -c -
           chmod +x "$HOME/.local/bin/solc-0.8.36"
           echo "SOLC_PATH=$HOME/.local/bin/solc-0.8.36" >> "$GITHUB_ENV"
-          echo "SOLAR=$GITHUB_WORKSPACE/target/solar-main/target/debug/solar" >> "$GITHUB_ENV"
+          echo "SOLAR=$GITHUB_WORKSPACE/target/solar/target/debug/solar" >> "$GITHUB_ENV"
 
       - name: Build Solar
         id: build-solar
-        working-directory: target/solar-main
+        working-directory: target/solar
         run: |
           set -euo pipefail
           cargo build --locked -p solar-compiler --bin solar 2>&1 | tee "$GITHUB_WORKSPACE/target/solar-ci/solar-build.log"
@@ -490,7 +492,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: solar-main-compatibility
+          name: solar-compatibility
           path: target/solar-ci/
           retention-days: 14
           if-no-files-found: warn
