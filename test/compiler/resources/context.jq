@@ -45,7 +45,7 @@ def hex: ascii_downcase | ltrimstr("0x") | explode
   elif $pointer | has("define") then
     if ($pointer.define.slot | hex) != ($entry.slot | tonumber) then
       error("\($variable.identifier): template bound to slot \($pointer.define.slot), the layout says \($entry.slot)")
-    elif $pointer.in.template != ($entry.type | escaped) then
+    elif $pointer.in.template != ("storage-" + ($entry.type | escaped)) then
       error("\($variable.identifier): references \($pointer.in.template), its type is \($entry.type | escaped)")
     elif ($resources[0].pointers | has($pointer.in.template) | not) then
       error("\($variable.identifier): references the unknown template \($pointer.in.template)")
