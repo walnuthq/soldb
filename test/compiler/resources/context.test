@@ -5,7 +5,7 @@
 # tells the debugger where the state lives without the storage layout. The runtime
 # program lists the immutables its code reads as well, as regions of the code. solc refuses
 # ETHDebug output with the optimizer, so this needs no optimization.
-# REQUIRES: soldb, compiler-solc, solc-ethdebug-program-context, optimization-none
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-program-context, solc-ethdebug-layout-templates, optimization-none
 # RUN: rm -rf %t
 # RUN: mkdir -p %t
 # RUN: cd %S/.. && %solc Resources.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources --ethdebug-compilation --storage-layout -o %t > %t/compile.stdout 2> %t/compile.stderr
@@ -51,11 +51,11 @@
 # POINTERS-NEXT: hash: region at slot 0x03
 # POINTERS-NEXT: color: region at slot 0x04 offset 0x1f length 0x01
 # POINTERS-NEXT: price: region at slot 0x04 offset 0x0f length 0x10
-# POINTERS-NEXT: origin: template t_struct$_Point_${{[0-9]+}}_storage at slot 0x05
-# POINTERS-NEXT: packed: template t_array$_t_uint16_$4_storage at slot 0x06
-# POINTERS-NEXT: values: template t_array$_t_uint256_$dyn_storage at slot 0x07
-# POINTERS-NEXT: blob: template t_bytes_storage at slot 0x08
-# POINTERS-NEXT: text: template t_string_storage at slot 0x09
+# POINTERS-NEXT: origin: template storage-t_struct$_Point_${{[0-9]+}}_storage at slot 0x05
+# POINTERS-NEXT: packed: template storage-t_array$_t_uint16_$4_storage at slot 0x06
+# POINTERS-NEXT: values: template storage-t_array$_t_uint256_$dyn_storage at slot 0x07
+# POINTERS-NEXT: blob: template storage-t_bytes_storage at slot 0x08
+# POINTERS-NEXT: text: template storage-t_string_storage at slot 0x09
 # POINTERS-NEXT: balances: mapping base slot 0x0a
 # POINTERS-NEXT: nested: mapping base slot 0x0b
 # POINTERS-NEXT: scratch: transient region at slot 0x00
