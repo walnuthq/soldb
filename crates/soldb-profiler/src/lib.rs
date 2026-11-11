@@ -367,6 +367,12 @@ pub struct ProfileTotals {
     pub unmapped_gas: u64,
     /// Program gas whose instruction carries no source range.
     pub sourceless_gas: u64,
+    /// Gas the frames of the profiled calls report; absent when one has no record of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_gas: Option<u64>,
+    /// Frame gas charged outside every step; absent when it cannot be told from a refund.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_steps_gas: Option<u64>,
 }
 
 /// One top-level call: Foundry's deployment, `setUp` and test each are one.
@@ -761,6 +767,8 @@ fn profile(
         .gas
         .checked_sub(source_metrics.gas)
         .ok_or_else(|| SoldbError::Message("profile source gas exceeds program gas".to_owned()))?;
+    let frame_gas = profiled_frame_gas(trace, &root_calls, &roots);
+    let outside_steps_gas = outside_steps_gas(trace, frame_gas, step_metrics.gas);
 
     Ok(ProfileReport {
         schema_version: PROFILE_SCHEMA_VERSION,
@@ -781,6 +789,8 @@ fn profile(
             source_gas: source_metrics.gas,
             unmapped_gas,
             sourceless_gas,
+            frame_gas,
+            outside_steps_gas,
         },
         roots: if selector.is_some() {
             root_rows(&roots, &root_metrics)?
@@ -794,6 +804,43 @@ fn profile(
         hotspots: hotspot_rows,
         folded_stacks,
     })
+}
+
+/// The sum of what the frames of the profiled calls report, when all of them do.
+fn profiled_frame_gas(
+    trace: &TransactionTrace,
+    root_calls: &[RootCall],
+    roots: &[ProfileRoot],
+) -> Option<u64> {
+    let mut total = 0_u64;
+    for (call, root) in root_calls.iter().zip(roots) {
+        if !root.profiled {
+            continue;
+        }
+        let gas = call.frame_gas_used(trace)?;
+        total = total.checked_add(gas)?;
+    }
+    Some(total)
+}
+
+/// Frame gas no step accounts for. A replayed frame's gas is net of refunds and steps are not,
+/// so with a refund the difference does not mean this.
+fn outside_steps_gas(
+    trace: &TransactionTrace,
+    frame_gas: Option<u64>,
+    step_gas: u64,
+) -> Option<u64> {
+    let frame_gas = frame_gas?;
+    let refunded = trace
+        .artifacts
+        .gas
+        .as_ref()
+        .and_then(|gas| gas.refunded)
+        .unwrap_or(0);
+    if refunded != 0 {
+        return None;
+    }
+    frame_gas.checked_sub(step_gas)
 }
 
 /// Returns a step's gas without the gas a call forwards, which the callee's steps already count.
@@ -1695,8 +1742,8 @@ mod tests {
 
     use serde_json::json;
     use soldb_core::{
-        ContractCreation, ExecutionCall, RootKind, StepSnapshot, TraceArtifacts, TraceCapabilities,
-        TraceStep, TransactionTrace,
+        ContractCreation, ExecutionCall, GasSummary, RootKind, StepSnapshot, TraceArtifacts,
+        TraceCapabilities, TraceStep, TransactionTrace,
     };
     use soldb_ethdebug::{source_range, EthdebugInfo, Instruction};
 
@@ -2525,6 +2572,50 @@ mod tests {
         assert!(report.source_lines.is_empty());
         assert_eq!(report.hotspots[0].source, None);
         assert!(report.folded_text().contains("Counter Unsafe Name"));
+    }
+
+    #[test]
+    fn reports_the_frame_gas_of_the_selected_call_and_what_no_step_accounts_for() {
+        let mut trace = foundry_trace();
+        trace.gas_used = 1_000;
+        trace.artifacts.calls[1].gas_used = Some(150);
+
+        let report =
+            profile_root(&trace, &[], &RootSelector::Index(1)).expect("profile the second call");
+
+        assert_eq!(report.transaction.gas_used, 1_000);
+        assert_eq!(report.totals.frame_gas, Some(150));
+        assert_eq!(report.totals.outside_steps_gas, Some(45));
+    }
+
+    #[test]
+    fn claims_no_frame_gas_when_a_profiled_call_has_no_record_of_it() {
+        let mut trace = foundry_trace();
+        trace.artifacts.calls[1].gas_used = Some(150);
+
+        let report = profile_transaction(&trace, &[]).expect("profile both calls");
+
+        assert_eq!(report.totals.frame_gas, None);
+        assert_eq!(report.totals.outside_steps_gas, None);
+    }
+
+    #[test]
+    fn claims_no_gas_outside_steps_for_a_trace_with_a_refund() {
+        let mut trace = foundry_trace();
+        trace.artifacts.calls[1].gas_used = Some(150);
+        trace.artifacts.gas = Some(GasSummary {
+            used: 150,
+            spent: Some(200),
+            refunded: Some(50),
+            remaining: None,
+            limit: None,
+        });
+
+        let report =
+            profile_root(&trace, &[], &RootSelector::Index(1)).expect("profile the second call");
+
+        assert_eq!(report.totals.frame_gas, Some(150));
+        assert_eq!(report.totals.outside_steps_gas, None);
     }
 
     /// `setUp` and a test, each a top-level call into the test contract at `0xaa`.

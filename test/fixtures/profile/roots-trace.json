@@ -58,7 +58,7 @@
         "value": "0",
         "input": "0x",
         "gas_limit": 1000,
-        "gas_used": null,
+        "gas_used": 50,
         "output": "0x",
         "success": true,
         "error": null
