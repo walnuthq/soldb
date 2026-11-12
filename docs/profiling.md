@@ -54,6 +54,12 @@ The report separates:
 Transaction gas and traced instruction gas are separate quantities. Intrinsic
 transaction gas, refunds, and backend accounting can make them differ.
 
+When the trace records the gas of its top-level calls, `Gas outside steps` is the gas
+those calls report minus the traced instruction gas: gas that was charged but that no
+step spent, such as a creation's code deposit. The line is left out when a call has no
+recorded gas, or when the trace reports a refund, because a replayed call's gas is net
+of refunds and the steps' gas is not.
+
 ### Call and creation gas
 
 A call's `gas_cost` includes the gas it forwards to the callee, whose steps count it
@@ -66,7 +72,8 @@ step starts with:
 - A call that runs no steps, such as one to a precompile, is charged what the caller
   lost before its next step.
 
-Gas charged outside any step, such as a creation's code deposit, is not in the profile.
+Gas charged outside any step, such as a creation's code deposit, is not attributed to a
+contract, function, or source line. It appears only in `Gas outside steps`.
 
 ## Captured traces
 
@@ -103,7 +110,11 @@ A trace that does not record kinds, such as a `forge test --debug --dump`
 bundle, has no kinds to select, and selects a call by its number instead: `--root 2`.
 A number works on any trace.
 
-Every table and total then covers only those calls. `Top-level calls` lists all
+Every table and total then covers only those calls. If some calls are left out,
+`Profiled calls gas used`, the gas the selected calls report, replaces
+`Transaction gas used`, since the transaction's gas also covers the calls left out.
+`transaction.gasUsed` in the JSON stays the whole transaction's; `totals.frameGas` is
+the selected calls'. `Top-level calls` lists all
 of them, numbered from `#0`, with their gas and the first function each entered,
 such as `setUp`, and marks the rest `(not profiled)`. Folded stacks start with the
 call they belong to: its kind when the trace records one, such as

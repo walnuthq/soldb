@@ -16,7 +16,10 @@
 # FOLDED: Counter [0x000000000000000000000000000000000000cafe];CALL Counter
 
 # EXECUTION: Top-level calls profiled: execution
+# EXECUTION-NOT: Transaction gas used
+# EXECUTION: Profiled calls gas used: 50
 # EXECUTION: Traced instruction gas: 8 across 2 steps
+# EXECUTION-NEXT: Gas outside steps: 42
 # EXECUTION: #0 [setup] Counter {{.*}} (not profiled)
 # EXECUTION-NOT: (not profiled)
 # EXECUTION: Opcodes

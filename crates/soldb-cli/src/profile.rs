@@ -239,17 +239,14 @@ fn print_report(report: &ProfileReport, top: usize) {
     if let Some(root) = &report.root {
         println!("{} {root}", info("Top-level calls profiled:"));
     }
-    println!(
-        "{} {}",
-        info("Transaction gas used:"),
-        number_color(report.transaction.gas_used)
-    );
+    print_gas_used(report);
     println!(
         "{} {} across {} steps",
         info("Traced instruction gas:"),
         number_color(report.totals.step_gas),
         number_color(report.totals.steps)
     );
+    print_outside_steps_gas(report);
     println!(
         "{} {} ({})",
         info("Program-attributed gas:"),
@@ -281,6 +278,30 @@ fn print_report(report: &ProfileReport, top: usize) {
     print_source_lines(report, top);
     print_opcodes(report, top);
     print_hotspots(report, top);
+}
+
+/// The trace's gas, unless a selection left out some of its top-level calls.
+fn print_gas_used(report: &ProfileReport) {
+    if report.roots.iter().all(|root| root.profiled) {
+        println!(
+            "{} {}",
+            info("Transaction gas used:"),
+            number_color(report.transaction.gas_used)
+        );
+        return;
+    }
+    let label = info("Profiled calls gas used:");
+    match report.totals.frame_gas {
+        Some(gas) => println!("{label} {}", number_color(gas)),
+        None => println!("{label} not recorded by the trace"),
+    }
+}
+
+fn print_outside_steps_gas(report: &ProfileReport) {
+    let Some(gas) = report.totals.outside_steps_gas else {
+        return;
+    };
+    println!("{} {}", info("Gas outside steps:"), number_color(gas));
 }
 
 fn profile_status(report: &ProfileReport) -> String {

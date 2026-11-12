@@ -80,6 +80,17 @@ impl RootCall {
         }
     }
 
+    /// The gas the call's own frame reports; `None` when it has no record of it, as the
+    /// trace's own root does.
+    #[must_use]
+    pub fn frame_gas_used(&self, trace: &TransactionTrace) -> Option<u64> {
+        match self.record {
+            RootRecord::Trace => None,
+            RootRecord::Call(index) => trace.artifacts.calls.get(index)?.gas_used,
+            RootRecord::Creation(index) => trace.artifacts.creations.get(index)?.gas_used,
+        }
+    }
+
     /// The calldata of a call, or the init code of a creation.
     #[must_use]
     pub fn input<'a>(&self, trace: &'a TransactionTrace) -> &'a str {
