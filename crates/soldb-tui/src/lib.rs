@@ -5,12 +5,15 @@
 //! the state, the stack, memory, the backtrace, and the opcodes around the program
 //! counter, with a command line at the bottom that takes every REPL command. Keys step
 //! without typing: `n`, `s`, `c`, `f`, `i` forward and their capitals backward, the way
-//! gdb's TUI works; `q` returns to the prompt and `Q` leaves the debugger.
+//! gdb's TUI works; `q` returns to the prompt and `Q` leaves the debugger. `y` copies the
+//! focused pane and `Y` saves it to a file, whole, including what the pane cuts off.
 //!
 //! Nothing here decides anything about the trace: every pane shows what the session
 //! answers, so the view and the REPL cannot disagree.
 
-use std::io::{self, IsTerminal, Stdout};
+use std::fs;
+use std::io::{self, IsTerminal, Stdout, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -159,12 +162,14 @@ struct View {
     focus: Pane,
     /// Scroll offset per pane, in lines from the top.
     scroll: [u16; Pane::ALL.len()],
+    /// Horizontal scroll offset per pane, in columns from the left.
+    hscroll: [u16; Pane::ALL.len()],
     /// Whether the source pane follows the current line.
     follow: bool,
     /// The command being typed, when the console has the cursor.
     input: Option<String>,
     /// What the last commands answered, newest last.
-    console: Vec<String>,
+    console: Vec<Line<'static>>,
     /// The panes' contents.
     source: Vec<Line<'static>>,
     source_current: Option<usize>,
@@ -183,9 +188,10 @@ impl View {
         Self {
             focus: Pane::Source,
             scroll: [0; Pane::ALL.len()],
+            hscroll: [0; Pane::ALL.len()],
             follow: true,
             input: None,
-            console: vec!["Keys: n s c f i step forward, N S C F I backward, b breaks on the source line, : types a command, Tab moves focus, ? help, q back to the prompt, Q quit".to_owned()],
+            console: vec![Line::from("Keys: n s c f i step forward, N S C F I backward, b breaks on the source line, : types a command, Tab moves focus, y copies the pane, Y saves it, ? help, q back to the prompt, Q quit")],
             source: Vec::new(),
             source_current: None,
             variables: Vec::new(),
@@ -447,7 +453,8 @@ impl View {
         let renderer = Renderer::new(false);
         let command = DebuggerCommand::parse(line);
         if !line.trim().is_empty() {
-            self.console.push(format!("soldb> {}", line.trim()));
+            self.console
+                .push(Line::from(format!("soldb> {}", line.trim())));
         }
         for output in session.execute(command) {
             match output {
@@ -455,7 +462,7 @@ impl View {
                 Output::Tui => {}
                 other => {
                     for text in renderer.render(&other).lines() {
-                        self.console.push(text.to_owned());
+                        self.console.push(Line::from(text.to_owned()));
                     }
                 }
             }
@@ -464,6 +471,50 @@ impl View {
         self.refresh(session);
         self.scroll[pane_index(Pane::Console)] = u16::MAX;
         None
+    }
+
+    /// Shows a line in the console, which scrolls to it.
+    fn report(&mut self, text: String) {
+        self.console.push(Line::from(text));
+        self.scroll[pane_index(Pane::Console)] = u16::MAX;
+    }
+
+    /// What a pane holds, as plain text, whatever of it fits on the screen.
+    fn pane_text(&self, pane: Pane) -> String {
+        let mut text = String::new();
+        for line in self.lines(pane) {
+            text.push_str(&line.to_string());
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Sends the focused pane to the clipboard through the terminal, with OSC 52.
+    fn copy_focused(&mut self, out: &mut impl Write) {
+        let title = self.focus.title();
+        let text = self.pane_text(self.focus);
+        let sent =
+            write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes())).and_then(|()| out.flush());
+        match sent {
+            Ok(()) => {
+                // The terminal does not answer, so this cannot claim the copy worked.
+                self.report(format!(
+                    "Sent {title} to the clipboard over OSC 52 ({} bytes)",
+                    text.len()
+                ));
+                self.report("A terminal without OSC 52 ignores this; Y saves to a file".to_owned());
+            }
+            Err(error) => self.report(format!("cannot copy {title}: {error}")),
+        }
+    }
+
+    /// Writes the focused pane to `path`.
+    fn save_focused(&mut self, path: &Path) {
+        let title = self.focus.title();
+        match fs::write(path, self.pane_text(self.focus)) {
+            Ok(()) => self.report(format!("Saved {title} to `{}`", path.display())),
+            Err(error) => self.report(format!("cannot write `{}`: {error}", path.display())),
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent, session: &mut Session) -> Option<Exit> {
@@ -521,6 +572,14 @@ impl View {
                 self.scroll_by(-1);
                 return None;
             }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.hscroll_by(-4);
+                return None;
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.hscroll_by(4);
+                return None;
+            }
             KeyCode::PageDown => {
                 self.scroll_by(10);
                 return None;
@@ -532,6 +591,15 @@ impl View {
             KeyCode::Char('g') => {
                 self.follow = true;
                 self.center_on_current();
+                return None;
+            }
+            KeyCode::Char('y') => {
+                self.copy_focused(&mut io::stdout());
+                return None;
+            }
+            KeyCode::Char('Y') => {
+                let path = pane_file(self.focus, session.state().current_step);
+                self.save_focused(&path);
                 return None;
             }
             KeyCode::Char('m') => {
@@ -569,6 +637,12 @@ impl View {
         }
     }
 
+    fn hscroll_by(&mut self, delta: i32) {
+        let index = pane_index(self.focus);
+        let current = i32::from(self.hscroll[index]);
+        self.hscroll[index] = (current + delta).clamp(0, i32::from(u16::MAX - 1)) as u16;
+    }
+
     fn draw(&mut self, frame: &mut Frame<'_>, session: &Session) {
         let area = frame.area();
         let rows = Layout::default()
@@ -595,29 +669,46 @@ impl View {
                 Constraint::Percentage(30),
             ])
             .split(top[1]);
-        self.pane(frame, Pane::Source, left[0], &self.source);
-        self.pane(frame, Pane::Opcodes, left[1], &self.opcodes);
-        self.pane(frame, Pane::Variables, right[0], &self.variables);
-        self.pane(frame, Pane::Stack, right[1], &self.stack);
-        self.pane(frame, Pane::Memory, right[2], &self.memory);
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(rows[1]);
-        self.pane(frame, Pane::Backtrace, bottom[0], &self.backtrace);
-        let console = self
-            .console
-            .iter()
-            .map(|line| Line::from(line.clone()))
-            .collect::<Vec<_>>();
-        self.pane(frame, Pane::Console, bottom[1], &console);
+        let panes = [
+            (Pane::Source, left[0]),
+            (Pane::Opcodes, left[1]),
+            (Pane::Variables, right[0]),
+            (Pane::Stack, right[1]),
+            (Pane::Memory, right[2]),
+            (Pane::Backtrace, bottom[0]),
+            (Pane::Console, bottom[1]),
+        ];
+        for (pane, pane_area) in panes {
+            // Keep the offset drawn, so the next key scrolls from what is on the screen.
+            let (scroll, hscroll) = self.pane(frame, pane, pane_area);
+            self.scroll[pane_index(pane)] = scroll;
+            self.hscroll[pane_index(pane)] = hscroll;
+        }
         self.draw_status(frame, rows[2], session);
         if self.help {
             self.draw_help(frame, area);
         }
     }
 
-    fn pane(&self, frame: &mut Frame<'_>, pane: Pane, area: Rect, lines: &[Line<'static>]) {
+    fn lines(&self, pane: Pane) -> &[Line<'static>] {
+        match pane {
+            Pane::Source => &self.source,
+            Pane::Variables => &self.variables,
+            Pane::Stack => &self.stack,
+            Pane::Memory => &self.memory,
+            Pane::Backtrace => &self.backtrace,
+            Pane::Opcodes => &self.opcodes,
+            Pane::Console => &self.console,
+        }
+    }
+
+    /// Draws a pane and returns the vertical and horizontal offsets it was drawn at.
+    fn pane(&self, frame: &mut Frame<'_>, pane: Pane, area: Rect) -> (u16, u16) {
+        let lines = self.lines(pane);
         let focused = self.focus == pane;
         let border = if focused {
             Style::default().fg(Color::Cyan)
@@ -631,10 +722,17 @@ impl View {
         let inner_height = area.height.saturating_sub(2) as usize;
         let max_scroll = lines.len().saturating_sub(inner_height) as u16;
         let scroll = self.scroll[pane_index(pane)].min(max_scroll);
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+        let max_hscroll = widest
+            .saturating_sub(inner_width)
+            .min(usize::from(u16::MAX)) as u16;
+        let hscroll = self.hscroll[pane_index(pane)].min(max_hscroll);
         let paragraph = Paragraph::new(lines.to_vec())
             .block(block)
-            .scroll((scroll, 0));
+            .scroll((scroll, hscroll));
         frame.render_widget(paragraph, area);
+        (scroll, hscroll)
     }
 
     fn draw_status(&self, frame: &mut Frame<'_>, area: Rect, session: &Session) {
@@ -656,7 +754,7 @@ impl View {
                 Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             ]),
             None => Line::from(Span::styled(
-                " n/s/c/f/i step  N/S/C/F/I back  b break  m mode  : command  Tab focus  ? help  q prompt  Q quit",
+                " ? help  n/s/c/f/i step  N/S/C/F/I back  b break  m mode  : command  Tab focus  y/Y copy/save  q prompt  Q quit",
                 Style::default().fg(Color::DarkGray),
             )),
         };
@@ -677,7 +775,8 @@ impl View {
             "N  back over   S  back into   C  back to bp   F  back out   I  back one",
             "b  break on the current line     m  toggle source/asm     g  recenter",
             ":  type any REPL command (Enter runs it, Esc cancels)",
-            "Tab / Shift-Tab  move focus     j/k, arrows, PgUp/PgDn  scroll the pane",
+            "Tab / Shift-Tab  move focus     j/k, up/down, PgUp/PgDn  scroll   h/l, left/right  scroll sideways",
+            "y  copy the focused pane (OSC 52)     Y  save it to a file",
             "q  back to the prompt   Q  quit   Ctrl-X A  back to the prompt",
             "",
             "Press any key to close.",
@@ -701,6 +800,35 @@ fn pane_index(pane: Pane) -> usize {
         .iter()
         .position(|candidate| *candidate == pane)
         .unwrap_or(0)
+}
+
+/// The file `Y` writes a pane to, named so that another step does not overwrite it.
+fn pane_file(pane: Pane, step: usize) -> PathBuf {
+    PathBuf::from(format!(
+        "soldb-{}-step-{step}.txt",
+        pane.title().to_lowercase()
+    ))
+}
+
+/// Standard base64 with padding, which OSC 52 carries.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let packed = chunk
+            .iter()
+            .fold(0u32, |packed, byte| (packed << 8) | u32::from(*byte));
+        let group = packed << (8 * (3 - chunk.len()));
+        for index in 0..4 {
+            if index <= chunk.len() {
+                let digit = (group >> (18 - 6 * index)) & 63;
+                encoded.push(char::from(ALPHABET[digit as usize]));
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    encoded
 }
 
 fn dim(text: String) -> Line<'static> {
@@ -745,4 +873,143 @@ fn variable_line(ty: &str, name: &str, value: &str, place: Option<&str>) -> Line
 /// An answer as plain lines, for a pane that shows text.
 fn text_lines(renderer: &Renderer, output: &Output) -> Vec<Line<'static>> {
     renderer.lines(output).into_iter().map(Line::from).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::backend::TestBackend;
+    use soldb_repl::DebuggerState;
+
+    use super::*;
+
+    fn draw(view: &mut View, session: &Session) {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| view.draw(frame, session)).unwrap();
+    }
+
+    fn scroll(view: &View, pane: Pane) -> u16 {
+        view.scroll[pane_index(pane)]
+    }
+
+    #[test]
+    fn console_scrolls_up_right_after_a_command() {
+        let mut session = Session::new(DebuggerState::new());
+        let mut view = View::new();
+        view.focus = Pane::Console;
+        assert!(view.run_command("help", &mut session).is_none());
+
+        draw(&mut view, &session);
+        let bottom = scroll(&view, Pane::Console);
+        assert!(bottom > 0, "`help` should not fit in the console");
+        view.scroll_by(-1);
+        draw(&mut view, &session);
+        assert_eq!(scroll(&view, Pane::Console), bottom - 1);
+    }
+
+    #[test]
+    fn sideways_scroll_stops_at_the_widest_line() {
+        let session = Session::new(DebuggerState::new());
+        let mut view = View::new();
+        view.focus = Pane::Memory;
+        view.memory = vec![Line::from("x".repeat(100))];
+
+        view.hscroll_by(1000);
+        draw(&mut view, &session);
+        let end = view.hscroll[pane_index(Pane::Memory)];
+        assert!(end > 0 && end < 100);
+        view.hscroll_by(-4);
+        draw(&mut view, &session);
+        assert_eq!(view.hscroll[pane_index(Pane::Memory)], end - 4);
+    }
+
+    #[test]
+    fn scrolling_past_the_end_does_not_delay_scrolling_back() {
+        let session = Session::new(DebuggerState::new());
+        let mut view = View::new();
+        view.focus = Pane::Memory;
+        view.memory = (0..40)
+            .map(|index| Line::from(format!("word {index}")))
+            .collect();
+
+        view.scroll_by(1000);
+        draw(&mut view, &session);
+        let bottom = scroll(&view, Pane::Memory);
+        assert!(bottom < 40);
+        view.scroll_by(-1);
+        draw(&mut view, &session);
+        assert_eq!(scroll(&view, Pane::Memory), bottom - 1);
+    }
+
+    #[test]
+    fn pane_text_keeps_what_the_pane_cuts_off() {
+        let session = Session::new(DebuggerState::new());
+        let mut view = View::new();
+        let word = "ab".repeat(32);
+        view.memory = vec![
+            Line::from(vec![Span::raw("0x0000: "), Span::raw(word.clone())]),
+            Line::from("return data"),
+        ];
+        // On 80 columns the pane is far narrower than the word.
+        draw(&mut view, &session);
+        assert_eq!(
+            view.pane_text(Pane::Memory),
+            format!("0x0000: {word}\nreturn data\n")
+        );
+    }
+
+    #[test]
+    fn copy_sends_the_focused_pane_over_osc52() {
+        let mut view = View::new();
+        view.focus = Pane::Stack;
+        view.stack = vec![Line::from("[ 0] 0x2a")];
+
+        let mut out = Vec::new();
+        view.copy_focused(&mut out);
+
+        let expected = format!("\x1b]52;c;{}\x07", base64(b"[ 0] 0x2a\n"));
+        assert_eq!(out, expected.into_bytes());
+        assert!(view.pane_text(Pane::Console).contains("Sent Stack"));
+        assert_eq!(scroll(&view, Pane::Console), u16::MAX);
+    }
+
+    #[test]
+    fn save_writes_the_focused_pane_and_reports_a_failure() {
+        let mut view = View::new();
+        view.focus = Pane::Variables;
+        view.variables = vec![Line::from("uint256 amount = 4")];
+        let dir = std::env::temp_dir().join(format!("soldb-tui-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("variables.txt");
+
+        view.save_focused(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "uint256 amount = 4\n");
+        assert!(view.pane_text(Pane::Console).contains("Saved Variables"));
+
+        view.save_focused(&dir.join("missing").join("variables.txt"));
+        assert!(view.pane_text(Pane::Console).contains("cannot write"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pane_file_names_the_pane_and_the_step() {
+        assert_eq!(
+            pane_file(Pane::Memory, 156),
+            PathBuf::from("soldb-memory-step-156.txt")
+        );
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        for (input, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(input.as_bytes()), encoded);
+        }
+    }
 }

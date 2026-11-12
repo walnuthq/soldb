@@ -63,6 +63,14 @@ without typing, their capitals step backward, `b` breaks on the current line, `m
 switches source and assembly, `:` types a command, `Tab` moves between panes, `?` lists
 the keys, `q` returns to the prompt, and `Q` leaves the debugger.
 
+`h` and `l`, or the left and right arrows, scroll the focused pane sideways.
+
+`y` copies the focused pane and `Y` saves it to `soldb-<pane>-step-<step>.txt` in the
+current directory. Both take the whole pane, including lines scrolled out of view and text
+cut off at its edge. `y` asks the terminal to set the clipboard with OSC 52; a terminal
+that does not support it, or has it turned off, ignores the request without saying so, and
+some limit its size. `Y` works everywhere.
+
 ## What a Stop Shows
 
 Every stop is one line: where the step is in the source, then the step, its program
