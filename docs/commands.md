@@ -209,6 +209,11 @@ Aliases: `b <file>:<line>`
 Stop when execution enters a source line. The file may be given as a name, a trailing part
 of its path, or the whole path.
 
+When two loaded sources share a file name, a path that matches one of them by its trailing
+part or whole path stops only in that one: `break mocks/Vault.sol:8` does not stop in
+`src/Vault.sol`. A bare file name, or a path that matches no source by path, stops in every
+source with that file name.
+
 A line breakpoint hits once each time the line is entered, not on every instruction the
 line compiles to, and not when a call made from the line returns into the middle of it. A
 line inside a multi-line statement resolves to the statement: `break Counter.sol:12` on the
