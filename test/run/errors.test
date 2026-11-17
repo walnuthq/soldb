@@ -1,0 +1,50 @@
+# Revert data is decoded against the errors the contracts' ABIs declare, as solc compiles
+# them: in the contract itself, in a contract it calls, in a constructor, and Solidity's own.
+# REQUIRES: soldb
+# RUN: %soldb compile %S/fixtures/Errors.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+
+# A custom error of the called contract, with the raw data under it.
+# RUN: %soldb run %t.out/Vault.bin "onlyOwner()" --constructor-args 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out 2>&1 | FileCheck --check-prefix=OWN %s
+# OWN: Status: REVERTED
+# OWN-NEXT: Error: Unauthorized(0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266)
+# OWN-NEXT: 0x8e4a23d6000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266
+
+# Bubbled up from the contract it calls, whose ABI declares it.
+# RUN: %soldb run %t.out/Vault.bin "pay(address,uint256)" 0x0000000000000000000000000000000000000002 1000 --constructor-args 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out --ethdebug-dir 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be:Token:%t.out 2>&1 | FileCheck --check-prefix=CALLEE %s
+# CALLEE: Error: InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+
+# Solidity's own errors need no ABI entry; `require` keeps showing its text alone.
+# RUN: %soldb run %t.out/Vault.bin "addOne(uint8)" 2 --constructor-args 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out 2>&1 | FileCheck --check-prefix=PANIC %s
+# RUN: %soldb run %t.out/Vault.bin "requirePositive(uint256)" 0 --constructor-args 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out 2>&1 | FileCheck --check-prefix=REQUIRE %s
+# PANIC: Error: Panic(0x11: arithmetic underflow or overflow)
+# REQUIRE: Error: x must be positive
+# REQUIRE-NOT: 0x08c379a0
+
+# A constructor that reverts: the deployment `run` makes before the call, the constructor
+# traced with `--deploy`, and a contract created by a call.
+# RUN: not %soldb run %t.out/Token.bin "transfer(address,uint256)" 0x0000000000000000000000000000000000000002 1 --constructor-args 0 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Token:%t.out 2>&1 | FileCheck --check-prefix=CONSTRUCTOR %s
+# RUN: %soldb run %t.out/Vault.bin --deploy --constructor-args 0 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out --ethdebug-dir 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be:Token:%t.out 2>&1 | FileCheck --check-prefix=DEPLOY %s
+# RUN: %soldb run %t.out/Vault.bin "deployToken(uint256)" 0 --constructor-args 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out --ethdebug-dir 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be:Token:%t.out 2>&1 | FileCheck --check-prefix=FACTORY %s
+# CONSTRUCTOR: the contract was not deployed: ZeroAmount()
+# DEPLOY: Error: ZeroAmount()
+# DEPLOY-NEXT: 0x1f2a2005
+# FACTORY: Error: ZeroAmount()
+
+# In a session, a stop at a `REVERT` says what it reverts with, also inside a `try` that
+# catches it, and the caller's return data shows decoded.
+# RUN: %soldb run %t.out/Vault.bin "pay(address,uint256)" 0x0000000000000000000000000000000000000002 1000 --constructor-args 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out --ethdebug-dir 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be:Token:%t.out --batch -x "break revert" -x continue -x continue -x returndata 2>&1 | FileCheck --check-prefix=SESSION %s
+# RUN: %soldb run %t.out/Vault.bin "tryPay(address,uint256)" 0x0000000000000000000000000000000000000002 1000 --constructor-args 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out --ethdebug-dir 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be:Token:%t.out --batch -x "break revert" -x continue 2>&1 | FileCheck --check-prefix=CAUGHT %s
+# SESSION: Breakpoint #1 hit at step
+# SESSION: Reverts with: InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+# SESSION: Breakpoint #1 hit at step
+# SESSION: Reverts with: InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+# SESSION: Return data: 100 bytes
+# SESSION: Decoded: InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+# CAUGHT: in transfer
+# CAUGHT: Reverts with: InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+
+# Under `--json`, the stop carries `revert` and the return data `decoded`.
+# RUN: %soldb run %t.out/Vault.bin "pay(address,uint256)" 0x0000000000000000000000000000000000000002 1000 --constructor-args 100 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Vault:%t.out --ethdebug-dir 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be:Token:%t.out --batch --json -x "break revert" -x continue -x continue -x returndata | jq -r 'select(.revert or .decoded) | "\(.kind) \(.revert // .decoded)"' | FileCheck --check-prefix=JSON %s
+# JSON: stop InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+# JSON-NEXT: stop InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+# JSON-NEXT: return_data InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)

@@ -244,10 +244,20 @@ impl Renderer {
                 data.clone(),
             ],
             Output::ReturnData { bytes: 0, .. } => vec![self.dim("Return data: empty.")],
-            Output::ReturnData { bytes, data } => vec![
-                format!("{} {} bytes", self.info("Return data:"), self.number(bytes)),
-                data.clone(),
-            ],
+            Output::ReturnData {
+                bytes,
+                data,
+                decoded,
+            } => {
+                let mut lines = vec![
+                    format!("{} {} bytes", self.info("Return data:"), self.number(bytes)),
+                    data.clone(),
+                ];
+                if let Some(decoded) = decoded {
+                    lines.push(format!("{} {decoded}", self.info("Decoded:")));
+                }
+                lines
+            }
             Output::Variables {
                 warning,
                 pc,
@@ -413,6 +423,9 @@ impl Renderer {
             }
             None => lines.push(status),
         }
+        if let Some(revert) = &stop.revert {
+            lines.push(format!("{} {revert}", self.warning("Reverts with:")));
+        }
         if let Some(stack) = &stop.stack {
             lines.push(format!(
                 "{} {}",
@@ -572,14 +585,24 @@ mod tests {
         assert_eq!(
             renderer.render(&Output::ReturnData {
                 bytes: 1,
-                data: "0x2a".to_owned()
+                data: "0x2a".to_owned(),
+                decoded: None,
             }),
             "Return data: 1 bytes\n0x2a\n"
         );
         assert_eq!(
             renderer.render(&Output::ReturnData {
+                bytes: 4,
+                data: "0x31bad44c".to_owned(),
+                decoded: Some("ZeroAmount()".to_owned()),
+            }),
+            "Return data: 4 bytes\n0x31bad44c\nDecoded: ZeroAmount()\n"
+        );
+        assert_eq!(
+            renderer.render(&Output::ReturnData {
                 bytes: 0,
-                data: "0x".to_owned()
+                data: "0x".to_owned(),
+                decoded: None,
             }),
             "Return data: empty.\n"
         );
@@ -645,12 +668,14 @@ mod tests {
             has_source: true,
             stack: None,
             note: Some("something".to_owned()),
+            revert: Some("ZeroAmount()".to_owned()),
         };
         assert_eq!(
             renderer.render(&Output::Stop(stop)),
             "Breakpoint #1 hit at step 12, Counter.sol:7\n\
              Counter.sol:7 in increment  (step 12/99, pc 34, PUSH1, gas 5000)\n    \
              7 |         count += 1;\n\
+             Reverts with: ZeroAmount()\n\
              Note: something\n"
         );
         let bare = Stop {
@@ -665,6 +690,7 @@ mod tests {
             has_source: false,
             stack: Some(vec!["0x2".to_owned(), "0x1".to_owned()]),
             note: None,
+            revert: None,
         };
         assert_eq!(
             renderer.render(&Output::Stop(bare)),

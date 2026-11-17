@@ -31,10 +31,10 @@ use soldb_debugger::{
     CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam,
 };
 use soldb_ethdebug::{
-    encode_function_call, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-    function_selector, load_debug_program_with_sources, parse_contract_mapping,
-    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, EventRegistry,
-    SourceMapEnvironment,
+    encode_function_call, ethdebug_resources_from_metadata, find_abi_file, find_ethdebug_metadata,
+    function_selector, load_debug_program_with_sources, load_error_abis, parse_contract_mapping,
+    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, ErrorRegistry,
+    EventRegistry, SourceMapEnvironment,
 };
 use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
 use soldb_rpc::{RpcLog, TraceBackend};
@@ -1328,16 +1328,17 @@ fn run_command(args: &RunArgs) -> SoldbResult<()> {
         if let Some(deployment) = prefix.first() {
             let deployed = chain.deploy(deployment)?;
             if !deployed.success {
+                let errors = error_registry_reporting(&resolve_contract_specs_reporting(
+                    &args.ethdebug_dir,
+                    args.contracts.as_deref(),
+                    &args.source_path,
+                ));
                 let reason = deployed
-                    .error
-                    .clone()
-                    .or_else(|| {
-                        deployed
-                            .artifacts
-                            .revert_data
-                            .as_deref()
-                            .and_then(soldb_rpc::decode_revert_reason)
-                    })
+                    .artifacts
+                    .revert_data
+                    .as_deref()
+                    .and_then(|data| errors.decode(data))
+                    .or_else(|| deployed.error.clone())
                     .unwrap_or_else(|| "the constructor reverted".to_owned());
                 return Err(soldb_core::SoldbError::Message(format!(
                     "the contract was not deployed: {reason}\nnote: pass the constructor's arguments with `--constructor-args`, one per argument"
@@ -1930,8 +1931,14 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
 }
 
 fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
+    let errors = revert_errors(
+        trace,
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    );
     let Some(spec) = trace_contract_spec(args) else {
-        print_plain_trace_summary(trace);
+        print_plain_trace_summary(trace, &errors);
         return;
     };
     let metadata = trace_debug_metadata(&spec);
@@ -1965,9 +1972,7 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
         error_color("REVERTED")
     };
     println!("{} {}", info("Status:"), status);
-    if let Some(error) = &trace.error {
-        println!("{} {}", error_color("Error:"), error_color(error));
-    }
+    print_trace_error(trace, &errors);
     println!();
     println!("{}", bold(info("Call Stack:")));
     println!("{}", separator(60));
@@ -1985,7 +1990,7 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
     );
 }
 
-fn print_plain_trace_summary(trace: &TransactionTrace) {
+fn print_plain_trace_summary(trace: &TransactionTrace, errors: &ErrorRegistry) {
     println!(
         "{} {}",
         info("Transaction"),
@@ -2000,9 +2005,7 @@ fn print_plain_trace_summary(trace: &TransactionTrace) {
     println!("{} {}", info("Status:"), status);
     println!("{} {}", info("Gas used:"), success(trace.gas_used));
     println!("{} {}", info("Steps:"), number_color(trace.steps.len()));
-    if let Some(error) = &trace.error {
-        println!("{} {}", error_color("Error:"), error_color(error));
-    }
+    print_trace_error(trace, errors);
 }
 
 fn print_trace_backend_details(trace: &TransactionTrace) {
@@ -2121,6 +2124,12 @@ fn print_simulation_summary(
         .or_else(|| simulate_contract_name(args))
         .unwrap_or_else(|| contract_address.to_owned());
     let has_debug_info = !args.ethdebug_dir.is_empty() || args.contracts.is_some();
+    let errors = revert_errors(
+        trace,
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    );
     // Where the call ran is worth a line whenever no node was involved; the node's URL
     // is only interesting when nothing else identifies the session.
     match (&args.rpc_url, &args.replayed_from) {
@@ -2153,9 +2162,7 @@ fn print_simulation_summary(
         error_color("REVERTED")
     };
     println!("{} {}", info("Status:"), status);
-    if let Some(error) = &trace.error {
-        println!("{} {}", error_color("Error:"), error_color(error));
-    }
+    print_trace_error(trace, &errors);
     println!();
     println!("{}", bold(info("Call Stack:")));
     println!("{}", separator(60));
@@ -2264,7 +2271,8 @@ impl TraceSourceIndex {
         .with_code_generator(Some(code_generator))
         .with_code_hash(spec.code_hash.as_deref())
         .with_storage_layout(program.storage_layout)
-        .with_transient_storage_layout(program.transient_storage_layout);
+        .with_transient_storage_layout(program.transient_storage_layout)
+        .with_errors(program.errors);
         Ok(Some(Self {
             spec: spec.clone(),
             resources: program.resources,
@@ -2606,7 +2614,7 @@ fn abi_entries_for_spec(spec: &ResolvedContractSpec) -> Option<Vec<FunctionAbiEn
 }
 
 fn abi_value_for_spec(spec: &ResolvedContractSpec) -> Option<serde_json::Value> {
-    if let Some(abi_path) = abi_path_for_contract(&spec.debug_dir, &spec.name) {
+    if let Some(abi_path) = find_abi_file(&spec.debug_dir, &spec.name) {
         let content = fs::read_to_string(abi_path).ok()?;
         let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
         if value.is_array() {
@@ -3037,7 +3045,7 @@ fn event_registry_reporting(specs: Vec<ResolvedContractSpec>) -> EventRegistry {
 fn event_registry_for_specs(specs: Vec<ResolvedContractSpec>) -> SoldbResult<EventRegistry> {
     let mut registry = EventRegistry::default();
     for spec in specs {
-        let Some(abi_path) = abi_path_for_contract(&spec.debug_dir, &spec.name) else {
+        let Some(abi_path) = find_abi_file(&spec.debug_dir, &spec.name) else {
             continue;
         };
         let content = fs::read_to_string(&abi_path).map_err(|error| {
@@ -3051,6 +3059,62 @@ fn event_registry_for_specs(specs: Vec<ResolvedContractSpec>) -> SoldbResult<Eve
         }
     }
     Ok(registry)
+}
+
+/// Solidity's own errors and those the ABIs of `specs` declare. An ABI that cannot be read
+/// is reported once, and the errors it declares show as raw revert data.
+fn error_registry_reporting(specs: &[ResolvedContractSpec]) -> ErrorRegistry {
+    let mut registry = ErrorRegistry::default();
+    for spec in specs {
+        match load_error_abis(&spec.debug_dir, &spec.name) {
+            Ok(errors) => registry.extend(errors),
+            Err(error) => report_once(
+                format!("errors:{error}"),
+                &format!(
+                    "could not read the errors `{}` declares: {error}",
+                    spec.name
+                ),
+                "its custom errors are shown as raw revert data",
+            ),
+        }
+    }
+    registry
+}
+
+/// The errors a failed trace's revert data is decoded against; a trace that succeeded
+/// needs none read.
+fn revert_errors(
+    trace: &TransactionTrace,
+    ethdebug_dirs: &[String],
+    contracts_file: Option<&str>,
+    source_paths: &[String],
+) -> ErrorRegistry {
+    if trace.success {
+        return ErrorRegistry::default();
+    }
+    error_registry_reporting(&resolve_contract_specs_reporting(
+        ethdebug_dirs,
+        contracts_file,
+        source_paths,
+    ))
+}
+
+/// The `Error:` line: the decoded revert data with the raw data under it, else the
+/// backend's text.
+fn print_trace_error(trace: &TransactionTrace, errors: &ErrorRegistry) {
+    let data = normalize_hex(&trace.output);
+    let decoded = (!trace.success).then(|| errors.decode(&data)).flatten();
+    match (decoded, &trace.error) {
+        (Some(decoded), _) => {
+            println!("{} {}", error_color("Error:"), error_color(&decoded));
+            // `revert("…")` showed its text alone before; keep the hex for other errors.
+            if !data.starts_with("0x08c379a0") {
+                println!("       {}", dim(&data));
+            }
+        }
+        (None, Some(error)) => println!("{} {}", error_color("Error:"), error_color(error)),
+        (None, None) => {}
+    }
 }
 
 fn should_decode_events(args: &ListEventsArgs) -> bool {
@@ -3370,17 +3434,6 @@ fn ethdebug_resources_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<serde
     }
 
     TraceSourceIndex::load(spec).map(|index| index.resources)
-}
-
-fn abi_path_for_contract(debug_dir: &Path, contract_name: &str) -> Option<std::path::PathBuf> {
-    let dir = debug_dir;
-    [
-        format!("{contract_name}.abi"),
-        format!("{contract_name}.json"),
-    ]
-    .into_iter()
-    .map(|file_name| dir.join(file_name))
-    .find(|path| path.exists())
 }
 
 fn normalize_contract_address_key(address: &str) -> String {
@@ -4242,7 +4295,7 @@ contract Counter {
             resolve_ethdebug_spec(&format!("0xmissing:{}", debug_dir.display())).expect("fallback");
         assert_eq!(fallback[0].name, "Token");
         assert_eq!(
-            abi_path_for_contract(&debug_dir, "Token").expect("abi path"),
+            find_abi_file(&debug_dir, "Token").expect("abi path"),
             debug_dir.join("Token.abi")
         );
     }
@@ -4400,7 +4453,7 @@ contract Counter {
             save_trace: None,
         };
         let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
-        print_plain_trace_summary(&trace);
+        print_plain_trace_summary(&trace, &ErrorRegistry::default());
         print_raw_trace(&trace, &trace_args);
         assert_eq!(trace_contract_name(&trace_args).as_deref(), Some("Legacy"));
     }

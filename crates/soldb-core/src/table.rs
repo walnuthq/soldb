@@ -863,6 +863,26 @@ impl<'a> StepView<'a> {
         run_value(&self.table.return_data, self.index).and_then(|data| data.as_deref())
     }
 
+    /// The data a `REVERT` step reverts with, as `0x`-prefixed hex, read from its memory at
+    /// the offset and size on its stack; `None` for other steps or without stack or memory.
+    #[must_use]
+    pub fn revert_data(&self) -> Option<String> {
+        if self.op() != opcode::REVERT {
+            return None;
+        }
+        let stack = self.stack();
+        let offset = stack.peek(0)?.to_usize()?;
+        let size = stack.peek(1)?.to_usize()?;
+        let memory = self.memory()?;
+        // Memory past its recorded end reads as zeros, as in the EVM.
+        let mut data = vec![0; size];
+        if let Some(available) = memory.get(offset.min(memory.len())..) {
+            let len = available.len().min(size);
+            data[..len].copy_from_slice(&available[..len]);
+        }
+        Some(format!("0x{}", encode_hex(&data)))
+    }
+
     /// The step as a [`TraceStep`] of its own.
     #[must_use]
     pub fn to_trace_step(&self) -> TraceStep {
@@ -1397,6 +1417,38 @@ mod tests {
                 (opcode::KECCAK256, "KECCAK256"),
                 (0xef, "opcode 0xef not defined"),
                 (opcode::INVALID, "NOT AN OPCODE"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_revert_reads_its_data_from_memory() {
+        // Stack bottom first: size, then offset on top.
+        let step = |op: &str, stack: [&str; 2], memory: Option<&[u8]>| {
+            let mut step = TraceStep::new(0, Arc::from(op), 0, 0, 1, None, StepSnapshot::default());
+            step.snapshot.stack = stack.map(Arc::from).to_vec();
+            step.snapshot.memory = memory.map(Bytes::copy_from_slice);
+            step
+        };
+        let memory: &[u8] = &[0xaa, 0x31, 0xba, 0xd4, 0x4c];
+        let table = StepTable::from(vec![
+            step("REVERT", ["0x4", "0x1"], Some(memory)),
+            // Past the end of memory reads as zeros.
+            step("REVERT", ["0x3", "0x4"], Some(memory)),
+            step("RETURN", ["0x4", "0x1"], Some(memory)),
+            step("REVERT", ["0x4", "0x1"], None),
+        ]);
+        let data = table
+            .iter()
+            .map(|step| step.revert_data())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            data,
+            [
+                Some("0x31bad44c".to_owned()),
+                Some("0x4c0000".to_owned()),
+                None,
+                None
             ]
         );
     }

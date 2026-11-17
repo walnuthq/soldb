@@ -269,6 +269,7 @@ impl Session {
             has_source: self.state.has_source(),
             stack,
             note: None,
+            revert: self.state.revert_reason(),
         })
     }
 
@@ -519,10 +520,12 @@ impl Session {
                 "Return data is not in this trace; the backend did not record it per step.",
             );
         }
-        let data = step.return_data().unwrap_or_default();
+        let data = format!("0x{}", step.return_data().unwrap_or_default());
+        let decoded = self.state.decode_error(&data);
         Output::ReturnData {
-            bytes: data.len() / 2,
-            data: format!("0x{data}"),
+            bytes: (data.len() - 2) / 2,
+            data,
+            decoded,
         }
     }
 

@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use soldb_core::{SoldbError, SoldbResult};
 
+use crate::errors::{load_error_abis, ErrorAbi};
 use crate::metadata::{read_compilation_source, EthdebugInfo};
 use crate::source_map::{load_source_map_program_with_sources, SourceMapEnvironment};
 use crate::storage_layout::StorageLayout;
@@ -51,6 +52,8 @@ pub struct DebugProgram {
     pub storage_layout: Option<StorageLayout>,
     /// Where its `transient` state variables live, from `--transient-storage-layout`.
     pub transient_storage_layout: Option<StorageLayout>,
+    /// The errors its ABI declares, which revert data is decoded against.
+    pub errors: Vec<ErrorAbi>,
     /// Sources the artifact names that could not be read, so a frontend can say why its
     /// lines are missing instead of degrading to an opcode view without a word.
     pub missing_sources: Vec<String>,
@@ -303,6 +306,7 @@ pub fn load_debug_program_with_sources(
             .map_err(|error| SoldbError::Message(format!("{}: {error}", program_path.display())))?;
         let storage_layout = load_storage_layout(root, &info.contract_name)?;
         let transient_storage_layout = load_transient_storage_layout(root, &info.contract_name)?;
+        let errors = load_error_abis(root, &info.contract_name)?;
         let mut program = DebugProgram {
             info,
             resources,
@@ -311,6 +315,7 @@ pub fn load_debug_program_with_sources(
             legacy: false,
             storage_layout,
             transient_storage_layout,
+            errors,
             missing_sources: Vec::new(),
         };
         program.read_sources(root, source_roots);
@@ -330,6 +335,7 @@ pub fn load_debug_program_with_sources(
         Some(layout) => Some(layout),
         None => load_transient_storage_layout(root, &program.info.contract_name)?,
     };
+    let errors = load_error_abis(root, &program.info.contract_name)?;
     let mut program = DebugProgram {
         info: program.info,
         resources: program.resources,
@@ -338,10 +344,21 @@ pub fn load_debug_program_with_sources(
         legacy: true,
         storage_layout,
         transient_storage_layout,
+        errors,
         missing_sources: Vec::new(),
     };
     program.read_sources(root, source_roots);
     Ok(Some(program))
+}
+
+/// The ABI file for `contract_name` in `root`: the `<Contract>.abi` that `solc --abi -o`
+/// writes, or a `<Contract>.json` build artifact with an `abi` array.
+#[must_use]
+pub fn find_abi_file(root: &Path, contract_name: &str) -> Option<PathBuf> {
+    ["abi", "json"]
+        .into_iter()
+        .map(|extension| root.join(format!("{contract_name}.{extension}")))
+        .find(|path| path.exists())
 }
 
 /// The `<Contract>_storage.json` that `solc --storage-layout -o <root>` writes, when it
@@ -447,6 +464,7 @@ mod tests {
         find_program_ethdebug, load_debug_program, load_storage_layout,
         load_transient_storage_layout, read_debug_source, read_json_file,
     };
+    use crate::errors::load_error_abis;
     use crate::source_map::SourceMapEnvironment;
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -682,5 +700,38 @@ mod tests {
             error.to_string().contains("does not contain resources"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn error_abis_are_read_from_the_abi_file_or_a_legacy_combined_json() {
+        let names = |dir: &PathBuf, contract: &str| {
+            load_error_abis(dir, contract)
+                .expect("errors")
+                .into_iter()
+                .map(|error| error.signature())
+                .collect::<Vec<_>>()
+        };
+        let abi = json!([
+            {"type": "function", "name": "pay", "inputs": []},
+            {"type": "error", "name": "Unauthorized", "inputs": [{"name": "caller", "type": "address"}]}
+        ]);
+
+        let dir = temp_dir("errors-abi");
+        assert!(names(&dir, "Vault").is_empty());
+        fs::write(dir.join("Vault.abi"), abi.to_string()).expect("write abi");
+        assert_eq!(names(&dir, "Vault"), ["Unauthorized(address)"]);
+        fs::write(dir.join("Vault.abi"), "{").expect("write abi");
+        let error = load_error_abis(&dir, "Vault").expect_err("malformed abi");
+        assert!(error.to_string().contains("Vault.abi"), "{error}");
+
+        // Older solc releases write each `abi` in `combined.json` as a JSON string.
+        let dir = temp_dir("errors-combined");
+        fs::write(
+            dir.join("combined.json"),
+            json!({"contracts": {"Vault.sol:Vault": {"abi": abi.to_string()}}}).to_string(),
+        )
+        .expect("write combined json");
+        assert_eq!(names(&dir, "Vault"), ["Unauthorized(address)"]);
+        assert!(names(&dir, "Token").is_empty());
     }
 }

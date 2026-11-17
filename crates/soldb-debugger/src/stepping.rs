@@ -36,8 +36,8 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use soldb_core::{opcode, EvmWord, StepView, TransactionTrace};
 use soldb_ethdebug::{
-    function_selector, parse_path, CodeGenerator, EthdebugInfo, FunctionExit, Instruction,
-    PathSegment, SourceLocation, StorageLayout,
+    function_selector, parse_path, CodeGenerator, ErrorAbi, EthdebugInfo, FunctionExit,
+    Instruction, PathSegment, SourceLocation, StorageLayout,
 };
 
 use crate::condition::Value;
@@ -84,6 +84,8 @@ pub struct ContractDebugInfo {
     pub storage_layout: Option<StorageLayout>,
     /// Where its `transient` state variables live, from `--transient-storage-layout`.
     pub transient_storage_layout: Option<StorageLayout>,
+    /// The errors its ABI declares, which revert data is decoded against.
+    pub errors: Vec<ErrorAbi>,
     /// Which code generator produced the program, when the artifact or the host says.
     /// Decides whether local variables can be inferred from the stack; see
     /// [`StepMap::locals_at`].
@@ -320,6 +322,7 @@ impl ContractDebugInfo {
             types,
             storage_layout: None,
             transient_storage_layout: None,
+            errors: Vec::new(),
             code_generator: None,
             line_starts,
             pc_index,
@@ -422,6 +425,13 @@ impl ContractDebugInfo {
     #[must_use]
     pub fn with_transient_storage_layout(mut self, layout: Option<StorageLayout>) -> Self {
         self.transient_storage_layout = self.with_enum_variants(layout);
+        self
+    }
+
+    /// Attaches the errors the contract's ABI declares, so its revert data is decoded.
+    #[must_use]
+    pub fn with_errors(mut self, errors: Vec<ErrorAbi>) -> Self {
+        self.errors = errors;
         self
     }
 

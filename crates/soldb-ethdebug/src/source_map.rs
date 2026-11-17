@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
+use crate::artifacts::read_json_file;
+use crate::errors::{error_abis, parse_error_abis, ErrorAbi};
 use crate::opcodes;
 use crate::storage_layout::StorageLayout;
 use crate::{EthdebugInfo, Instruction, SourceLocation, SourceMapContext, SourceMapJump};
@@ -339,6 +341,35 @@ fn source_map_program_from_combined(
         storage_layout,
         transient_storage_layout,
     }))
+}
+
+/// The errors in the `abi` entry of `contract_name` in `root`'s `combined.json`, which older
+/// solc releases wrote as a JSON string; empty without the file, the contract, or the entry.
+pub(crate) fn load_combined_errors(root: &Path, contract_name: &str) -> SoldbResult<Vec<ErrorAbi>> {
+    let path = root.join("combined.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let combined = read_json_file(&path)?;
+    let Some(contracts) = combined.get("contracts").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let Some((contract_key, contract)) = find_contract(contracts, contract_name)? else {
+        return Ok(Vec::new());
+    };
+    let Some(abi) = contract.get("abi") else {
+        return Ok(Vec::new());
+    };
+    match abi {
+        Value::String(text) => parse_error_abis(text),
+        abi => error_abis(abi),
+    }
+    .map_err(|error| {
+        SoldbError::Message(format!(
+            "legacy artifact `{}` has an invalid `abi` for `{contract_key}`: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// A contract's layout entry `key` in a `combined.json`, when it was compiled with it.
