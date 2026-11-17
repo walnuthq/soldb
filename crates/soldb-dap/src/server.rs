@@ -887,16 +887,18 @@ impl DapServer {
             return Vec::new();
         };
         let digits = data.chars().collect::<Vec<_>>();
-        digits
-            .chunks(64)
-            .enumerate()
-            .map(|(index, word)| {
+        // The buffer decoded as an error comes first, above its words.
+        let decoded = self.debugger.decode_error(&format!("0x{data}"));
+        decoded
+            .map(|decoded| json!({"name": "decoded", "value": decoded, "variablesReference": 0}))
+            .into_iter()
+            .chain(digits.chunks(64).enumerate().map(|(index, word)| {
                 json!({
                     "name": format!("returndata[0x{:x}]", index * 32),
                     "value": word.iter().collect::<String>(),
                     "variablesReference": 0
                 })
-            })
+            }))
             .collect()
     }
 
@@ -1014,10 +1016,12 @@ impl DapServer {
             StepOutcome::NoTrace => "pause",
             _ => "step",
         };
-        self.event(
-            "stopped",
-            Some(json!({"reason": reason, "threadId": self.thread_id})),
-        )
+        let mut body = json!({"reason": reason, "threadId": self.thread_id});
+        if let Some(revert) = self.debugger.revert_reason() {
+            body["description"] = json!(format!("Paused on revert: {revert}"));
+            body["text"] = json!(revert);
+        }
+        self.event("stopped", Some(body))
     }
 
     fn response(
@@ -1131,7 +1135,8 @@ impl LoadedSource {
             contract: ContractDebugInfo::new(address, &name, program.info, program.source_contents)
                 .with_code_generator(Some(code_generator))
                 .with_storage_layout(program.storage_layout)
-                .with_transient_storage_layout(program.transient_storage_layout),
+                .with_transient_storage_layout(program.transient_storage_layout)
+                .with_errors(program.errors),
         })
     }
 }
@@ -1142,8 +1147,10 @@ mod tests {
     use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use serde_json::json;
+    use serde_json::{json, Value};
     use soldb_core::{TraceStep, TransactionTrace};
+    use soldb_debugger::ContractDebugInfo;
+    use soldb_ethdebug::{parse_error_abis, EthdebugInfo};
 
     use crate::{decode_dap_frame, encode_dap_frame, DapMessage};
 
@@ -1265,6 +1272,74 @@ mod tests {
         assert_eq!(variables[0]["name"], "returndata[0x0]");
         assert_eq!(variables[0]["value"], format!("{:0>64}", "2a"));
         assert_eq!(variables[1]["name"], "returndata[0x20]");
+    }
+
+    #[test]
+    fn a_revert_is_decoded_on_the_stop_and_in_the_return_data() {
+        let mut trace = sample_trace();
+        let mut steps = trace.steps.to_steps();
+        // `ZeroAmount()` as the last call's result, and as what the next step reverts with.
+        let snapshot = |stack: Vec<soldb_core::Word>, memory: Option<&'static [u8]>| {
+            soldb_core::StepSnapshot::new(
+                stack,
+                memory.map(soldb_core::Bytes::from_static),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .with_return_data(Some("1f2a2005".to_owned()))
+        };
+        steps[0] = TraceStep::new(
+            0,
+            "PUSH1".into(),
+            100,
+            3,
+            1,
+            None,
+            snapshot(Vec::new(), None),
+        );
+        steps[1] = TraceStep::new(
+            2,
+            "REVERT".into(),
+            97,
+            0,
+            1,
+            None,
+            snapshot(
+                vec!["0x4".into(), "0x0".into()],
+                Some(&[0x1f, 0x2a, 0x20, 0x05]),
+            ),
+        );
+        trace.steps = steps.into();
+        let info = EthdebugInfo {
+            compilation: Value::Null,
+            contract_name: "Vault".to_owned(),
+            environment: "call".to_owned(),
+            instructions: Vec::new(),
+            sources: BTreeMap::new(),
+            variable_locations: BTreeMap::new(),
+        };
+        let errors = parse_error_abis(r#"[{"type":"error","name":"ZeroAmount","inputs":[]}]"#)
+            .expect("error abi");
+        let contract =
+            ContractDebugInfo::new(None, "Vault", info, BTreeMap::new()).with_errors(errors);
+        let mut server = DapServer::with_session(trace, vec![contract], &std::env::temp_dir())
+            .expect("top-level calls must start at different steps");
+        server.handle_message(&DapMessage::request(1, "launch", None));
+
+        let words = server.handle_message(&DapMessage::request(
+            2,
+            "variables",
+            Some(json!({"variablesReference": RETURN_DATA_REF})),
+        ));
+        let variables = &words[0].body.as_ref().expect("body")["variables"];
+        assert_eq!(variables[0]["name"], "decoded");
+        assert_eq!(variables[0]["value"], "ZeroAmount()");
+        assert_eq!(variables[1]["name"], "returndata[0x0]");
+
+        let messages = server.handle_message(&DapMessage::request(3, "next", None));
+        let body = messages[1].body.as_ref().expect("body");
+        assert_eq!(body["description"], "Paused on revert: ZeroAmount()");
+        assert_eq!(body["text"], "ZeroAmount()");
     }
 
     #[test]

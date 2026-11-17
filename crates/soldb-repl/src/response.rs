@@ -76,6 +76,9 @@ pub enum Output {
     ReturnData {
         bytes: usize,
         data: String,
+        /// The data decoded as an error, when the backend could.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decoded: Option<String>,
     },
     /// The variables in scope, and the state variables.
     Variables {
@@ -172,6 +175,9 @@ pub struct Stop {
     /// breakpoint that can never be hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The decoded error a `REVERT` step reverts with, when the backend could decode it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revert: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

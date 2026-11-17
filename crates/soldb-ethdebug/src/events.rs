@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
 use crate::abi::keccak256;
+use crate::storage_layout::word_to_decimal;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventParam {
@@ -93,18 +94,9 @@ impl EventRegistry {
 }
 
 pub fn parse_event_abis(input: &str) -> SoldbResult<Vec<EventAbi>> {
-    let value = serde_json::from_str::<Value>(input)
-        .map_err(|error| SoldbError::Message(format!("Invalid ABI JSON: {error}")))?;
-    let items = if let Some(items) = value.as_array() {
-        items
-    } else {
-        value.get("abi").and_then(Value::as_array).ok_or_else(|| {
-            SoldbError::Message("ABI JSON must be an array or contain an 'abi' array".to_owned())
-        })?
-    };
-
+    let value = parse_abi_json(input)?;
     let mut events = Vec::new();
-    for item in items {
+    for item in abi_items(&value)? {
         if item.get("type").and_then(Value::as_str) != Some("event") {
             continue;
         }
@@ -130,6 +122,22 @@ pub fn parse_event_abis(input: &str) -> SoldbResult<Vec<EventAbi>> {
     Ok(events)
 }
 
+pub(crate) fn parse_abi_json(input: &str) -> SoldbResult<Value> {
+    serde_json::from_str::<Value>(input)
+        .map_err(|error| SoldbError::Message(format!("Invalid ABI JSON: {error}")))
+}
+
+/// The entries of an ABI: an array, or an object with an `abi` array as build artifacts have.
+pub(crate) fn abi_items(value: &Value) -> SoldbResult<&[Value]> {
+    value
+        .as_array()
+        .or_else(|| value.get("abi").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .ok_or_else(|| {
+            SoldbError::Message("ABI JSON must be an array or contain an 'abi' array".to_owned())
+        })
+}
+
 pub fn event_signature(event: &EventAbi) -> String {
     let input_types = event
         .inputs
@@ -145,7 +153,7 @@ pub fn event_topic(event: &EventAbi) -> String {
     format!("0x{}", bytes_to_hex(&keccak256(signature.as_bytes())))
 }
 
-fn parse_event_param(value: &Value) -> Option<EventParam> {
+pub(crate) fn parse_event_param(value: &Value) -> Option<EventParam> {
     let components = value
         .get("components")
         .and_then(Value::as_array)
@@ -210,7 +218,7 @@ fn decode_event(
     })
 }
 
-fn canonical_event_type(input: &EventParam) -> String {
+pub(crate) fn canonical_event_type(input: &EventParam) -> String {
     if let Some(suffix) = input.ty.strip_prefix("tuple") {
         let components = input
             .components
@@ -238,7 +246,7 @@ fn indexed_param_is_hashed(input: &EventParam) -> bool {
         || is_tuple_param(input)
 }
 
-fn decode_param_at(
+pub(crate) fn decode_param_at(
     input: &EventParam,
     data: &[u8],
     head_offset: usize,
@@ -358,7 +366,7 @@ fn decode_array_items(
     Ok(Value::Array(values))
 }
 
-fn event_param_head_words(input: &EventParam) -> SoldbResult<usize> {
+pub(crate) fn event_param_head_words(input: &EventParam) -> SoldbResult<usize> {
     if event_param_is_dynamic(input)? {
         return Ok(1);
     }
@@ -489,7 +497,7 @@ fn read_word(data: &[u8], offset: usize) -> SoldbResult<&[u8]> {
         .ok_or_else(|| SoldbError::Message("Event data is missing an ABI word".to_owned()))
 }
 
-fn parse_hex_data(data: &str) -> SoldbResult<Vec<u8>> {
+pub(crate) fn parse_hex_data(data: &str) -> SoldbResult<Vec<u8>> {
     let data = data.trim_start_matches("0x");
     if data.is_empty() {
         return Ok(Vec::new());
@@ -518,8 +526,11 @@ fn decode_static_word(arg_type: &str, word: &str) -> SoldbResult<Value> {
         return Ok(json!(u128::from_str_radix(&word, 16).unwrap_or(0) != 0));
     }
     if arg_type.starts_with("uint") {
-        let value = u128::from_str_radix(&word, 16)
-            .map_err(|error| SoldbError::Message(format!("Invalid uint event word: {error}")))?;
+        let Ok(value) = u128::from_str_radix(&word, 16) else {
+            // Wider than 128 bits, such as `type(uint256).max`.
+            let bytes = parse_hex_data(&word)?;
+            return Ok(json!(word_to_decimal(&bytes)));
+        };
         if let Ok(value) = u64::try_from(value) {
             return Ok(json!(value));
         }

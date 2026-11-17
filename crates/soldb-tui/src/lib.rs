@@ -224,6 +224,10 @@ impl View {
                         text.push_str(function);
                     }
                 }
+                if let Some(revert) = &stop.revert {
+                    text.push_str("  reverts with ");
+                    text.push_str(revert);
+                }
                 text
             }
             None => "no trace loaded".to_owned(),
@@ -320,9 +324,15 @@ impl View {
                 .collect(),
             other => text_lines(&renderer, &other),
         };
-        if let Output::ReturnData { bytes, data } = session.return_data() {
+        if let Output::ReturnData {
+            bytes,
+            data,
+            decoded,
+        } = session.return_data()
+        {
             if bytes > 0 {
-                self.memory.extend(return_data_lines(bytes, &data));
+                self.memory
+                    .extend(return_data_lines(bytes, &data, decoded.as_deref()));
             }
         }
         self.backtrace = text_lines(&renderer, &session.backtrace());
@@ -836,9 +846,15 @@ fn dim(text: String) -> Line<'static> {
 }
 
 /// The return data buffer under the memory, in 32-byte words like memory.
-fn return_data_lines(bytes: usize, data: &str) -> Vec<Line<'static>> {
+fn return_data_lines(bytes: usize, data: &str, decoded: Option<&str>) -> Vec<Line<'static>> {
     let digits = data.trim_start_matches("0x").chars().collect::<Vec<_>>();
     let mut lines = vec![dim(format!("return data, {bytes} bytes:"))];
+    if let Some(decoded) = decoded {
+        lines.push(Line::from(Span::styled(
+            decoded.to_owned(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     for (index, word) in digits.chunks(64).enumerate() {
         lines.push(Line::from(vec![
             Span::styled(

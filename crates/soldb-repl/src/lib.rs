@@ -40,8 +40,8 @@ pub use session::{
 };
 use soldb_debugger::{
     call_target, check_root_calls, normalize_address, variables_for_step, ChainStorage, Condition,
-    ConditionContext, ContractDebugInfo, DebugVariable, Evaluation, Frame, FrameState,
-    LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
+    ConditionContext, ContractDebugInfo, DebugVariable, ErrorRegistry, Evaluation, Frame,
+    FrameState, LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
     StorageLayout, StorageTape, StorageWords,
 };
 
@@ -239,6 +239,8 @@ pub struct DebuggerState {
     step_map: Option<StepMap>,
     storage_tape: Option<StorageTape>,
     transient_tape: Option<StorageTape>,
+    /// Solidity's own errors and those the loaded contracts declare.
+    errors: ErrorRegistry,
     /// Something the frontend should tell the user, kept until it does: a breakpoint that
     /// cannot be hit, or a condition that could not be evaluated. Both are silent traps
     /// otherwise.
@@ -256,6 +258,7 @@ impl Default for DebuggerState {
             step_map: None,
             storage_tape: None,
             transient_tape: None,
+            errors: ErrorRegistry::default(),
             note: RefCell::new(None),
         }
     }
@@ -283,6 +286,7 @@ impl DebuggerState {
         contracts: Vec<ContractDebugInfo>,
     ) -> SoldbResult<()> {
         check_root_calls(&trace)?;
+        self.errors = error_registry(&contracts);
         let map = StepMap::new(&trace, contracts);
         let (storage_tape, transient_tape) = StorageTape::persistent_and_transient(&trace, &map);
         self.storage_tape = Some(storage_tape);
@@ -296,6 +300,7 @@ impl DebuggerState {
     /// Maps every step through the contracts' debug info, enabling source-level stepping,
     /// line and function breakpoints, and source locations in frames.
     pub fn attach_debug_info(&mut self, contracts: Vec<ContractDebugInfo>) {
+        self.errors = error_registry(&contracts);
         if let Some(trace) = &self.trace {
             let map = StepMap::new(trace, contracts);
             let (storage_tape, transient_tape) = StorageTape::persistent_and_transient(trace, &map);
@@ -359,6 +364,19 @@ impl DebuggerState {
             .contract_at_step(self.current_step)?
             .transient_storage_layout
             .as_ref()
+    }
+
+    /// `data`, `0x`-prefixed hex, decoded as `Name(arg, …)` when it is an error of
+    /// Solidity's own or one a loaded contract declares.
+    #[must_use]
+    pub fn decode_error(&self, data: &str) -> Option<String> {
+        self.errors.decode(data)
+    }
+
+    /// The decoded error the `REVERT` at the current step reverts with.
+    #[must_use]
+    pub fn revert_reason(&self) -> Option<String> {
+        self.decode_error(&self.current_step_data()?.revert_data()?)
     }
 
     pub fn trace(&self) -> Option<&TransactionTrace> {
@@ -1071,6 +1089,17 @@ impl DebuggerState {
             op: step.mnemonic().to_owned(),
         }
     }
+}
+
+/// Solidity's own errors and those `contracts` declare.
+fn error_registry(contracts: &[ContractDebugInfo]) -> ErrorRegistry {
+    let mut registry = ErrorRegistry::default();
+    registry.extend(
+        contracts
+            .iter()
+            .flat_map(|contract| contract.errors.iter().cloned()),
+    );
+    registry
 }
 
 /// A storage slot as lowercase hex without `0x` or leading zeros, from decimal or hex
@@ -1975,7 +2004,8 @@ contract C {
             session.execute(DebuggerCommand::ReturnData),
             [Output::ReturnData {
                 bytes: 0,
-                data: "0x".to_owned()
+                data: "0x".to_owned(),
+                decoded: None,
             }]
         );
         session.execute(DebuggerCommand::Goto(2));
@@ -1983,8 +2013,70 @@ contract C {
             session.execute(DebuggerCommand::ReturnData),
             [Output::ReturnData {
                 bytes: 1,
-                data: "0x2a".to_owned()
+                data: "0x2a".to_owned(),
+                decoded: None,
             }]
+        );
+    }
+
+    #[test]
+    fn errors_are_decoded_from_the_return_data_and_the_reverted_memory() {
+        use crate::response::{Output, StopReason};
+        use crate::Session;
+
+        let mut trace = sample_trace();
+        let mut steps = trace.steps.to_steps();
+        // `Panic(0x11)`, which needs no ABI.
+        steps[2].snapshot = steps[2]
+            .normalized_snapshot()
+            .with_return_data(Some(format!("4E487B71{:0>64}", "11")));
+        // `revert ZeroAmount()`: size 4 at offset 0, the offset on top of the stack.
+        steps[3].op = "REVERT".into();
+        steps[3].snapshot.stack = vec!["0x4".into(), "0x0".into()];
+        steps[3].snapshot.memory = Some(soldb_core::Bytes::from_static(&[0x1f, 0x2a, 0x20, 0x05]));
+        trace.steps = steps.into();
+        trace.capabilities.return_data = true;
+        let mut state = DebuggerState::new();
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
+        let mut session = Session::new(state);
+
+        session.execute(DebuggerCommand::Goto(2));
+        assert!(matches!(
+            &session.execute(DebuggerCommand::ReturnData)[..],
+            [Output::ReturnData { decoded: Some(decoded), .. }]
+                if decoded == "Panic(0x11: arithmetic underflow or overflow)"
+        ));
+        assert_eq!(session.stop(StopReason::Moved).unwrap().revert, None);
+
+        // A custom error is decoded once a contract that declares it is loaded.
+        session.execute(DebuggerCommand::Goto(3));
+        assert_eq!(session.stop(StopReason::Moved).unwrap().revert, None);
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "call".to_owned(),
+            instructions: Vec::new(),
+            sources: BTreeMap::new(),
+            variable_locations: BTreeMap::new(),
+        };
+        let errors = soldb_ethdebug::parse_error_abis(
+            r#"[{"type":"error","name":"ZeroAmount","inputs":[]}]"#,
+        )
+        .unwrap();
+        session
+            .state_mut()
+            .attach_debug_info(vec![ContractDebugInfo::new(
+                None,
+                "C",
+                info,
+                BTreeMap::new(),
+            )
+            .with_errors(errors)]);
+        assert_eq!(
+            session.stop(StopReason::Moved).unwrap().revert.as_deref(),
+            Some("ZeroAmount()")
         );
     }
 

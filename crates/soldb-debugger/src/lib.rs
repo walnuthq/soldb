@@ -39,7 +39,7 @@ pub use debug_diff::{
     DebugTraceSummary,
 };
 pub use roots::{check_root_calls, root_calls, RootCall, RootRecord};
-pub use soldb_ethdebug::{CodeGenerator, StorageLayout};
+pub use soldb_ethdebug::{error_abis, CodeGenerator, ErrorAbi, ErrorRegistry, StorageLayout};
 pub use state::{
     short_hex, state_value, state_variables, CachedChain, ChainRead, ChainStorage, StateSource,
     StateVariable, StorageTape, StorageWords,

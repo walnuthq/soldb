@@ -332,7 +332,9 @@ Artifacts produced per contract in the output directory:
   file listing sources. A compile removes whichever of the two it did not write, because
   a directory holding both — one compiler's output on top of another's — gives a loader
   no way to tell which describes the programs next to them.
-- `<Contract>.abi`, `<Contract>.bin` — ABI and bytecode.
+- `<Contract>.abi`, `<Contract>.bin` — ABI and bytecode. The errors the ABI declares are
+  what revert data is decoded against (`load_error_abis`, also reading a legacy
+  `combined.json`); `Error(string)` and `Panic(uint256)` need no ABI.
 
 ### Compiler Channels
 

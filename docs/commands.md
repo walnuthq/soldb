@@ -94,6 +94,21 @@ debug information loaded it is the step alone: `step 156/1071, pc 1872, PUSH2, g
 978188`. In assembly mode (`mode asm`) the stop prints the top of the EVM stack instead of
 the source line, each word with its index from the bottom of the stack.
 
+A stop at a `REVERT` whose data decodes as an error adds the error:
+
+```text
+Errors.sol:18 in transfer  (step 803/827, pc 999, REVERT, gas 29500460)
+   18 |         if (have < amount) revert InsufficientBalance(have, amount, address(this));
+Reverts with: InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+```
+
+The data is read from memory at the offset and size on the stack. `Error(string)` and
+`Panic(uint256)` are always decoded; a custom error is decoded when a loaded contract's ABI
+declares it, from `<Contract>.abi` next to its debug artifacts or the `abi` of a legacy
+`combined.json`. An error declared only by a contract that was not loaded stays raw data.
+Under `--json` the stop carries it as `revert`, the full-screen view puts it on the status
+line, and the DAP server sets the stopped event's `description` and `text`.
+
 ## Stepping
 
 A trace is a complete recording, so every command below is a search over it. Nothing is
@@ -513,7 +528,18 @@ Return data: 32 bytes
 ```
 
 The buffer is empty until the frame makes a call, and each call replaces it; after a
-reverted call it holds the revert data, such as an `Error(string)`. The debug-rpc backend
+reverted call it holds the revert data, such as an `Error(string)`. Data that decodes as an
+error, under the same rules as a stop at a `REVERT`, is shown decoded after it:
+
+```text
+soldb> returndata
+Return data: 100 bytes
+0x832f98b5…
+Decoded: InsufficientBalance(100, 1000, 0xa16e02e87b7454126e5e10d957a927a7f5b5d2be)
+```
+
+Under `--json` that is the `decoded` field, and the DAP server lists it as `decoded` above
+the words. The debug-rpc backend
 asks the node for it with `enableReturnData`, and the replay backend reads it from the
 interpreter. Says so when the trace carries no return data; a trace with no call at all
 has an empty buffer throughout. The full-screen view shows it under the memory, and the
