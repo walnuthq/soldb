@@ -336,12 +336,13 @@ Artifacts produced per contract in the output directory:
 
 ### Compiler Channels
 
-CI runs the lit suite against three compilers, for three different reasons:
+CI runs the lit suite against four compilers, for four different reasons:
 
 | channel | why |
 | --- | --- |
 | solc 0.8.31 (pinned) | the legacy `--ethdebug`/`--ethdebug-runtime` flag generation |
 | solc 0.8.36 (pinned) | the modern `--experimental --ethdebug-program …` generation |
+| solc latest release, resolved at run time | the newest release; a break there shows a new compiler needs a fix here |
 | solc `develop`, built from source | where ETHDebug output changes first |
 
 A separate non-blocking `solar` job builds the Solar release named by `SOLAR_REF` in
