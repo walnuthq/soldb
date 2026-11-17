@@ -119,6 +119,8 @@ jobs:
           - version: "0.8.36"
             binary: solc-linux-amd64-v0.8.36+commit.8a079791
             sha256: c8d35afdddc3cd2743ee88b8f25e0fecd16e2bdd5f2120f37e52cd9cc45ae0e6
+          # The newest release, resolved from the solc binaries list when the job runs.
+          - version: latest
     steps:
       - uses: actions/checkout@v4
 
@@ -148,6 +150,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
+
+          if [ "$ETHDEBUG_SOLC_VERSION" = latest ]; then
+            # Assigned first so that `set -e` stops the step when the lookup fails.
+            latest="$(curl -fsSL https://binaries.soliditylang.org/linux-amd64/list.json | jq -er '
+              .latestRelease as $v
+              | first(.builds[] | select(.version == $v))
+              | "\(.version) \(.path) \(.sha256 | ltrimstr("0x"))"')"
+            read -r ETHDEBUG_SOLC_VERSION ETHDEBUG_SOLC_BINARY ETHDEBUG_SOLC_SHA256 <<<"$latest"
+            echo "::notice title=solc latest::Testing against solc $ETHDEBUG_SOLC_VERSION"
+          fi
 
           # ETHDebug compiler under test (matrixed).
           curl -fsSL \
@@ -222,7 +234,12 @@ jobs:
     # Deliberately non-blocking: `develop` is a moving target we do not control, so a break
     # there is an early warning for us, not a reason to hold up a soldb pull request. When
     # this job goes red, read it before assuming the fault is ours.
+    #
+    # Disabled until soldb reads `ethdebug_compilation.json` and passes `--ethdebug-compilation`:
+    # solc develop no longer embeds the source list in `ethdebug_resources.json`. Remove the
+    # `if` below once that lands.
     name: lit (solc develop)
+    if: false
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
