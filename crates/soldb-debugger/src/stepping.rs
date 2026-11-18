@@ -783,16 +783,22 @@ impl<T> Default for NearestLines<T> {
 }
 
 impl<T: Copy> NearestLines<T> {
-    /// Walks past a step and returns the line of the nearest step before it at the same
-    /// depth, or `None` when a shallower step or no step at that depth comes first.
-    fn visit(&mut self, depth: u32, key: Option<T>) -> Option<T> {
+    /// Returns the line of the nearest step at `depth` walked past so far, or `None` when
+    /// a shallower step or no step at that depth comes first.
+    fn peek(&mut self, depth: u32) -> Option<T> {
         while self.lines.last().is_some_and(|(level, _)| *level > depth) {
             self.lines.pop();
         }
-        let nearest = match self.lines.last() {
+        match self.lines.last() {
             Some((level, line)) if *level == depth => Some(*line),
             _ => None,
-        };
+        }
+    }
+
+    /// Walks past a step and returns the line of the nearest step before it at the same
+    /// depth, or `None` when a shallower step or no step at that depth comes first.
+    fn visit(&mut self, depth: u32, key: Option<T>) -> Option<T> {
+        let nearest = self.peek(depth);
         if let Some(key) = key {
             if nearest.is_some() {
                 self.lines.pop();
@@ -2143,13 +2149,15 @@ impl StepMap {
     }
 
     /// A lone instruction attributed to another line, between two runs of the same line
-    /// at the same depth, counts as that line when `folds_into` accepts the line around it.
-    /// solc emits such instructions at function entry, between runs of the function's
-    /// declaration, and stopping on them would show a later line before an earlier one.
-    /// Elsewhere a lone instruction can be the only code of a statement that runs, such as
-    /// a constant an `if` arm assigns, pushed on the branch edge between instructions of
-    /// the `if`; folding it would leave that statement with no step, so breakpoints on it
-    /// could never hit. The runs are looked for within the step's own top-level call.
+    /// at the same depth, counts as that line when it goes back to the line the first run
+    /// followed, or when `folds_into` accepts the line around it. solc emits such
+    /// instructions at function entry, between runs of the function's declaration, and
+    /// stack cleanup of the statement just left in the middle of the next one; stopping on
+    /// them would show a line again, or a later line before an earlier one. Any other lone
+    /// instruction can be the only code of a statement that runs, such as a constant an
+    /// `if` arm assigns, pushed on the branch edge between instructions of the `if`;
+    /// folding it would leave that statement with no step, so breakpoints on it could never
+    /// hit. The runs are looked for within the step's own top-level call.
     ///
     /// One pass in each direction finds every step's neighbours, so deep recursion does
     /// not make each step search the frames it calls.
@@ -2166,18 +2174,28 @@ impl StepMap {
                 lines.clear();
             }
         }
-        let mut lines = NearestLines::default();
+        // The line of the nearest step before each one at its depth, and the line of the
+        // run before that line's run.
+        let mut lines = NearestLines::<(LineKey, Option<LineKey>)>::default();
         for (index, after) in after.into_iter().enumerate() {
             let step = &steps[index];
             if step.starts_root {
                 lines.clear();
             }
-            let before = lines.visit(step.frame_depth, step.key);
+            let nearest = lines.peek(step.frame_depth);
+            let runs = step.key.map(|key| match nearest {
+                Some((line, previous)) if line == key => (line, previous),
+                Some((line, _)) => (key, Some(line)),
+                None => (key, None),
+            });
+            lines.visit(step.frame_depth, runs);
             let Some(key) = step.key else {
                 continue;
             };
+            let before = nearest.map(|(line, _)| line);
+            let back = nearest.is_some_and(|(_, previous)| previous == Some(key));
             let after = after.and_then(|after| steps[after as usize].key);
-            if before.is_some_and(&folds_into) && before == after && before != Some(key) {
+            if (back || before.is_some_and(&folds_into)) && before == after && before != Some(key) {
                 steps[index].key = before;
             }
         }
@@ -4925,16 +4943,42 @@ contract P {
                     lines.clear();
                 }
             }
-            let mut lines = NearestLines::default();
+            // The line of each depth's last run and of the run before it, in full.
+            let mut runs = Vec::<(u32, Vec<LineKey>)>::new();
             for (step, after) in expected.iter_mut().zip(after) {
                 if step.starts_root {
-                    lines.clear();
+                    runs.clear();
                 }
-                let before = lines.visit(step.frame_depth, step.key);
+                while runs
+                    .last()
+                    .is_some_and(|(level, _)| *level > step.frame_depth)
+                {
+                    runs.pop();
+                }
+                let seen = match runs.last() {
+                    Some((level, seen)) if *level == step.frame_depth => seen.clone(),
+                    _ => Vec::new(),
+                };
                 let Some(key) = step.key else {
                     continue;
                 };
-                if before.is_some_and(folds_into) && before == after && before != Some(key) {
+                let mut next = seen.clone();
+                if next.last() != Some(&key) {
+                    next.push(key);
+                }
+                if runs
+                    .last()
+                    .is_some_and(|(level, _)| *level == step.frame_depth)
+                {
+                    runs.pop();
+                }
+                runs.push((step.frame_depth, next));
+                let before = seen.last().copied();
+                let back = seen.len() >= 2 && seen[seen.len() - 2] == key;
+                if (back || before.is_some_and(folds_into))
+                    && before == after
+                    && before != Some(key)
+                {
                     step.key = before;
                 }
             }
@@ -5367,6 +5411,27 @@ contract D {
             frame_entry: false,
             line_start: false,
         }
+    }
+
+    #[test]
+    fn a_lone_step_back_to_the_line_just_left_folds() {
+        let mut steps = vec![
+            // Line 4, then line 5 with one instruction of line 4 in its middle: stack
+            // cleanup of the statement just left.
+            step_info(1, Some(4), false),
+            step_info(1, Some(5), false),
+            step_info(1, Some(4), false),
+            step_info(1, Some(5), false),
+            // A lone line 6 between runs of line 5 keeps its line: it was not just left.
+            step_info(1, Some(6), false),
+            step_info(1, Some(5), false),
+        ];
+        StepMap::smooth_single_step_excursions(&mut steps, |_| false);
+        let lines = steps
+            .iter()
+            .map(|step| step.key.map(|key| key.line))
+            .collect::<Vec<_>>();
+        assert_eq!(lines, [4, 5, 5, 5, 6, 5].map(Some));
     }
 
     #[test]
