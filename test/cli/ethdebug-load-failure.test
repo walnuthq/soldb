@@ -18,6 +18,15 @@
 # UNRESOLVED: warning: could not resolve the requested contracts
 # UNRESOLVED-SAME: no contracts found for
 
+# A spec that does not resolve is left out on its own: the contract the other one names
+# still loads.
+# RUN: %soldb trace %{test_tx} --ethdebug-dir %{project_root}/test/missing-ethdebug --ethdebug-dir %{contract_address}:TestContract:%{ethdebug_dir} --rpc %{rpc_url} 2>&1 | FileCheck %s --check-prefix=PARTIAL
+
+# PARTIAL: warning: could not resolve the requested contracts
+# PARTIAL: note: continuing without source-level information for the contracts it names
+# PARTIAL: Contract: TestContract
+# PARTIAL: TestContract::runtime_dispatcher
+
 # The report goes to stderr, so `--save-trace` still writes one valid trace.
 # RUN: %soldb trace %{test_tx} --ethdebug-dir %{contract_address}:TestContract:%{project_root}/test/missing-ethdebug --rpc %{rpc_url} --save-trace %t.trace 2>/dev/null >/dev/null && jq -e '(.steps | length) > 0' %t.trace > /dev/null
 

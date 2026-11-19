@@ -94,9 +94,13 @@ impl EventRegistry {
 }
 
 pub fn parse_event_abis(input: &str) -> SoldbResult<Vec<EventAbi>> {
-    let value = parse_abi_json(input)?;
+    event_abis(&parse_abi_json(input)?)
+}
+
+/// The event entries of an ABI already parsed as JSON.
+pub fn event_abis(abi: &Value) -> SoldbResult<Vec<EventAbi>> {
     let mut events = Vec::new();
-    for item in abi_items(&value)? {
+    for item in abi_items(abi)? {
         if item.get("type").and_then(Value::as_str) != Some("event") {
             continue;
         }
@@ -136,6 +140,11 @@ pub(crate) fn abi_items(value: &Value) -> SoldbResult<&[Value]> {
         .ok_or_else(|| {
             SoldbError::Message("ABI JSON must be an array or contain an 'abi' array".to_owned())
         })
+}
+
+/// The entries of an ABI as one JSON array, whichever of the two shapes it came in.
+pub(crate) fn abi_entries(value: &Value) -> SoldbResult<Value> {
+    abi_items(value).map(|items| Value::Array(items.to_vec()))
 }
 
 pub fn event_signature(event: &EventAbi) -> String {

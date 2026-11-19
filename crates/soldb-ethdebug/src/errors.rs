@@ -5,19 +5,17 @@
 //! comes from the chain and is not trusted; decoding reuses the checked event decoder.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
-use soldb_core::{SoldbError, SoldbResult};
+use soldb_core::SoldbResult;
 
 use crate::abi::keccak256;
-use crate::artifacts::find_abi_file;
+use crate::artifacts::load_abi;
 use crate::events::{
     abi_items, canonical_event_type, decode_param_at, event_param_head_words, parse_abi_json,
     parse_event_param, parse_hex_data, EventParam,
 };
-use crate::source_map::load_combined_errors;
 
 /// An error declared in an ABI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,13 +117,10 @@ pub fn error_abis(abi: &Value) -> SoldbResult<Vec<ErrorAbi>> {
 /// or in a legacy `combined.json`. A missing ABI is not an error, as custom errors then show
 /// as raw data; an unreadable one is.
 pub fn load_error_abis(root: &Path, contract_name: &str) -> SoldbResult<Vec<ErrorAbi>> {
-    let Some(path) = find_abi_file(root, contract_name) else {
-        return load_combined_errors(root, contract_name);
-    };
-    fs::read_to_string(&path)
-        .map_err(|error| SoldbError::Message(error.to_string()))
-        .and_then(|content| parse_error_abis(&content))
-        .map_err(|error| SoldbError::Message(format!("{}: {error}", path.display())))
+    match load_abi(root, contract_name)? {
+        Some(abi) => error_abis(&abi),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn builtin(name: &str, ty: &str) -> ErrorAbi {

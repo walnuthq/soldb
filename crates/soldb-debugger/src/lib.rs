@@ -53,10 +53,10 @@ pub use state::{
     StateVariable, StorageTape, StorageWords,
 };
 pub use stepping::{
-    address_from_word, call_target, normalize_address, source_path_matches, ContractDebugInfo,
-    Frame, FunctionId, InferredVariable, JumpMarker, LineKey, LocalsStatus, ResolvedFunction,
-    ResolvedLine, SourceCache, SourceListing, StepLocation, StepMap, VariableKind,
-    INFERRED_LOCALS_NOTE, INFERRED_LOCALS_WARNING,
+    address_from_word, call_target, normalize_address, source_path_matches, CallExit, CallNode,
+    ContractDebugInfo, Frame, FunctionId, InferredVariable, JumpMarker, LineKey, LocalsStatus,
+    ResolvedFunction, ResolvedLine, SourceCache, SourceListing, StepLocation, StepMap,
+    VariableKind, INFERRED_LOCALS_NOTE, INFERRED_LOCALS_WARNING,
 };
 pub use types::{SourceTypes, StructMember};
 

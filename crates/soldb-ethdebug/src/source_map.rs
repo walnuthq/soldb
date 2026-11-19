@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
 use crate::artifacts::read_json_file;
-use crate::errors::{error_abis, parse_error_abis, ErrorAbi};
+use crate::events::{abi_entries, parse_abi_json};
 use crate::opcodes;
 use crate::storage_layout::StorageLayout;
 use crate::{EthdebugInfo, Instruction, SourceLocation, SourceMapContext, SourceMapJump};
@@ -343,28 +343,28 @@ fn source_map_program_from_combined(
     }))
 }
 
-/// The errors in the `abi` entry of `contract_name` in `root`'s `combined.json`, which older
-/// solc releases wrote as a JSON string; empty without the file, the contract, or the entry.
-pub(crate) fn load_combined_errors(root: &Path, contract_name: &str) -> SoldbResult<Vec<ErrorAbi>> {
+/// The entries of the `abi` of `contract_name` in `root`'s `combined.json`, which older solc
+/// releases wrote as a JSON string; `None` without the file, the contract, or the entry.
+pub(crate) fn load_combined_abi(root: &Path, contract_name: &str) -> SoldbResult<Option<Value>> {
     let path = root.join("combined.json");
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let combined = read_json_file(&path)?;
     let Some(contracts) = combined.get("contracts").and_then(Value::as_object) else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let Some((contract_key, contract)) = find_contract(contracts, contract_name)? else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let Some(abi) = contract.get("abi") else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
-    match abi {
-        Value::String(text) => parse_error_abis(text),
-        abi => error_abis(abi),
-    }
-    .map_err(|error| {
+    let entries = match abi {
+        Value::String(text) => parse_abi_json(text).and_then(|abi| abi_entries(&abi)),
+        abi => abi_entries(abi),
+    };
+    entries.map(Some).map_err(|error| {
         SoldbError::Message(format!(
             "legacy artifact `{}` has an invalid `abi` for `{contract_key}`: {error}",
             path.display()

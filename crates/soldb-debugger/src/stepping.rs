@@ -24,10 +24,14 @@
 //! dispatcher has, so a step outside every function is read as generated code belonging
 //! to the statement that was executing, unless no function follows it in its frame, in
 //! which case it is the dispatcher finishing up and the frame's functions have returned.
+//! A frame that reverts has no such ending: the revert after its last statement is that
+//! statement's.
 //! Interactive stepping also folds brief excursions to earlier lines when they are
 //! part of the surrounding statement.
 //!
 //! Everything here is a search over the recording. Nothing re-executes.
+
+mod calls;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -48,8 +52,10 @@ use crate::types::SourceTypes;
 use crate::{
     decode_arguments, is_value_type, parse_source_functions, readable_parameter, ArgumentLayout,
     ArgumentOrder, ByteRange, DebugLocation, DebugValue, DebugValueStatus, DebugVariable,
-    FrameArgument, FrameState, SourceFunction, SourceParam,
+    FrameArgument, FrameState, SourceFunction, SourceLocal, SourceParam,
 };
+
+pub use calls::{CallExit, CallNode};
 
 /// The warning a frontend shows once when it presents inferred local variables.
 pub const INFERRED_LOCALS_WARNING: &str = "local variables are inferred from the legacy source \
@@ -510,6 +516,24 @@ impl ContractDebugInfo {
         source.lines().nth(index)
     }
 
+    /// The name a return parameter of `function` is written with; `None` for one left
+    /// unnamed, which the parser calls `retN`.
+    #[must_use]
+    pub fn return_name<'a>(
+        &self,
+        function: &SourceFunction,
+        value: &'a SourceLocal,
+    ) -> Option<&'a str> {
+        let source = self.source_contents.get(&function.source_id)?;
+        let start = usize::try_from(value.declaration.start).ok()?;
+        let end = usize::try_from(value.declaration.end).ok()?;
+        let written = source.get(start..end)?;
+        written
+            .trim_end()
+            .ends_with(value.name.as_str())
+            .then_some(value.name.as_str())
+    }
+
     /// The source span the compiler attached to the instruction at `pc`.
     #[must_use]
     pub fn location_at_pc(&self, pc: u64) -> Option<SourceLocation> {
@@ -729,6 +753,15 @@ pub struct Frame {
     pub arguments: Vec<FrameArgument>,
     /// For a root frame, what its top-level call is, when the trace says.
     pub kind: Option<String>,
+}
+
+/// A frame while the steps are walked: where it was entered, the last step it has run
+/// itself, and whether the EVM entered it with a call or a creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameRecord {
+    pub(crate) entry_step: usize,
+    pub(crate) last_step: usize,
+    pub(crate) external: bool,
 }
 
 /// Lines of source around a step.
@@ -1361,6 +1394,15 @@ fn frame_calldata<'a>(trace: &'a TransactionTrace, step: usize, root_input: &'a 
         .map_or("", |call| call.input.as_str())
 }
 
+/// Whether `step` ends its frame with a failure: a `REVERT`, or an error a backend
+/// reported on an instruction that does not halt successfully.
+fn halts_with_failure(step: StepView<'_>) -> bool {
+    let op = step.op();
+    op == opcode::REVERT
+        || step.error().is_some()
+            && !matches!(op, opcode::RETURN | opcode::STOP | opcode::SELFDESTRUCT)
+}
+
 /// How many stack words a parameter takes: a `calldata` slice of a dynamic type is an
 /// offset and a length, an external function is an address and a selector, and
 /// everything else is one word.
@@ -1785,20 +1827,30 @@ impl StepMap {
 
         // Pass 2: a step outside every function is generated code for the statement that
         // is executing, unless no function runs later in its EVM frame; then it is the
-        // dispatcher finishing up after the function returned.
+        // dispatcher finishing up after the function returned. A frame that fails has no
+        // such epilogue: the code that reverts after its last statement is that
+        // statement's, as a `require` or a checked operation is.
         let structured = |contract: Option<usize>| {
             contract.is_some_and(|index| !contracts[index].functions.is_empty())
         };
         // Frame ids are dense from zero, so a flag per id stands in for a set of them.
         let mut function_follows = vec![false; next_frame_id as usize];
+        let mut seen = vec![false; next_frame_id as usize];
+        let mut fails = vec![false; next_frame_id as usize];
         let mut epilogue = vec![false; framed.len()];
         for (index, step) in framed.iter().enumerate().rev() {
+            let frame = step.frame_id as usize;
+            // Walking backwards, a frame's first step met is its last.
+            if !seen[frame] {
+                seen[frame] = true;
+                fails[frame] = halts_with_failure(trace.steps.step(index));
+            }
             match step.location.map(|location| location.function) {
                 Some(Some(_)) => {
-                    function_follows[step.frame_id as usize] = true;
+                    function_follows[frame] = true;
                 }
                 Some(None) if structured(step.contract) => {
-                    epilogue[index] = !function_follows[step.frame_id as usize];
+                    epilogue[index] = !function_follows[frame] && !fails[frame];
                 }
                 _ => {}
             }
@@ -2930,25 +2982,40 @@ impl StepMap {
     /// The call structure at `step`, innermost frame first.
     #[must_use]
     pub fn frames(&self, step: usize) -> Vec<Frame> {
-        struct Record {
-            entry_step: usize,
-            last_step: usize,
-            external: bool,
-        }
         if step >= self.steps.len() {
             return Vec::new();
         }
-        let mut stack = Vec::<Record>::new();
-        for (index, info) in self.steps.iter().enumerate().take(step + 1) {
+        self.walk_frames(step, |_, _| {})
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(depth, record)| self.frame_of(depth, *record))
+            .collect()
+    }
+
+    /// Walks the steps up to and including `last` and returns the frames open at it,
+    /// outermost first. Every frame that closes on the way is handed to `closed` with its
+    /// depth.
+    pub(crate) fn walk_frames(
+        &self,
+        last: usize,
+        mut closed: impl FnMut(usize, FrameRecord),
+    ) -> Vec<FrameRecord> {
+        let mut stack = Vec::<FrameRecord>::new();
+        for (index, info) in self.steps.iter().enumerate().take(last + 1) {
             let depth = info.frame_depth as usize;
-            stack.truncate(if info.starts_root { 0 } else { depth + 1 });
+            let open = if info.starts_root { 0 } else { depth + 1 };
+            while stack.len() > open {
+                let record = stack.pop().expect("the stack is longer than `open`");
+                closed(stack.len(), record);
+            }
             // Frames entered at this step. When an external call and a function both begin
             // here, the outer one is the call.
             let entered_call =
                 index == 0 || info.starts_root || info.evm_depth > self.steps[index - 1].evm_depth;
             let mut first_new = true;
             while stack.len() <= depth {
-                stack.push(Record {
+                stack.push(FrameRecord {
                     entry_step: index,
                     last_step: index,
                     external: first_new && entered_call,
@@ -2959,39 +3026,54 @@ impl StepMap {
                 top.last_step = index;
             }
         }
-
         stack
-            .iter()
-            .enumerate()
-            .rev()
-            .map(|(depth, record)| {
-                let info = self.steps[record.last_step];
-                let location = info
-                    .location
-                    .and_then(|location| self.describe(&location, info.generated));
-                Frame {
-                    depth: depth as u32,
-                    external: record.external,
-                    address: info
-                        .address
-                        .and_then(|index| self.addresses.get(index))
-                        .cloned(),
-                    contract_name: info
-                        .contract
-                        .and_then(|index| self.contracts.get(index))
-                        .map(|contract| contract.name.clone()),
-                    function_name: location
-                        .as_ref()
-                        .and_then(|location| location.function_name.clone()),
-                    entry_step: record.entry_step,
-                    step: record.last_step,
-                    pc: self.pcs[record.last_step],
-                    location,
-                    arguments: Vec::new(),
-                    kind: self.root_kind(depth, record.entry_step),
-                }
-            })
-            .collect()
+    }
+
+    /// A frame at `depth` as it stands at its record's last step.
+    pub(crate) fn frame_of(&self, depth: usize, record: FrameRecord) -> Frame {
+        let info = self.steps[record.last_step];
+        let location = info
+            .location
+            .and_then(|location| self.describe(&location, info.generated));
+        Frame {
+            depth: depth as u32,
+            external: record.external,
+            address: info
+                .address
+                .and_then(|index| self.addresses.get(index))
+                .cloned(),
+            contract_name: info
+                .contract
+                .and_then(|index| self.contracts.get(index))
+                .map(|contract| contract.name.clone()),
+            function_name: location
+                .as_ref()
+                .and_then(|location| location.function_name.clone()),
+            entry_step: record.entry_step,
+            step: record.last_step,
+            pc: self.pcs[record.last_step],
+            location,
+            arguments: Vec::new(),
+            kind: self.root_kind(depth, record.entry_step),
+        }
+    }
+
+    /// `frame` with the arguments it was entered with, read off the trace at its entry
+    /// step; see [`StepMap::frame_arguments`].
+    #[must_use]
+    pub fn with_arguments(&self, trace: &TransactionTrace, mut frame: Frame) -> Frame {
+        let Some(entry) = trace.steps.get(frame.entry_step) else {
+            return frame;
+        };
+        let stack = entry.stack().to_vec();
+        frame.arguments = self.frame_arguments(
+            &frame,
+            FrameState {
+                stack: &stack,
+                memory: entry.memory(),
+            },
+        );
+        frame
     }
 
     /// The kind of the top-level call a frame at `depth` entered at `entry_step` runs, for
@@ -3057,13 +3139,29 @@ fn prove_argument_layouts(
         return evidence;
     }
     // The calldata each EVM frame was entered with: the transaction's input at the root,
-    // and the recorded input of a call for a nested frame.
+    // and the recorded input of a call for a nested frame, or, when the backend recorded
+    // no calls, what the caller's memory held where the call instruction read it.
     let mut calldata_by_entry = FxHashMap::<usize, &str>::default();
     calldata_by_entry.insert(0, trace.input_data.as_str());
     for call in &trace.artifacts.calls {
         if let Some(entry_step) = call.entry_step {
             calldata_by_entry.insert(entry_step, call.input.as_str());
         }
+    }
+    let read_inputs = framed
+        .iter()
+        .enumerate()
+        .skip(1)
+        // Only a frame whose code is described is examined.
+        .filter(|(index, step)| {
+            step.contract.is_some()
+                && step.evm_depth > framed[index - 1].evm_depth
+                && !calldata_by_entry.contains_key(index)
+        })
+        .filter_map(|(index, _)| Some((index, trace.steps.step(index - 1).call_input()?)))
+        .collect::<Vec<_>>();
+    for (index, input) in &read_inputs {
+        calldata_by_entry.insert(*index, input.as_str());
     }
 
     let mut examined = std::collections::HashSet::<u32>::new();
@@ -3112,17 +3210,7 @@ fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[EvmWord
     if !function.params.iter().all(readable_parameter) {
         return Evidence::Unknown;
     }
-    let signature = format!(
-        "{}({})",
-        function.name,
-        function
-            .params
-            .iter()
-            .map(|param| canonical_value_type(&param.ty))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    let Ok(selector) = function_selector(&signature) else {
+    let Some(selector) = source_selector(function) else {
         return Evidence::Unknown;
     };
     let data = calldata.trim_start_matches("0x");
@@ -3175,6 +3263,23 @@ fn argument_evidence(function: &SourceFunction, calldata: &str, stack: &[EvmWord
         // The arguments are not on the entry stack: this is not where they live.
         (false, false) => Evidence::Contradicted,
     }
+}
+
+/// The selector of `function` as its declaration spells its parameter types. A struct, an
+/// enum, or a contract type is not written by its ABI name, so a function that takes one
+/// gets a selector no calldata carries, and matches nothing.
+fn source_selector(function: &SourceFunction) -> Option<[u8; 4]> {
+    let signature = format!(
+        "{}({})",
+        function.name,
+        function
+            .params
+            .iter()
+            .map(|param| canonical_value_type(&param.ty))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    function_selector(&signature).ok()
 }
 
 /// The ABI name of a value type as written in the source: the bare integer names are
@@ -4686,6 +4791,29 @@ contract P {
         assert_eq!(map.finish(2), Some(7));
         assert_eq!(map.reverse_finish(4), Some(0));
         assert_eq!(map.previous_source(6), Some(2));
+    }
+
+    #[test]
+    fn a_revert_after_the_last_statement_belongs_to_that_statement() {
+        // Line 5 runs, then a helper with the whole-contract span reverts: a `require`
+        // failing, not the dispatcher finishing up.
+        let map = StepMap::new(
+            &trace(vec![
+                step(0, 1, "PUSH1", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(14, 1, "POP", &[]),
+                step(40, 1, "JUMPDEST", &[]),
+                step(30, 1, "REVERT", &["0x0", "0x0"]),
+            ]),
+            vec![contract(None)],
+        );
+        let revert = map.location(4).expect("location");
+        assert!(revert.generated);
+        assert_eq!(revert.line, 5);
+        assert_eq!(revert.function_name.as_deref(), Some("outer"));
+        assert_eq!(map.frame_depth(4), Some(1));
+        let frames = map.frames(4);
+        assert_eq!(frames[0].function_name.as_deref(), Some("outer"));
     }
 
     #[test]

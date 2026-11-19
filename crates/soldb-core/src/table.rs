@@ -33,6 +33,10 @@ use crate::{
 /// walks back further.
 pub const STACK_CHECKPOINT: usize = 32;
 
+/// How far past recorded memory a step's memory range may reach: what one instruction can
+/// expand memory by within a block's gas, with room to spare.
+const MAX_MEMORY_EXPANSION: usize = 1 << 22;
+
 const CHUNK_BITS: u32 = 14;
 const CHUNK: usize = 1 << CHUNK_BITS;
 
@@ -870,11 +874,43 @@ impl<'a> StepView<'a> {
         if self.op() != opcode::REVERT {
             return None;
         }
+        self.memory_range(0, 1)
+    }
+
+    /// The data a `RETURN` or `REVERT` step halts its frame with, as [`StepView::revert_data`]
+    /// reads it; `None` for other steps.
+    #[must_use]
+    pub fn halt_data(&self) -> Option<String> {
+        if !matches!(self.op(), opcode::RETURN | opcode::REVERT) {
+            return None;
+        }
+        self.memory_range(0, 1)
+    }
+
+    /// The input a call instruction passes to the account it calls, read from memory at
+    /// the offset and size on its stack; `None` for other steps or without stack or memory.
+    #[must_use]
+    pub fn call_input(&self) -> Option<String> {
+        match self.op() {
+            opcode::CALL | opcode::CALLCODE => self.memory_range(3, 4),
+            opcode::DELEGATECALL | opcode::STATICCALL => self.memory_range(2, 3),
+            _ => None,
+        }
+    }
+
+    /// The memory bytes at the offset and size the stack holds `offset_at` and `size_at`
+    /// words from the top, as `0x`-prefixed hex.
+    fn memory_range(&self, offset_at: usize, size_at: usize) -> Option<String> {
         let stack = self.stack();
-        let offset = stack.peek(0)?.to_usize()?;
-        let size = stack.peek(1)?.to_usize()?;
+        let offset = stack.peek(offset_at)?.to_usize()?;
+        let size = stack.peek(size_at)?.to_usize()?;
         let memory = self.memory()?;
-        // Memory past its recorded end reads as zeros, as in the EVM.
+        // The instruction itself expands memory to cover the range, so memory past its
+        // recorded end reads as zeros, as in the EVM. A range far past that end is not
+        // one a frame could have paid for.
+        if offset.checked_add(size)? > memory.len().saturating_add(MAX_MEMORY_EXPANSION) {
+            return None;
+        }
         let mut data = vec![0; size];
         if let Some(available) = memory.get(offset.min(memory.len())..) {
             let len = available.len().min(size);
@@ -1448,6 +1484,45 @@ mod tests {
                 Some("0x31bad44c".to_owned()),
                 Some("0x4c0000".to_owned()),
                 None,
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn halts_and_calls_read_their_data_from_memory() {
+        let step = |op: &str, stack: &[&str]| {
+            let mut step = TraceStep::new(0, Arc::from(op), 0, 0, 1, None, StepSnapshot::default());
+            step.snapshot.stack = stack.iter().map(|word| Arc::from(*word)).collect();
+            step.snapshot.memory = Some(Bytes::copy_from_slice(&[0xaa, 0x31, 0xba, 0xd4]));
+            step
+        };
+        let table = StepTable::from(vec![
+            // Bottom first: RETURN's size, then its offset on top.
+            step("RETURN", &["0x2", "0x1"]),
+            step("STOP", &["0x2", "0x1"]),
+            // CALL: gas, address, value, offset, size from the top; bottom first here.
+            step("CALL", &["0x3", "0x1", "0x0", "0xb", "0x5"]),
+            step("STATICCALL", &["0x2", "0x2", "0xb", "0x5"]),
+            // A range no frame could pay for is refused rather than allocated.
+            step("RETURN", &["0xffffffffffff", "0x0"]),
+        ]);
+        let halts = table
+            .iter()
+            .map(|step| step.halt_data())
+            .collect::<Vec<_>>();
+        assert_eq!(halts, [Some("0x31ba".to_owned()), None, None, None, None]);
+        let inputs = table
+            .iter()
+            .map(|step| step.call_input())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inputs,
+            [
+                None,
+                None,
+                Some("0x31bad4".to_owned()),
+                Some("0xbad4".to_owned()),
                 None
             ]
         );
