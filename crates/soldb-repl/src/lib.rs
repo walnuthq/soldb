@@ -41,7 +41,7 @@ pub use session::{
 use soldb_debugger::{
     call_target, check_root_calls, normalize_address, variables_for_step, ChainStorage, Condition,
     ConditionContext, ContractDebugInfo, DebugVariable, ErrorRegistry, Evaluation, Frame,
-    FrameState, LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
+    LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
     StorageLayout, StorageTape, StorageWords,
 };
 
@@ -928,21 +928,10 @@ impl DebuggerState {
         let (Some(map), Some(trace)) = (&self.step_map, &self.trace) else {
             return Vec::new();
         };
-        let mut frames = map.frames(step);
-        for frame in &mut frames {
-            let Some(entry) = trace.steps.get(frame.entry_step) else {
-                continue;
-            };
-            let stack = entry.stack().to_vec();
-            frame.arguments = map.frame_arguments(
-                frame,
-                FrameState {
-                    stack: &stack,
-                    memory: entry.memory(),
-                },
-            );
-        }
-        frames
+        map.frames(step)
+            .into_iter()
+            .map(|frame| map.with_arguments(trace, frame))
+            .collect()
     }
 
     /// The call structure at the current step, innermost frame first.

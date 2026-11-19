@@ -141,11 +141,15 @@ Gas used: 50835
 Status: SUCCESS
 
 Call Stack:
-#0 TestContract::runtime_dispatcher [entry] @ TestContract.sol:1
-  #1 increment [external] gas: 29241 @ TestContract.sol:23
-    #2 increment2 [internal] gas: 6322 @ TestContract.sol:39
-      #3 increment3 [internal] gas: 5172 @ TestContract.sol:54
+#0 TestContract::runtime_dispatcher
+#1 increment(uint256 amount = 4) at TestContract.sol:23
+  #2 increment2(uint256 amount = 4) [internal] at TestContract.sol:39
+    #3 increment3(uint256 amount, uint256 amount2) [internal] at TestContract.sol:54
 ```
+
+Every call is nested under its caller, with the arguments it was called with and what it
+returned. A call into another contract is named from that contract's debug info, and
+one without debug info shows its address and selector.
 
 When the transaction calls other contracts, give each one its debug info, either with
 one `--ethdebug-dir <address>:<name>:<dir>` per contract or with a mapping file:
@@ -217,16 +221,27 @@ soldb simulate <contract_address> "increment(uint256)" 10 --from <sender_address
 ```
 
 ```
-Contract: TestContract
-Gas used: 27157
+Contract: Payroll
 Status: REVERTED
-Error: Value must be even
+Error: InsufficientBalance(1000, 4950)
 
 Call Stack:
-#0 TestContract::runtime_dispatcher [entry] @ TestContract.sol:1
-  #1 increment [external] gas: 20835 @ TestContract.sol:23
-    #2 isEven [internal] gas: 6322 @ TestContract.sol:38 !!!
+#0 Payroll::runtime_dispatcher
+#1 pay(uint256 amount = 5000) at Payroll.sol:37
+  #2 _fee(uint256 amount = 5000) [internal] at Payroll.sol:43
+    ← return (uint256 = 50)
+  #3 Ledger::debitWithMemo(address from = 0x5fbd…0aa3, uint256 amount = 4950, bytes32 memo = 0x…1388) at Payroll.sol:21
+    #4 debit(address from = 0x5fbd…0aa3, uint256 amount = 4950) [internal] at Payroll.sol:14
+      ← revert started here at Payroll.sol:16
+    ← revert InsufficientBalance(1000, 4950)
+  ← revert InsufficientBalance(1000, 4950)
+Backtrace:
+  at Ledger.debit (Payroll.sol:16)
+  at Ledger.debitWithMemo (Payroll.sol:23)
+  at Payroll.pay (Payroll.sol:40)
 ```
+
+A failed call ends with the frames its revert started in, innermost first.
 
 Structs and tuples are passed as tuples, and `--interactive` works here as well:
 

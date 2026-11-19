@@ -126,9 +126,9 @@ The crate in `crates/soldb-cli` is named `soldb` on crates.io, so the install is
 through it for variable decoding, and both drive `soldb-repl`, whose stepping and
 breakpoints rest on `soldb-debugger`'s `StepMap`, so the terminal and an editor stop at
 the same steps and report the same values. Debug artifacts are found and read through
-`soldb_ethdebug::load_debug_program` in both frontends. The CLI still builds the `trace`
-command's call-frame summary itself in `main.rs`; new frontend logic that both would want
-belongs in `soldb-debugger`, not in a second copy.
+`soldb_ethdebug::load_debug_program` in both frontends. The call stack a summary prints
+is `StepMap::call_tree` too; the CLI only words it, in `call_tree.rs`. New frontend logic
+that both would want belongs in `soldb-debugger`, not in a second copy.
 
 - **soldb-core**: the shared vocabulary — `TransactionTrace` and the `StepTable` of its
   steps, read through `StepView`; `TraceStep` and `StepSnapshot`, a step as a backend
@@ -177,8 +177,14 @@ belongs in `soldb-debugger`, not in a second copy.
   searches behind `next`, `step`, `finish`, their reverse forms,
   line and function breakpoints, and `backtrace`. Compiler-generated helpers carry the
   whole-contract span; the map attributes them to the executing statement and marks them
-  `generated`. `state.rs` reads state variables: `StorageTape` indexes every storage word
-  the trace recorded by the account whose storage it belongs to (a `DELEGATECALL` writes
+  `generated`, and in a frame that reverts that includes the code after its last
+  statement, which is the failing `require` or check rather than the dispatcher.
+  `StepMap::call_tree` lists every frame of the run as entered and left, from the same
+  walk `frames` makes, with an external call's input and how it ended, and an internal
+  function's return value where the stack heights around the call prove it;
+  `revert_origin` follows a revert passed up unchanged to the call it started in.
+  `state.rs` reads state variables: `StorageTape` indexes every storage word the trace
+  recorded by the account whose storage it belongs to (a `DELEGATECALL` writes
   the caller's, which `StepMap::storage_context_index` decides) and by the step it holds
   from, and drops what a reverted frame wrote; a slot with no record is unknown, never
   zero. A frontend that has a node can fill those in through the `ChainStorage` trait,
@@ -332,9 +338,9 @@ Artifacts produced per contract in the output directory:
   file listing sources. A compile removes whichever of the two it did not write, because
   a directory holding both — one compiler's output on top of another's — gives a loader
   no way to tell which describes the programs next to them.
-- `<Contract>.abi`, `<Contract>.bin` — ABI and bytecode. The errors the ABI declares are
-  what revert data is decoded against (`load_error_abis`, also reading a legacy
-  `combined.json`); `Error(string)` and `Panic(uint256)` need no ABI.
+- `<Contract>.abi`, `<Contract>.bin` — ABI and bytecode. Calls, events, and revert data
+  are decoded against the ABI, read through `load_abi` from that file or from a legacy
+  `combined.json`; `Error(string)` and `Panic(uint256)` need no ABI.
 
 ### Compiler Channels
 

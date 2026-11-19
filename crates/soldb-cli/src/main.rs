@@ -18,6 +18,7 @@
 //!   [`soldb_core::SoldbError::AlreadyReported`] so the exit path does not print it
 //!   twice. Failures exit with code 2.
 
+mod call_tree;
 mod debug_diff;
 mod profile;
 
@@ -28,12 +29,12 @@ use soldb_core::{
     encode_hex, opcode, EvmWord, ExecutionLog, SoldbResult, StepView, TransactionTrace,
 };
 use soldb_debugger::{
-    CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam,
+    CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam, StepMap,
 };
 use soldb_ethdebug::{
-    encode_function_call, ethdebug_resources_from_metadata, find_abi_file, find_ethdebug_metadata,
-    function_selector, load_debug_program_with_sources, load_error_abis, parse_contract_mapping,
-    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, ErrorRegistry,
+    encode_function_call, ethdebug_resources_from_metadata, event_abis, find_ethdebug_metadata,
+    function_selector, load_abi, load_debug_program_with_sources, load_error_abis,
+    parse_contract_mapping, parse_ethdebug_spec, parse_signature, DecodedEvent, ErrorRegistry,
     EventRegistry, SourceMapEnvironment,
 };
 use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
@@ -47,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Mutex, OnceLock};
 
+use call_tree::{call_tree_lines, CallTreeContext};
 use debug_diff::DebugDiffArgs;
 use profile::ProfileArgs;
 
@@ -1931,28 +1933,41 @@ fn list_contracts_command(args: &ListContractsArgs) -> SoldbResult<()> {
 }
 
 fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
-    let errors = revert_errors(
-        trace,
+    let specs = resolve_contract_specs_reporting(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
         &args.source_path,
     );
-    let Some(spec) = trace_contract_spec(args) else {
+    let errors = error_registry_reporting(&specs);
+    let root_address = trace.to_addr.as_ref().or(trace.contract_address.as_ref());
+    let map = summary_step_map(trace, &specs, root_address.map(String::as_str));
+    let root_name = root_address.map_or("<unknown>", String::as_str);
+    if specs.is_empty() {
         print_plain_trace_summary(trace, &errors);
+        print_call_stack(
+            trace,
+            &map,
+            &errors,
+            None,
+            root_name,
+            &trace_event_registry(args),
+        );
         return;
-    };
-    let metadata = trace_debug_metadata(&spec);
+    }
+    let spec = spec_for_address(&specs, root_address.map(String::as_str));
 
     println!(
         "{} {}",
         info("Loading transaction"),
         address_color(trace.tx_hash.as_deref().unwrap_or("<simulated>"))
     );
+    let metadata = spec.map(trace_debug_metadata).unwrap_or_default();
     if metadata.is_legacy {
         println!("{} {}", info("Debug format:"), bold("srcmap-runtime"));
     }
     print_trace_backend_details(trace);
-    println!("{} {}", info("Contract:"), function_color(&spec.name));
+    let contract_name = spec.map_or(root_name, |spec| spec.name.as_str());
+    println!("{} {}", info("Contract:"), function_color(contract_name));
     if let Some(version) = metadata.compiler_version {
         if let Some(name) = metadata.compiler_name {
             println!(
@@ -1973,21 +1988,77 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
     };
     println!("{} {}", info("Status:"), status);
     print_trace_error(trace, &errors);
+    let root_call = spec.and_then(|spec| abi_descriptor_for_calldata(spec, &trace.input_data));
+    print_call_stack(
+        trace,
+        &map,
+        &errors,
+        root_call,
+        contract_name,
+        &trace_event_registry(args),
+    );
+}
+
+/// The `Call Stack:` block that ends a summary.
+fn print_call_stack(
+    trace: &TransactionTrace,
+    map: &StepMap,
+    errors: &ErrorRegistry,
+    root_call: Option<CallDescriptor>,
+    root_name: &str,
+    events: &EventRegistry,
+) {
     println!();
     println!("{}", bold(info("Call Stack:")));
     println!("{}", separator(60));
-    println!(
-        "{} {}",
-        dim("#0"),
-        function_color(format!("{}::runtime_dispatcher", spec.name))
-    );
-    print_call_frames(&build_trace_call_frames(trace, &spec, None));
-    print_trace_event_lines(trace, &trace_event_registry(args));
+    let context = CallTreeContext {
+        errors,
+        root_call,
+        root_name,
+    };
+    for line in call_tree_lines(trace, map, &context) {
+        println!("{line}");
+    }
+    print_trace_event_lines(trace, events);
     println!("{}", separator(60));
     println!(
         "{}",
         dim("Use --raw flag to see detailed instruction trace")
     );
+}
+
+/// Maps the trace through every contract the user named, the one at `root_address`
+/// first, for the call tree a summary prints.
+fn summary_step_map(
+    trace: &TransactionTrace,
+    specs: &[ResolvedContractSpec],
+    root_address: Option<&str>,
+) -> StepMap {
+    let contracts = source_indexes_for_specs(specs.to_vec(), root_address)
+        .into_iter()
+        .map(|index| index.debug)
+        .collect();
+    StepMap::new(trace, contracts)
+}
+
+/// The spec describing the code at `address`: the one given for that address, or the
+/// only one given, which applies to whatever the transaction called.
+fn spec_for_address<'a>(
+    specs: &'a [ResolvedContractSpec],
+    address: Option<&str>,
+) -> Option<&'a ResolvedContractSpec> {
+    let at_address = address.and_then(|address| {
+        specs.iter().find(|spec| {
+            spec.address
+                .as_deref()
+                .is_some_and(|spec_address| spec_address.eq_ignore_ascii_case(address))
+        })
+    });
+    match (at_address, specs) {
+        (Some(spec), _) => Some(spec),
+        (None, [only]) => Some(only),
+        (None, _) => None,
+    }
 }
 
 fn print_plain_trace_summary(trace: &TransactionTrace, errors: &ErrorRegistry) {
@@ -2037,7 +2108,8 @@ fn print_raw_trace(trace: &TransactionTrace, args: &TraceView) {
         info("Loading transaction"),
         address_color(&args.tx_hash)
     );
-    if let Some(contract_name) = trace_contract_name(args) {
+    let root_address = trace.to_addr.as_ref().or(trace.contract_address.as_ref());
+    if let Some(contract_name) = trace_contract_name(args, root_address.map(String::as_str)) {
         println!("{} {}", info("Contract:"), function_color(contract_name));
     }
     print_trace_backend_details(trace);
@@ -2119,17 +2191,19 @@ fn print_simulation_summary(
     raw_data: &str,
     function_name: &str,
 ) {
-    let contract_name = auto_contract_name
-        .map(str::to_owned)
-        .or_else(|| simulate_contract_name(args))
-        .unwrap_or_else(|| contract_address.to_owned());
-    let has_debug_info = !args.ethdebug_dir.is_empty() || args.contracts.is_some();
-    let errors = revert_errors(
-        trace,
+    let specs = resolve_contract_specs_reporting(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
         &args.source_path,
     );
+    let errors = error_registry_reporting(&specs);
+    let map = summary_step_map(trace, &specs, Some(contract_address));
+    let spec = spec_for_address(&specs, Some(contract_address));
+    let contract_name = auto_contract_name
+        .map(str::to_owned)
+        .or_else(|| spec.map(|spec| spec.name.clone()))
+        .unwrap_or_else(|| contract_address.to_owned());
+    let has_debug_info = !args.ethdebug_dir.is_empty() || args.contracts.is_some();
     // Where the call ran is worth a line whenever no node was involved; the node's URL
     // is only interesting when nothing else identifies the session.
     match (&args.rpc_url, &args.replayed_from) {
@@ -2163,35 +2237,17 @@ fn print_simulation_summary(
     };
     println!("{} {}", info("Status:"), status);
     print_trace_error(trace, &errors);
-    println!();
-    println!("{}", bold(info("Call Stack:")));
-    println!("{}", separator(60));
-    println!(
-        "{} {}",
-        dim("#0"),
-        function_color(format!("{contract_name}::runtime_dispatcher"))
+    let root_call = spec
+        .and_then(|spec| abi_descriptor_for_calldata(spec, raw_data))
+        .or_else(|| simulated_call_descriptor(args, raw_data, function_name));
+    print_call_stack(
+        trace,
+        &map,
+        &errors,
+        root_call,
+        &contract_name,
+        &simulate_event_registry(args),
     );
-    let fallback = simulated_call_descriptor(args, raw_data, function_name);
-    print_call_frames(&build_simulation_call_frames(
-        trace, args, raw_data, fallback,
-    ));
-    print_trace_event_lines(trace, &simulate_event_registry(args));
-    println!("{}", separator(60));
-    println!(
-        "{}",
-        dim("Use --raw flag to see detailed instruction trace")
-    );
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CallFrame {
-    name: String,
-    params: Vec<DecodedCallParam>,
-    source_params: Vec<SourceParam>,
-    source_path: Option<String>,
-    source_line: Option<u64>,
-    raw_stack: Vec<EvmWord>,
-    internal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2280,10 +2336,6 @@ impl TraceSourceIndex {
         }))
     }
 
-    fn function_at_pc(&self, pc: u64) -> Option<&SourceFunction> {
-        self.debug.function_at_pc(pc)
-    }
-
     fn descriptor_for_calldata(&self, calldata: &str) -> Option<CallDescriptor> {
         let selector = selector_from_calldata(calldata)?;
         self.debug.functions.iter().find_map(|function| {
@@ -2292,57 +2344,6 @@ impl TraceSourceIndex {
             (function_selector == selector)
                 .then(|| descriptor_from_source_function(function, calldata))
         })
-    }
-}
-
-fn print_call_frames(frames: &[CallFrame]) {
-    for (index, frame) in frames.iter().enumerate() {
-        let call = format_call_frame(frame);
-        let location = format_call_frame_location(frame);
-        if frame.internal {
-            println!(
-                "{} {} {}{}",
-                dim(format!("#{}", index + 1)),
-                function_color(call),
-                dim("[internal]"),
-                location
-            );
-        } else {
-            println!(
-                "{} {}{}",
-                dim(format!("#{}", index + 1)),
-                function_color(call),
-                location
-            );
-        }
-        if frame.internal
-            && frame.params.is_empty()
-            && !frame.source_params.is_empty()
-            && !frame.raw_stack.is_empty()
-        {
-            println!(
-                "  {} {}",
-                info("raw entry stack:"),
-                number_color(format_raw_stack(&frame.raw_stack))
-            );
-        }
-    }
-}
-
-fn format_call_frame(frame: &CallFrame) -> String {
-    if !frame.params.is_empty() {
-        return format_decoded_call(&frame.name, &frame.params);
-    }
-    if !frame.source_params.is_empty() {
-        return format_source_prototype(&frame.name, &frame.source_params);
-    }
-    frame.name.clone()
-}
-
-fn format_call_frame_location(frame: &CallFrame) -> String {
-    match (&frame.source_path, frame.source_line) {
-        (Some(path), Some(line)) => dim(format!(" at {path}:{line}")),
-        _ => String::new(),
     }
 }
 
@@ -2385,108 +2386,6 @@ fn format_decoded_event_inline(decoded: &DecodedEvent) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     )
-}
-
-fn build_trace_call_frames(
-    trace: &TransactionTrace,
-    spec: &ResolvedContractSpec,
-    fallback: Option<CallDescriptor>,
-) -> Vec<CallFrame> {
-    let source_index = load_source_index(spec);
-    let descriptor = source_index
-        .as_ref()
-        .and_then(|index| index.descriptor_for_calldata(&trace.input_data))
-        .or_else(|| abi_descriptor_for_calldata(spec, &trace.input_data))
-        .or(fallback);
-    build_call_frames(trace, source_index.as_ref(), descriptor)
-}
-
-fn build_simulation_call_frames(
-    trace: &TransactionTrace,
-    args: &SimulationView,
-    raw_data: &str,
-    fallback: Option<CallDescriptor>,
-) -> Vec<CallFrame> {
-    let source_index = resolve_contract_specs_reporting(
-        &args.ethdebug_dir,
-        args.contracts.as_deref(),
-        &args.source_path,
-    )
-    .into_iter()
-    .find_map(|spec| load_source_index(&spec));
-    let descriptor = source_index
-        .as_ref()
-        .and_then(|index| index.descriptor_for_calldata(raw_data))
-        .or_else(|| {
-            resolve_contract_specs_reporting(
-                &args.ethdebug_dir,
-                args.contracts.as_deref(),
-                &args.source_path,
-            )
-            .into_iter()
-            .find_map(|spec| abi_descriptor_for_calldata(&spec, raw_data))
-        })
-        .or(fallback);
-    build_call_frames(trace, source_index.as_ref(), descriptor)
-}
-
-fn build_call_frames(
-    trace: &TransactionTrace,
-    source_index: Option<&TraceSourceIndex>,
-    descriptor: Option<CallDescriptor>,
-) -> Vec<CallFrame> {
-    let mut frames = Vec::<CallFrame>::new();
-
-    if let Some(index) = source_index {
-        for step in &trace.steps {
-            let Some(function) = index.function_at_pc(step.pc()) else {
-                continue;
-            };
-            if frames.iter().any(|frame| frame.name == function.name) {
-                continue;
-            }
-            frames.push(CallFrame {
-                name: function.name.clone(),
-                params: Vec::new(),
-                source_params: function.params.clone(),
-                source_path: index
-                    .debug
-                    .source_path(function.source_id)
-                    .map(str::to_owned),
-                source_line: Some(function.declaration_line),
-                raw_stack: step.stack().to_vec(),
-                internal: false,
-            });
-        }
-    }
-
-    if let Some(descriptor) = descriptor {
-        if let Some(frame) = frames
-            .iter_mut()
-            .find(|frame| frame.name == descriptor.name)
-        {
-            frame.params = descriptor.params;
-        } else {
-            frames.insert(
-                0,
-                CallFrame {
-                    name: descriptor.name,
-                    params: descriptor.params,
-                    source_params: Vec::new(),
-                    source_path: None,
-                    source_line: None,
-                    raw_stack: Vec::new(),
-                    internal: false,
-                },
-            );
-        }
-    }
-
-    for (index, frame) in frames.iter_mut().enumerate() {
-        frame.internal = index > 0;
-    }
-
-    frames
 }
 
 fn call_descriptor_for_calldata(
@@ -2614,24 +2513,9 @@ fn abi_entries_for_spec(spec: &ResolvedContractSpec) -> Option<Vec<FunctionAbiEn
 }
 
 fn abi_value_for_spec(spec: &ResolvedContractSpec) -> Option<serde_json::Value> {
-    if let Some(abi_path) = find_abi_file(&spec.debug_dir, &spec.name) {
-        let content = fs::read_to_string(abi_path).ok()?;
-        let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
-        if value.is_array() {
-            return Some(value);
-        }
-        return value.get("abi").filter(|abi| abi.is_array()).cloned();
-    }
-
-    let combined = read_json_file(&spec.debug_dir.join("combined.json")).ok()?;
-    let contracts = combined.get("contracts")?.as_object()?;
-    contracts
-        .iter()
-        .find(|(key, _)| {
-            key.rsplit_once(':')
-                .map_or(*key == &spec.name, |(_, name)| name == spec.name)
-        })
-        .and_then(|(_, contract)| contract.get("abi").filter(|abi| abi.is_array()).cloned())
+    // An unreadable ABI is reported where the events and errors are loaded from it; here
+    // it only means the call shows undecoded.
+    load_abi(&spec.debug_dir, &spec.name).ok().flatten()
 }
 
 fn descriptor_from_source_function(function: &SourceFunction, calldata: &str) -> CallDescriptor {
@@ -3045,16 +2929,10 @@ fn event_registry_reporting(specs: Vec<ResolvedContractSpec>) -> EventRegistry {
 fn event_registry_for_specs(specs: Vec<ResolvedContractSpec>) -> SoldbResult<EventRegistry> {
     let mut registry = EventRegistry::default();
     for spec in specs {
-        let Some(abi_path) = find_abi_file(&spec.debug_dir, &spec.name) else {
+        let Some(abi) = load_abi(&spec.debug_dir, &spec.name)? else {
             continue;
         };
-        let content = fs::read_to_string(&abi_path).map_err(|error| {
-            soldb_core::SoldbError::Message(format!(
-                "Failed to read ABI {}: {error}",
-                abi_path.display()
-            ))
-        })?;
-        for event in parse_event_abis(&content)? {
+        for event in event_abis(&abi)? {
             registry.insert(Some(spec.name.clone()), event)?;
         }
     }
@@ -3079,24 +2957,6 @@ fn error_registry_reporting(specs: &[ResolvedContractSpec]) -> ErrorRegistry {
         }
     }
     registry
-}
-
-/// The errors a failed trace's revert data is decoded against; a trace that succeeded
-/// needs none read.
-fn revert_errors(
-    trace: &TransactionTrace,
-    ethdebug_dirs: &[String],
-    contracts_file: Option<&str>,
-    source_paths: &[String],
-) -> ErrorRegistry {
-    if trace.success {
-        return ErrorRegistry::default();
-    }
-    error_registry_reporting(&resolve_contract_specs_reporting(
-        ethdebug_dirs,
-        contracts_file,
-        source_paths,
-    ))
 }
 
 /// The `Error:` line: the decoded revert data with the raw data under it, else the
@@ -3165,26 +3025,28 @@ fn load_source_index(spec: &ResolvedContractSpec) -> Option<TraceSourceIndex> {
     }
 }
 
-/// Resolves contract specs, reporting a bad spec instead of continuing with none.
+/// Resolves contract specs, reporting a bad spec instead of continuing without it.
 ///
 /// Every caller degrades to "no debug info" on failure, so without this a typo in
-/// `--ethdebug-dir` is indistinguishable from not passing it at all.
+/// `--ethdebug-dir` is indistinguishable from not passing it at all. A spec that does not
+/// resolve is left out on its own: the contracts the others name still load.
 fn resolve_contract_specs_reporting(
     ethdebug_dirs: &[String],
     contracts_file: Option<&str>,
     source_paths: &[String],
 ) -> Vec<ResolvedContractSpec> {
-    match resolve_contract_specs(ethdebug_dirs, contracts_file, source_paths) {
-        Ok(specs) => specs,
-        Err(error) => {
-            report_once(
+    let mut specs = Vec::new();
+    for resolved in resolve_each_spec(ethdebug_dirs, contracts_file) {
+        match resolved {
+            Ok(resolved) => specs.extend(resolved),
+            Err(error) => report_once(
                 format!("specs:{error}"),
                 &format!("could not resolve the requested contracts: {error}"),
-                "continuing without source-level information for this run",
-            );
-            Vec::new()
+                "continuing without source-level information for the contracts it names",
+            ),
         }
     }
+    with_source_paths(specs, source_paths)
 }
 
 /// Writes a warning and a follow-up note to stderr, at most once per `key`.
@@ -3210,20 +3072,36 @@ fn resolve_contract_specs(
     source_paths: &[String],
 ) -> SoldbResult<Vec<ResolvedContractSpec>> {
     let mut specs = Vec::new();
-    if let Some(contracts_file) = contracts_file {
-        specs.extend(load_contract_mapping_file(Path::new(contracts_file))?);
+    for resolved in resolve_each_spec(ethdebug_dirs, contracts_file) {
+        specs.extend(resolved?);
     }
+    Ok(with_source_paths(specs, source_paths))
+}
 
-    for spec_text in ethdebug_dirs {
-        specs.extend(resolve_ethdebug_spec(spec_text)?);
-    }
-    // Where to look for sources is a property of this invocation, not of one contract, so
-    // every spec gets what the user passed.
+/// The `--contracts` file and every `--ethdebug-dir` spec, each resolved on its own, in
+/// the order they apply.
+fn resolve_each_spec(
+    ethdebug_dirs: &[String],
+    contracts_file: Option<&str>,
+) -> Vec<SoldbResult<Vec<ResolvedContractSpec>>> {
+    contracts_file
+        .map(|file| load_contract_mapping_file(Path::new(file)))
+        .into_iter()
+        .chain(ethdebug_dirs.iter().map(|spec| resolve_ethdebug_spec(spec)))
+        .collect()
+}
+
+/// Where to look for sources is a property of this invocation, not of one contract, so
+/// every spec gets what the user passed.
+fn with_source_paths(
+    mut specs: Vec<ResolvedContractSpec>,
+    source_paths: &[String],
+) -> Vec<ResolvedContractSpec> {
     let source_paths = source_paths.iter().map(PathBuf::from).collect::<Vec<_>>();
     for spec in &mut specs {
         spec.source_paths = source_paths.clone();
     }
-    Ok(specs)
+    specs
 }
 
 fn resolve_ethdebug_spec(spec_text: &str) -> SoldbResult<Vec<ResolvedContractSpec>> {
@@ -3440,18 +3318,14 @@ fn normalize_contract_address_key(address: &str) -> String {
     address.to_ascii_lowercase()
 }
 
-fn trace_contract_name(args: &TraceView) -> Option<String> {
-    trace_contract_spec(args).map(|spec| spec.name)
-}
-
-fn trace_contract_spec(args: &TraceView) -> Option<ResolvedContractSpec> {
-    resolve_contract_specs_reporting(
+/// The name of the contract the transaction called, from the spec given for its address.
+fn trace_contract_name(args: &TraceView, root_address: Option<&str>) -> Option<String> {
+    let specs = resolve_contract_specs_reporting(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
         &args.source_path,
-    )
-    .into_iter()
-    .next()
+    );
+    spec_for_address(&specs, root_address).map(|spec| spec.name.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -3516,15 +3390,14 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
     }
 }
 
+/// The name of the contract the call goes to, from the spec given for its address.
 fn simulate_contract_name(args: &SimulationView) -> Option<String> {
-    resolve_contract_specs_reporting(
+    let specs = resolve_contract_specs_reporting(
         &args.ethdebug_dir,
         args.contracts.as_deref(),
         &args.source_path,
-    )
-    .into_iter()
-    .next()
-    .map(|spec| spec.name)
+    );
+    spec_for_address(&specs, Some(&args.contract_address)).map(|spec| spec.name.clone())
 }
 
 fn simulate_calldata(args: &SimulationView) -> SoldbResult<String> {
@@ -3765,6 +3638,8 @@ mod tests {
             "\u{1b}[93mwarning:\u{1b}[0m"
         );
     }
+    use soldb_ethdebug::{find_abi_file, parse_event_abis};
+
     use super::*;
     use serde_json::Value;
     use soldb_ethdebug::{source_range, EthdebugInfo, Instruction};
@@ -3988,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_call_frames_from_ethdebug_source_metadata() {
+    fn summary_nests_internal_calls_from_ethdebug_source_metadata() {
         let dir = temp_dir("ethdebug-frames");
         let source = r#"
 contract Counter {
@@ -4063,26 +3938,29 @@ contract Counter {
             ],
         );
 
-        let frames = build_trace_call_frames(&trace, &spec, None);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].name, "set");
-        assert_eq!(frames[0].params[0].name, "amount");
-        assert_eq!(frames[0].params[0].value, "4");
-        assert_eq!(frames[0].source_path.as_deref(), Some("Counter.sol"));
-        assert_eq!(frames[0].source_line, Some(3));
-        assert!(!frames[0].internal);
-        assert_eq!(frames[1].name, "helper");
-        assert_eq!(frames[1].source_path.as_deref(), Some("Counter.sol"));
-        assert_eq!(frames[1].source_line, Some(7));
-        assert!(frames[1].internal);
-        assert!(frames[1].params.is_empty());
-        assert_eq!(
-            format_source_prototype(&frames[1].name, &frames[1].source_params),
-            "helper(uint256 amount, uint256 amount2)"
+        let index = load_source_index(&spec).expect("load index");
+        let map = StepMap::new(&trace, vec![index.debug]);
+        let errors = ErrorRegistry::default();
+        let lines = call_tree_lines(
+            &trace,
+            &map,
+            &CallTreeContext {
+                errors: &errors,
+                root_call: None,
+                root_name: "Counter",
+            },
         );
+        // The helper `set` called is nested under it, and its arguments, which no frame
+        // of this trace proved the order of, are shown as the entry stack.
         assert_eq!(
-            format_raw_stack(&frames[1].raw_stack),
-            "[0] 0x00000000000000000000000000000000000000000000000000000000000000aa [1] 0x00000000000000000000000000000000000000000000000000000000000000bb [2] 0x0000000000000000000000000000000000000000000000000000000000000004"
+            lines,
+            [
+                "#0 Counter::runtime_dispatcher",
+                "#1 set(uint256 amount = 4) at Counter.sol:3",
+                "  #2 helper(uint256 amount, uint256 amount2) [internal] at Counter.sol:7",
+                "    raw entry stack: [0] 0x00000000000000000000000000000000000000000000000000000000000000aa [1] 0x00000000000000000000000000000000000000000000000000000000000000bb [2] 0x0000000000000000000000000000000000000000000000000000000000000004",
+                "  ← the recording ends inside this call",
+            ]
         );
     }
 
@@ -4126,6 +4004,7 @@ contract Counter {
         // Legacy maps attribute steps to functions like ETHDebug does.
         assert_eq!(
             index
+                .debug
                 .function_at_pc(2)
                 .map(|function| function.name.as_str()),
             Some("set")
@@ -4301,6 +4180,64 @@ contract Counter {
     }
 
     #[test]
+    fn a_spec_that_does_not_resolve_leaves_the_others_loaded() {
+        let dir = temp_dir("specs-partial");
+        let good = format!("0xabc:Token:{}", dir.display());
+        let bad = dir.join("no-artifacts-here").display().to_string();
+        let dirs = [good, bad];
+        let sources = ["/src".to_owned()];
+
+        assert!(resolve_contract_specs(&dirs, None, &sources).is_err());
+        let specs = resolve_contract_specs_reporting(&dirs, None, &sources);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "Token");
+        assert_eq!(specs[0].source_paths, [PathBuf::from("/src")]);
+    }
+
+    #[test]
+    fn events_and_calls_decode_from_a_legacy_combined_json() {
+        let abi = json!([
+            {"type": "function", "name": "set", "inputs": [{"name": "value", "type": "uint256"}]},
+            {"type": "event", "name": "Updated", "inputs": [
+                {"name": "value", "type": "uint256", "indexed": false}
+            ]}
+        ]);
+        // solc writes the `abi` as an array; older releases wrote it as a JSON string.
+        for (label, abi_entry) in [("array", abi.clone()), ("string", json!(abi.to_string()))] {
+            let dir = temp_dir(&format!("combined-abi-{label}"));
+            fs::write(
+                dir.join("combined.json"),
+                json!({"contracts": {"Token.sol:Token": {"abi": abi_entry}}}).to_string(),
+            )
+            .expect("write combined json");
+            let spec = ResolvedContractSpec {
+                address: Some("0xabc".to_owned()),
+                name: "Token".to_owned(),
+                debug_dir: dir,
+                source_paths: Vec::new(),
+                code_hash: None,
+            };
+
+            let calldata = encode_function_call("set(uint256)", &["7".to_owned()]).expect("call");
+            let call = abi_descriptor_for_calldata(&spec, &calldata).expect("decoded call");
+            assert_eq!(call.name, "set", "{label}");
+
+            let registry = event_registry_for_specs(vec![spec]).expect("registry");
+            let event = parse_event_abis(&abi.to_string())
+                .expect("events")
+                .remove(0);
+            let decoded = registry
+                .decode_log(
+                    &[soldb_ethdebug::event_topic(&event)],
+                    &format!("0x{:064x}", 7),
+                )
+                .expect("decoded event");
+            assert_eq!(decoded.event, "Updated", "{label}");
+            assert_eq!(decoded.contract_name.as_deref(), Some("Token"), "{label}");
+        }
+    }
+
+    #[test]
     fn event_json_covers_raw_and_decoded_paths() {
         let event = parse_event_abis(
             r#"[{"type":"event","name":"Updated","inputs":[{"name":"value","type":"uint256","indexed":false}]}]"#,
@@ -4455,7 +4392,10 @@ contract Counter {
         let trace = transaction_trace("0x".to_owned(), vec![trace_step(0, &[])]);
         print_plain_trace_summary(&trace, &ErrorRegistry::default());
         print_raw_trace(&trace, &trace_args);
-        assert_eq!(trace_contract_name(&trace_args).as_deref(), Some("Legacy"));
+        assert_eq!(
+            trace_contract_name(&trace_args, Some("0x2")).as_deref(),
+            Some("Legacy")
+        );
     }
 
     #[test]

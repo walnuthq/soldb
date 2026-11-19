@@ -92,17 +92,27 @@ The system analyzes the execution trace to reconstruct function calls:
    - Decodes function selectors from calldata
 
 2. **Call Stack Reconstruction:**
+   `StepMap::call_tree` lists every frame as it was entered and left: external calls by
+   the EVM depth, internal functions by the jumps onto their entry points, each under the
+   frame that made it. The REPL's `backtrace` is the same frames at one step.
    ```
-   Step 99:  JUMPDEST (PC: 296) → Function: x()
-   Step 296: JUMP (PC: 493)     → Internal call to y()
-   Step 493: JUMPDEST           → Function: y()
-   Step 966: RETURN             → Exit y()
+   #1 pay(uint256 amount = 5000) at Payroll.sol:37
+     #2 _fee(uint256 amount = 5000) [internal] at Payroll.sol:43
+       ← return (uint256 = 50)
+     #3 Ledger::debitWithMemo(…) at Payroll.sol:21
+       #4 debit(…) [internal] at Payroll.sol:14
+         ← revert started here at Payroll.sol:16
    ```
 
 3. **Parameter Extraction:**
-   - External calls: Decode from transaction calldata
-   - Internal calls: Extract from stack at function entry
-   - Unknown function signatures: Lookup via 4byte.directory API at `https://www.4byte.directory/api/v1/signatures/?hex_signature=0x{selector}`
+   - External calls: decoded from their input, the transaction's calldata for the root and
+     the caller's memory at the call instruction for a nested call
+   - Internal calls: read off the stack at the function's entry, once the trace proves
+     where the compiler leaves them
+   - Return values: decoded from an external call's return data; an internal function's
+     single return value is read where its caller resumes when the stack heights agree
+   - A revert is decoded against the errors the ABIs declare and followed down to the
+     call it started in
 
 ### 5. Architecture Flow
 

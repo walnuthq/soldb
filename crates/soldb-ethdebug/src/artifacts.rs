@@ -19,8 +19,11 @@ use serde_json::{json, Value};
 use soldb_core::{SoldbError, SoldbResult};
 
 use crate::errors::{load_error_abis, ErrorAbi};
+use crate::events::{abi_entries, parse_abi_json};
 use crate::metadata::{read_compilation_source, EthdebugInfo};
-use crate::source_map::{load_source_map_program_with_sources, SourceMapEnvironment};
+use crate::source_map::{
+    load_combined_abi, load_source_map_program_with_sources, SourceMapEnvironment,
+};
 use crate::storage_layout::StorageLayout;
 
 /// Which of solc's code generators produced a program.
@@ -361,6 +364,20 @@ pub fn find_abi_file(root: &Path, contract_name: &str) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+/// The ABI of `contract_name` in `root` as a JSON array of its entries: from the file
+/// [`find_abi_file`] finds, otherwise from a legacy `combined.json`. A missing ABI is not an
+/// error, as calls, events, and errors then show undecoded; an unreadable one is.
+pub fn load_abi(root: &Path, contract_name: &str) -> SoldbResult<Option<Value>> {
+    let Some(path) = find_abi_file(root, contract_name) else {
+        return load_combined_abi(root, contract_name);
+    };
+    fs::read_to_string(&path)
+        .map_err(|error| SoldbError::Message(error.to_string()))
+        .and_then(|content| abi_entries(&parse_abi_json(&content)?))
+        .map(Some)
+        .map_err(|error| SoldbError::Message(format!("{}: {error}", path.display())))
+}
+
 /// The `<Contract>_storage.json` that `solc --storage-layout -o <root>` writes, when it
 /// is there. A missing file is not an error: the layout is optional debug information.
 /// An unreadable one is, because the user compiled with it and would otherwise get a
@@ -461,10 +478,11 @@ mod tests {
 
     use super::{
         contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
-        find_program_ethdebug, load_debug_program, load_storage_layout,
+        find_program_ethdebug, load_abi, load_debug_program, load_storage_layout,
         load_transient_storage_layout, read_debug_source, read_json_file,
     };
     use crate::errors::load_error_abis;
+    use crate::events::event_abis;
     use crate::source_map::SourceMapEnvironment;
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -733,5 +751,44 @@ mod tests {
         .expect("write combined json");
         assert_eq!(names(&dir, "Vault"), ["Unauthorized(address)"]);
         assert!(names(&dir, "Token").is_empty());
+    }
+
+    #[test]
+    fn the_abi_is_one_array_whichever_artifact_holds_it() {
+        let abi = json!([{"type": "event", "name": "Paid", "inputs": []}]);
+        let events = |dir: &PathBuf| {
+            let abi = load_abi(dir, "Vault").expect("abi").expect("an abi");
+            assert!(abi.is_array());
+            event_abis(&abi)
+                .expect("events")
+                .into_iter()
+                .map(|event| event.name)
+                .collect::<Vec<_>>()
+        };
+
+        let dir = temp_dir("abi-none");
+        assert_eq!(load_abi(&dir, "Vault").expect("abi"), None);
+
+        // A build artifact keeps the entries under `abi`.
+        let dir = temp_dir("abi-artifact");
+        fs::write(dir.join("Vault.json"), json!({"abi": abi}).to_string()).expect("write");
+        assert_eq!(events(&dir), ["Paid"]);
+
+        let dir = temp_dir("abi-combined");
+        fs::write(
+            dir.join("combined.json"),
+            json!({"contracts": {"Vault.sol:Vault": {"abi": abi}}}).to_string(),
+        )
+        .expect("write combined json");
+        assert_eq!(events(&dir), ["Paid"]);
+        assert_eq!(load_abi(&dir, "Token").expect("abi"), None);
+
+        fs::write(
+            dir.join("combined.json"),
+            json!({"contracts": {"Vault.sol:Vault": {"abi": 7}}}).to_string(),
+        )
+        .expect("write combined json");
+        let error = load_abi(&dir, "Vault").expect_err("an abi that is no array");
+        assert!(error.to_string().contains("invalid `abi`"), "{error}");
     }
 }
