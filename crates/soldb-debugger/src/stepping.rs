@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use soldb_core::{opcode, EvmWord, StepView, TransactionTrace};
 use soldb_ethdebug::{
     function_selector, parse_path, CodeGenerator, ErrorAbi, EthdebugInfo, FunctionExit,
@@ -793,16 +793,22 @@ impl<T> Default for NearestLines<T> {
 }
 
 impl<T: Copy> NearestLines<T> {
-    /// Walks past a step and returns the line of the nearest step before it at the same
-    /// depth, or `None` when a shallower step or no step at that depth comes first.
-    fn visit(&mut self, depth: u32, key: Option<T>) -> Option<T> {
+    /// Returns the line of the nearest step at `depth` walked past so far, or `None` when
+    /// a shallower step or no step at that depth comes first.
+    fn peek(&mut self, depth: u32) -> Option<T> {
         while self.lines.last().is_some_and(|(level, _)| *level > depth) {
             self.lines.pop();
         }
-        let nearest = match self.lines.last() {
+        match self.lines.last() {
             Some((level, line)) if *level == depth => Some(*line),
             _ => None,
-        };
+        }
+    }
+
+    /// Walks past a step and returns the line of the nearest step before it at the same
+    /// depth, or `None` when a shallower step or no step at that depth comes first.
+    fn visit(&mut self, depth: u32, key: Option<T>) -> Option<T> {
+        let nearest = self.peek(depth);
         if let Some(key) = key {
             if nearest.is_some() {
                 self.lines.pop();
@@ -2130,20 +2136,42 @@ impl StepMap {
             roots,
         };
         if smooth {
-            Self::smooth_single_step_excursions(&mut map.steps);
+            let declarations = map.declaration_lines();
+            Self::smooth_single_step_excursions(&mut map.steps, |key| declarations.contains(&key));
         }
         map.mark_line_starts();
         map
     }
 
+    /// The lines function declarations begin on, as line keys.
+    fn declaration_lines(&self) -> FxHashSet<LineKey> {
+        self.contracts
+            .iter()
+            .enumerate()
+            .flat_map(|(contract, info)| {
+                info.functions.iter().map(move |function| LineKey {
+                    contract,
+                    source_id: function.source_id,
+                    line: function.declaration_line,
+                })
+            })
+            .collect()
+    }
+
     /// A lone instruction attributed to another line, between two runs of the same line
-    /// at the same depth, counts as that line. solc emits such instructions at function
-    /// entry, and stopping on them would show a later line before an earlier one. The runs
-    /// are looked for within the step's own top-level call.
+    /// at the same depth, counts as that line when it goes back to the line the first run
+    /// followed, or when `folds_into` accepts the line around it. solc emits such
+    /// instructions at function entry, between runs of the function's declaration, and
+    /// stack cleanup of the statement just left in the middle of the next one; stopping on
+    /// them would show a line again, or a later line before an earlier one. Any other lone
+    /// instruction can be the only code of a statement that runs, such as a constant an
+    /// `if` arm assigns, pushed on the branch edge between instructions of the `if`;
+    /// folding it would leave that statement with no step, so breakpoints on it could never
+    /// hit. The runs are looked for within the step's own top-level call.
     ///
     /// One pass in each direction finds every step's neighbours, so deep recursion does
     /// not make each step search the frames it calls.
-    fn smooth_single_step_excursions(steps: &mut [StepInfo]) {
+    fn smooth_single_step_excursions(steps: &mut [StepInfo], folds_into: impl Fn(LineKey) -> bool) {
         // The step after each one with its line, as an index: the forward pass reads its
         // key before changing anything after it.
         let mut after = vec![None; steps.len()];
@@ -2156,18 +2184,28 @@ impl StepMap {
                 lines.clear();
             }
         }
-        let mut lines = NearestLines::default();
+        // The line of the nearest step before each one at its depth, and the line of the
+        // run before that line's run.
+        let mut lines = NearestLines::<(LineKey, Option<LineKey>)>::default();
         for (index, after) in after.into_iter().enumerate() {
             let step = &steps[index];
             if step.starts_root {
                 lines.clear();
             }
-            let before = lines.visit(step.frame_depth, step.key);
+            let nearest = lines.peek(step.frame_depth);
+            let runs = step.key.map(|key| match nearest {
+                Some((line, previous)) if line == key => (line, previous),
+                Some((line, _)) => (key, Some(line)),
+                None => (key, None),
+            });
+            lines.visit(step.frame_depth, runs);
             let Some(key) = step.key else {
                 continue;
             };
+            let before = nearest.map(|(line, _)| line);
+            let back = nearest.is_some_and(|(_, previous)| previous == Some(key));
             let after = after.and_then(|after| steps[after as usize].key);
-            if before.is_some() && before == after && before != Some(key) {
+            if (back || before.is_some_and(&folds_into)) && before == after && before != Some(key) {
                 steps[index].key = before;
             }
         }
@@ -4635,6 +4673,29 @@ contract P {
     }
 
     #[test]
+    fn a_lone_instruction_between_runs_of_a_statement_keeps_its_line() {
+        // outer's entry, line 3, one instruction of line 4, line 3 again: the instruction
+        // can be the only code of line 4, so `next` stops on it.
+        let map = StepMap::new(
+            &trace(vec![
+                step(0, 1, "PUSH1", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(11, 1, "PUSH1", &[]),
+                step(12, 1, "PUSH1", &[]),
+                step(11, 1, "POP", &[]),
+                step(14, 1, "POP", &[]),
+                step(30, 1, "STOP", &[]),
+            ]),
+            vec![contract(None)],
+        );
+        assert_eq!(map.location(3).expect("location").line, 4);
+        assert_eq!(map.line_key(3), key(4));
+        assert!(map.is_line_start(3));
+        assert_eq!(map.next_source(2), Some(3));
+        assert_eq!(map.next_source(3), Some(4));
+    }
+
+    #[test]
     fn a_jump_onto_a_function_entry_is_a_call_even_when_it_is_active() {
         // outer calls inner, inner calls outer again, and both return: mutual recursion.
         // The entry points (pc 10 for outer, pc 20 for inner) make every jump onto them
@@ -4880,7 +4941,9 @@ contract P {
 
             // Smoothing, as it was done with every step's next line held in full.
             let mut smoothed = steps.clone();
-            StepMap::smooth_single_step_excursions(&mut smoothed);
+            // Lines 1 and 3 stand for function declarations.
+            let folds_into = |key: LineKey| key.line % 2 == 1;
+            StepMap::smooth_single_step_excursions(&mut smoothed, folds_into);
             let mut expected = steps.clone();
             let mut after = vec![None; expected.len()];
             let mut lines = NearestLines::default();
@@ -4890,16 +4953,42 @@ contract P {
                     lines.clear();
                 }
             }
-            let mut lines = NearestLines::default();
+            // The line of each depth's last run and of the run before it, in full.
+            let mut runs = Vec::<(u32, Vec<LineKey>)>::new();
             for (step, after) in expected.iter_mut().zip(after) {
                 if step.starts_root {
-                    lines.clear();
+                    runs.clear();
                 }
-                let before = lines.visit(step.frame_depth, step.key);
+                while runs
+                    .last()
+                    .is_some_and(|(level, _)| *level > step.frame_depth)
+                {
+                    runs.pop();
+                }
+                let seen = match runs.last() {
+                    Some((level, seen)) if *level == step.frame_depth => seen.clone(),
+                    _ => Vec::new(),
+                };
                 let Some(key) = step.key else {
                     continue;
                 };
-                if before.is_some() && before == after && before != Some(key) {
+                let mut next = seen.clone();
+                if next.last() != Some(&key) {
+                    next.push(key);
+                }
+                if runs
+                    .last()
+                    .is_some_and(|(level, _)| *level == step.frame_depth)
+                {
+                    runs.pop();
+                }
+                runs.push((step.frame_depth, next));
+                let before = seen.last().copied();
+                let back = seen.len() >= 2 && seen[seen.len() - 2] == key;
+                if (back || before.is_some_and(folds_into))
+                    && before == after
+                    && before != Some(key)
+                {
                     step.key = before;
                 }
             }
@@ -5335,6 +5424,27 @@ contract D {
     }
 
     #[test]
+    fn a_lone_step_back_to_the_line_just_left_folds() {
+        let mut steps = vec![
+            // Line 4, then line 5 with one instruction of line 4 in its middle: stack
+            // cleanup of the statement just left.
+            step_info(1, Some(4), false),
+            step_info(1, Some(5), false),
+            step_info(1, Some(4), false),
+            step_info(1, Some(5), false),
+            // A lone line 6 between runs of line 5 keeps its line: it was not just left.
+            step_info(1, Some(6), false),
+            step_info(1, Some(5), false),
+        ];
+        StepMap::smooth_single_step_excursions(&mut steps, |_| false);
+        let lines = steps
+            .iter()
+            .map(|step| step.key.map(|key| key.line))
+            .collect::<Vec<_>>();
+        assert_eq!(lines, [4, 5, 5, 5, 6, 5].map(Some));
+    }
+
+    #[test]
     fn smoothing_looks_past_deeper_frames_only() {
         let mut steps = vec![
             step_info(1, Some(1), false),
@@ -5364,7 +5474,7 @@ contract D {
             .map(|step| step.key.map(|key| key.line))
             .collect::<Vec<_>>();
         expected[1] = Some(1);
-        StepMap::smooth_single_step_excursions(&mut steps);
+        StepMap::smooth_single_step_excursions(&mut steps, |key| key.line == 1);
         let lines = steps
             .iter()
             .map(|step| step.key.map(|key| key.line))
