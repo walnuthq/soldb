@@ -24,8 +24,8 @@
 //! dispatcher has, so a step outside every function is read as generated code belonging
 //! to the statement that was executing, unless no function follows it in its frame, in
 //! which case it is the dispatcher finishing up and the frame's functions have returned.
-//! And a lone instruction attributed to another line between two runs of one line is
-//! treated as part of that line, so `next` does not stop on it.
+//! Interactive stepping also folds brief excursions to earlier lines when they are
+//! part of the surrounding statement.
 //!
 //! Everything here is a search over the recording. Nothing re-executes.
 
@@ -2137,7 +2137,11 @@ impl StepMap {
         };
         if smooth {
             let declarations = map.declaration_lines();
-            Self::smooth_single_step_excursions(&mut map.steps, |key| declarations.contains(&key));
+            Self::smooth_line_excursions(
+                &mut map.steps,
+                |key| declarations.contains(&key),
+                |index| (opcode::DUP1..=opcode::DUP16).contains(&trace.steps.step(index).op()),
+            );
         }
         map.mark_line_starts();
         map
@@ -2169,9 +2173,17 @@ impl StepMap {
     /// folding it would leave that statement with no step, so breakpoints on it could never
     /// hit. The runs are looked for within the step's own top-level call.
     ///
+    /// Optimized legacy code can also copy two operands with consecutive DUPs mapped
+    /// to the two preceding lines in reverse order. Fold those copies when straight-line
+    /// execution stays in the same frame and resumes on the surrounding line.
+    ///
     /// One pass in each direction finds every step's neighbours, so deep recursion does
     /// not make each step search the frames it calls.
-    fn smooth_single_step_excursions(steps: &mut [StepInfo], folds_into: impl Fn(LineKey) -> bool) {
+    fn smooth_line_excursions(
+        steps: &mut [StepInfo],
+        folds_into: impl Fn(LineKey) -> bool,
+        is_operand_copy: impl Fn(usize) -> bool,
+    ) {
         // The step after each one with its line, as an index: the forward pass reads its
         // key before changing anything after it.
         let mut after = vec![None; steps.len()];
@@ -2184,28 +2196,54 @@ impl StepMap {
                 lines.clear();
             }
         }
-        // The line of the nearest step before each one at its depth, and the line of the
-        // run before that line's run.
-        let mut lines = NearestLines::<(LineKey, Option<LineKey>)>::default();
+        // The last three runs of distinct lines at each depth, most recent first.
+        let mut lines = NearestLines::<[Option<LineKey>; 3]>::default();
         for (index, after) in after.into_iter().enumerate() {
-            let step = &steps[index];
+            let step = steps[index];
             if step.starts_root {
                 lines.clear();
             }
-            let nearest = lines.peek(step.frame_depth);
-            let runs = step.key.map(|key| match nearest {
-                Some((line, previous)) if line == key => (line, previous),
-                Some((line, _)) => (key, Some(line)),
-                None => (key, None),
-            });
-            lines.visit(step.frame_depth, runs);
             let Some(key) = step.key else {
+                lines.peek(step.frame_depth);
                 continue;
             };
-            let before = nearest.map(|(line, _)| line);
-            let back = nearest.is_some_and(|(_, previous)| previous == Some(key));
+            let [before, previous, earlier] = lines.peek(step.frame_depth).unwrap_or_default();
+            if before.is_some()
+                && before != Some(key)
+                && previous == Some(key)
+                && earlier.is_some()
+                && earlier != before
+                && !step.starts_root
+                && !step.frame_entry
+            {
+                if let Some([second_copy, resumed]) = steps.get(index + 1..index + 3) {
+                    if second_copy.key == earlier
+                        && resumed.key == before
+                        && [second_copy, resumed].into_iter().all(|next| {
+                            next.frame_depth == step.frame_depth
+                                && !next.starts_root
+                                && !next.frame_entry
+                        })
+                        && is_operand_copy(index)
+                        && is_operand_copy(index + 1)
+                    {
+                        steps[index].key = before;
+                        steps[index + 1].key = before;
+                        continue;
+                    }
+                }
+            }
+            let runs = if before == Some(key) {
+                [before, previous, earlier]
+            } else {
+                [Some(key), before, previous]
+            };
+            lines.visit(step.frame_depth, Some(runs));
             let after = after.and_then(|after| steps[after as usize].key);
-            if (back || before.is_some_and(&folds_into)) && before == after && before != Some(key) {
+            if (previous == Some(key) || before.is_some_and(&folds_into))
+                && before == after
+                && before != Some(key)
+            {
                 steps[index].key = before;
             }
         }
@@ -4943,7 +4981,7 @@ contract P {
             let mut smoothed = steps.clone();
             // Lines 1 and 3 stand for function declarations.
             let folds_into = |key: LineKey| key.line % 2 == 1;
-            StepMap::smooth_single_step_excursions(&mut smoothed, folds_into);
+            StepMap::smooth_line_excursions(&mut smoothed, folds_into, |_| false);
             let mut expected = steps.clone();
             let mut after = vec![None; expected.len()];
             let mut lines = NearestLines::default();
@@ -5436,12 +5474,30 @@ contract D {
             step_info(1, Some(6), false),
             step_info(1, Some(5), false),
         ];
-        StepMap::smooth_single_step_excursions(&mut steps, |_| false);
+        StepMap::smooth_line_excursions(&mut steps, |_| false, |_| false);
         let lines = steps
             .iter()
             .map(|step| step.key.map(|key| key.line))
             .collect::<Vec<_>>();
         assert_eq!(lines, [4, 5, 5, 5, 6, 5].map(Some));
+    }
+
+    #[test]
+    fn operand_copies_from_the_two_preceding_lines_fold_together() {
+        let original = [8, 9, 10, 9, 8, 10].map(|line| step_info(1, Some(line), false));
+        for (copies, starts_root, expected) in [
+            (&[3, 4][..], false, [8, 9, 10, 10, 10, 10]),
+            (&[3][..], false, [8, 9, 10, 9, 8, 10]),
+            (&[3, 4][..], true, [8, 9, 10, 9, 8, 10]),
+        ] {
+            let mut steps = original;
+            steps[5].starts_root = starts_root;
+            StepMap::smooth_line_excursions(&mut steps, |_| false, |index| copies.contains(&index));
+            assert_eq!(
+                steps.map(|step| step.key.map(|key| key.line)),
+                expected.map(Some)
+            );
+        }
     }
 
     #[test]
@@ -5474,7 +5530,7 @@ contract D {
             .map(|step| step.key.map(|key| key.line))
             .collect::<Vec<_>>();
         expected[1] = Some(1);
-        StepMap::smooth_single_step_excursions(&mut steps, |key| key.line == 1);
+        StepMap::smooth_line_excursions(&mut steps, |key| key.line == 1, |_| false);
         let lines = steps
             .iter()
             .map(|step| step.key.map(|key| key.line))
