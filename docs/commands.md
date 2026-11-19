@@ -133,6 +133,10 @@ soldb> next
 From the dispatcher, where no function is executing yet, `next` enters the function the
 transaction calls. Without debug metadata `next` moves one EVM instruction.
 
+In optimized legacy bytecode, two operand copies for one statement can be mapped to the
+two preceding lines. When the copies are consecutive and execution resumes on the same
+statement, source stepping and line breakpoints count them as part of that statement.
+
 ### `step`
 
 Aliases: `s`
