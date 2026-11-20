@@ -183,6 +183,17 @@ that both would want belongs in `soldb-debugger`, not in a second copy.
   walk `frames` makes, with an external call's input and how it ended, and an internal
   function's return value where the stack heights around the call prove it;
   `revert_origin` follows a revert passed up unchanged to the call it started in.
+  The tree holds calls: external calls, functions a jump called, the function an
+  external call's calldata selected, and modifiers, which run in line and are marked
+  `[modifier]`. Code the compiler laid out in line is no call, whichever pipeline
+  compiled it: it stays in the frame it runs in, and where the frame ran straight into
+  it the function is listed there once, marked `[inlined]`, with no arguments and no
+  end, because the recording has neither. Code of another function that a jump landed
+  on is a branch or a block the optimizer shares, credited by the source map to one of
+  the functions that share it, and is not listed. Do not turn either back into a frame:
+  on optimized via-IR code three quarters of the span changes are not calls. A jump the
+  artifact marks as a return is never a call, even onto a `JUMPDEST` that carries a
+  whole declaration.
   `state.rs` reads state variables: `StorageTape` indexes every storage word the trace
   recorded by the account whose storage it belongs to (a `DELEGATECALL` writes
   the caller's, which `StepMap::storage_context_index` decides) and by the step it holds

@@ -513,7 +513,7 @@ fn trace_summary_prints_status_and_step_count() {
 }
 
 #[test]
-fn trace_summary_prints_decoded_event_lines() {
+fn trace_summary_prints_no_event_lines() {
     let rpc_url = start_rpc_server(3);
     let (_abi_dir, ethdebug_spec) = write_function_abi(
         "TestContract",
@@ -537,7 +537,9 @@ fn trace_summary_prints_decoded_event_lines() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("emit TestContract::CounterIncremented(newValue = 4)"));
+    // The summary is the call stack; `list-events` shows what the transaction emitted.
+    assert!(stdout.contains("Call Stack:"));
+    assert!(!stdout.contains("emit "), "{stdout}");
     assert!(!stdout.contains("Artifacts:"));
 }
 

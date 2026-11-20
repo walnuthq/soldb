@@ -11,4 +11,3 @@
 # CHECK: Call Stack:
 # CHECK: #0 TestContract::runtime_dispatcher
 # CHECK: #1 increment(uint256 amount = 4)
-# CHECK: emit TestContract::CounterIncremented

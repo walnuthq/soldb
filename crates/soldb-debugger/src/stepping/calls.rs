@@ -5,11 +5,13 @@
 //! same walk over the same frame depths, so a frame in the tree is the frame `backtrace`
 //! shows at any step inside it.
 
+use std::collections::BTreeSet;
+
 use soldb_core::{opcode, TransactionTrace};
 
 use super::{
     call_target, calldata_for_step, hex_bytes, parameter_slots, parameter_stack_slots,
-    source_selector, Frame, FrameRecord, FunctionId, StepMap,
+    source_selector, Frame, FrameRecord, FunctionId, JumpMarker, StepMap,
 };
 use crate::roots::root_index;
 use crate::{decode_arguments, ArgumentLayout, FrameArgument, FrameState, SourceParam};
@@ -31,6 +33,12 @@ pub struct CallNode {
     /// A call to an account that ran no code, such as a precompile or an account without
     /// code. It has no steps; its `entry_step` is the call instruction.
     pub codeless: bool,
+    /// Not a call: code of `function` that the compiler laid out in line in the frame
+    /// `parent`, which ran into it at `entry_step`. Nothing in the recording says where it
+    /// ends or what it was passed, so it has no steps of its own, no callees, and no
+    /// arguments, and a function is listed once in the frame it ran in. Code of another
+    /// function that a jump landed on is not listed at all: see [`StepMap::call_tree`].
+    pub inlined: bool,
 }
 
 /// How an external call ended.
@@ -65,8 +73,17 @@ impl CallExit {
 }
 
 impl StepMap {
-    /// Every frame of the trace in the order it was entered, each after the frame that
-    /// called it.
+    /// Every call of the trace in the order it was entered, each after the frame that
+    /// made it: the external calls, the functions a jump called, the function an external
+    /// call's dispatcher selected, and the modifiers that ran around a function.
+    ///
+    /// Code the compiler laid out in line is not a call, whichever function its span
+    /// names, and whichever pipeline compiled it: it stays in the frame it runs in, and
+    /// its callees are that frame's. Where the frame ran straight into it, an
+    /// [`CallNode::inlined`] entry lists the function. Where a jump landed on it, it is
+    /// a branch or a block the optimizer shares between functions, credited to one of
+    /// them, and it is not listed. [`StepMap::frames`] still shows either at a step
+    /// inside it.
     #[must_use]
     pub fn call_tree(&self, trace: &TransactionTrace) -> Vec<CallNode> {
         let Some(last) = self.steps.len().checked_sub(1) else {
@@ -127,6 +144,7 @@ impl StepMap {
                 parent: callers.last().copied(),
                 end_step: record.last_step,
                 codeless,
+                inlined: false,
             });
             callers.push(nodes.len() - 1);
         }
@@ -134,17 +152,15 @@ impl StepMap {
         // the compiler laid the body out in line, that frame was not entered at an entry
         // point, and the call's own calldata names the function instead.
         let mut has_callee = vec![false; nodes.len()];
+        let mut selected = vec![false; nodes.len()];
         for index in 0..nodes.len() {
             let Some(parent) = nodes[index].parent else {
                 continue;
             };
             let first = !std::mem::replace(&mut has_callee[parent], true);
             let entry = nodes[index].frame.entry_step;
-            if first
-                && !nodes[index].frame.external
-                && nodes[parent].frame.external
-                && self.entered_function(entry).is_none()
-            {
+            selected[index] = first && !nodes[index].frame.external && nodes[parent].frame.external;
+            if selected[index] && self.entered_function(entry).is_none() {
                 if let Some(selected) = self.selected_function(trace, &nodes[parent], entry) {
                     nodes[index].function = Some(selected);
                 }
@@ -156,7 +172,205 @@ impl StepMap {
                 nodes[parent].end_step = nodes[parent].end_step.max(nodes[index].end_step);
             }
         }
-        nodes
+        // What is left out hands its callees to the nearest frame above that stays.
+        let shown = (0..nodes.len())
+            .map(|index| {
+                let node = &nodes[index];
+                node.frame.external
+                    || selected[index]
+                    || self.is_modifier(node.function)
+                    || self.entered_by_call(trace, node.frame.entry_step)
+            })
+            .collect::<Vec<_>>();
+        let parents = nodes.iter().map(|node| node.parent).collect::<Vec<_>>();
+        // The nearest frame that stays, from `parent` up.
+        let staying = |mut parent: Option<usize>| {
+            while let Some(above) = parent.filter(|above| !shown[*above]) {
+                parent = parents[above];
+            }
+            parent
+        };
+        // A modifier ends where the body of the function it runs around begins: the
+        // first code under it, laid out in line, whose span is that function's. What
+        // runs from there on is the function's, not the modifier's.
+        let mut handover = vec![None::<(usize, usize)>; nodes.len()];
+        // Where the body of each function begins, when modifiers ran before it.
+        let mut bodies = vec![None::<usize>; nodes.len()];
+        for index in 0..nodes.len() {
+            if shown[index] || nodes[index].function.is_none() {
+                continue;
+            }
+            let mut around = Vec::new();
+            let mut owner = staying(parents[index]);
+            while let Some(modifier) =
+                owner.filter(|above| self.is_modifier(nodes[*above].function))
+            {
+                around.push(modifier);
+                owner = staying(parents[modifier]);
+            }
+            let Some(owner) = owner.filter(|owner| nodes[*owner].function == nodes[index].function)
+            else {
+                continue;
+            };
+            let body = nodes[index].frame.entry_step;
+            bodies[owner].get_or_insert(body);
+            for modifier in around {
+                handover[modifier].get_or_insert((body, owner));
+            }
+        }
+        for (index, node) in nodes.iter_mut().enumerate() {
+            if let Some((body, _)) = handover[index] {
+                node.end_step = node.end_step.min(body.saturating_sub(1));
+            }
+        }
+        let functions = nodes.iter().map(|node| node.function).collect::<Vec<_>>();
+        let mut position = vec![None; nodes.len()];
+        let mut leading = vec![None::<(usize, usize)>; nodes.len()];
+        // The functions already listed as laid out in line, by the frame they ran in.
+        let mut listed = BTreeSet::<(Option<usize>, FunctionId)>::new();
+        let mut calls = Vec::with_capacity(nodes.len());
+        for (index, mut node) in nodes.into_iter().enumerate() {
+            let entry = node.frame.entry_step;
+            let mut owner = staying(parents[index]);
+            while let Some((_, body_owner)) = owner
+                .and_then(|above| handover[above])
+                .filter(|(body, _)| entry >= *body)
+            {
+                owner = Some(body_owner);
+            }
+            // What a function's leading modifier called before the body is the modifier's.
+            let parent = owner.and_then(|above| {
+                leading[above]
+                    .filter(|(body, _)| entry < *body)
+                    .map(|(_, modifier)| modifier)
+                    .or(position[above])
+            });
+            if !shown[index] {
+                // Code laid out in line. The frame's own function coming back after
+                // another's code is not listed: it is the frame.
+                let Some(function) = node.function else {
+                    continue;
+                };
+                let own = owner.and_then(|above| functions[above]) == Some(function);
+                if own || !self.fell_into(trace, entry) || !listed.insert((parent, function)) {
+                    continue;
+                }
+                node.parent = parent;
+                node.end_step = entry;
+                node.inlined = true;
+                node.frame.arguments.clear();
+                calls.push(node);
+                continue;
+            }
+            node.parent = parent;
+            position[index] = Some(calls.len());
+            let lead = selected[index].then(|| self.leading_frame(&node)).flatten();
+            calls.push(node);
+            let Some(mut lead) = lead else {
+                continue;
+            };
+            lead.parent = position[index];
+            if self.is_modifier(lead.function) {
+                // Without a step that shows where the body starts, nothing says where the
+                // modifier ends, and it gets no frame.
+                if let Some(body) = bodies[index].filter(|body| *body > entry) {
+                    lead.end_step = body - 1;
+                    leading[index] = Some((body, calls.len()));
+                    calls.push(lead);
+                }
+            } else if let Some(function) = lead.function.filter(|_| self.fell_into(trace, entry)) {
+                lead.inlined = true;
+                listed.insert((position[index], function));
+                calls.push(lead);
+            }
+        }
+        calls
+    }
+
+    /// A frame for the function whose code the call `call` begins in, when that is not
+    /// the function the call runs. A function laid out in line with its modifiers begins
+    /// in the first one's code, and one laid out with a callee can begin in the callee's.
+    fn leading_frame(&self, call: &CallNode) -> Option<CallNode> {
+        let entry = call.frame.entry_step;
+        let location = self.steps.get(entry)?.location?;
+        let function = Some(FunctionId {
+            contract: location.key.contract,
+            function: location.function?,
+        });
+        if function == call.function {
+            return None;
+        }
+        let record = FrameRecord {
+            entry_step: entry,
+            last_step: entry,
+            external: false,
+        };
+        Some(CallNode {
+            frame: self.frame_of(call.frame.depth as usize + 1, record),
+            function,
+            parent: None,
+            end_step: entry,
+            codeless: false,
+            inlined: false,
+        })
+    }
+
+    /// Whether execution reached the code at `step` by running into it: from the
+    /// instruction before it in its EVM frame, or back from a call that instruction made.
+    ///
+    /// That is what laid out in line means. Code a jump lands on is somewhere else in the
+    /// bytecode: a branch, or a block the optimizer shares between functions and the
+    /// source map credits to one of them, and nothing says which.
+    fn fell_into(&self, trace: &TransactionTrace, step: usize) -> bool {
+        let Some(before) = step.checked_sub(1) else {
+            return false;
+        };
+        let (Some(here), Some(previous)) = (self.steps.get(step), self.steps.get(before)) else {
+            return false;
+        };
+        if here.starts_root || previous.evm_depth < here.evm_depth {
+            return false;
+        }
+        if previous.evm_depth > here.evm_depth {
+            return true;
+        }
+        match trace.steps.step(before).op() {
+            opcode::JUMP => false,
+            opcode::JUMPI => self.pcs[step] == self.pcs[before] + 1,
+            _ => true,
+        }
+    }
+
+    /// Whether a jump called the frame entered at `step`: one in its own EVM frame that
+    /// the artifact marks as a call, or that lands on a function's entry point.
+    fn entered_by_call(&self, trace: &TransactionTrace, step: usize) -> bool {
+        let Some(before) = step.checked_sub(1) else {
+            return false;
+        };
+        let (Some(here), Some(previous)) = (self.steps.get(step), self.steps.get(before)) else {
+            return false;
+        };
+        if here.starts_root
+            || here.evm_depth != previous.evm_depth
+            || trace.steps.step(before).op() != opcode::JUMP
+        {
+            return false;
+        }
+        let marked = previous
+            .contract
+            .and_then(|contract| self.contracts.get(contract))
+            .is_some_and(|contract| {
+                contract.jump_marker_at_pc(self.pcs[before]) == JumpMarker::Call
+            });
+        marked || self.entered_function(step).is_some()
+    }
+
+    /// Whether `function` is a modifier: it runs in line around the function that names
+    /// it, so no jump calls it, and it is still a frame of its own in the source.
+    fn is_modifier(&self, function: Option<FunctionId>) -> bool {
+        function
+            .and_then(|id| self.contracts.get(id.contract)?.functions.get(id.function))
+            .is_some_and(|function| function.placeholder.is_some())
     }
 
     /// The function whose entry point `step` is at, in the code the step runs.
@@ -437,7 +651,7 @@ mod tests {
     use soldb_ethdebug::{function_selector, source_range, EthdebugInfo, Instruction};
 
     use super::CallExit;
-    use crate::{ContractDebugInfo, StepMap};
+    use crate::{CodeGenerator, ContractDebugInfo, StepMap};
 
     const SOURCE: &str = "\
 contract C {
@@ -742,6 +956,88 @@ contract G {
             let trace = guarded_trace(&pcs, input);
             assert_eq!(first_function(&trace).0, first_function(&trace).1);
         }
+    }
+
+    /// An entry of the tree: the function, its parent, the steps it spans, and whether it
+    /// is code laid out in line rather than a frame.
+    type Entry = (Option<String>, Option<usize>, usize, usize, bool);
+
+    /// Every entry of the tree `contract` gives `trace`.
+    fn shape(trace: &TransactionTrace, contract: ContractDebugInfo) -> Vec<Entry> {
+        let map = StepMap::new(trace, vec![contract.clone()]);
+        map.call_tree(trace)
+            .into_iter()
+            .map(|node| {
+                let name = node
+                    .function
+                    .map(|id| contract.functions[id.function].name.clone());
+                (
+                    name,
+                    node.parent,
+                    node.frame.entry_step,
+                    node.end_step,
+                    node.inlined,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn code_laid_out_in_line_is_listed_in_its_frame_and_is_not_a_call() {
+        let root = |end| (None, None, 0, end, false);
+        let run = |end| (Some("run".to_owned()), Some(0), 1, end, false);
+        let fee = |entry| (Some("fee".to_owned()), Some(1), entry, entry, true);
+
+        // `run`'s body runs straight into `fee`'s: the optimizer put `fee` in line.
+        // Nothing called it, and it is listed once however often its code comes back.
+        let once = guarded_trace(&[0, 11, 21, 30], &run_calldata(7));
+        assert_eq!(shape(&once, contract(ROOT)), [root(3), run(2), fee(2)]);
+        let twice = guarded_trace(&[0, 11, 21, 11, 21, 30], &run_calldata(7));
+        assert_eq!(shape(&twice, contract(ROOT)), [root(5), run(4), fee(2)]);
+
+        // The pipeline does not decide it: the same code from via-IR reads the same.
+        let via_ir = contract(ROOT).with_code_generator(Some(CodeGenerator::ViaIr));
+        assert_eq!(shape(&once, via_ir), [root(3), run(2), fee(2)]);
+
+        // A jump that lands in `fee`'s code away from its entry point is not a call
+        // either, and the code is somewhere else in the bytecode: a branch, or a block
+        // the optimizer shares and the source map credits to `fee`. It is not listed.
+        let jumped = guarded_trace(&[0, 11, 1, 21, 30], &run_calldata(7));
+        assert_eq!(shape(&jumped, contract(ROOT)), [root(4), run(3)]);
+    }
+
+    #[test]
+    fn a_modifier_is_a_frame_of_its_own_around_the_body() {
+        let run = |parent, entry, end| (Some("run".to_owned()), Some(parent), entry, end, false);
+        let guard =
+            |parent, entry, end| (Some("guard".to_owned()), Some(parent), entry, end, false);
+
+        // Entered by a jump: the modifier's check, the body, the modifier's tail.
+        let called = guarded_trace(&[0, 1, 10, 11, 12, 13], &run_calldata(7));
+        assert_eq!(
+            shape(&called, guarded_contract()),
+            [
+                (None, None, 0, 5, false),
+                run(0, 2, 5),
+                guard(1, 3, 3),
+                guard(1, 5, 5)
+            ]
+        );
+
+        // Laid out in line, the call begins in the modifier's code: the function is the
+        // one the calldata selected, and the modifier ends where the body begins.
+        let inline = guarded_trace(&[0, 11, 12, 13], &run_calldata(7));
+        assert_eq!(
+            shape(&inline, guarded_contract()),
+            [(None, None, 0, 3, false), run(0, 1, 3), guard(1, 1, 1)]
+        );
+
+        // Without a step of the body nothing says where the modifier ends.
+        let only_modifier = guarded_trace(&[0, 11, 13], &run_calldata(7));
+        assert_eq!(
+            shape(&only_modifier, guarded_contract()),
+            [(None, None, 0, 2, false), run(0, 1, 2)]
+        );
     }
 
     const FAILURE: &[u8] = &[0xde, 0xad, 0xbe, 0xef];

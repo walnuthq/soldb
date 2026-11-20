@@ -107,6 +107,7 @@ impl Tree<'_> {
                 let line = self.function_line(function, input.as_deref(), false);
                 lines.push(numbered(0, line));
                 lines.extend(self.body(function, 1));
+                lines.extend(self.inlined_lines(index, 1));
             }
             None => {
                 if let Some(call) = &self.context.root_call {
@@ -120,13 +121,41 @@ impl Tree<'_> {
     }
 
     /// The function an external call's dispatcher handed it to: the frame's only callee,
-    /// when that is a function of its own code.
+    /// when that is a function of its own code. Code laid out in line is not a callee.
     fn selected_function(&self, index: usize) -> Option<usize> {
-        let [only] = self.children[index].as_slice() else {
-            return None;
-        };
-        let callee = &self.nodes[*only];
-        (!callee.frame.external && self.source_function(*only).is_some()).then_some(*only)
+        let mut called = self.children[index]
+            .iter()
+            .copied()
+            .filter(|callee| !self.nodes[*callee].inlined);
+        let only = called.next().filter(|_| called.next().is_none())?;
+        let callee = &self.nodes[only];
+        (!callee.frame.external && self.source_function(only).is_some()).then_some(only)
+    }
+
+    /// Code of another function laid out in line in a frame: its prototype and where it
+    /// is declared. Nothing says what it was passed or where it ended.
+    fn inlined_line(&self, index: usize, level: usize) -> Option<Line> {
+        let (contract, function) = self.source_function(index)?;
+        let prototype = format_source_prototype(&function.name, &function.params);
+        Some(plain(
+            level,
+            format!(
+                "{} {}{}",
+                function_color(prototype),
+                dim("[inlined]"),
+                declared_at(contract, function)
+            ),
+        ))
+    }
+
+    /// The functions laid out in line in `index` itself, for a frame whose calls are
+    /// shown as another's.
+    fn inlined_lines(&self, index: usize, level: usize) -> Vec<Line> {
+        self.children[index]
+            .iter()
+            .filter(|callee| self.nodes[**callee].inlined)
+            .filter_map(|callee| self.inlined_line(*callee, level))
+            .collect()
     }
 
     /// What a frame did, one level in: its callees, and the revert that started in it.
@@ -142,6 +171,12 @@ impl Tree<'_> {
     fn callees(&self, index: usize, level: usize) -> Vec<Line> {
         let mut blocks = Vec::<(Vec<Line>, usize)>::new();
         for &callee in &self.children[index] {
+            if self.nodes[callee].inlined {
+                if let Some(line) = self.inlined_line(callee, level) {
+                    blocks.push((vec![line], 1));
+                }
+                continue;
+            }
             let block = self.callee(callee, level);
             let leaf = self.children[callee].is_empty();
             match blocks.last_mut() {
@@ -173,6 +208,7 @@ impl Tree<'_> {
                 let contract = node.frame.contract_name.as_deref().unwrap_or("");
                 let mut lines = vec![numbered(level, format!("{contract}::{line}"))];
                 lines.extend(self.body(function, level + 1));
+                lines.extend(self.inlined_lines(index, level + 1));
                 lines
             }
             None => {
@@ -190,9 +226,10 @@ impl Tree<'_> {
     fn internal_function(&self, index: usize, level: usize) -> Vec<Line> {
         let node = &self.nodes[index];
         let mut lines = vec![numbered(level, self.function_line(index, None, true))];
-        let has_params = self
-            .source_function(index)
-            .is_some_and(|(_, function)| !function.params.is_empty());
+        // A modifier is not entered by a call, so no entry stack holds its parameters.
+        let has_params = self.source_function(index).is_some_and(|(_, function)| {
+            !function.params.is_empty() && function.placeholder.is_none()
+        });
         if has_params && node.frame.arguments.is_empty() {
             if let Some(entry) = self.trace.steps.get(node.frame.entry_step) {
                 lines.push(plain(
@@ -212,8 +249,8 @@ impl Tree<'_> {
         lines
     }
 
-    /// A function's line: its name and arguments, `[internal]` for one entered by a jump,
-    /// and where it is declared.
+    /// A function's line: its name and arguments, `[internal]` for one entered by a jump
+    /// and `[modifier]` for a modifier, and where it is declared.
     fn function_line(&self, index: usize, input: Option<&str>, internal: bool) -> String {
         let node = &self.nodes[index];
         let Some((contract, function)) = self.source_function(index) else {
@@ -233,16 +270,12 @@ impl Tree<'_> {
             }
             None => format_source_prototype(&function.name, &function.params),
         };
-        let internal = if internal {
-            format!(" {}", dim("[internal]"))
-        } else {
-            String::new()
+        let internal = match internal {
+            true if function.placeholder.is_some() => format!(" {}", dim("[modifier]")),
+            true => format!(" {}", dim("[internal]")),
+            false => String::new(),
         };
-        let location = contract
-            .source_path(function.source_id)
-            .map(|path| dim(format!(" at {path}:{}", function.declaration_line)))
-            .unwrap_or_default();
-        format!("{call}{internal}{location}")
+        format!("{call}{internal}{}", declared_at(contract, function))
     }
 
     /// A call into code without debug info: the account and the selector it was called
@@ -358,6 +391,8 @@ fn innermost_node(nodes: &[CallNode], step: usize) -> Option<usize> {
     nodes
         .iter()
         .enumerate()
+        // Code laid out in line has no steps of its own: they are its frame's.
+        .filter(|(_, node)| !node.inlined)
         .filter(|(_, node)| node.frame.entry_step <= step && step <= node.end_step)
         .max_by_key(|(_, node)| node.frame.depth)
         .map(|(index, _)| index)
@@ -394,6 +429,14 @@ fn backtrace_lines(map: &StepMap, step: usize) -> Vec<String> {
         lines.push(format!("  at {}{location}", function_color(name)));
     }
     lines
+}
+
+/// ` at path:line` where `function` is declared, dimmed, or nothing when the path is unknown.
+fn declared_at(contract: &ContractDebugInfo, function: &SourceFunction) -> String {
+    contract
+        .source_path(function.source_id)
+        .map(|path| dim(format!(" at {path}:{}", function.declaration_line)))
+        .unwrap_or_default()
 }
 
 /// A function's return values decoded from ABI-encoded data.
@@ -705,6 +748,30 @@ contract C {
             [
                 format!("  #3 {CALLEE}::{selector} × 2"),
                 "  ← return (uint256 = 1)".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn code_laid_out_in_line_is_one_unnumbered_line_in_its_frame() {
+        // `run`'s body runs straight into `fee`'s code and back: no jump called `fee`.
+        let mut inline = trace(&[], ("STOP", &[]), 0, ("STOP", &[]));
+        inline.steps = vec![
+            step(0, 1, "PUSH1", &[], &[]),
+            step(11, 1, "PUSH1", &["0x64"], &[]),
+            step(21, 1, "DIV", &["0x64"], &[]),
+            step(11, 1, "PUSH1", &["0x64"], &[]),
+            step(21, 1, "DIV", &["0x64"], &[]),
+            step(30, 1, "STOP", &[], &[]),
+        ]
+        .into();
+        assert_eq!(
+            lines(&inline, vec![contract(ROOT)]),
+            [
+                "#0 C::runtime_dispatcher",
+                "#1 run(uint256 a = 100) at C.sol:2",
+                "  fee(uint256 a) [inlined] at C.sol:6",
+                "  ← return (uint256)",
             ]
         );
     }
