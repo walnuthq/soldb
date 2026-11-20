@@ -25,9 +25,7 @@ mod profile;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
-use soldb_core::{
-    encode_hex, opcode, EvmWord, ExecutionLog, SoldbResult, StepView, TransactionTrace,
-};
+use soldb_core::{encode_hex, opcode, EvmWord, SoldbResult, StepView, TransactionTrace};
 use soldb_debugger::{
     CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam, StepMap,
 };
@@ -56,6 +54,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn colors_enabled() -> bool {
+    // Unit tests compare the text itself, whether or not they run in a terminal.
+    if cfg!(test) {
+        return false;
+    }
     *COLORS_ENABLED.get_or_init(|| colors_enabled_on(io::stdout().is_terminal()))
 }
 
@@ -1944,14 +1946,7 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
     let root_name = root_address.map_or("<unknown>", String::as_str);
     if specs.is_empty() {
         print_plain_trace_summary(trace, &errors);
-        print_call_stack(
-            trace,
-            &map,
-            &errors,
-            None,
-            root_name,
-            &trace_event_registry(args),
-        );
+        print_call_stack(trace, &map, &errors, None, root_name);
         return;
     }
     let spec = spec_for_address(&specs, root_address.map(String::as_str));
@@ -1989,14 +1984,7 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
     println!("{} {}", info("Status:"), status);
     print_trace_error(trace, &errors);
     let root_call = spec.and_then(|spec| abi_descriptor_for_calldata(spec, &trace.input_data));
-    print_call_stack(
-        trace,
-        &map,
-        &errors,
-        root_call,
-        contract_name,
-        &trace_event_registry(args),
-    );
+    print_call_stack(trace, &map, &errors, root_call, contract_name);
 }
 
 /// The `Call Stack:` block that ends a summary.
@@ -2006,7 +1994,6 @@ fn print_call_stack(
     errors: &ErrorRegistry,
     root_call: Option<CallDescriptor>,
     root_name: &str,
-    events: &EventRegistry,
 ) {
     println!();
     println!("{}", bold(info("Call Stack:")));
@@ -2019,7 +2006,6 @@ fn print_call_stack(
     for line in call_tree_lines(trace, map, &context) {
         println!("{line}");
     }
-    print_trace_event_lines(trace, events);
     println!("{}", separator(60));
     println!(
         "{}",
@@ -2240,14 +2226,7 @@ fn print_simulation_summary(
     let root_call = spec
         .and_then(|spec| abi_descriptor_for_calldata(spec, raw_data))
         .or_else(|| simulated_call_descriptor(args, raw_data, function_name));
-    print_call_stack(
-        trace,
-        &map,
-        &errors,
-        root_call,
-        &contract_name,
-        &simulate_event_registry(args),
-    );
+    print_call_stack(trace, &map, &errors, root_call, &contract_name);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2345,47 +2324,6 @@ impl TraceSourceIndex {
                 .then(|| descriptor_from_source_function(function, calldata))
         })
     }
-}
-
-fn print_trace_event_lines(trace: &TransactionTrace, events: &EventRegistry) {
-    for log in &trace.artifacts.logs {
-        println!(
-            "  {} {}",
-            dim("emit"),
-            function_color(format_trace_event(log, events))
-        );
-    }
-}
-
-fn format_trace_event(log: &ExecutionLog, events: &EventRegistry) -> String {
-    if let Some(decoded) = events.decode_log(&log.topics, &log.data) {
-        return format_decoded_event_inline(&decoded);
-    }
-    let topic = log.topics.first().map_or("<anonymous>", String::as_str);
-    format!("{topic}(data = {})", normalize_hex(&log.data))
-}
-
-fn format_decoded_event_inline(decoded: &DecodedEvent) -> String {
-    let name = decoded.contract_name.as_ref().map_or_else(
-        || decoded.event.clone(),
-        |contract| format!("{contract}::{}", decoded.event),
-    );
-    format!(
-        "{}({})",
-        name,
-        decoded
-            .args
-            .iter()
-            .map(|arg| {
-                if arg.name.is_empty() {
-                    display_json_value(&arg.value)
-                } else {
-                    format!("{} = {}", arg.name, display_json_value(&arg.value))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
 }
 
 fn call_descriptor_for_calldata(
@@ -2893,37 +2831,6 @@ fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
         args.contracts.as_deref(),
         &args.source_path,
     )?)
-}
-
-fn trace_event_registry(args: &TraceView) -> EventRegistry {
-    event_registry_reporting(resolve_contract_specs_reporting(
-        &args.ethdebug_dir,
-        args.contracts.as_deref(),
-        &args.source_path,
-    ))
-}
-
-fn simulate_event_registry(args: &SimulationView) -> EventRegistry {
-    event_registry_reporting(resolve_contract_specs_reporting(
-        &args.ethdebug_dir,
-        args.contracts.as_deref(),
-        &args.source_path,
-    ))
-}
-
-/// Builds the event registry, reporting a failure instead of decoding nothing in silence.
-fn event_registry_reporting(specs: Vec<ResolvedContractSpec>) -> EventRegistry {
-    match event_registry_for_specs(specs) {
-        Ok(registry) => registry,
-        Err(error) => {
-            report_once(
-                format!("events:{error}"),
-                &format!("could not load event ABIs: {error}"),
-                "logs are shown without decoded names or arguments",
-            );
-            EventRegistry::default()
-        }
-    }
 }
 
 fn event_registry_for_specs(specs: Vec<ResolvedContractSpec>) -> SoldbResult<EventRegistry> {
@@ -3933,7 +3840,11 @@ contract Counter {
         let trace = transaction_trace(
             calldata,
             vec![
-                trace_step(10, &["0x01", "0x02"]),
+                // A jump from `set` onto the entry point of `helper`: a call.
+                soldb_core::TraceStep {
+                    op: "JUMP".into(),
+                    ..trace_step(10, &["0x01", "0x02"])
+                },
                 trace_step(20, &["0xaa", "0xbb", "0x04"]),
             ],
         );

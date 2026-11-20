@@ -1966,7 +1966,12 @@ impl StepMap {
                 }
                 Some(own) => match own.function {
                     Some(function) => {
-                        let entering = landed_by_jump && step.entry == Some(function);
+                        // A jump the artifact marks as a return is not a call, even where
+                        // it lands on a `JUMPDEST` that carries a whole declaration, as
+                        // the one after a modifier's call does.
+                        let entering = landed_by_jump
+                            && previous_marker != JumpMarker::Return
+                            && step.entry == Some(function);
                         // Back from the decoder in the function's own frame: the
                         // parameters are on top, whether a jump to the body follows or
                         // the body was inlined here.
@@ -4911,6 +4916,51 @@ contract P {
         );
         assert_eq!(map.frame_depth(4), Some(2));
         assert_eq!(map.frame_depth(6), Some(1));
+    }
+
+    #[test]
+    fn a_marked_return_onto_an_entry_point_is_not_a_call() {
+        // inner returns by a jump the artifact marks, and lands on the `JUMPDEST` that
+        // carries outer's whole declaration, as the one after a modifier's call does. It
+        // is a return to outer, not a call of it: the depth goes back to outer's.
+        let whole = SOURCE.len() as u64;
+        let info = EthdebugInfo {
+            compilation: serde_json::Value::Null,
+            contract_name: "C".to_owned(),
+            environment: "runtime".to_owned(),
+            instructions: vec![
+                instruction(0, 0, whole),
+                instruction(1, 0, whole),
+                instruction(10, offset_of("function outer"), 90),
+                instruction_with(12, offset_of("inner(b);"), 9, json!({"invoke": {}})),
+                instruction(20, offset_of("function inner"), 55),
+                instruction_with(21, offset_of("x += 1;"), 7, json!({"return": {}})),
+                instruction(30, 0, whole),
+            ],
+            sources: BTreeMap::from([(0, "C.sol".to_owned())]),
+            variable_locations: BTreeMap::new(),
+        };
+        let contract =
+            ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
+        assert_eq!(contract.function_entry_at_pc(10), Some(0));
+        let map = StepMap::new(
+            &trace(vec![
+                step(0, 1, "PUSH1", &[]),
+                step(1, 1, "JUMP", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(12, 1, "JUMP", &[]),
+                step(20, 1, "JUMPDEST", &[]),
+                step(21, 1, "JUMP", &[]),
+                step(10, 1, "JUMPDEST", &[]),
+                step(30, 1, "STOP", &[]),
+            ]),
+            vec![contract],
+        );
+        let depths = (0..7)
+            .map(|step| map.frame_depth(step).expect("depth"))
+            .collect::<Vec<_>>();
+        assert_eq!(depths, vec![0, 0, 1, 1, 2, 2, 1]);
+        assert!(!map.is_frame_entry(6));
     }
 
     #[test]
