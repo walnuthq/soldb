@@ -6,9 +6,10 @@
 //! ETHDebug's command-line surface has changed across compiler releases: older versions
 //! accept `--ethdebug`/`--ethdebug-runtime`, while newer ones expose the same output
 //! through `--experimental --ethdebug-program`/`--ethdebug-program-runtime`/
-//! `--ethdebug-resources`. [`CompilerConfig::compile_with_ethdebug`] probes for that by
-//! trying the configured flags and falling back only when the compiler rejects them as
-//! unrecognised, so a single code path works across versions without a hardcoded cutoff.
+//! `--ethdebug-resources`/`--ethdebug-compilation`. [`CompilerConfig::compile_with_ethdebug`]
+//! probes for that by trying the configured flags and falling back only when the compiler
+//! rejects them as unrecognised, so a single code path works across versions without a
+//! hardcoded cutoff.
 //! Artifact discovery is version-tolerant for the same reason and accepts either the
 //! `ethdebug.json` or the `ethdebug_resources.json` spelling of the resources file.
 
@@ -418,6 +419,9 @@ pub struct CompilationResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilerOutputFiles {
     pub ethdebug: Option<PathBuf>,
+    /// The compilation record newer compilers write apart from the resources.
+    #[serde(default)]
+    pub ethdebug_compilation: Option<PathBuf>,
     pub contracts: BTreeMap<String, ContractArtifactFiles>,
 }
 
@@ -644,9 +648,14 @@ fn run_solc(
 /// solc names it `ethdebug.json` under the flags it used to take and
 /// `ethdebug_resources.json` under the ones it takes now, so compiling into a directory
 /// that a different compiler already wrote leaves both. A loader has no way to tell which
-/// one describes the programs sitting next to them, so the stale one goes.
+/// one describes the programs sitting next to them, so the stale one goes. The same holds
+/// for the separate compilation record.
 fn drop_stale_metadata(output_dir: &Path, started: SystemTime) {
-    for name in ["ethdebug.json", "ethdebug_resources.json"] {
+    for name in [
+        "ethdebug.json",
+        "ethdebug_resources.json",
+        "ethdebug_compilation.json",
+    ] {
         let path = output_dir.join(name);
         // Only a file that is certainly older than this run is removed; a timestamp that
         // cannot be read leaves it alone.
@@ -668,7 +677,7 @@ const MODERN_ETHDEBUG_REPLACEMENTS: &[(&str, &str)] = &[
 ];
 
 fn modern_ethdebug_flags(flags: &[String]) -> Vec<String> {
-    let mut modern = Vec::with_capacity(flags.len() + 2);
+    let mut modern = Vec::with_capacity(flags.len() + 3);
     modern.push("--experimental".to_owned());
     for flag in flags {
         let replacement = MODERN_ETHDEBUG_REPLACEMENTS
@@ -678,9 +687,11 @@ fn modern_ethdebug_flags(flags: &[String]) -> Vec<String> {
         modern.push(replacement);
     }
     // The old single `--ethdebug` flag also produced the global resources file
-    // (`ethdebug.json`); the modern API splits that out into its own opt-in flag.
+    // (`ethdebug.json`) with the compilation in it; the modern API selects the resources
+    // and the compilation record with separate flags.
     if flags.iter().any(|flag| flag == "--ethdebug") {
         modern.push("--ethdebug-resources".to_owned());
+        modern.push("--ethdebug-compilation".to_owned());
     }
     modern
 }
@@ -704,6 +715,7 @@ fn discover_output_files(output_dir: &Path) -> SoldbResult<CompilerOutputFiles> 
     .find(|path| path.exists());
     let mut files = CompilerOutputFiles {
         ethdebug: global_ethdebug,
+        ethdebug_compilation: existing_path(output_dir.join("ethdebug_compilation.json")),
         contracts: BTreeMap::new(),
     };
 
@@ -972,7 +984,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create dir");
         // What a run with the other flag generation left behind.
         let stale = dir.join("ethdebug.json");
+        let stale_compilation = dir.join("ethdebug_compilation.json");
         std::fs::write(&stale, "{}").expect("write stale");
+        std::fs::write(&stale_compilation, "{}").expect("write stale compilation");
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         let started = std::time::SystemTime::now();
@@ -982,11 +996,21 @@ mod tests {
 
         super::drop_stale_metadata(&dir, started);
         assert!(!stale.exists(), "the older name is removed");
+        assert!(
+            !stale_compilation.exists(),
+            "a previous compilation record is removed"
+        );
         assert!(fresh.exists(), "the one this run wrote stays");
 
         // A directory holding only what this run wrote is left alone.
         super::drop_stale_metadata(&dir, started);
         assert!(fresh.exists());
+        std::fs::write(&stale_compilation, "{}").expect("write fresh compilation");
+        super::drop_stale_metadata(&dir, started);
+        assert!(
+            stale_compilation.exists(),
+            "this run's compilation record stays"
+        );
         std::fs::remove_dir_all(&dir).expect("clean up");
     }
     use std::io::{Read, Write};
@@ -1022,6 +1046,64 @@ mod tests {
         assert!(files.bytecode.as_ref().expect("bin").exists());
         assert!(files.abi.as_ref().expect("abi").exists());
         assert!(files.ethdebug.as_ref().expect("ethdebug").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compiles_with_separate_compilation_output_on_modern_solc() {
+        let temp = temp_dir("compile-modern");
+        let contract = temp.join("Counter.sol");
+        std::fs::write(&contract, "contract Counter {}").expect("source");
+        let out = temp.join("out");
+        let cfg = CompilerConfig::with_paths(
+            fake_solc("0.8.36", false).to_string_lossy(),
+            &out,
+            temp.join("build"),
+        );
+        let result = cfg
+            .compile_with_ethdebug(&contract, None)
+            .expect("modern compile");
+        let args = std::fs::read_to_string(out.join("solc-args.txt")).expect("args");
+        for flag in [
+            "--experimental",
+            "--ethdebug-program",
+            "--ethdebug-program-runtime",
+            "--ethdebug-resources",
+            "--ethdebug-compilation",
+        ] {
+            assert!(
+                args.split_whitespace().any(|arg| arg == flag),
+                "missing {flag}: {args}"
+            );
+        }
+        assert_eq!(
+            result.files.ethdebug,
+            Some(out.join("ethdebug_resources.json"))
+        );
+        assert_eq!(
+            result.files.ethdebug_compilation,
+            Some(out.join("ethdebug_compilation.json"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn legacy_solc_has_no_separate_compilation_record() {
+        let temp = temp_dir("compile-legacy-record");
+        let contract = temp.join("Counter.sol");
+        std::fs::write(&contract, "contract Counter {}").expect("source");
+        let out = temp.join("out");
+        let cfg = CompilerConfig::with_paths(
+            fake_solc("0.8.31", false).to_string_lossy(),
+            &out,
+            temp.join("build"),
+        );
+        let result = cfg
+            .compile_with_ethdebug(&contract, None)
+            .expect("legacy compile");
+        let args = std::fs::read_to_string(out.join("solc-args.txt")).expect("args");
+        assert!(!args.contains("--ethdebug-compilation"), "{args}");
+        assert_eq!(result.files.ethdebug_compilation, None);
     }
 
     #[test]
@@ -1154,11 +1236,12 @@ mod tests {
 
     #[cfg(unix)]
     /// Every fake compiler a test runs, as (version, has a constructor).
-    const FAKE_SOLCS: [(&str, bool); 5] = [
+    const FAKE_SOLCS: [(&str, bool); 6] = [
         ("0.8.26", false),
         ("0.8.28", false),
         ("0.8.31", false),
         ("0.8.31", true),
+        ("0.8.36", false),
         ("0.8.37-develop.2026.8.22", false),
     ];
 
@@ -1197,6 +1280,8 @@ mod tests {
         // 0.8.26 stands for a release from before transient storage, which rejects the
         // flag asking for its layout.
         let rejects_transient = if version == "0.8.26" { "true" } else { "false" };
+        // 0.8.36 stands for a release that dropped `--ethdebug` for the modern flags.
+        let modern = if version == "0.8.36" { "true" } else { "false" };
         let script = format!(
             r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -1210,6 +1295,10 @@ for arg in "$@"; do
   if [ "$prev" = "-o" ]; then
     out="$arg"
   fi
+  if [ "$arg" = "--ethdebug" ] && {modern}; then
+    echo "unrecognised option '--ethdebug'" >&2
+    exit 1
+  fi
   if [ "$arg" = "--transient-storage-layout" ] && {rejects_transient}; then
     echo "unrecognised option '--transient-storage-layout'" >&2
     exit 1
@@ -1218,9 +1307,12 @@ for arg in "$@"; do
 done
 mkdir -p "$out"
 echo "$@" > "$out/solc-args.txt"
-cat > "$out/ethdebug.json" <<'EOF'
-{{"version":1}}
-EOF
+if {modern}; then
+  echo '{{"types":{{}},"pointers":{{}}}}' > "$out/ethdebug_resources.json"
+  echo '{{"sources":[]}}' > "$out/ethdebug_compilation.json"
+else
+  echo '{{"version":1}}' > "$out/ethdebug.json"
+fi
 cat > "$out/Counter.abi" <<'EOF'
 [{{"type":"function","name":"get","inputs":[]}}{constructor_abi}]
 EOF

@@ -172,7 +172,9 @@ COMPILE_EXIT_CODE=${PIPESTATUS[0]}
 
 # solc >= ~0.8.32 dropped the `--ethdebug`/`--ethdebug-runtime` flags in favor of
 # `--ethdebug-program`/`--ethdebug-program-runtime` (gated behind `--experimental`), and
-# moved the global resources output behind its own `--ethdebug-resources` flag. Retry with
+# moved the global resources output behind its own `--ethdebug-resources` flag. The compilation
+# record (compiler, source list) is a separate `--ethdebug-compilation` output; 0.8.39 no longer
+# embeds it in the resources. Retry with
 # the modern flag names if solc specifically rejected the legacy ones, rather than hardcoding
 # a version cutoff that will inevitably drift out of date again.
 if [ "$USE_ETHDEBUG" = true ] && [ $COMPILE_EXIT_CODE -ne 0 ] && grep -q "unrecognised option" "$DEBUG_DIR/compile.log" && grep -q -- "--ethdebug" "$DEBUG_DIR/compile.log"; then
@@ -184,6 +186,7 @@ if [ "$USE_ETHDEBUG" = true ] && [ $COMPILE_EXIT_CODE -ne 0 ] && grep -q "unreco
         --ethdebug-program
         --ethdebug-program-runtime
         --ethdebug-resources
+        --ethdebug-compilation
         --bin
         --abi
         --storage-layout

@@ -31,10 +31,10 @@ use soldb_debugger::{
     CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam,
 };
 use soldb_ethdebug::{
-    encode_function_call, ethdebug_resources_from_metadata, find_abi_file, find_ethdebug_metadata,
-    function_selector, load_debug_program_with_sources, load_error_abis, parse_contract_mapping,
-    parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent, ErrorRegistry,
-    EventRegistry, SourceMapEnvironment,
+    encode_function_call, find_abi_file, find_ethdebug_metadata, function_selector,
+    load_debug_program_with_sources, load_error_abis, load_ethdebug_metadata,
+    parse_contract_mapping, parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent,
+    ErrorRegistry, EthdebugMetadata, EventRegistry, SourceMapEnvironment,
 };
 use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
 use soldb_rpc::{RpcLog, TraceBackend};
@@ -854,6 +854,8 @@ struct InfoResourcesContractJson {
     name: String,
     debug_dir: String,
     resources: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compilation: Option<serde_json::Value>,
 }
 
 fn info_resources_command(args: &InfoResourcesArgs) -> SoldbResult<()> {
@@ -871,11 +873,13 @@ fn info_resources_command(args: &InfoResourcesArgs) -> SoldbResult<()> {
     let contracts = specs
         .iter()
         .map(|spec| {
+            let metadata = ethdebug_metadata_for_spec(spec)?;
             Ok(InfoResourcesContractJson {
                 address: spec.address.clone(),
                 name: spec.name.clone(),
                 debug_dir: spec.debug_dir.display().to_string(),
-                resources: ethdebug_resources_for_spec(spec)?,
+                resources: metadata.resources,
+                compilation: metadata.compilation,
             })
         })
         .collect::<SoldbResult<Vec<_>>>()?;
@@ -896,8 +900,8 @@ fn print_info_resources(contracts: &[InfoResourcesContractJson]) {
         }
         println!("Debug directory: {}", contract.debug_dir);
         if let Some(compiler) = contract
-            .resources
-            .get("compilation")
+            .compilation
+            .as_ref()
             .and_then(|compilation| compilation.get("compiler"))
         {
             let name = compiler
@@ -911,12 +915,15 @@ fn print_info_resources(contracts: &[InfoResourcesContractJson]) {
             println!("Compiler: {name} {version}");
         }
         let source_count = contract
-            .resources
-            .get("compilation")
+            .compilation
+            .as_ref()
             .and_then(|compilation| compilation.get("sources"))
             .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        println!("Sources: {source_count}");
+            .map(Vec::len);
+        match source_count {
+            Some(count) => println!("Sources: {count}"),
+            None => println!("Sources: unavailable (no compilation record)"),
+        }
         println!();
     }
 }
@@ -1617,6 +1624,7 @@ impl NodeStorage {
                     format!("chain-storage-block:{rpc_url}"),
                     &format!("could not find the block of the traced transaction: {error}"),
                     "state variables this transaction never touched stay unknown",
+                    None,
                 );
                 return None;
             }
@@ -1641,6 +1649,7 @@ impl NodeStorage {
                         format!("chain-storage-latest:{rpc_url}"),
                         &format!("could not resolve the latest block: {error}"),
                         "state variables this call never touched stay unknown",
+                        None,
                     );
                     return None;
                 }
@@ -1664,6 +1673,7 @@ impl NodeStorage {
                         format!("chain-storage-read:{rpc_url}"),
                         &format!("could not read storage from the node: {error}"),
                         "state variables the transaction never touched stay unknown",
+                        None,
                     );
                     None
                 }
@@ -1854,6 +1864,7 @@ fn print_debugger_resources(source_index: &TraceSourceIndex, json_output: bool) 
         name: source_index.spec.name.clone(),
         debug_dir: source_index.spec.debug_dir.display().to_string(),
         resources: source_index.resources.clone(),
+        compilation: Some(source_index.debug.info.compilation.clone()),
     };
     if json_output {
         print_json(&InfoResourcesJson {
@@ -2259,6 +2270,7 @@ impl TraceSourceIndex {
                     program.missing_sources.join(", ")
                 ),
                 "source lines and functions are unavailable for them; the paths are relative to the directory the contract was compiled in, so run soldb from there or keep the sources next to the artifacts",
+                None,
             );
         }
         let code_generator = program.code_generator();
@@ -3036,6 +3048,7 @@ fn event_registry_reporting(specs: Vec<ResolvedContractSpec>) -> EventRegistry {
                 format!("events:{error}"),
                 &format!("could not load event ABIs: {error}"),
                 "logs are shown without decoded names or arguments",
+                None,
             );
             EventRegistry::default()
         }
@@ -3075,6 +3088,7 @@ fn error_registry_reporting(specs: &[ResolvedContractSpec]) -> ErrorRegistry {
                     spec.name
                 ),
                 "its custom errors are shown as raw revert data",
+                None,
             ),
         }
     }
@@ -3154,11 +3168,13 @@ fn load_source_index(spec: &ResolvedContractSpec) -> Option<TraceSourceIndex> {
             report_once(
                 format!("ethdebug:{}:{}", spec.name, spec.debug_dir.display()),
                 &format!(
-                    "could not load debug metadata for `{}` from `{}`: {error}",
+                    "could not load debug metadata for `{}`\n  directory: `{}`\n  reason: {}",
                     spec.name,
-                    spec.debug_dir.display()
+                    spec.debug_dir.display(),
+                    error.summary()
                 ),
                 "source lines, variables, and decoded parameters are unavailable for it",
+                error.help(),
             );
             None
         }
@@ -3181,14 +3197,16 @@ fn resolve_contract_specs_reporting(
                 format!("specs:{error}"),
                 &format!("could not resolve the requested contracts: {error}"),
                 "continuing without source-level information for this run",
+                None,
             );
             Vec::new()
         }
     }
 }
 
-/// Writes a warning and a follow-up note to stderr, at most once per `key`.
-fn report_once(key: String, message: &str, note: &str) {
+/// Writes a warning and a follow-up note to stderr, at most once per `key`, with an
+/// optional `help:` line after the note saying what to do next.
+fn report_once(key: String, message: &str, note: &str, help: Option<&str>) {
     static REPORTED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
     let mut reported = match REPORTED.get_or_init(|| Mutex::new(BTreeSet::new())).lock() {
@@ -3200,8 +3218,14 @@ fn report_once(key: String, message: &str, note: &str) {
     if !reported.insert(key) {
         return;
     }
+    // Blank lines set the report off from the progress lines around it.
+    eprintln!();
     eprintln!("{} {message}", paint_stderr("warning:", "93"));
     eprintln!("{} {note}", paint_stderr("note:", "2"));
+    if let Some(help) = help {
+        eprintln!("{} {help}", paint_stderr("help:", "96"));
+    }
+    eprintln!();
 }
 
 fn resolve_contract_specs(
@@ -3427,13 +3451,15 @@ fn read_json_file(path: &Path) -> SoldbResult<serde_json::Value> {
     })
 }
 
-fn ethdebug_resources_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<serde_json::Value> {
-    if let Some(path) = find_ethdebug_metadata(&spec.debug_dir) {
-        let metadata = read_json_file(&path)?;
-        return ethdebug_resources_from_metadata(&path, &metadata);
+fn ethdebug_metadata_for_spec(spec: &ResolvedContractSpec) -> SoldbResult<EthdebugMetadata> {
+    if let Some(metadata) = load_ethdebug_metadata(&spec.debug_dir)? {
+        return Ok(metadata);
     }
 
-    TraceSourceIndex::load(spec).map(|index| index.resources)
+    TraceSourceIndex::load(spec).map(|index| EthdebugMetadata {
+        resources: index.resources,
+        compilation: Some(index.debug.info.compilation),
+    })
 }
 
 fn normalize_contract_address_key(address: &str) -> String {
@@ -3485,14 +3511,13 @@ fn trace_debug_metadata(spec: &ResolvedContractSpec) -> TraceDebugMetadata {
         };
     }
 
-    let compiler = find_ethdebug_metadata(&spec.debug_dir)
-        .and_then(|ethdebug_json| read_json_file(&ethdebug_json).ok())
-        .and_then(|value| {
-            value
-                .get("compilation")
-                .and_then(|compilation| compilation.get("compiler"))
-                .cloned()
-        });
+    // Artifact load errors are reported when the source index loads; this is only the
+    // heading.
+    let compiler = load_ethdebug_metadata(&spec.debug_dir)
+        .ok()
+        .flatten()
+        .and_then(|metadata| metadata.compilation)
+        .and_then(|compilation| compilation.get("compiler").cloned());
     let compiler_name = compiler
         .as_ref()
         .and_then(|compiler| compiler.get("name"))
@@ -3632,17 +3657,21 @@ fn simulation_source_file(args: &SimulationView, contract_name: &str) -> Option<
     .into_iter()
     .find(|spec| spec.name == contract_name)
     .and_then(|spec| {
-        let ethdebug = find_ethdebug_metadata(&spec.debug_dir)?;
-        read_json_file(&ethdebug).ok().and_then(|value| {
-            value
-                .get("compilation")
-                .and_then(|compilation| compilation.get("sources"))
-                .and_then(serde_json::Value::as_array)
-                .and_then(|sources| sources.first())
-                .and_then(|source| source.get("path"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+        // Artifact load errors are reported when the source index loads; this is only
+        // the heading.
+        load_ethdebug_metadata(&spec.debug_dir)
+            .ok()
+            .flatten()
+            .and_then(|metadata| metadata.compilation)
+            .and_then(|compilation| {
+                compilation
+                    .get("sources")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|sources| sources.first())
+                    .and_then(|source| source.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
     })
 }
 

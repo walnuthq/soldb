@@ -47,6 +47,31 @@ pub enum SoldbError {
     /// message was already shown.
     #[error("")]
     AlreadyReported,
+    /// A failure with a separate suggestion for what to do next. A frontend that reports
+    /// it in parts reads [`SoldbError::summary`] and [`SoldbError::help`]; one that prints
+    /// it as is gets both lines.
+    #[error("{message}\nhelp: {help}")]
+    WithHelp { message: String, help: String },
+}
+
+impl SoldbError {
+    /// The suggestion for what to do next, when the error carries one.
+    #[must_use]
+    pub fn help(&self) -> Option<&str> {
+        match self {
+            Self::WithHelp { help, .. } => Some(help),
+            Self::Message(_) | Self::AlreadyReported => None,
+        }
+    }
+
+    /// The message without its suggestion.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::WithHelp { message, .. } => message.clone(),
+            other => other.to_string(),
+        }
+    }
 }
 
 pub type SoldbResult<T> = Result<T, SoldbError>;

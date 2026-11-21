@@ -382,7 +382,10 @@ rejected as unsupported.
 
 **solc flag drift is a real, tested compatibility surface.** Older compilers accept
 `--ethdebug --ethdebug-runtime`; solc dropped those around 0.8.32 in favor of
-`--experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources`.
+`--experimental --ethdebug-program --ethdebug-program-runtime --ethdebug-resources
+--ethdebug-compilation`. Since 0.8.39 the compilation record (compiler, source list and
+contents) is only in `ethdebug_compilation.json`; older compilers embed it in the
+resources file, and an embedded record wins over a separate file.
 `CompilerConfig::compile_with_ethdebug` tries the legacy flags and falls back on the
 modern ones *only* when solc reports an unrecognised option, deliberately avoiding a
 hardcoded version cutoff. CI runs the whole lit suite twice, once per flag generation
