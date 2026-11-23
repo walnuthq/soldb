@@ -35,9 +35,9 @@ pub use abi::{
 pub use artifacts::{
     contract_name_from_program_path, ethdebug_resources_from_metadata, find_abi_file,
     find_ethdebug_metadata, find_program_ethdebug, load_contract_mapping, load_debug_program,
-    load_debug_program_with_sources, load_storage_layout, load_transient_storage_layout,
-    parse_contract_mapping, read_debug_source, read_json_file, source_candidates, CodeGenerator,
-    ContractMapping, DebugProgram,
+    load_debug_program_with_sources, load_ethdebug_metadata, load_storage_layout,
+    load_transient_storage_layout, parse_contract_mapping, read_debug_source, read_json_file,
+    source_candidates, CodeGenerator, ContractMapping, DebugProgram, EthdebugMetadata,
 };
 pub use errors::{error_abis, load_error_abis, parse_error_abis, ErrorAbi, ErrorRegistry};
 pub use events::{

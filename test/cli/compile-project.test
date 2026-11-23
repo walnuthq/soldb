@@ -34,10 +34,11 @@
 
 # Compiling into a directory another compiler already wrote must not leave both of solc's
 # global metadata names behind: a loader cannot tell which one describes the programs
-# sitting next to them.
+# sitting next to them. `ethdebug_compilation.json` is no resources name: the modern flags
+# write it beside `ethdebug_resources.json`, so it is not counted.
 # RUN: rm -rf %t.mixed && %soldb compile %S/../examples/Counter.sol -o %t.mixed --solc %{solc_path} > /dev/null 2>&1
 # RUN: touch -t 200001010000 %t.mixed/ethdebug.json 2>/dev/null || printf '{}' > %t.mixed/ethdebug.json
 # RUN: %soldb compile %S/../examples/Counter.sol -o %t.mixed --solc %{solc_path} > /dev/null 2>&1
-# RUN: ls %t.mixed | grep -c '^ethdebug' | FileCheck --check-prefix=ONEMETA %s
+# RUN: ls %t.mixed | grep -cE '^ethdebug(_resources)?\.json$' | FileCheck --check-prefix=ONEMETA %s
 
 # ONEMETA: 1
