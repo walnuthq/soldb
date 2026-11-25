@@ -682,9 +682,9 @@ fn parse_type(value: &Value, depth: usize) -> SoldbResult<TypeDocument> {
     };
     let places = || -> SoldbResult<u64> {
         let places = number(object, "places", "a fixed-point type")?;
-        if places == 0 || places > 80 {
+        if places > 80 {
             return Err(SoldbError::Message(format!(
-                "`places` must be between 1 and 80, not {places}"
+                "`places` must be between 0 and 80, not {places}"
             )));
         }
         Ok(places)
@@ -1212,12 +1212,34 @@ mod tests {
     }
 
     #[test]
+    fn decodes_zero_place_fixed_point_resources() {
+        let resources = Resources::parse(&json!({
+            "ethdebug": {"schema": "ethdebug/format/info/resources", "version": "0.1.0-draft.3"},
+            "types": {
+                "t_fixed8x0": {"kind": "fixed", "bits": 8, "places": 0},
+                "t_ufixed8x0": {"kind": "ufixed", "bits": 8, "places": 0}
+            },
+            "pointers": {}
+        }))
+        .expect("draft.3 resources");
+
+        for (id, expected) in [("t_fixed8x0", "-1"), ("t_ufixed8x0", "255")] {
+            let document = resources.type_document(id).expect("fixed-point type");
+            assert_eq!(
+                document.decode(&[0xff], &resources).expect("decode"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn malformed_documents_are_rejected() {
         for bad in [
             json!({"kind": "uint"}),
             json!({"kind": "uint", "bits": 12}),
             json!({"kind": "uint", "bits": 8, "size": 1}),
             json!({"kind": "uint", "bits": 8, "class": "complex"}),
+            json!({"kind": "fixed", "bits": 8, "places": -1}),
             json!({"kind": "ufixed", "bits": 128, "places": 81}),
             json!({"kind": "contract", "library": true, "interface": true}),
             json!({"kind": "enum"}),
