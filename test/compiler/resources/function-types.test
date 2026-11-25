@@ -1,0 +1,16 @@
+# Load compiler-produced function signatures through the CLI, including the outer
+# tuple for one argument and the absence of a return-list reference for no returns.
+# REQUIRES: soldb, compiler-solc, solc-ethdebug-resource-tables, optimization-none
+# RUN: rm -rf %t
+# RUN: mkdir -p %t
+# RUN: cd %S/../../fixtures/ethdebug-function-types && %solc FunctionTypes.sol --via-ir --debug-info ethdebug,ast-id --experimental --ethdebug-program-runtime --ethdebug-resources --ethdebug-compilation -o %t > %t/compile.stdout 2> %t/compile.stderr
+# RUN: %soldb info resources --ethdebug-dir 0x1:FunctionTypes:%t --json > %t/resources.json
+# RUN: jq -c '.contracts[0].resources as $resources | $resources.types | to_entries[] | select(.value.kind == "function") | [.key, ($resources.types[.value.contains.parameters.type.id].contains | map(.type.id)), (if .value.contains | has("returns") then $resources.types[.value.contains.returns.type.id].contains | map(.type.id) else null end)]' %t/resources.json | FileCheck %s --check-prefix=SIGNATURE
+# SIGNATURE-DAG: ["t_function_external_nonpayable$__$returns$__$",[],null]
+# SIGNATURE-DAG: ["t_function_external_nonpayable$_t_uint32_$returns$__$",["t_uint32"],null]
+# SIGNATURE-DAG: ["t_function_external_nonpayable$__$returns$_t_uint32_$",[],["t_uint32"]]
+# SIGNATURE-DAG: ["t_function_external_nonpayable$_t_uint32_$returns$_t_uint32_$",["t_uint32"],["t_uint32"]]
+# SIGNATURE-DAG: ["t_function_external_nonpayable$_t_uint32_$_t_bool_$_t_address_$returns$_t_bytes4_$_t_int16_$",["t_uint32","t_bool","t_address"],["t_bytes4","t_int16"]]
+# SIGNATURE-DAG: ["t_function_internal_nonpayable$__$returns$__$",[],null]
+# SIGNATURE-DAG: ["t_function_internal_nonpayable$_t_uint32_$returns$_t_uint32_$",["t_uint32"],["t_uint32"]]
+# SIGNATURE-DAG: ["t_function_internal_nonpayable$_t_uint32_$_t_bool_$_t_address_$returns$_t_bytes4_$_t_int16_$",["t_uint32","t_bool","t_address"],["t_bytes4","t_int16"]]

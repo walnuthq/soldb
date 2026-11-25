@@ -37,7 +37,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use soldb_core::{opcode, EvmWord, StepView, TransactionTrace};
 use soldb_ethdebug::{
     function_selector, parse_path, CodeGenerator, ErrorAbi, EthdebugInfo, FunctionExit,
-    Instruction, PathSegment, SourceLocation, StorageLayout,
+    Instruction, PathSegment, Resources, SourceLocation, StorageLayout,
 };
 
 use crate::condition::Value;
@@ -86,6 +86,9 @@ pub struct ContractDebugInfo {
     pub transient_storage_layout: Option<StorageLayout>,
     /// The errors its ABI declares, which revert data is decoded against.
     pub errors: Vec<ErrorAbi>,
+    /// The type and pointer tables of the ETHDebug resources, which the state variables of
+    /// the program-level context are read through.
+    pub resources: Option<Resources>,
     /// Which code generator produced the program, when the artifact or the host says.
     /// Decides whether local variables can be inferred from the stack; see
     /// [`StepMap::locals_at`].
@@ -323,6 +326,7 @@ impl ContractDebugInfo {
             storage_layout: None,
             transient_storage_layout: None,
             errors: Vec::new(),
+            resources: None,
             code_generator: None,
             line_starts,
             pc_index,
@@ -411,6 +415,14 @@ impl ContractDebugInfo {
         for (source_id, text) in sources {
             self.types.extend_from(&cache.read(source_id, text).types);
         }
+        self
+    }
+
+    /// Attaches the type and pointer tables of the contract's ETHDebug resources, so the
+    /// state variables of its program-level context can be read through their pointers.
+    #[must_use]
+    pub fn with_resources(mut self, resources: Option<Resources>) -> Self {
+        self.resources = resources;
         self
     }
 
@@ -3294,6 +3306,7 @@ contract C {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         ContractDebugInfo::new(address, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]))
     }
@@ -3380,6 +3393,7 @@ contract P {
             ],
             sources: BTreeMap::from([(0, "P.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         ContractDebugInfo::new(
             None,
@@ -3788,6 +3802,7 @@ contract P {
                 .collect(),
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         ContractDebugInfo::new(
             Some(address),
@@ -4138,6 +4153,7 @@ contract P {
             instructions,
             sources: BTreeMap::from([(0, "L.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         ContractDebugInfo::new(
             Some(ROOT),
@@ -4839,6 +4855,7 @@ contract P {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let marked =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
@@ -4910,6 +4927,7 @@ contract P {
             ],
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
@@ -5200,6 +5218,7 @@ contract P {
             instructions,
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract =
             ContractDebugInfo::new(None, "C", info, BTreeMap::from([(0, SOURCE.to_owned())]));
@@ -5295,6 +5314,7 @@ contract D {
             instructions,
             sources: BTreeMap::from([(0, "D.sol".to_owned()), (1, "E.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let contract = ContractDebugInfo::new(
             None,
@@ -5547,6 +5567,7 @@ contract D {
             instructions: Vec::new(),
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let code = "contract C { function run() external {} }";
         let mut cache = SourceCache::default();
