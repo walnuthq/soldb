@@ -40,9 +40,9 @@ pub use session::{
 };
 use soldb_debugger::{
     call_target, check_root_calls, normalize_address, variables_for_step_at, ChainStorage,
-    Condition, ConditionContext, ContractDebugInfo, DebugVariable, ErrorRegistry, Evaluation, Frame,
-    FrameState, LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
-    StorageLayout, StorageTape, StorageWords,
+    Condition, ConditionContext, ContractDebugInfo, DebugVariable, ErrorRegistry, Evaluation,
+    Frame, FrameState, LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation,
+    StepMap, StorageLayout, StorageTape, StorageWords,
 };
 
 /// Where a step's variables came from.
@@ -2130,6 +2130,7 @@ contract C {
             instructions: Vec::new(),
             sources: BTreeMap::new(),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let errors = soldb_ethdebug::parse_error_abis(
             r#"[{"type":"error","name":"ZeroAmount","inputs":[]}]"#,

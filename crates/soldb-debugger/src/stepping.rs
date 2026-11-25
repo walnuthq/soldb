@@ -5567,6 +5567,7 @@ contract D {
             instructions: Vec::new(),
             sources: BTreeMap::from([(0, "C.sol".to_owned())]),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let code = "contract C { function run() external {} }";
         let mut cache = SourceCache::default();

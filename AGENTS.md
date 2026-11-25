@@ -353,7 +353,7 @@ Artifacts produced per contract in the output directory:
 
 ### Compiler Channels
 
-CI runs the lit suite against four compilers, for four different reasons:
+CI runs the lit suite against five compiler channels:
 
 | channel | why |
 | --- | --- |
@@ -361,7 +361,7 @@ CI runs the lit suite against four compilers, for four different reasons:
 | solc 0.8.36 (pinned) | the modern `--experimental --ethdebug-program …` generation |
 | solc latest release, resolved at run time | the newest release; a break there shows a new compiler needs a fix here |
 | solc `develop`, built from source | where ETHDebug output changes first |
-| solc `feature/ethdebug-program-context` of the `walnuthq/solidity` fork, built from source | the ETHDebug type and pointer tables, until argotorg/solidity#16990 and its follow-ups land on `develop` |
+| solc `feature/ethdebug-program-context` of the `walnuthq/solidity` fork, built from source | covers program-level context variables until they land on `develop` |
 
 A separate non-blocking `solar` job builds the Solar release named by `SOLAR_REF` in
 `.github/workflows/ci.yml` (`v0.3.0`; move it to each new release) and
@@ -384,31 +384,24 @@ Python compiler-preparation adapter. The Solar binary must support the debug
 output selectors; CI does not fall back to Standard JSON.
 See `docs/debug-diff.md` for local commands and retained reports.
 
-The `develop` job is a matrix over the sources it builds solc from: `argotorg/solidity@develop`
-and, until the ETHDebug type and pointer tables land there, the stacked branch of the
-`walnuthq/solidity` fork that carries them. Each build is cached by commit, and the job is
+The `develop` job builds `argotorg/solidity@develop` and the fork branch with program-level
+context variables. Each build is cached by commit, and the job is
 **non-blocking** (`continue-on-error: true`): those branches move without us, so a break
 there is an early warning, not a reason to hold up a pull request. It also runs on a daily
-schedule so a change lands in front of us without needing a soldb pull request, and it
-prints whether the build emits ETHDebug variable locations yet — the thing `vars` and
-`print` read — and whether it fills the type and pointer tables. As of `f985208` develop
-emits neither; instruction `context` carries only `code`. Remove the fork entry from the
-matrix once `develop` reports the tables as present.
+schedule and reports whether each build emits instruction variable locations and fills
+the type and pointer tables. Remove the fork entry once `develop` emits program-level
+context variables.
 
 Development builds report a prerelease version such as `0.8.37-develop.2026.8.22`. The
 version gate reads only the leading `major.minor.patch`; do not reintroduce a parser that
 chokes on the suffix, or the one compiler that matters most for new ETHDebug output gets
 rejected as unsupported.
 
-The compiler suite gates the same way: `test/compiler/lit.cfg.py` reads the selected
-solc's version and adds a `solc-at-least-<version>` feature for every version in its
-`SOLC_VERSION_GATES`, so a test for output only a newer compiler emits says
-`REQUIRES: solc-at-least-0.8.38` and is skipped on the pinned channels until the pinned
-version catches up. `test/compiler/resources/` pins the ETHDebug type and pointer tables
-that way; it also needs `optimization-none`, because solc refuses ETHDebug output with
-the optimizer. Where a version cannot tell, the config probes: it compiles a one-variable
-contract and adds `solc-ethdebug-program-context` when the runtime program lists the
-variable in its program-level context, which `test/compiler/resources/context.test` needs.
+The compiler suite probes the output instead of using the compiler version to gate
+resource tests. `test/compiler/lit.cfg.py` compiles small contracts to check for type
+tables, layout-qualified templates, and program-level context variables. Resource
+tests also require `optimization-none`, because solc refuses ETHDebug output with
+the optimizer.
 
 **solc flag drift is a real, tested compatibility surface.** Older compilers accept
 `--ethdebug --ethdebug-runtime`; solc dropped those around 0.8.32 in favor of

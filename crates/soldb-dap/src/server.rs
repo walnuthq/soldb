@@ -1353,6 +1353,7 @@ mod tests {
             instructions: Vec::new(),
             sources: BTreeMap::new(),
             variable_locations: BTreeMap::new(),
+            state_variables: Vec::new(),
         };
         let errors = parse_error_abis(r#"[{"type":"error","name":"ZeroAmount","inputs":[]}]"#)
             .expect("error abi");
