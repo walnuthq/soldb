@@ -823,6 +823,7 @@ A rule selects values in up to three ways, and a value has to meet every one giv
   array, the name of the mapping or array: `--var balances` formats `balances[0xabc…]`.
   This is the one that matters most in Solidity, where nearly every amount is a `uint256`
   and its type says nothing about its decimals.
+- **`--all`**: every value, whatever it is shown under; the same as `--var '*'`.
 - **`--contract <name>`**: only in that contract's code, so two tokens with different
   decimals can share variable names.
 
@@ -833,6 +834,16 @@ one; `-f default` turns formatting off for what it matches:
 ```text
 soldb> type format add -f decimals:18 uint256
 soldb> type format add -f default --var nonce --var '*Id'
+```
+
+`--all` is the broadest rule of all, and wants its exceptions said after it: it scales a
+count or a timestamp as readily as an amount. A `decimals:@<name>` rule leaves `<name>`
+itself alone, so this reads every amount of a token in its own decimals:
+
+```text
+soldb> type format add -f decimals:@decimals --all --contract USDC
+soldb> type format add -f timestamp --var '*deadline*' --contract USDC
+soldb> type format add -f default --var nonce --contract USDC
 ```
 
 A format applies inside a struct and an array, member by member, and a format that reads a

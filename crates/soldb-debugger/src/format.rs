@@ -195,7 +195,7 @@ impl Matcher {
     ) -> Result<Self, String> {
         if types.is_empty() && vars.is_empty() {
             return Err(
-                "name the values it applies to: one or more types, `--var <name>`, or both"
+                "name the values it applies to: one or more types, `--var <name>`, or `--all`"
                     .to_owned(),
             );
         }
@@ -233,13 +233,22 @@ impl fmt::Display for Matcher {
     /// The matcher as the arguments that set it, so a listed rule can be typed again.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = self.types.clone();
-        parts.extend(self.vars.iter().map(|var| format!("--var {var}")));
+        parts.extend(self.vars.iter().map(|var| {
+            if var == EVERY_NAME {
+                "--all".to_owned()
+            } else {
+                format!("--var {var}")
+            }
+        }));
         if let Some(contract) = &self.contract {
             parts.push(format!("--contract {contract}"));
         }
         formatter.write_str(&parts.join(" "))
     }
 }
+
+/// The name pattern `--all` stands for: every name.
+const EVERY_NAME: &str = "*";
 
 /// A type without the keyword a layout labels it with: `struct Pool.Position` is
 /// `Pool.Position`.
@@ -568,10 +577,12 @@ fn parse_add<'a>(
         match option {
             _ if option == flag || option == long => rule = Some(value(option)?),
             "-v" | "--var" => vars.push(value(option)?),
+            // Every value, by whatever name it is shown under.
+            "--all" if inline.is_none() => vars.push(EVERY_NAME.to_owned()),
             "--contract" => contract = Some(value(option)?),
             _ if option.starts_with('-') && option.len() > 1 => {
                 return Err(format!(
-                    "unknown option `{option}`; `type {} add` takes `{flag} <{}>`, `--var <name>`, and `--contract <name>`",
+                    "unknown option `{option}`; `type {} add` takes `{flag} <{}>`, `--var <name>`, `--all`, and `--contract <name>`",
                     kind.noun(),
                     match kind {
                         FormatterKind::Format => "format",
@@ -1544,6 +1555,11 @@ mod tests {
         assert_eq!(leaf_name("item.tags[1]"), "tags");
         assert_eq!(leaf_name("config.limit"), "limit");
         assert!(Matcher::new(Vec::new(), Vec::new(), None).is_err());
+        let every = Matcher::new(Vec::new(), vec!["*".to_owned()], Some("Token".to_owned()))
+            .expect("every name");
+        assert_eq!(every.to_string(), "--all --contract Token");
+        assert!(every.matches(Some("Token"), "anything", Some("uint8")));
+        assert!(!every.matches(Some("Other"), "anything", Some("uint8")));
     }
 
     #[test]

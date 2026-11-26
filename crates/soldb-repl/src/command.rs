@@ -403,13 +403,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "type format|summary <subcommand>",
         summary: "choose how values are shown: token decimals, hex, dates, one-line summaries",
         details: &[
-            "type format add -f <format> [<type>...] [--var <name>]... [--contract <name>]",
-            "type summary add -s <template> [<type>...] [--var <name>]... [--contract <name>]",
+            "type format add -f <format> [<type>...] [--var <name>]... [--all] [--contract <name>]",
+            "type summary add -s <template> [<type>...] [--var <name>]... [--all] [--contract <name>]",
             "type format|summary list | delete <n> | clear",
             "A rule applies to values of the types named (uint256, UD60x18, Pool.Position) and",
             "to values shown under the names given: a variable, a struct member, or a mapping",
-            "or array whose entries it is. Names and types take * and ? wildcards. With",
-            "--contract, only in that contract's code. The rule added last wins.",
+            "or array whose entries it is. Names and types take * and ? wildcards, and --all",
+            "is every name. With --contract, only in that contract's code. The rule added last",
+            "wins, so a narrower rule after a broad one makes the exceptions to it.",
             "Formats: decimal (d), hex (x), binary (t), decimals:<n>, decimals:@<state variable>,",
             "  ether and wad (decimals:18), gwei (decimals:9), ray (decimals:27), bps, q<bits>,",
             "  timestamp, duration, string (s), default.",
@@ -702,6 +703,16 @@ mod tests {
                 types: vec!["Pool.Position".to_owned()],
                 vars: Vec::new(),
                 contract: None,
+            }))
+        );
+        assert_eq!(
+            DebuggerCommand::parse("type format add -f decimals:@decimals --all --contract USDC"),
+            DebuggerCommand::Type(Ok(FormatterCommand::Add {
+                kind: FormatterKind::Format,
+                rule: "decimals:@decimals".to_owned(),
+                types: Vec::new(),
+                vars: vec!["*".to_owned()],
+                contract: Some("USDC".to_owned()),
             }))
         );
         assert_eq!(
