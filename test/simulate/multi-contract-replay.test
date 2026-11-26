@@ -1,0 +1,27 @@
+# A call simulated on OP Sepolia, replayed from its bundle with no node: the same calls
+# as a mined transaction, nested and decoded the same way. Recorded with
+# `soldb simulate 0x59A7… "processOrder(uint256,string,string)" 10 express electronic
+# --backend replay --save-replay`.
+# REQUIRES: soldb
+# RUN: %soldb replay %{project_root}/test/fixtures/replay/process-order-sepolia-call.json --ethdebug-dir 0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd:TaxCalculator:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd/debug --ethdebug-dir 0xbE734aD6434E16f6bE04706005faED6fD38eb2B2:ShippingManager:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xbE734aD6434E16f6bE04706005faED6fD38eb2B2/debug --ethdebug-dir 0xf776FF56e2400e31f3070c1ac70Ab80433B01823:PaymentProcessor:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xf776FF56e2400e31f3070c1ac70Ab80433B01823/debug 2>&1 | FileCheck %s
+
+# The call succeeded, so no event is marked as undone: a sub-call that returned is
+# not a frame that reverted.
+# RUN: %soldb replay %{project_root}/test/fixtures/replay/process-order-sepolia-call.json 2>&1 | not grep -F "(reverted)"
+
+# CHECK: Replayed from {{.*}}; no node involved
+# CHECK: Contract: 0x59A714559B46c823d87986b5c5B7C630e2f5668d
+# CHECK: Call Stack:
+# CHECK-NEXT: ---
+# CHECK-NEXT: #0 0x59A714559B46c823d87986b5c5B7C630e2f5668d::runtime_dispatcher
+# CHECK-NEXT:   #1 0xdcdd1dd0ff17043f8bcd1ac9e5be20bbed4fac0a::0x41304fac
+# CHECK-NEXT:     0xdf2f43000ad262ff{{.*}} [event]
+# CHECK-NEXT:   #2 TaxCalculator::calculateTax(uint256 value = 10, string orderType = express)
+# CHECK-NEXT:     #3 getBaseRate(string orderType) [internal]
+# CHECK-NEXT:       raw entry stack:
+# CHECK-NEXT:       ← return (uint256 = 10)
+# CHECK-NEXT:     TaxCalculator::TaxComputed(caller = 0x59a714559b46c823d87986b5c5b7c630e2f5668d, orderValue = 10, taxAmount = 1) [event]
+# CHECK-NEXT:     ← return (uint256 = 1)
+# CHECK:   #5 ShippingManager::initiateShipping(address customer = 0x286af310ea3303c80ebe9a66f6998b21bd8c1c29, string method = electronic)
+# CHECK:       ← return (uint256 = 30)
+# CHECK:   #8 PaymentProcessor::processPayment(address from = 0x286af310ea3303c80ebe9a66f6998b21bd8c1c29, uint256 amount = 11)

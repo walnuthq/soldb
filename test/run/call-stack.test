@@ -1,0 +1,53 @@
+# The summary's call stack is the tree of calls the run made: a function that returned is
+# a sibling of the calls after it, a call into another contract is named from that
+# contract's debug info, every frame shows its arguments and what it returned, and a
+# revert names where it started. No node: Payroll's constructor creates the Ledger.
+# REQUIRES: soldb
+# RUN: %soldb compile %S/../examples/Payroll.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: %soldb run %t.out/Payroll.bin "pay(uint256)" 5000 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Payroll:%t.out --ethdebug-dir 0xa16E02E87b7454126E5E10d957A927A7F5B5d2be:Ledger:%t.out 2>&1 | FileCheck --check-prefix=REVERT %s
+# The order the contracts are named in changes nothing.
+# RUN: %soldb run %t.out/Payroll.bin "pay(uint256)" 5000 --ethdebug-dir 0xa16E02E87b7454126E5E10d957A927A7F5B5d2be:Ledger:%t.out --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Payroll:%t.out 2>&1 | FileCheck --check-prefix=REVERT %s
+
+# REVERT: Contract: Payroll
+# REVERT: Status: REVERTED
+# REVERT: Call Stack:
+# REVERT-NEXT: ---
+# REVERT-NEXT: #0 Payroll::runtime_dispatcher
+# REVERT-NEXT: #1 pay(uint256 amount = 5000) at {{.*}}Payroll.sol:37
+# REVERT-NEXT:   #2 _fee(uint256 amount = 5000) [internal] at {{.*}}Payroll.sol:43
+# REVERT-NEXT:     ← return (uint256 = 50)
+# REVERT-NEXT:   #3 Ledger::debitWithMemo(address from = 0x5fbdb2315678afecb367f032d93f642f64180aa3, uint256 amount = 4950, bytes32 memo = 0x{{0+}}1388) at {{.*}}Payroll.sol:21
+# REVERT-NEXT:     #4 debit(address from = 0x5fbdb2315678afecb367f032d93f642f64180aa3, uint256 amount = 4950) [internal] at {{.*}}Payroll.sol:14
+# REVERT-NEXT:       ← revert started here at {{.*}}Payroll.sol:16
+# REVERT-NEXT:     ← revert InsufficientBalance(1000, 4950)
+# REVERT-NEXT:   ← revert InsufficientBalance(1000, 4950)
+# REVERT-NEXT: Backtrace:
+# REVERT-NEXT:   at Ledger.debit ({{.*}}Payroll.sol:16)
+# REVERT-NEXT:   at Ledger.debitWithMemo ({{.*}}Payroll.sol:23)
+# REVERT-NEXT:   at Payroll.pay ({{.*}}Payroll.sol:40)
+# REVERT-NOT: mint
+# REVERT-NOT: credit
+
+# A successful run shows what each call returned and has no backtrace.
+# RUN: %soldb run %t.out/Payroll.bin "pay(uint256)" 500 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Payroll:%t.out --ethdebug-dir 0xa16E02E87b7454126E5E10d957A927A7F5B5d2be:Ledger:%t.out 2>&1 | FileCheck --check-prefix=SUCCESS %s
+
+# SUCCESS: Status: SUCCESS
+# SUCCESS: #1 pay(uint256 amount = 500)
+# SUCCESS-NEXT:   #2 _fee(uint256 amount = 500) [internal]
+# SUCCESS-NEXT:     ← return (uint256 = 5)
+# SUCCESS-NEXT:   #3 Ledger::debitWithMemo({{.*}}uint256 amount = 495
+# SUCCESS-NEXT:     #4 debit({{.*}}uint256 amount = 495) [internal]
+# SUCCESS-NEXT:       ← return (bool = true)
+# SUCCESS-NEXT:     ← return (bool = true)
+# SUCCESS-NEXT:   ← return (uint256 net = 495)
+# SUCCESS-NOT: Backtrace:
+
+# A revert in the called function itself starts there, with `Error(string)` decoded.
+# RUN: %soldb run %t.out/Payroll.bin "pay(uint256)" 0 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Payroll:%t.out --ethdebug-dir 0xa16E02E87b7454126E5E10d957A927A7F5B5d2be:Ledger:%t.out 2>&1 | FileCheck --check-prefix=REQUIRE %s
+
+# REQUIRE: #3 Ledger::debitWithMemo(
+# REQUIRE-NEXT:     ← revert started here at {{.*}}Payroll.sol:22
+# REQUIRE-NEXT:     ← revert memo required
+# REQUIRE: Backtrace:
+# REQUIRE-NEXT:   at Ledger.debitWithMemo ({{.*}}Payroll.sol:22)
+# REQUIRE-NEXT:   at Payroll.pay ({{.*}}Payroll.sol:40)
