@@ -19,6 +19,7 @@ use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult};
 
 use crate::abi::keccak256;
+use crate::value_shape::{Scalar, ValueShape};
 
 /// A 256-bit storage word or slot number, big-endian.
 pub type Word = [u8; 32];
@@ -38,6 +39,9 @@ pub struct StorageLayout {
     /// numbers enum values; whoever has the sources fills this in, and a value then
     /// decodes as `Color.Blue` rather than `2`.
     pub enum_variants: BTreeMap<String, Vec<String>>,
+    /// The type each user-defined value type wraps, keyed the same way. Whoever has the
+    /// sources fills this in too, so `type Price is int128` is read as a signed number.
+    pub value_types: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +107,22 @@ pub struct DecodedStorage {
     pub display: String,
     /// The word the value came from, for value types, as `0x`-prefixed hex.
     pub raw: Option<String>,
+    /// What the value is made of; it renders back to `display`.
+    pub shape: ValueShape,
+}
+
+impl DecodedStorage {
+    fn new(shape: ValueShape, raw: Option<String>) -> Self {
+        Self {
+            display: shape.render(),
+            raw,
+            shape,
+        }
+    }
+
+    fn text(display: String, raw: Option<String>) -> Self {
+        Self::new(ValueShape::Text(display), raw)
+    }
 }
 
 impl StorageLayout {
@@ -142,6 +162,7 @@ impl StorageLayout {
             types,
             source: value.clone(),
             enum_variants: BTreeMap::new(),
+            value_types: BTreeMap::new(),
         })
     }
 
@@ -208,6 +229,15 @@ impl StorageLayout {
 
     /// `Color.Blue` for an enum value whose variants are known; see
     /// [`StorageLayout::enum_variants`].
+    /// The type a user-defined value type labeled `label` wraps, or `label` itself.
+    fn underlying<'a>(&'a self, label: &'a str) -> &'a str {
+        let short = label.rsplit('.').next().unwrap_or(label);
+        self.value_types
+            .get(label)
+            .or_else(|| self.value_types.get(short))
+            .map_or(label, String::as_str)
+    }
+
     fn enum_display(&self, label: &str, bytes: &[u8]) -> Option<String> {
         let name = label.strip_prefix("enum ")?;
         let short = name.rsplit('.').next().unwrap_or(name);
@@ -338,28 +368,28 @@ impl StorageLayout {
         read: &dyn Fn(&Word) -> Option<Word>,
     ) -> Result<DecodedStorage, Word> {
         let Some(ty) = self.type_of(&reference.type_id) else {
-            return Ok(DecodedStorage {
-                display: format!(
+            return Ok(DecodedStorage::text(
+                format!(
                     "<type `{}` is not in the storage layout>",
                     reference.type_id
                 ),
-                raw: None,
-            });
+                None,
+            ));
         };
         match ty.encoding {
-            StorageEncoding::Mapping => Ok(DecodedStorage {
-                display: "<mapping; index it with [key]>".to_owned(),
-                raw: None,
-            }),
+            StorageEncoding::Mapping => Ok(DecodedStorage::text(
+                "<mapping; index it with [key]>".to_owned(),
+                None,
+            )),
             StorageEncoding::DynamicArray => {
                 let length = read(&reference.slot).ok_or(reference.slot)?;
-                Ok(DecodedStorage {
-                    display: format!(
+                Ok(DecodedStorage::text(
+                    format!(
                         "<{} element(s); index it with [i]>",
                         word_to_decimal(&length)
                     ),
-                    raw: Some(word_hex(&length)),
-                })
+                    Some(word_hex(&length)),
+                ))
             }
             StorageEncoding::Bytes => {
                 let head = read(&reference.slot).ok_or(reference.slot)?;
@@ -393,13 +423,10 @@ impl StorageLayout {
                 } else {
                     format!("0x{}", hex(&bytes))
                 };
-                Ok(DecodedStorage {
-                    display,
-                    raw: Some(word_hex(&head)),
-                })
+                Ok(DecodedStorage::text(display, Some(word_hex(&head))))
             }
             StorageEncoding::Inplace if !ty.members.is_empty() => {
-                let mut parts = Vec::with_capacity(ty.members.len());
+                let mut members = Vec::with_capacity(ty.members.len());
                 for member in &ty.members {
                     let inner = StorageRef {
                         path: format!("{}.{}", reference.path, member.label),
@@ -408,24 +435,28 @@ impl StorageLayout {
                         type_id: member.type_id.clone(),
                     };
                     let value = self.decode(&inner, read)?;
-                    parts.push(format!("{}: {}", member.label, value.display));
+                    members.push((member.label.clone(), value.shape));
                 }
-                Ok(DecodedStorage {
-                    display: format!("{{ {} }}", parts.join(", ")),
-                    raw: None,
-                })
+                let name = ty.label.strip_prefix("struct ").unwrap_or(&ty.label);
+                Ok(DecodedStorage::new(
+                    ValueShape::Struct {
+                        ty: name.to_owned(),
+                        members,
+                    },
+                    None,
+                ))
             }
             StorageEncoding::Inplace if ty.base.is_some() => {
                 let base_id = ty.base.as_deref().expect("checked above");
                 let Some(base) = self.type_of(base_id) else {
-                    return Ok(DecodedStorage {
-                        display: format!("<element type `{base_id}` is not in the storage layout>"),
-                        raw: None,
-                    });
+                    return Ok(DecodedStorage::text(
+                        format!("<element type `{base_id}` is not in the storage layout>"),
+                        None,
+                    ));
                 };
                 let length = static_array_length(&ty.label).unwrap_or(0);
                 let shown = length.min(8);
-                let mut parts = Vec::with_capacity(shown as usize);
+                let mut elements = Vec::with_capacity(shown as usize);
                 for index in 0..shown {
                     let (slot, offset) =
                         element_place(&reference.slot, index, base.number_of_bytes);
@@ -435,15 +466,15 @@ impl StorageLayout {
                         offset,
                         type_id: base_id.to_owned(),
                     };
-                    parts.push(self.decode(&inner, read)?.display);
+                    elements.push(self.decode(&inner, read)?.shape);
                 }
-                if length > shown {
-                    parts.push(format!("... {} more", length - shown));
-                }
-                Ok(DecodedStorage {
-                    display: format!("[{}]", parts.join(", ")),
-                    raw: None,
-                })
+                Ok(DecodedStorage::new(
+                    ValueShape::Array {
+                        elements,
+                        more: length - shown,
+                    },
+                    None,
+                ))
             }
             StorageEncoding::Inplace => {
                 let word = read(&reference.slot).ok_or(reference.slot)?;
@@ -455,12 +486,14 @@ impl StorageLayout {
                     .min(32 - size);
                 let end = 32 - offset;
                 let bytes = &word[end - size..end];
-                Ok(DecodedStorage {
-                    display: self
-                        .enum_display(&ty.label, bytes)
-                        .unwrap_or_else(|| decode_value(bytes, &ty.label)),
-                    raw: Some(word_hex(&word)),
-                })
+                let shown = self
+                    .enum_display(&ty.label, bytes)
+                    .unwrap_or_else(|| decode_value(bytes, &ty.label));
+                let scalar = Scalar::new(&ty.label, self.underlying(&ty.label), bytes, shown);
+                Ok(DecodedStorage::new(
+                    ValueShape::Scalar(scalar),
+                    Some(word_hex(&word)),
+                ))
             }
         }
     }

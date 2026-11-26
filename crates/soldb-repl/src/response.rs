@@ -8,6 +8,8 @@
 
 use serde::Serialize;
 
+use soldb_debugger::FormatterKind;
+
 /// One item of a command's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -35,6 +37,21 @@ pub enum Output {
     },
     Breakpoints {
         breakpoints: Vec<BreakpointInfo>,
+    },
+    /// A format or a summary was added or deleted.
+    Formatter {
+        event: FormatterEvent,
+        /// Whether it is a format or a summary.
+        formatter: FormatterKind,
+        id: u32,
+        /// What it is and what it applies to, as `type … add` would set it again.
+        label: String,
+    },
+    /// The formats or the summaries set, in the order they were added; of those that
+    /// match a value, the last one is used.
+    Formatters {
+        formatter: FormatterKind,
+        rules: Vec<FormatterInfo>,
     },
     Backtrace {
         /// Said once a session, when frames carry arguments read off the stack: a
@@ -197,6 +214,19 @@ pub struct StopLocation {
 pub enum BreakpointEvent {
     Set,
     Cleared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatterEvent {
+    Added,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FormatterInfo {
+    pub id: u32,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

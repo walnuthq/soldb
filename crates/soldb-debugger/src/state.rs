@@ -517,11 +517,13 @@ fn read(layout: &StorageLayout, words: &StorageWords<'_>, reference: &StorageRef
             display: decoded.display,
             raw: decoded.raw,
             status: DebugValueStatus::Decoded,
+            shape: Some(Box::new(decoded.shape)),
         },
         Err(missing) => DebugValue {
             display: words.unavailable(&missing),
             raw: None,
             status: DebugValueStatus::Unavailable,
+            shape: None,
         },
     };
     StateVariable {

@@ -324,6 +324,25 @@ impl SourceTypes {
         self.struct_members(scope, name).is_some()
     }
 
+    /// The type every user-defined value type wraps, keyed like
+    /// [`SourceTypes::enum_variants_by_name`], for
+    /// [`soldb_ethdebug::StorageLayout::value_types`].
+    #[must_use]
+    pub fn value_types_by_name(&self) -> std::collections::BTreeMap<String, String> {
+        let mut names = std::collections::BTreeMap::new();
+        for decl in &self.value_types {
+            if let Some(scope) = &decl.scope {
+                names
+                    .entry(format!("{scope}.{}", decl.name))
+                    .or_insert_with(|| decl.underlying.clone());
+            }
+            names
+                .entry(decl.name.clone())
+                .or_insert_with(|| decl.underlying.clone());
+        }
+        names
+    }
+
     /// Every enum's variants, keyed the way a storage layout labels the type
     /// (`Shop.Color`) and by its bare name (`Color`), for
     /// [`soldb_ethdebug::StorageLayout::enum_variants`]. A bare name declared twice keeps

@@ -13,6 +13,9 @@
 //! - [`abi`] encodes calldata and parses function signatures, including tuples and
 //!   arrays, and carries the keccak-256 implementation used to derive selectors.
 //! - [`events`] decodes logs against event ABIs.
+//! - [`storage_layout`] reads state variables through solc's storage layout, and
+//!   [`value_shape`] keeps what a decoded value is made of, so it can be shown in another
+//!   format than its default one.
 //!
 //! Everything decoded here comes from files or from chain data, so it is untrusted:
 //! offsets and lengths read out of an artifact or a log payload are validated rather
@@ -26,6 +29,7 @@ pub mod metadata;
 pub mod opcodes;
 pub mod source_map;
 pub mod storage_layout;
+pub mod value_shape;
 
 pub use abi::{
     canonical_abi_input_type, encode_abi_arguments, encode_function_call, function_selector,
@@ -60,3 +64,4 @@ pub use storage_layout::{
     word_to_decimal, DecodedStorage, PathSegment, StorageEncoding, StorageLayout, StorageMember,
     StorageRef, StorageType, StorageVariable, Word,
 };
+pub use value_shape::{array_text, scalar_kind, struct_text, Scalar, ScalarKind, ValueShape};

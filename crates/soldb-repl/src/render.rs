@@ -7,8 +7,11 @@
 
 use std::fmt::Write as _;
 
+use soldb_debugger::FormatterKind;
+
 use crate::response::{
-    BreakpointEvent, Level, Output, StateInfo, Stop, StopReason, ValueStatus, VariableInfo,
+    BreakpointEvent, FormatterEvent, Level, Output, StateInfo, Stop, StopReason, ValueStatus,
+    VariableInfo,
 };
 
 /// Renders [`Output`] as lines of text.
@@ -95,6 +98,38 @@ impl Renderer {
                         .map(|breakpoint| {
                             format!("#{} {}", self.number(breakpoint.id), breakpoint.label)
                         })
+                        .collect()
+                }
+            }
+            Output::Formatter {
+                event,
+                formatter,
+                id,
+                label,
+            } => {
+                let title = match formatter {
+                    FormatterKind::Format => "Format",
+                    FormatterKind::Summary => "Summary",
+                };
+                vec![match event {
+                    FormatterEvent::Added => {
+                        format!("{} {label}", self.success(format!("{title} #{id} added:")))
+                    }
+                    FormatterEvent::Deleted => self.info(format!("{title} #{id} deleted")),
+                }]
+            }
+            Output::Formatters { formatter, rules } => {
+                if rules.is_empty() {
+                    let noun = formatter.noun();
+                    let hint = match formatter {
+                        FormatterKind::Format => "type format add -f <format> <type>",
+                        FormatterKind::Summary => "type summary add -s <template> <type>",
+                    };
+                    vec![self.dim(format!("No {noun} set; add one with `{hint}`"))]
+                } else {
+                    rules
+                        .iter()
+                        .map(|rule| format!("#{} {}", self.number(rule.id), rule.label))
                         .collect()
                 }
             }

@@ -6,6 +6,8 @@
 //! [`DebuggerCommand::Unknown`], which the session answers with a message, the way a
 //! shell does.
 
+use soldb_debugger::FormatterCommand;
+
 use crate::{BreakpointTarget, DisplayMode, SourceBreakpointTarget};
 
 /// A command as typed, with its arguments parsed.
@@ -35,6 +37,14 @@ pub enum DebuggerCommand {
     /// An empty name means the user typed `print` with no argument; the session reports
     /// the usage rather than treating it as an unknown command.
     Print(String),
+    /// `print/<format> <path>`: one variable with every number in it written in a
+    /// format, as typed, such as `x` or `decimals:6`.
+    PrintAs {
+        format: String,
+        path: String,
+    },
+    /// A `type format` or `type summary` command, or why the line is not one.
+    Type(Result<FormatterCommand, String>),
     Info(DebuggerInfoCommand),
     /// The call structure at the current step.
     Backtrace,
@@ -377,11 +387,38 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "print",
         aliases: &["p"],
-        usage: "print <variable>|<path>",
+        usage: "print[/<format>] <path>",
         summary: "one variable, or a path into one: item.tags[1], balances[0xabc], stored.owner",
         details: &[
             "A path follows struct members, array elements, mapping entries, and `length`",
             "from a local or a state variable, in any chain.",
+            "With a format, every number in the value is written in it, whatever `type format`",
+            "set: p/x slot, p/decimals:6 amount, p/timestamp deadline. See `help type`.",
+        ],
+        group: CommandGroup::Variables,
+    },
+    CommandSpec {
+        name: "type",
+        aliases: &[],
+        usage: "type format|summary <subcommand>",
+        summary: "choose how values are shown: token decimals, hex, dates, one-line summaries",
+        details: &[
+            "type format add -f <format> [<type>...] [--var <name>]... [--contract <name>]",
+            "type summary add -s <template> [<type>...] [--var <name>]... [--contract <name>]",
+            "type format|summary list | delete <n> | clear",
+            "A rule applies to values of the types named (uint256, UD60x18, Pool.Position) and",
+            "to values shown under the names given: a variable, a struct member, or a mapping",
+            "or array whose entries it is. Names and types take * and ? wildcards. With",
+            "--contract, only in that contract's code. The rule added last wins.",
+            "Formats: decimal (d), hex (x), binary (t), decimals:<n>, decimals:@<state variable>,",
+            "  ether and wad (decimals:18), gwei (decimals:9), ray (decimals:27), bps, q<bits>,",
+            "  timestamp, duration, string (s), default.",
+            "A summary is a template: ${var} is the value, ${var.member} or ${member} a part of",
+            "it, and %<format> writes a part in a format: \"${var.amount%decimals:6} USDC\".",
+            "  type format add -f decimals:6 --var balances --var totalSupply --contract USDC",
+            "  type format add -f decimals:@decimals --var amount --var value",
+            "  type summary add -s \"${liquidity%wad} in [${tickLower}, ${tickUpper}]\" Position",
+            "Put these in .soldbinit to have them in every session.",
         ],
         group: CommandGroup::Variables,
     },
@@ -437,6 +474,15 @@ impl DebuggerCommand {
         let mut parts = line.split_whitespace();
         let word = parts.next().unwrap_or_default();
         let rest = parts.collect::<Vec<_>>().join(" ");
+        if let Some((name, format)) = word.split_once('/') {
+            return match command_spec(name) {
+                Some(spec) if spec.name == "print" && !format.is_empty() => Self::PrintAs {
+                    format: format.to_owned(),
+                    path: rest,
+                },
+                _ => Self::Unknown(line.to_owned()),
+            };
+        }
         let Some(spec) = command_spec(word) else {
             return Self::Unknown(line.to_owned());
         };
@@ -490,6 +536,8 @@ impl DebuggerCommand {
                 .parse::<u32>()
                 .map_or_else(|_| unknown(), Self::Delete),
             "help" => Self::Help((!rest.is_empty()).then_some(rest)),
+            // The words after `type`, quotes kept: a summary template may hold spaces.
+            "type" => Self::Type(FormatterCommand::parse(&line[word.len()..])),
             "tui" => Self::Tui,
             "quit" => Self::Quit,
             _ => unknown(),
@@ -628,7 +676,90 @@ fn parse_source_line_number(input: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_spec, CommandGroup, DebuggerCommand, COMMANDS};
+    use soldb_debugger::FormatterKind;
+
+    use super::{command_spec, CommandGroup, DebuggerCommand, FormatterCommand, COMMANDS};
+
+    #[test]
+    fn type_commands_parse_options_and_quoted_templates() {
+        assert_eq!(
+            DebuggerCommand::parse(
+                "type format add -f decimals:18 uint256 --var amount -v '*Amount' --contract=Token"
+            ),
+            DebuggerCommand::Type(Ok(FormatterCommand::Add {
+                kind: FormatterKind::Format,
+                rule: "decimals:18".to_owned(),
+                types: vec!["uint256".to_owned()],
+                vars: vec!["amount".to_owned(), "*Amount".to_owned()],
+                contract: Some("Token".to_owned()),
+            }))
+        );
+        assert_eq!(
+            DebuggerCommand::parse(r#"type summary add -s "${a}  of \"${b}\"" Pool.Position"#),
+            DebuggerCommand::Type(Ok(FormatterCommand::Add {
+                kind: FormatterKind::Summary,
+                rule: r#"${a}  of "${b}""#.to_owned(),
+                types: vec!["Pool.Position".to_owned()],
+                vars: Vec::new(),
+                contract: None,
+            }))
+        );
+        assert_eq!(
+            DebuggerCommand::parse("type summary list"),
+            DebuggerCommand::Type(Ok(FormatterCommand::List(FormatterKind::Summary)))
+        );
+        assert_eq!(
+            DebuggerCommand::parse("type format delete #2"),
+            DebuggerCommand::Type(Ok(FormatterCommand::Delete(FormatterKind::Format, 2)))
+        );
+        assert_eq!(
+            DebuggerCommand::parse("type format clear"),
+            DebuggerCommand::Type(Ok(FormatterCommand::Clear(FormatterKind::Format)))
+        );
+        for (line, expected) in [
+            ("type", "needs `format` or `summary`"),
+            ("type filter add", "`type filter` is not a command"),
+            ("type format", "needs `add`, `list`"),
+            ("type format add uint256", "needs `-f <format>`"),
+            ("type summary add -f hex uint256", "unknown option `-f`"),
+            ("type format add -f", "`-f` needs a value"),
+            ("type format delete x", "needs the number"),
+            ("type summary add -s \"${var}", "is not closed"),
+        ] {
+            match DebuggerCommand::parse(line) {
+                DebuggerCommand::Type(Err(reason)) => {
+                    assert!(reason.contains(expected), "{line}: {reason}");
+                }
+                other => panic!("{line}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn print_takes_a_format_after_a_slash() {
+        assert_eq!(
+            DebuggerCommand::parse("p/x slot"),
+            DebuggerCommand::PrintAs {
+                format: "x".to_owned(),
+                path: "slot".to_owned()
+            }
+        );
+        assert_eq!(
+            DebuggerCommand::parse("print/decimals:6 balances[0xabc]"),
+            DebuggerCommand::PrintAs {
+                format: "decimals:6".to_owned(),
+                path: "balances[0xabc]".to_owned()
+            }
+        );
+        assert!(matches!(
+            DebuggerCommand::parse("print/ x"),
+            DebuggerCommand::Unknown(_)
+        ));
+        assert!(matches!(
+            DebuggerCommand::parse("next/x"),
+            DebuggerCommand::Unknown(_)
+        ));
+    }
 
     #[test]
     fn info_help_offers_json_only_for_resources() {

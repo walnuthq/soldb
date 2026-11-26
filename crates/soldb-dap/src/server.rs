@@ -18,10 +18,14 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use soldb_core::{encode_hex, SoldbError, SoldbResult, TransactionTrace};
-use soldb_debugger::{CachedChain, ChainRead, ChainStorage, ContractDebugInfo, StepLocation};
+use soldb_debugger::{
+    CachedChain, ChainRead, ChainStorage, ContractDebugInfo, DebugValue, StepLocation,
+    StorageWords, ValueFormat,
+};
 use soldb_ethdebug::{load_contract_mapping, load_debug_program, SourceMapEnvironment};
 use soldb_repl::{
-    BreakpointTarget, DebuggerState, SourceBreakpointTarget, StepOutcome, VariablesOrigin,
+    type_command, BreakpointTarget, DebuggerCommand, DebuggerState, Renderer,
+    SourceBreakpointTarget, StepOutcome, VariablesOrigin,
 };
 use soldb_rpc::trace_transaction;
 
@@ -278,6 +282,14 @@ impl DapServer {
         match self.load_launch_arguments(request.arguments.as_ref()) {
             Ok(summary) => {
                 let mut messages = vec![self.response(request, true, Some(json!({})), None)];
+                if !self.prepared {
+                    for output in self.init_commands(request.arguments.as_ref()) {
+                        messages.push(self.event(
+                            "output",
+                            Some(json!({"category": "console", "output": output})),
+                        ));
+                    }
+                }
                 if let Some(summary) = summary {
                     messages.push(self.event(
                         "output",
@@ -639,7 +651,15 @@ impl DapServer {
             .and_then(|args| args.get("expression"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let result = self.evaluate_expression(expression);
+        let result = match DebuggerCommand::parse(expression) {
+            // The debug console takes the commands that set how values are shown.
+            command @ DebuggerCommand::Type(_) => self.console_command(command),
+            DebuggerCommand::PrintAs { format, path } => match ValueFormat::parse(&format) {
+                Ok(format) => self.evaluate_as(path.trim(), &format),
+                Err(reason) => format!("<{reason}>"),
+            },
+            _ => self.evaluate_expression(expression),
+        };
         self.response(
             request,
             true,
@@ -790,6 +810,102 @@ impl DapServer {
         source.root.join(path).display().to_string()
     }
 
+    /// The `initCommands` of the launch arguments, run in order, and what each answered.
+    /// Like LLDB's, they set the session up; only `type` commands are taken here.
+    fn init_commands(&mut self, arguments: Option<&Value>) -> Vec<String> {
+        let Some(commands) = arguments
+            .and_then(|args| args.get("initCommands"))
+            .and_then(Value::as_array)
+        else {
+            return Vec::new();
+        };
+        let mut answers = Vec::new();
+        for command in commands {
+            let Some(line) = command.as_str() else {
+                answers.push(format!(
+                    "soldb: `initCommands` holds strings; {command} is not one\n"
+                ));
+                continue;
+            };
+            match DebuggerCommand::parse(line) {
+                parsed @ DebuggerCommand::Type(_) => answers.push(self.console_command(parsed)),
+                DebuggerCommand::Empty => {}
+                _ => answers.push(format!(
+                    "soldb: `{}` was not run; `initCommands` takes `type format` and `type summary` commands\n",
+                    line.trim()
+                )),
+            }
+        }
+        answers
+    }
+
+    /// A `type` command typed in the debug console, answered as the REPL would.
+    fn console_command(&mut self, command: DebuggerCommand) -> String {
+        let DebuggerCommand::Type(parsed) = command else {
+            return String::new();
+        };
+        let output = match parsed {
+            Ok(command) => type_command(self.debugger.formatters_mut(), command),
+            Err(reason) => soldb_repl::Output::Message {
+                level: soldb_repl::Level::Warning,
+                text: format!("Cannot set the format: {reason}"),
+                note: None,
+            },
+        };
+        Renderer::new(false).render(&output)
+    }
+
+    /// A state variable of the contract executing, for a `decimals:@<name>` format, or
+    /// why it cannot be read.
+    fn read_state(
+        &self,
+        words: Option<&StorageWords<'_>>,
+        path: &str,
+    ) -> Result<DebugValue, String> {
+        let Some(layout) = self.debugger.storage_layout() else {
+            return Err("no storage layout is loaded".to_owned());
+        };
+        let Some(words) = words else {
+            return Err("no storage was recorded".to_owned());
+        };
+        soldb_debugger::state_value(layout, words, path).map(|variable| variable.value)
+    }
+
+    /// `value`, shown under `name`, with the session's formats and summaries, or with
+    /// every number in `format` when one is given.
+    fn shown(&self, name: &str, value: &DebugValue, format: Option<&ValueFormat>) -> String {
+        if format.is_none() && self.debugger.formatters().is_empty() {
+            return value.display.clone();
+        }
+        let words = self
+            .debugger
+            .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage));
+        let read = |path: &str| self.read_state(words.as_ref(), path);
+        let view = self
+            .debugger
+            .formatters()
+            .view(self.debugger.contract_name(), &read);
+        match format {
+            Some(format) => view.render_as(value, format),
+            None => view.render(name, value),
+        }
+    }
+
+    /// `print/<format>` in the debug console: a local or a state variable, with every
+    /// number in it written in `format`.
+    fn evaluate_as(&self, path: &str, format: &ValueFormat) -> String {
+        if let Some(found) = self.local_value(path) {
+            return match found {
+                Ok(value) => self.shown(path, &value, Some(format)),
+                Err(reason) => format!("<{reason}>"),
+            };
+        }
+        match self.state_value(path) {
+            Ok(value) => self.shown(path, &value, Some(format)),
+            Err(reason) => reason,
+        }
+    }
+
     /// The locals at the current step, and whether they were inferred from the stack
     /// rather than read from compiler variable locations.
     fn local_variables(&self) -> (Vec<Value>, bool) {
@@ -803,7 +919,7 @@ impl DapServer {
             .map(|variable| {
                 json!({
                     "name": variable.name,
-                    "value": variable.value.display,
+                    "value": self.shown(&variable.name, &variable.value, None),
                     "type": variable.ty,
                     "variablesReference": 0
                 })
@@ -833,7 +949,7 @@ impl DapServer {
             .map(|variable| {
                 json!({
                     "name": variable.name,
-                    "value": variable.value.display,
+                    "value": self.shown(&variable.name, &variable.value, None),
                     "type": variable.ty,
                     "evaluateName": variable.name,
                     "variablesReference": 0
@@ -976,36 +1092,58 @@ impl DapServer {
     /// A local variable in scope at the current step, by name, or a path through one
     /// such as `item.tags[1]`.
     fn evaluate_local(&self, name: &str) -> Option<String> {
-        match self.debugger.local_path(name)? {
-            Ok(variable) => Some(variable.value.display),
+        match self.local_value(name)? {
+            Ok(value) => Some(self.shown(name, &value, None)),
             Err(reason) => Some(format!("<{reason}>")),
         }
+    }
+
+    /// The value of a local in scope, or of a path through one: inferred from the stack,
+    /// or, by name, at the location ETHDebug gives it. `None` when no local has the name.
+    fn local_value(&self, name: &str) -> Option<Result<DebugValue, String>> {
+        if let Some(found) = self.debugger.local_path(name) {
+            return Some(found.map(|variable| variable.value));
+        }
+        let step_variables = self.debugger.variables().ok()?;
+        step_variables
+            .variables
+            .into_iter()
+            .find(|variable| variable.name == name.trim())
+            .map(|variable| Ok(variable.value))
     }
 
     /// A storage path such as `counter` or `balances[0xabc]`, read through the storage
     /// layout when one is loaded, or a `transient` state variable by name.
     fn evaluate_state(&self, expression: &str) -> String {
+        match self.state_value(expression) {
+            Ok(value) => self.shown(expression, &value, None),
+            Err(reason) => reason,
+        }
+    }
+
+    /// The value at a storage path, or a `transient` state variable by name; `Err` is
+    /// what to show instead.
+    fn state_value(&self, expression: &str) -> Result<DebugValue, String> {
         if let (Some(layout), Some(words)) = (
             self.debugger.transient_storage_layout(),
             self.debugger.transient_words(),
         ) {
             if let Ok(variable) = soldb_debugger::state_value(layout, &words, expression) {
-                return variable.value.display;
+                return Ok(variable.value);
             }
         }
         let Some(layout) = self.debugger.storage_layout() else {
-            return "<unsupported expression>".to_owned();
+            return Err("<unsupported expression>".to_owned());
         };
         let Some(words) = self
             .debugger
             .storage_words_with_chain(self.chain.as_ref().map(|chain| chain as &dyn ChainStorage))
         else {
-            return "<unsupported expression>".to_owned();
+            return Err("<unsupported expression>".to_owned());
         };
-        match soldb_debugger::state_value(layout, &words, expression) {
-            Ok(variable) => variable.value.display,
-            Err(error) => format!("<{error}>"),
-        }
+        soldb_debugger::state_value(layout, &words, expression)
+            .map(|variable| variable.value)
+            .map_err(|error| format!("<{error}>"))
     }
 
     fn stopped_event(&mut self, outcome: StepOutcome) -> DapMessage {
@@ -1550,6 +1688,68 @@ mod tests {
             messages[0].body.as_ref().expect("body")["variables"][0]["value"],
             "42"
         );
+
+        // The debug console sets how values are shown, as the REPL's `type` commands do.
+        let evaluate = |server: &mut DapServer, seq: u64, expression: &str| {
+            let request =
+                DapMessage::request(seq, "evaluate", Some(json!({"expression": expression})));
+            server.handle_message(&request)[0]
+                .body
+                .as_ref()
+                .expect("body")["result"]
+                .as_str()
+                .expect("result")
+                .to_owned()
+        };
+        assert_eq!(
+            evaluate(&mut server, 5, "type format add -f hex --var x"),
+            "Format #1 added: hex for --var x\n"
+        );
+        let messages = server.handle_message(&variables);
+        assert_eq!(
+            messages[0].body.as_ref().expect("body")["variables"][0]["value"],
+            "0x2a"
+        );
+        assert_eq!(evaluate(&mut server, 6, "x"), "0x2a");
+        assert_eq!(evaluate(&mut server, 7, "p/decimals:1 x"), "4.2");
+        assert!(evaluate(&mut server, 8, "type format add -f nope x").contains("unknown format"));
+    }
+
+    #[test]
+    fn launch_runs_the_type_commands_of_init_commands() {
+        let temp = temp_dir("soldb-dap-init-commands");
+        std::fs::create_dir_all(&temp).expect("create temp");
+        let trace_file = temp.join("trace.json");
+        std::fs::write(
+            &trace_file,
+            serde_json::to_string(&sample_trace()).expect("trace json"),
+        )
+        .expect("write trace");
+        let mut server = DapServer::new();
+        let launch = DapMessage::request(
+            1,
+            "launch",
+            Some(json!({
+                "traceFile": trace_file.display().to_string(),
+                "initCommands": ["type format add -f decimals:18 uint256", "next", 7]
+            })),
+        );
+        let messages = server.handle_message(&launch);
+        assert_eq!(messages[0].success, Some(true));
+        let console = messages
+            .iter()
+            .filter(|message| message.event.as_deref() == Some("output"))
+            .map(|message| {
+                message.body.as_ref().expect("body")["output"]
+                    .as_str()
+                    .expect("output")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(console[0], "Format #1 added: decimals:18 for uint256\n");
+        assert!(console[1].contains("`next` was not run"), "{console:?}");
+        assert!(console[2].contains("7 is not one"), "{console:?}");
+        assert_eq!(server.debugger.formatters().formats().len(), 1);
     }
 
     #[test]

@@ -569,6 +569,114 @@ fn trace_interactive_accepts_repl_commands() {
 }
 
 #[test]
+fn a_session_starts_with_the_commands_of_its_init_file() {
+    let dir = temp_dir("init-file");
+    fs::write(
+        dir.join(".soldbinit"),
+        "# Token amounts\ntype format add -f decimals:6 --var balances\n\ntype format add -f nope uint256\nquit\n",
+    )
+    .expect("write .soldbinit");
+    let named = dir.join("formats.soldb");
+    fs::write(
+        &named,
+        "type summary add -s \"${var} USDC\" --var balances\n",
+    )
+    .expect("write the named init file");
+
+    let rpc_url = start_rpc_server(3);
+    let output = run_with_stdin(
+        Command::new(env!("CARGO_BIN_EXE_soldb"))
+            .current_dir(&dir)
+            .args(["trace", "0xabc", "--rpc", &rpc_url, "--interactive"]),
+        "type format list\nq\n",
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("Read 2 commands from `.soldbinit`"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("#1 decimals:6 for --var balances"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Format #1 added"), "{stdout}");
+    assert!(
+        stderr.contains(".soldbinit:4: Cannot add the format: unknown format `nope`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(".soldbinit:5: `quit` does not run from an init file"),
+        "{stderr}"
+    );
+
+    // `--init` names another file instead, and `--no-init` reads none.
+    let rpc_url = start_rpc_server(3);
+    let output = run_with_stdin(
+        Command::new(env!("CARGO_BIN_EXE_soldb"))
+            .current_dir(&dir)
+            .args([
+                "trace",
+                "0xabc",
+                "--rpc",
+                &rpc_url,
+                "--interactive",
+                "--init",
+                named.to_str().expect("utf8 path"),
+            ]),
+        "type format list\ntype summary list\nq\n",
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(output.status.success());
+    assert!(stdout.contains("No format set"), "{stdout}");
+    assert!(
+        stdout.contains(r#"#1 "${var} USDC" for --var balances"#),
+        "{stdout}"
+    );
+
+    let rpc_url = start_rpc_server(3);
+    let output = run_with_stdin(
+        Command::new(env!("CARGO_BIN_EXE_soldb"))
+            .current_dir(&dir)
+            .args([
+                "trace",
+                "0xabc",
+                "--rpc",
+                &rpc_url,
+                "--interactive",
+                "--no-init",
+            ]),
+        "type format list\nq\n",
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(output.status.success());
+    assert!(!stdout.contains(".soldbinit"), "{stdout}");
+    assert!(stdout.contains("No format set"), "{stdout}");
+
+    // A file `--init` names has to be there.
+    let rpc_url = start_rpc_server(3);
+    let output = run_with_stdin(
+        Command::new(env!("CARGO_BIN_EXE_soldb"))
+            .current_dir(&dir)
+            .args([
+                "trace",
+                "0xabc",
+                "--rpc",
+                &rpc_url,
+                "-i",
+                "--init",
+                "missing.soldb",
+            ]),
+        "q\n",
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("cannot read the init file `missing.soldb`"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn trace_interactive_accepts_source_line_breakpoints() {
     let (_dir, spec) = write_source_breakpoint_debug_dir();
     let rpc_url = start_rpc_server(3);

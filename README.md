@@ -286,6 +286,7 @@ banner, or colour. Editors use the same engine through `soldb-dap`. See
 - Step forward and backward by source line or instruction; `goto` any step
 - Breakpoints on lines, functions, storage writes, reverts, calls, and opcodes, with conditions on variables
 - Locals and state variables decoded by type, including memory structs, arrays, strings, calldata slices, mappings, and enums; `print` follows paths such as `orders[1].status`
+- Values shown the way they are meant: token amounts in their decimals (read from the contract's own `decimals` where it stores them), timestamps as dates, `sqrtPriceX96` as a price, structs as one-line summaries, with LLDB-style `type format` and `type summary` rules kept per project in `.soldbinit`
 - Call stack with decoded arguments; stack, memory, storage, and calldata at any step
 - Transaction traces, call simulation, and `soldb run` for compiled bytecode with no node
 - Replay backend for nodes without `debug_traceTransaction`; `--save-replay` files reproduce a trace on any machine

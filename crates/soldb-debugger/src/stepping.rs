@@ -435,10 +435,12 @@ impl ContractDebugInfo {
         self
     }
 
-    /// Hands the sources' enum declarations to a layout, so an enum shows by variant name.
+    /// Hands the sources' enum and user-defined value type declarations to a layout, so
+    /// an enum shows by variant name and a value type is read as the type it wraps.
     fn with_enum_variants(&self, layout: Option<StorageLayout>) -> Option<StorageLayout> {
         layout.map(|mut layout| {
             layout.enum_variants = self.types.enum_variants_by_name();
+            layout.value_types = self.types.value_types_by_name();
             layout
         })
     }
@@ -2587,6 +2589,7 @@ impl StepMap {
             display: "<unavailable>".to_owned(),
             raw: None,
             status: DebugValueStatus::Unavailable,
+            shape: None,
         };
         layout
             .iter()

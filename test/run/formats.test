@@ -1,0 +1,44 @@
+# Formats and summaries show values the way they are meant: an amount in the decimals
+# the contract stores, a timestamp as a date, basis points as a percentage, a Q64.96
+# price as a number, a `bytes32` as text, and a struct as one line. The rules come from
+# an init file, as a project's `.soldbinit` would hold them. No node: the contract is
+# compiled here and run on a local chain.
+# REQUIRES: soldb
+# RUN: %soldb compile %S/../examples/Formats.sol -o %t.out --solc %{solc_path} > /dev/null 2>&1
+# RUN: echo 'type format add -f decimals:@decimals --var totalSupply --var balances' > %t.soldbinit
+# RUN: echo 'type format add -f timestamp --var deadline' >> %t.soldbinit
+# RUN: echo 'type format add -f bps --var feeBps' >> %t.soldbinit
+# RUN: echo 'type format add -f q96 Price' >> %t.soldbinit
+# RUN: echo 'type format add -f string --var symbol' >> %t.soldbinit
+# RUN: echo 'type summary add -s "${liquidity%%wad} in [${tickLower}, ${tickUpper}]" Position' >> %t.soldbinit
+# RUN: printf 'break Formats.sol:36 if totalSupply == 1_500e6\ncontinue\nvars\nprint balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]\np/x totalSupply\np/d sqrtPriceX96\ntype format list\nquit\n' | %soldb run %t.out/Formats.bin "mint(address,uint256)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 1500 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Formats:%t.out --init %t.soldbinit -i 2>&1 | FileCheck %s
+
+# The init file runs quietly, before the session starts.
+# CHECK: Read 6 commands from `{{.*}}.soldbinit`
+# CHECK-NOT: Format #1 added
+
+# A condition takes a number written the way Solidity writes one.
+# CHECK: Breakpoint #1 hit at step {{[0-9]+}}, {{.*}}Formats.sol:36 if totalSupply == 1_500e6
+
+# CHECK: State:
+# CHECK-NEXT: uint8 decimals = 6 [slot 0x0]
+# CHECK-NEXT: uint256 totalSupply = 1500 [slot 0x1]
+# CHECK-NEXT: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x2]
+# CHECK-NEXT: uint256 deadline = 2023-11-14T22:13:20Z [slot 0x3]
+# CHECK-NEXT: uint16 feeBps = 2.5% [slot 0x4]
+# CHECK-NEXT: Formats.Price sqrtPriceX96 = 1 [slot 0x4 + 2]
+# CHECK-NEXT: bytes32 symbol = "USDC" [slot 0x5]
+# CHECK-NEXT: struct Formats.Position position = 3 in [-10, 10] [slot 0x6]
+
+# A mapping entry is shown under the mapping's name, so `--var balances` reaches it.
+# CHECK: uint256 balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266] = 1500 [slot 0x{{[0-9a-f]+}}]
+
+# A format given to `print` writes every number in it, whatever the rules say.
+# CHECK: uint256 totalSupply = 0x59682f00 [slot 0x1]
+# CHECK: Formats.Price sqrtPriceX96 = 79228162514264337593543950336 [slot 0x4 + 2]
+
+# CHECK: #1 decimals:@decimals for --var totalSupply --var balances
+# CHECK-NEXT: #2 timestamp for --var deadline
+# CHECK-NEXT: #3 bps for --var feeBps
+# CHECK-NEXT: #4 q96 for Price
+# CHECK-NEXT: #5 string for --var symbol

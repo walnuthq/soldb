@@ -331,6 +331,9 @@ A condition compares values the debugger can read at that step:
 - `pc`, `gas`, `depth`, and `step` as numbers, and `op` as text.
 
 Operands are those names, decimal or `0x` numbers, `true`, `false`, and quoted strings.
+Numbers can also be written the way Solidity writes them, which is how a token amount is
+easiest to give: `amount > 1.5e18`, `balance >= 1_000e6`. Such a number has to be whole;
+`1.55e1` is refused rather than rounded.
 Comparisons are `==`, `!=`, `<`, `<=`, `>`, and `>=`; a bare name holds when it is true or
 non-zero. Terms join with `&&` and `||`, which is as far as it goes: there is no
 arithmetic and no calls, because evaluating those would mean executing Solidity, and the
@@ -748,6 +751,173 @@ array reports the entry's own slot, so the value can be checked against `storage
 If the name is not live at the current program counter and names no state variable, SolDB
 says so and names the PC it looked at, so you can step to a point where the variable is in
 scope.
+
+### `print/<format> <variable>`
+
+Aliases: `p/<format> <variable>`
+
+Print one variable with every number in it written in a [format](#formats), whatever
+`type format` has set: GDB's `print/x`, with the formats a contract needs.
+
+```text
+soldb> p/x counter
+uint256 counter = 0x4 [slot 0x0]
+soldb> p/decimals:6 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]
+uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = 25.5 [slot 0xa3c1…9502]
+soldb> p/timestamp deadline
+uint256 deadline = 2026-11-26T09:30:00Z [slot 0x4]
+```
+
+## Formats and Summaries
+
+Nearly every number in a contract is an integer that means something else: a token amount
+scaled by its decimals, a price by `1e18` or `2**96`, a deadline counting seconds since
+1970. The debugger decodes a value by its type, which shows `25500000`; a *format* shows the
+same value as `25.5`. A *summary* goes further and writes a whole value as a one-line
+template. Both follow LLDB's `type format` and `type summary`, and both change only what is
+shown: `raw` in the JSON answers still carries the word, and a breakpoint condition still
+compares the value itself.
+
+### `type format add -f <format> [<type>...] [--var <name>]... [--contract <name>]`
+
+Show the values a rule selects in a format:
+
+```text
+soldb> type format add -f decimals:6 --var balances --var totalSupply --var value --contract USDC
+Format #1 added: decimals:6 for --var balances --var totalSupply --var value --contract USDC
+soldb> type format add -f decimals:18 UD60x18
+Format #2 added: decimals:18 for UD60x18
+soldb> type format add -f timestamp --var '*deadline*' --var expiry
+Format #3 added: timestamp for --var *deadline* --var expiry
+soldb> vars
+uint256 value = 25.5 [stack+2]
+State:
+uint8 decimals = 6 [slot 0x0]
+uint256 totalSupply = 1000000.5 [slot 0x1]
+mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x2]
+soldb> print balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]
+uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = 25.5 [slot 0xa3c1…9502]
+```
+
+A rule selects values in up to three ways, and a value has to meet every one given:
+
+- **types**, the words without an option: the declared type, such as `uint256`, a
+  user-defined value type such as `UD60x18` or `Pool.Price`, or a struct for a summary.
+  A type is matched with and without the contract or library that declares it, so
+  `Position` matches `Pool.Position`.
+- **`--var <name>`**, repeatable: the name the value is shown under. That is the
+  variable's own name, a struct member's name, and, for the entries of a mapping or an
+  array, the name of the mapping or array: `--var balances` formats `balances[0xabc…]`.
+  This is the one that matters most in Solidity, where nearly every amount is a `uint256`
+  and its type says nothing about its decimals.
+- **`--contract <name>`**: only in that contract's code, so two tokens with different
+  decimals can share variable names.
+
+Names and types take `*` and `?` wildcards; quote them in a shell. When several rules match
+a value, the one added last wins, so a later, narrower rule overrides an earlier, broader
+one; `-f default` turns formatting off for what it matches:
+
+```text
+soldb> type format add -f decimals:18 uint256
+soldb> type format add -f default --var nonce --var '*Id'
+```
+
+A format applies inside a struct and an array, member by member, and a format that reads a
+value as a number (`decimals`, `bps`, `q`, `timestamp`, `duration`) leaves addresses, enums,
+and other non-numbers as they are.
+
+### Formats
+
+| format | shows | for |
+| --- | --- | --- |
+| `decimal`, `d` | `1500000000000000000`, every digit of a 256-bit value | the full number |
+| `hex`, `x` | `0x14d1120d7b160000` | slots, flags, raw words |
+| `binary`, `t` | `0b101` | bitmaps |
+| `decimals:<n>` | `1.5`, exact, no trailing zeros | token amounts, prices scaled by `10**n` |
+| `ether`, `wad` | `decimals:18` | |
+| `gwei` | `decimals:9` | |
+| `ray` | `decimals:27` | Aave and Maker rates |
+| `decimals:@<state variable>` | `decimals:<n>` with `n` read from the contract | a token's own `decimals` |
+| `bps` | `2.5%` for `250` | fees in basis points |
+| `q<bits>` | the value divided by `2**bits`: `1` for `2**96` with `q96` | `sqrtPriceX96`, Q64.64 |
+| `timestamp` | `2026-11-26T09:30:00Z` | `block.timestamp`, deadlines, expiries |
+| `duration` | `7d 3h 20m` | lock-ups, periods |
+| `string`, `s` | `"ETH-A"` | text stored in a `bytes32` |
+| `default` | the value as the debugger decodes it | exempting values from a rule |
+
+A fixed-point value is exact. A `q` value is exact when its fraction ends within 18 digits,
+and otherwise cut there and marked `…`, so a rounded number never passes for an exact one.
+Signed values keep their sign in every format but `hex` and `binary`, which write the
+two's complement as it is stored.
+
+`decimals:@decimals` takes the number of decimal places from a state variable of the
+contract executing, which is how a token's amounts read in its own decimals without saying
+what they are. It works where the contract keeps them in storage, as USDC does; a token
+that returns a constant from `decimals()`, as OpenZeppelin's `ERC20` does, keeps nothing to
+read, and the value says so next to the number rather than guessing:
+
+```text
+uint256 amount = 1500000 <decimals unknown: no state variable named `decimals` in the storage layout>
+```
+
+For such a token, name the decimals: `-f decimals:18 --contract Token`.
+
+### `type summary add -s <template> [<type>...] [--var <name>]... [--contract <name>]`
+
+Show a value as a one-line template. `${var}` is the value itself, `${var.member}` (or
+`${member}`) a member of a struct, `${var.items[2]}` an element, and a placeholder may end
+in `%<format>` to write that part in a format:
+
+```text
+soldb> type summary add -s "${liquidity%wad} in [${tickLower}, ${tickUpper}]" Position
+Summary #4 added: "${liquidity%wad} in [${tickLower}, ${tickUpper}]" for Position
+soldb> print position
+struct Pool.Position position = 3 in [-10, 10] [slot 0x3]
+soldb> type summary add -s "${var%decimals:6} USDC" --var balances --contract USDC
+```
+
+A part without a format is shown with the formats that match it. Summaries match the way
+formats do, and apply to structs and to single values; the one added last wins.
+
+### `type format list`, `type summary list`
+
+List the rules, numbered, in the order they were added, each written as the arguments that
+set it, so a list can be pasted into an init file.
+
+### `type format delete <n>`, `type format clear`
+
+Remove one rule by number, or all of them; `type summary delete` and `type summary clear`
+do the same for summaries.
+
+### `.soldbinit`
+
+Formats belong to a project rather than to one session, so a session starts by running the
+commands in `.soldbinit` in the current directory, when there is one, before any `-x`
+command. `--init <file>` reads another file instead and `--no-init` reads none. Lines that
+start with `#` are comments:
+
+```text
+# Token amounts
+type format add -f decimals:@decimals --var balance* --var totalSupply --var amount --var value
+type format add -f decimals:18 --contract WETH --var balanceOf --var totalSupply
+type format add -f timestamp --var *deadline* --var *Timestamp
+type summary add -s "${var%decimals:6} USDC" --var balances --contract USDC
+```
+
+What the commands answer is not printed; the session says once how many it read, and a
+command that fails is reported on stderr with its file and line. An init file can hold any
+command, breakpoints and movements included, except `quit` and `tui`.
+
+The DAP server takes the same commands: in the debug console, and from the
+`initCommands` array of the launch arguments, as LLDB's adapter does:
+
+```json
+{"request": "launch", "traceFile": "trace.json",
+ "initCommands": ["type format add -f decimals:6 --var balances"]}
+```
+
+So do the WebAssembly bindings, through `trace.formatCommands`, which takes the text of a
+`.soldbinit`; see [the WebAssembly API](wasm.md#api).
 
 ## Metadata
 

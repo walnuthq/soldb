@@ -14,6 +14,10 @@
 //! oracle, so the host fetches the JSON-RPC responses and the ETHDebug artifacts itself
 //! and hands them over. What comes out is the same [`TransactionTrace`] the CLI produces
 //! from the same inputs.
+//!
+//! How values are shown is the host's to choose, with the same `type format` and
+//! `type summary` commands the REPL takes: a host reads a project's `.soldbinit` and
+//! passes its text to [`Trace::format_commands`].
 
 use std::collections::BTreeMap;
 
@@ -21,7 +25,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soldb_core::{SoldbError, SoldbResult, TraceCapabilities, TransactionTrace};
-use soldb_debugger::DebugSession;
+use soldb_debugger::{
+    DebugSession, DebugValue, FormatterAnswer, FormatterCommand, FormatterKind, Formatters,
+};
 use soldb_ethdebug::{read_compilation_source, EthdebugInfo};
 use soldb_evm::{DebugTraceResult, RpcReceipt, RpcTransaction, SimulateCallRequest};
 
@@ -97,6 +103,8 @@ struct LoadedArtifacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trace {
     session: DebugSession,
+    /// How the variables of a step are shown: what [`Trace::format_commands`] set.
+    formatters: Formatters,
 }
 
 /// Parses one JSON argument, naming it in the error so a caller with several string
@@ -183,6 +191,7 @@ impl Trace {
     pub(crate) fn from_trace(trace: TransactionTrace) -> Self {
         Self {
             session: DebugSession::new(trace),
+            formatters: Formatters::new(),
         }
     }
 
@@ -209,12 +218,55 @@ impl Trace {
     /// Serializes one step, or returns `None` past the end of the trace.
     ///
     /// With debug info attached the step carries its source span, enclosing function,
-    /// and decoded variables; without it, opcode-level state only.
+    /// and decoded variables, shown with the formats [`Trace::format_commands`] set;
+    /// without it, opcode-level state only.
     pub fn step_json(&self, index: usize) -> SoldbResult<Option<String>> {
-        self.session
-            .step(index)
-            .map(|step| to_json(&step))
-            .transpose()
+        let Some(mut step) = self.session.step(index) else {
+            return Ok(None);
+        };
+        if !self.formatters.is_empty() {
+            let contract = self
+                .session
+                .ethdebug
+                .as_ref()
+                .map(|info| info.contract_name.as_str());
+            let view = self.formatters.view(contract, &no_state);
+            for variable in &mut step.variables {
+                variable.value.display = view.render(&variable.name, &variable.value);
+            }
+        }
+        to_json(&step).map(Some)
+    }
+
+    /// Runs `type format` and `type summary` commands, one per line, as a `.soldbinit`
+    /// holds them: blank lines and lines starting with `#` are skipped.
+    ///
+    /// The answer is a JSON array with one object per command, tagged by `kind` the way
+    /// the CLI's `--json` answers are (`formatter`, `formatters`, or a `message` saying
+    /// what went wrong), with the `line` it came from. The formats apply to every step
+    /// serialized after.
+    pub fn format_commands(&mut self, commands: &str) -> SoldbResult<String> {
+        let mut answers = Vec::new();
+        for (index, line) in commands.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let answer = match line
+                .strip_prefix("type")
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            {
+                Some(rest) => match FormatterCommand::parse(rest) {
+                    Ok(command) => self.formatters.run(command),
+                    Err(reason) => Err(format!("Cannot set the format: {reason}")),
+                },
+                None => Err(format!(
+                    "`{line}` is not a `type format` or `type summary` command"
+                )),
+            };
+            answers.push(Answer::new(answer, index + 1));
+        }
+        to_json(&answers)
     }
 
     #[must_use]
@@ -256,6 +308,83 @@ impl Trace {
     #[must_use]
     pub fn session(&self) -> &DebugSession {
         &self.session
+    }
+}
+
+/// What a `decimals:@<name>` format reads here: nothing, since a host hands over no
+/// storage layout.
+fn no_state(path: &str) -> Result<DebugValue, String> {
+    Err(format!(
+        "the WebAssembly bindings do not read state variables such as `{path}`"
+    ))
+}
+
+/// A formatter command's answer, in the shape of the CLI's `--json` answers, with the
+/// line of the input it answers.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Answer {
+    Formatter {
+        event: &'static str,
+        formatter: FormatterKind,
+        id: u32,
+        label: String,
+        line: usize,
+    },
+    Formatters {
+        formatter: FormatterKind,
+        rules: Vec<Rule>,
+        line: usize,
+    },
+    Message {
+        level: &'static str,
+        text: String,
+        line: usize,
+    },
+}
+
+#[derive(Serialize)]
+struct Rule {
+    id: u32,
+    label: String,
+}
+
+impl Answer {
+    fn new(answer: Result<FormatterAnswer, String>, line: usize) -> Self {
+        match answer {
+            Ok(FormatterAnswer::Added { kind, id, label }) => Self::Formatter {
+                event: "added",
+                formatter: kind,
+                id,
+                label,
+                line,
+            },
+            Ok(FormatterAnswer::Deleted { kind, id }) => Self::Formatter {
+                event: "deleted",
+                formatter: kind,
+                id,
+                label: String::new(),
+                line,
+            },
+            Ok(FormatterAnswer::Listed { kind, rules }) => Self::Formatters {
+                formatter: kind,
+                rules: rules
+                    .into_iter()
+                    .map(|(id, label)| Rule { id, label })
+                    .collect(),
+                line,
+            },
+            Ok(FormatterAnswer::Cleared { kind, count }) => Self::Message {
+                level: "info",
+                text: format!("Deleted {}", kind.counted(count)),
+                line,
+            },
+            Err(text) => Self::Message {
+                level: "warning",
+                text,
+                line,
+            },
+        }
     }
 }
 
@@ -617,6 +746,64 @@ mod tests {
         // Variables are scoped to the program counter they were declared at.
         assert!(step_at(&trace, 0).variables.is_empty());
         assert!(step_at(&trace, 2).variables.is_empty());
+    }
+
+    #[test]
+    fn format_commands_set_how_step_variables_are_shown() {
+        let mut trace = trace();
+        trace.attach_ethdebug(&counter_artifacts()).expect("attach");
+        let answers: Value = serde_json::from_str(
+            &trace
+                .format_commands(
+                    "# Counter.sol\n\
+                     type format add -f decimals:@decimals uint256\n\
+                     type format add -f hex --var count\n\
+                     \n\
+                     type summary add -s \"${var} wei\" --var count --contract Counter\n\
+                     type format add -f nope uint256\n\
+                     next\n\
+                     type format list\n",
+                )
+                .expect("answers"),
+        )
+        .expect("JSON");
+        assert_eq!(
+            answers[1],
+            json!({"kind": "formatter", "event": "added", "formatter": "format", "id": 2, "label": "hex for --var count", "line": 3})
+        );
+        assert_eq!(answers[2]["formatter"], "summary");
+        assert_eq!(answers[2]["line"], 5);
+        assert_eq!(answers[3]["kind"], "message");
+        assert!(answers[3]["text"]
+            .as_str()
+            .expect("text")
+            .starts_with("Cannot add the format: unknown format `nope`"));
+        assert_eq!(
+            answers[4]["text"],
+            "`next` is not a `type format` or `type summary` command"
+        );
+        assert_eq!(
+            answers[5]["rules"][0]["label"],
+            "decimals:@decimals for uint256"
+        );
+
+        // The summary wins for `count`, and writes the value itself in the format added
+        // last of those that match it.
+        let step = step_at(&trace, 1);
+        assert_eq!(step.variables[0].value.display, "0x40 wei");
+        assert_eq!(step.variables[0].value.raw.as_deref(), Some("0x40"));
+        assert_eq!(step.variables[1].value.display, SENDER);
+
+        // Without the summary, the decimals format reads the contract's state, which these
+        // bindings do not have, and says so beside the value.
+        trace.format_commands("type summary clear").expect("clear");
+        trace
+            .format_commands("type format delete 2")
+            .expect("delete");
+        assert_eq!(
+            step_at(&trace, 1).variables[0].value.display,
+            "64 <decimals unknown: the WebAssembly bindings do not read state variables such as `decimals`>"
+        );
     }
 
     #[test]

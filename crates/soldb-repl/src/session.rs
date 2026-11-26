@@ -8,15 +8,16 @@
 
 use soldb_core::encode_hex;
 use soldb_debugger::{
-    state_value, state_variables, ChainStorage, DebugValueStatus, DebugVariable, StateSource,
-    StateVariable, StorageWords, INFERRED_LOCALS_WARNING,
+    state_value, state_variables, ChainStorage, DebugValue, DebugValueStatus, DebugVariable,
+    FormatterAnswer, FormatterCommand, Formatters, StateSource, StateVariable, StorageWords,
+    ValueFormat, ValueFormatter, INFERRED_LOCALS_WARNING,
 };
 
 use crate::command::{command_spec, CommandGroup, COMMANDS};
 use crate::response::{
-    ArgumentInfo, BreakpointEvent, BreakpointInfo, FrameInfo, Level, ListedLine, LoadedContract,
-    MemoryInfo, MemoryWord, Output, ResourceInfo, SlotInfo, StateInfo, Stop, StopLocation,
-    StopReason, ValueStatus, VariableInfo,
+    ArgumentInfo, BreakpointEvent, BreakpointInfo, FormatterEvent, FormatterInfo, FrameInfo, Level,
+    ListedLine, LoadedContract, MemoryInfo, MemoryWord, Output, ResourceInfo, SlotInfo, StateInfo,
+    Stop, StopLocation, StopReason, ValueStatus, VariableInfo,
 };
 use crate::{
     BreakpointKind, DebuggerCommand, DebuggerInfoCommand, DebuggerState, DisplayMode, StepOutcome,
@@ -148,6 +149,24 @@ impl Session {
                     vec![self.variables(Some(name))]
                 }
             }
+            DebuggerCommand::PrintAs { format, path } => {
+                let path = path.trim();
+                match ValueFormat::parse(&format) {
+                    Err(reason) => vec![message(Level::Warning, format!("Cannot print: {reason}"))],
+                    Ok(_) if path.is_empty() => {
+                        vec![message(Level::Warning, "Usage: print/<format> <variable>")]
+                    }
+                    Ok(format) => vec![self.variables_as(Some(path), Some(&format))],
+                }
+            }
+            DebuggerCommand::Type(Ok(command)) => {
+                vec![type_command(self.state.formatters_mut(), command)]
+            }
+            DebuggerCommand::Type(Err(reason)) => vec![Output::Message {
+                level: Level::Warning,
+                text: format!("Cannot set the format: {reason}"),
+                note: Some("type `help type` for the syntax".to_owned()),
+            }],
             DebuggerCommand::Backtrace => vec![self.backtrace()],
             DebuggerCommand::List => vec![self.listing(LISTING_RADIUS)],
             DebuggerCommand::Memory { offset, length } => vec![self.memory(offset, length)],
@@ -305,6 +324,14 @@ impl Session {
         } else {
             (None, None)
         };
+        let words = self.storage_words();
+        let current = self.state.contract_name();
+        let read = |path: &str| self.read_state(words.as_ref(), path);
+        let elsewhere = |path: &str| {
+            Err(format!(
+                "`{path}` is read only for the contract executing at this step"
+            ))
+        };
         let frames = frames
             .iter()
             .enumerate()
@@ -316,14 +343,26 @@ impl Session {
                     .or_else(|| frame.contract_name.clone())
                     .or_else(|| frame.address.clone())
                     .unwrap_or_else(|| "<unknown>".to_owned()),
-                arguments: frame
-                    .arguments
-                    .iter()
-                    .map(|argument| ArgumentInfo {
-                        name: argument.name.clone(),
-                        value: argument.value.display.clone(),
-                    })
-                    .collect(),
+                arguments: {
+                    // A `decimals:@<name>` reads the state of the contract executing now,
+                    // which is not the state of another frame's contract.
+                    let contract = frame.contract_name.as_deref();
+                    let state: &dyn Fn(&str) -> Result<DebugValue, String> =
+                        if contract.is_some() && contract == current {
+                            &read
+                        } else {
+                            &elsewhere
+                        };
+                    let view = self.state.formatters().view(contract, state);
+                    frame
+                        .arguments
+                        .iter()
+                        .map(|argument| ArgumentInfo {
+                            name: argument.name.clone(),
+                            value: view.render(&argument.name, &argument.value),
+                        })
+                        .collect()
+                },
                 location: frame
                     .location
                     .as_ref()
@@ -565,6 +604,27 @@ impl Session {
     /// The variables in scope at the current step, or the one named by `filter`, which
     /// may be a path into a local or a state variable.
     pub fn variables(&mut self, filter: Option<&str>) -> Output {
+        self.variables_as(filter, None)
+    }
+
+    /// A state variable of the contract executing, as a `decimals:@<name>` format reads
+    /// it, or why it cannot be read.
+    fn read_state(
+        &self,
+        words: Option<&StorageWords<'_>>,
+        path: &str,
+    ) -> Result<DebugValue, String> {
+        let Some(layout) = self.state.storage_layout() else {
+            return Err("no storage layout is loaded".to_owned());
+        };
+        let Some(words) = words else {
+            return Err("no storage was recorded".to_owned());
+        };
+        state_value(layout, words, path).map(|variable| variable.value)
+    }
+
+    /// [`Session::variables`], with every number written in `format` when one is given.
+    fn variables_as(&mut self, filter: Option<&str>, format: Option<&ValueFormat>) -> Output {
         let Some(step) = self.state.current_step_data() else {
             return message(Level::Warning, "Cannot read variables: no trace is loaded");
         };
@@ -603,12 +663,18 @@ impl Session {
         let chain_label = words.as_ref().and_then(StorageWords::chain_label);
         let transient_words = self.state.transient_words();
         let transient_layout = self.state.transient_storage_layout();
+        let read = |path: &str| self.read_state(words.as_ref(), path);
+        let view = self
+            .state
+            .formatters()
+            .view(self.state.contract_name(), &read);
+        let shown = Shown { view, format };
 
         if let Some(name) = filter {
             if let Some(variable) = locals.iter().find(|variable| variable.name == name) {
                 return Output::Variable {
                     warning,
-                    variable: local_info(variable),
+                    variable: local_info(variable, &shown),
                 };
             }
             // A path through a local: `item.tags[1]`, `stored.owners[0xabc]`, `blob.length`.
@@ -616,7 +682,7 @@ impl Session {
                 Some(Ok(variable)) => {
                     return Output::Variable {
                         warning,
-                        variable: local_info(&variable),
+                        variable: local_info(&variable, &shown),
                     }
                 }
                 Some(Err(reason)) => {
@@ -631,7 +697,7 @@ impl Session {
                 if let Ok(variable) = state_value(transient_layout, transient_words, name) {
                     return Output::Variable {
                         warning,
-                        variable: transient_info(&variable),
+                        variable: transient_info(&variable, &shown),
                     };
                 }
             }
@@ -647,7 +713,7 @@ impl Session {
             return match state_value(layout, words, name) {
                 Ok(variable) => Output::Variable {
                     warning,
-                    variable: state_info(&variable, chain_label),
+                    variable: state_info(&variable, chain_label, &shown),
                 },
                 Err(error) => Output::Message {
                     level: Level::Warning,
@@ -667,7 +733,7 @@ impl Session {
             (Some(layout), Some(words)) => StateInfo::Variables {
                 variables: state_variables(layout, words)
                     .iter()
-                    .map(|variable| state_info(variable, chain_label))
+                    .map(|variable| state_info(variable, chain_label, &shown))
                     .collect(),
             },
             (Some(_), None) => StateInfo::NoStorage,
@@ -676,14 +742,17 @@ impl Session {
         let transient = match (transient_layout, transient_words.as_ref()) {
             (Some(layout), Some(words)) => state_variables(layout, words)
                 .iter()
-                .map(transient_info)
+                .map(|variable| transient_info(variable, &shown))
                 .collect(),
             _ => Vec::new(),
         };
         Output::Variables {
             warning,
             pc,
-            locals: locals.iter().map(local_info).collect(),
+            locals: locals
+                .iter()
+                .map(|variable| local_info(variable, &shown))
+                .collect(),
             unavailable,
             state,
             transient,
@@ -750,6 +819,51 @@ impl Session {
     }
 }
 
+/// Runs a `type format` or `type summary` command against a session's formatters.
+pub fn type_command(formatters: &mut Formatters, command: FormatterCommand) -> Output {
+    match formatters.run(command) {
+        Ok(FormatterAnswer::Added { kind, id, label }) => Output::Formatter {
+            event: FormatterEvent::Added,
+            formatter: kind,
+            id,
+            label,
+        },
+        Ok(FormatterAnswer::Deleted { kind, id }) => Output::Formatter {
+            event: FormatterEvent::Deleted,
+            formatter: kind,
+            id,
+            label: String::new(),
+        },
+        Ok(FormatterAnswer::Listed { kind, rules }) => Output::Formatters {
+            formatter: kind,
+            rules: rules
+                .into_iter()
+                .map(|(id, label)| FormatterInfo { id, label })
+                .collect(),
+        },
+        Ok(FormatterAnswer::Cleared { kind, count }) => {
+            message(Level::Info, format!("Deleted {}", kind.counted(count)))
+        }
+        Err(reason) => message(Level::Warning, reason),
+    }
+}
+
+/// How a command shows values: through the session's formats, or with every number in
+/// one format, as `print/<format>` asks.
+struct Shown<'a> {
+    view: ValueFormatter<'a>,
+    format: Option<&'a ValueFormat>,
+}
+
+impl Shown<'_> {
+    fn value(&self, name: &str, value: &DebugValue) -> String {
+        match self.format {
+            Some(format) => self.view.render_as(value, format),
+            None => self.view.render(name, value),
+        }
+    }
+}
+
 fn message(level: Level, text: impl Into<String>) -> Output {
     Output::Message {
         level,
@@ -768,11 +882,11 @@ fn status(status: DebugValueStatus) -> ValueStatus {
 
 /// A local, parameter, or return value with the stack slot it was read from, or without
 /// one when it could not be read.
-fn local_info(variable: &DebugVariable) -> VariableInfo {
+fn local_info(variable: &DebugVariable, shown: &Shown<'_>) -> VariableInfo {
     VariableInfo {
         name: variable.name.clone(),
         ty: variable.ty.clone(),
-        value: variable.value.display.clone(),
+        value: shown.value(&variable.name, &variable.value),
         raw: variable.value.raw.clone(),
         status: status(variable.value.status),
         place: (variable.value.status != DebugValueStatus::Unavailable)
@@ -780,7 +894,11 @@ fn local_info(variable: &DebugVariable) -> VariableInfo {
     }
 }
 
-fn state_info(variable: &StateVariable, chain_label: Option<&str>) -> VariableInfo {
+fn state_info(
+    variable: &StateVariable,
+    chain_label: Option<&str>,
+    shown: &Shown<'_>,
+) -> VariableInfo {
     let mut place = if variable.offset == 0 {
         format!("slot {}", variable.slot)
     } else {
@@ -792,7 +910,7 @@ fn state_info(variable: &StateVariable, chain_label: Option<&str>) -> VariableIn
     VariableInfo {
         name: variable.name.clone(),
         ty: variable.ty.clone(),
-        value: variable.value.display.clone(),
+        value: shown.value(&variable.name, &variable.value),
         raw: variable.value.raw.clone(),
         status: status(variable.value.status),
         place: Some(place),
@@ -800,7 +918,7 @@ fn state_info(variable: &StateVariable, chain_label: Option<&str>) -> VariableIn
 }
 
 /// A `transient` state variable, its place marked so it is not read as a storage slot.
-fn transient_info(variable: &StateVariable) -> VariableInfo {
+fn transient_info(variable: &StateVariable, shown: &Shown<'_>) -> VariableInfo {
     let place = if variable.offset == 0 {
         format!("transient slot {}", variable.slot)
     } else {
@@ -808,7 +926,7 @@ fn transient_info(variable: &StateVariable) -> VariableInfo {
     };
     VariableInfo {
         place: Some(place),
-        ..state_info(variable, None)
+        ..state_info(variable, None, shown)
     }
 }
 
