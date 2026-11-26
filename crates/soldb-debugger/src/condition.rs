@@ -300,8 +300,47 @@ impl Operand {
                 .map(Self::Literal)
                 .map_err(|error| error.to_string());
         }
+        if input.starts_with(|character: char| character.is_ascii_digit()) {
+            return number_literal(input).map(Self::Literal);
+        }
         Ok(Self::Name(input.to_owned()))
     }
+}
+
+/// A number written the way Solidity writes one: `1_000_000`, `1e18`, `1.5e18`. It has to
+/// be a whole number, so `1.55e1` is refused rather than rounded.
+fn number_literal(input: &str) -> Result<Word, String> {
+    let not_a_number =
+        || format!("`{input}` is not a number; write it as `1500`, `0x5dc`, `1.5e3`, or `1_500`");
+    let digits = input.replace('_', "");
+    let (mantissa, exponent) = match digits.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent.parse::<usize>().map_err(|_| not_a_number())?,
+        ),
+        None => (digits.as_str(), 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(not_a_number());
+    }
+    if exponent > 78 + fraction.len() {
+        return Err(format!("`{input}` does not fit in 256 bits"));
+    }
+    let mut value = format!("{whole}{fraction}");
+    if exponent >= fraction.len() {
+        value.push_str(&"0".repeat(exponent - fraction.len()));
+    } else {
+        let kept = value.len() - (fraction.len() - exponent);
+        if value[kept..].bytes().any(|byte| byte != b'0') {
+            return Err(format!("`{input}` is not a whole number"));
+        }
+        value.truncate(kept);
+    }
+    parse_word(&value).map_err(|error| error.to_string())
 }
 
 /// Everything a condition can read at one step.
@@ -493,6 +532,36 @@ mod tests {
         assert!(Condition::parse("").is_err());
         assert!(Condition::parse("counter >").is_err());
         assert!(Condition::parse("a && ").is_err());
+    }
+
+    #[test]
+    fn numbers_can_be_written_as_solidity_writes_them() {
+        let literal = |text: &str| match Operand::parse(text) {
+            Ok(Operand::Literal(word)) => Ok(word),
+            Ok(other) => panic!("{text}: {other:?}"),
+            Err(reason) => Err(reason),
+        };
+        let ether = super::word_of_u64(1_000_000_000_000_000_000);
+        assert_eq!(literal("1e18"), Ok(ether));
+        assert_eq!(
+            literal("1.5e18"),
+            Ok(super::word_of_u64(1_500_000_000_000_000_000))
+        );
+        assert_eq!(literal("1_000e6"), Ok(super::word_of_u64(1_000_000_000)));
+        assert_eq!(literal("2_500"), Ok(super::word_of_u64(2_500)));
+        assert_eq!(literal("1.50e1"), Ok(super::word_of_u64(15)));
+        assert!(literal("1.55e1")
+            .unwrap_err()
+            .contains("not a whole number"));
+        assert!(literal("1e80").unwrap_err().contains("does not fit"));
+        assert!(literal("1.2.3").unwrap_err().contains("is not a number"));
+        assert!(literal("2x").unwrap_err().contains("is not a number"));
+        assert_eq!(
+            parse("amount >= 1.5e18").groups[0][0].right,
+            Some(Operand::Literal(super::word_of_u64(
+                1_500_000_000_000_000_000
+            )))
+        );
     }
 
     #[test]

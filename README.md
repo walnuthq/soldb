@@ -126,8 +126,16 @@ for imports. `--base-path`, `--include-path`, `--remapping`, and `--no-project` 
 that.
 
 Contracts built by older compilers work through their legacy source maps: SolDB reads
-`combined.json` when ETHDebug programs are absent. If the sources are not next to the
-artifacts, pass `--source-path <dir>`.
+`combined.json` when ETHDebug programs are absent. `soldb compile --legacy` builds one with
+any solc, ETHDebug or not: the legacy pipeline's source maps and storage layout, with
+`<Contract>.bin` and `<Contract>.abi` beside them. Lines, functions, frames, and state
+variables come from those, and locals are read off the stack:
+
+```bash
+soldb compile src/Token.sol -o out --legacy --solc solc-0.8.16
+```
+
+If the sources are not next to the artifacts, pass `--source-path <dir>`.
 
 Trace a transaction:
 
@@ -286,6 +294,7 @@ banner, or colour. Editors use the same engine through `soldb-dap`. See
 - Step forward and backward by source line or instruction; `goto` any step
 - Breakpoints on lines, functions, storage writes, reverts, calls, and opcodes, with conditions on variables
 - Locals and state variables decoded by type, including memory structs, arrays, strings, calldata slices, mappings, and enums; `print` follows paths such as `orders[1].status`
+- Values shown the way they are meant: token amounts in their decimals (read from the contract's own `decimals` where it stores them), timestamps as dates, `sqrtPriceX96` as a price, structs as one-line summaries, with LLDB-style `type format` and `type summary` rules kept per project in `.soldbinit`
 - Call stack with decoded arguments; stack, memory, storage, and calldata at any step
 - Transaction traces, call simulation, and `soldb run` for compiled bytecode with no node
 - Replay backend for nodes without `debug_traceTransaction`; `--save-replay` files reproduce a trace on any machine

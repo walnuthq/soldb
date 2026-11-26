@@ -124,6 +124,15 @@ impl Trace {
         self.inner.step_json(index).map_err(js_error)
     }
 
+    /// Runs `type format` and `type summary` commands, one per line, as a `.soldbinit`
+    /// holds them, and answers with a JSON array of one object per command, tagged by
+    /// `kind` as the CLI's `--json` answers are. The formats apply to every `step()` after:
+    /// `type format add -f decimals:6 --var balances` shows `25500000` as `25.5`.
+    #[wasm_bindgen(js_name = formatCommands)]
+    pub fn format_commands(&mut self, commands: &str) -> Result<String, JsError> {
+        self.inner.format_commands(commands).map_err(js_error)
+    }
+
     /// The trace's header as JSON (see [`pipeline::TraceSummary`]): hash, parties,
     /// gas, status, backend, capabilities, step count, and the attached debug info.
     pub fn summary(&self) -> Result<String, JsError> {

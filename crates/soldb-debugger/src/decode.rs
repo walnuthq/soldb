@@ -17,8 +17,8 @@
 
 use soldb_core::Bytes;
 use soldb_ethdebug::{
-    decode_value, parse_word, word_hex, PathSegment, StorageEncoding, StorageLayout, StorageRef,
-    Word,
+    decode_value, parse_word, word_hex, PathSegment, Scalar, StorageEncoding, StorageLayout,
+    StorageRef, ValueShape, Word,
 };
 
 use crate::condition::Value;
@@ -109,6 +109,7 @@ impl<'a> ValueReader<'a> {
                     display: format!("<{base} at {}>", short_hex(&parsed)),
                     raw: Some(short_hex(&parsed)),
                     status: DebugValueStatus::Raw,
+                    shape: None,
                 }),
             },
             Some("storage") => {
@@ -117,6 +118,7 @@ impl<'a> ValueReader<'a> {
                     display: format!("<{base} in storage at slot {}{reason}>", short_hex(&parsed)),
                     raw: raw.clone(),
                     status: DebugValueStatus::Raw,
+                    shape: None,
                 };
                 let Some(layout) = self.layout else {
                     return Err(placeholder("; no storage layout is loaded"));
@@ -386,22 +388,28 @@ impl<'a> ValueReader<'a> {
             Place::Word { word, ty } => self.value_word(&word_hex(word), ty),
             Place::Memory { pointer, ty } => {
                 let raw = Some(format!("{pointer:#x}"));
-                let display = match &self.memory {
-                    Some(_) => self.read_memory(*pointer, ty, 0).unwrap_or_else(|| {
-                        if self.is_unresolved(ty) {
-                            format!(
-                                "<{ty} in memory at {pointer:#x}; its declaration could not be resolved>"
-                            )
-                        } else {
-                            format!(
-                                "<{ty} in memory at {pointer:#x}, beyond what this step captured>"
-                            )
-                        }
-                    }),
-                    None => {
-                        format!("<{ty} in memory at {pointer:#x}; this backend captured no memory>")
-                    }
+                let shape = match &self.memory {
+                    Some(_) => self.read_memory(*pointer, ty, 0),
+                    None => None,
                 };
+                let Some(shape) = shape else {
+                    let display = if self.memory.is_none() {
+                        format!("<{ty} in memory at {pointer:#x}; this backend captured no memory>")
+                    } else if self.is_unresolved(ty) {
+                        format!(
+                            "<{ty} in memory at {pointer:#x}; its declaration could not be resolved>"
+                        )
+                    } else {
+                        format!("<{ty} in memory at {pointer:#x}, beyond what this step captured>")
+                    };
+                    return DebugValue {
+                        display,
+                        raw,
+                        status: DebugValueStatus::Raw,
+                        shape: None,
+                    };
+                };
+                let display = shape.render();
                 let status = if display.starts_with('<') {
                     DebugValueStatus::Raw
                 } else {
@@ -411,6 +419,7 @@ impl<'a> ValueReader<'a> {
                     display,
                     raw,
                     status,
+                    shape: Some(Box::new(shape)),
                 }
             }
             Place::Storage { reference, ty } => self.storage_value(reference, ty),
@@ -492,43 +501,47 @@ impl<'a> ValueReader<'a> {
     }
 
     /// A one-word value: a value type, an enum, a user-defined value type, or a contract.
-    pub(crate) fn value_word(&self, word: &str, ty: &str) -> DebugValue {
-        let ty = self.resolve_value_type(ty);
+    pub(crate) fn value_word(&self, word: &str, declared: &str) -> DebugValue {
+        let ty = self.resolve_value_type(declared);
         let normalized = normalize_hex(word);
         let digits = normalized.trim_start_matches("0x");
         let raw = Some(normalized.clone());
+        let decoded = |display: String| {
+            let shape = parse_word(&normalized).ok().map(|word| {
+                Box::new(ValueShape::Scalar(Scalar::new(
+                    declared,
+                    ty,
+                    &word,
+                    display.clone(),
+                )))
+            });
+            DebugValue {
+                display,
+                raw: raw.clone(),
+                status: DebugValueStatus::Decoded,
+                shape,
+            }
+        };
         if let Some(variants) = self.types.enum_variants(self.scope, ty) {
             let index = u64::from_str_radix(digits, 16).ok();
             let display = match index.and_then(|index| variants.get(index as usize)) {
                 Some(variant) => format!("{ty}.{variant}"),
                 None => digits.trim_start_matches('0').to_owned(),
             };
-            return DebugValue {
-                display: if display.is_empty() {
-                    "0".to_owned()
-                } else {
-                    display
-                },
-                raw,
-                status: DebugValueStatus::Decoded,
-            };
+            return decoded(if display.is_empty() {
+                "0".to_owned()
+            } else {
+                display
+            });
         }
         if let Some(display) = decode_static_word(digits, ty) {
-            return DebugValue {
-                display,
-                raw,
-                status: DebugValueStatus::Decoded,
-            };
+            return decoded(display);
         }
         // A contract or interface type is an address on the stack.
         if is_type_name(ty) && !self.is_reference(ty) {
             if let Ok(parsed) = parse_word(&normalized) {
                 if parsed[..12].iter().all(|byte| *byte == 0) {
-                    return DebugValue {
-                        display: decode_value(&parsed[12..], "address"),
-                        raw,
-                        status: DebugValueStatus::Decoded,
-                    };
+                    return decoded(decode_value(&parsed[12..], "address"));
                 }
             }
         }
@@ -536,6 +549,7 @@ impl<'a> ValueReader<'a> {
             display: normalized,
             raw,
             status: DebugValueStatus::Raw,
+            shape: None,
         }
     }
 
@@ -632,20 +646,20 @@ impl<'a> ValueReader<'a> {
 
     /// A value at `pointer` of memory, or `None` when the capture does not reach it or
     /// the type is not one memory holds.
-    pub(crate) fn read_memory(&self, pointer: usize, ty: &str, depth: usize) -> Option<String> {
+    pub(crate) fn read_memory(&self, pointer: usize, ty: &str, depth: usize) -> Option<ValueShape> {
         let memory = self.memory.as_deref()?;
         if depth > MAX_DEPTH {
-            return Some(format!("<{ty} at {pointer:#x}>"));
+            return Some(ValueShape::text(format!("<{ty} at {pointer:#x}>")));
         }
         if ty == "string" || ty == "bytes" {
             let length = word_as_usize(&memory_word(memory, pointer)?)?;
             let bytes = memory_bytes(memory, pointer.checked_add(32)?, length)?;
             if ty == "string" {
                 if let Ok(text) = std::str::from_utf8(bytes) {
-                    return Some(format!("{text:?}"));
+                    return Some(ValueShape::text(format!("{text:?}")));
                 }
             }
-            return Some(format!("0x{}", hex_of(bytes)));
+            return Some(ValueShape::text(format!("0x{}", hex_of(bytes))));
         }
         if let Some((element, count)) = array_shape(ty) {
             let (first, count) = match count {
@@ -657,40 +671,42 @@ impl<'a> ValueReader<'a> {
                 Some(count) => (pointer, count),
             };
             let shown = count.min(SHOWN_ELEMENTS);
-            let mut parts = Vec::with_capacity(shown + 1);
+            let mut elements = Vec::with_capacity(shown);
             for index in 0..shown {
                 let word = memory_word(memory, first.checked_add(index.checked_mul(32)?)?)?;
-                parts.push(self.memory_element_display(&word, element, depth));
+                elements.push(self.memory_element_shape(&word, element, depth));
             }
-            if count > shown {
-                parts.push(format!("... {} more", count - shown));
-            }
-            return Some(format!("[{}]", parts.join(", ")));
+            return Some(ValueShape::Array {
+                elements,
+                more: (count - shown) as u64,
+            });
         }
         if let Some(members) = self.types.members_seen_from(self.scope, ty) {
             let mut parts = Vec::with_capacity(members.len());
             for (index, member) in members.iter().enumerate() {
                 let word = memory_word(memory, pointer.checked_add(index.checked_mul(32)?)?)?;
-                parts.push(format!(
-                    "{}: {}",
-                    member.name,
-                    self.memory_element_display(&word, &member.ty, depth)
+                parts.push((
+                    member.name.clone(),
+                    self.memory_element_shape(&word, &member.ty, depth),
                 ));
             }
-            return Some(format!("{{ {} }}", parts.join(", ")));
+            return Some(ValueShape::Struct {
+                ty: ty.to_owned(),
+                members: parts,
+            });
         }
         None
     }
 
     /// One word of a memory array or struct: the value, or the value behind the pointer.
-    fn memory_element_display(&self, word: &Word, ty: &str, depth: usize) -> String {
+    fn memory_element_shape(&self, word: &Word, ty: &str, depth: usize) -> ValueShape {
         if self.is_reference(ty) {
             let pointer = word_as_usize(word);
             return pointer
                 .and_then(|pointer| self.read_memory(pointer, ty, depth + 1))
-                .unwrap_or_else(|| format!("<{ty} at {}>", short_hex(word)));
+                .unwrap_or_else(|| ValueShape::text(format!("<{ty} at {}>", short_hex(word))));
         }
-        self.value_word(&word_hex(word), ty).display
+        word_shape(self.value_word(&word_hex(word), ty))
     }
 
     fn storage_value(&self, reference: &StorageRef, ty: &str) -> DebugValue {
@@ -702,6 +718,7 @@ impl<'a> ValueReader<'a> {
             ),
             raw: raw.clone(),
             status: DebugValueStatus::Raw,
+            shape: None,
         };
         let Some(layout) = self.layout else {
             return placeholder("; no storage layout is loaded");
@@ -716,11 +733,13 @@ impl<'a> ValueReader<'a> {
                 display: decoded.display,
                 raw: decoded.raw.or(raw),
                 status: DebugValueStatus::Decoded,
+                shape: Some(Box::new(decoded.shape)),
             },
             Err(missing) => DebugValue {
                 display: words.unavailable(&missing),
                 raw,
                 status: DebugValueStatus::Unavailable,
+                shape: None,
             },
         }
     }
@@ -748,6 +767,7 @@ impl<'a> ValueReader<'a> {
                 display,
                 raw: Some(raw),
                 status: DebugValueStatus::Decoded,
+                shape: None,
             };
         }
         let Some(element) = ty.strip_suffix("[]") else {
@@ -758,27 +778,23 @@ impl<'a> ValueReader<'a> {
                 display: format!("[{length} items at calldata offset {offset:#x}]"),
                 raw: None,
                 status: DebugValueStatus::Raw,
+                shape: None,
             };
         }
         let shown = length.min(SHOWN_ELEMENTS);
-        let mut elements = Vec::with_capacity(shown + 1);
+        let mut elements = Vec::with_capacity(shown);
         for index in 0..shown {
             let Some(bytes) = self.calldata_bytes(offset + index * 32, 32) else {
                 return unavailable();
             };
-            elements.push(
-                self.value_word(&format!("0x{}", hex_of(&bytes)), element)
-                    .display,
-            );
+            elements.push(word_shape(
+                self.value_word(&format!("0x{}", hex_of(&bytes)), element),
+            ));
         }
-        if length > shown {
-            elements.push(format!("... {} more", length - shown));
-        }
-        DebugValue {
-            display: format!("[{}]", elements.join(", ")),
-            raw: None,
-            status: DebugValueStatus::Decoded,
-        }
+        decoded(ValueShape::Array {
+            elements,
+            more: (length - shown) as u64,
+        })
     }
 
     /// A one-word `calldata` reference: a fixed-size array or a struct of value types
@@ -792,27 +808,24 @@ impl<'a> ValueReader<'a> {
             display: format!("<{ty} calldata at offset {offset:#x}>"),
             raw: None,
             status: DebugValueStatus::Raw,
+            shape: None,
         };
         if let Some((element, Some(count))) = array_shape(ty) {
             if self.is_reference(element) {
                 return placeholder;
             }
             let shown = count.min(SHOWN_ELEMENTS);
-            let mut elements = Vec::with_capacity(shown + 1);
+            let mut elements = Vec::with_capacity(shown);
             for index in 0..shown {
                 let Some(word) = word_at(index) else {
                     return unavailable();
                 };
-                elements.push(self.value_word(&word, element).display);
+                elements.push(word_shape(self.value_word(&word, element)));
             }
-            if count > shown {
-                elements.push(format!("... {} more", count - shown));
-            }
-            return DebugValue {
-                display: format!("[{}]", elements.join(", ")),
-                raw: None,
-                status: DebugValueStatus::Decoded,
-            };
+            return decoded(ValueShape::Array {
+                elements,
+                more: (count - shown) as u64,
+            });
         }
         if let Some(members) = self.types.members_seen_from(self.scope, ty) {
             if members.iter().any(|member| self.is_reference(&member.ty)) {
@@ -823,19 +836,35 @@ impl<'a> ValueReader<'a> {
                 let Some(word) = word_at(index) else {
                     return unavailable();
                 };
-                parts.push(format!(
-                    "{}: {}",
-                    member.name,
-                    self.value_word(&word, &member.ty).display
+                parts.push((
+                    member.name.clone(),
+                    word_shape(self.value_word(&word, &member.ty)),
                 ));
             }
-            return DebugValue {
-                display: format!("{{ {} }}", parts.join(", ")),
-                raw: None,
-                status: DebugValueStatus::Decoded,
-            };
+            return decoded(ValueShape::Struct {
+                ty: ty.to_owned(),
+                members: parts,
+            });
         }
         placeholder
+    }
+}
+
+/// The shape of a one-word value, or its text when it has none.
+fn word_shape(value: DebugValue) -> ValueShape {
+    match value.shape {
+        Some(shape) => *shape,
+        None => ValueShape::Text(value.display),
+    }
+}
+
+/// A value decoded into `shape`, shown as the shape renders.
+fn decoded(shape: ValueShape) -> DebugValue {
+    DebugValue {
+        display: shape.render(),
+        raw: None,
+        status: DebugValueStatus::Decoded,
+        shape: Some(Box::new(shape)),
     }
 }
 
@@ -978,6 +1007,7 @@ fn unavailable() -> DebugValue {
         display: "<unavailable>".to_owned(),
         raw: None,
         status: DebugValueStatus::Unavailable,
+        shape: None,
     }
 }
 
@@ -986,6 +1016,7 @@ fn unreadable(word: &str) -> DebugValue {
         display: "<unreadable stack word>".to_owned(),
         raw: Some(word.to_owned()),
         status: DebugValueStatus::Unavailable,
+        shape: None,
     }
 }
 

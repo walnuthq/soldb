@@ -1,0 +1,45 @@
+# `compile --legacy` builds for debugging without ETHDebug, with any compiler: the legacy
+# pipeline's source maps and the storage layout in `combined.json`. A session over it
+# steps by source line, reads locals off the stack, reads state variables and mapping
+# entries through the layout, and shows them in the formats a project sets. No node: the
+# contract is run on a local chain.
+# REQUIRES: soldb
+# RUN: rm -rf %t.out
+# RUN: %soldb compile --legacy %S/../examples/Formats.sol -o %t.out --solc %{solc_path} | FileCheck %s --check-prefix=COMPILE
+
+# COMPILE: Source map compilation successful
+# COMPILE: combined.json
+# COMPILE: Contract: Formats
+# COMPILE: Formats.bin
+
+# RUN: printf 'type format add -f decimals:@decimals --var totalSupply --var balances --var amount\ntype format add -f timestamp --var deadline\nbreak Formats.sol:36 if totalSupply == 1_500e6\ncontinue\nvars\nprint balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266]\np/x amount\nquit\n' | %soldb run %t.out/Formats.bin "mint(address,uint256)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 1500 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Formats:%t.out -i 2>&1 | FileCheck %s
+
+# CHECK: Breakpoint #1 hit at step {{[0-9]+}}, {{.*}}Formats.sol:36 if totalSupply == 1_500e6
+# The legacy code generator keeps locals at fixed stack slots, so they are read there.
+# CHECK: warning: local variables are inferred from the legacy source map
+# `whole` is as decoded; `amount` is 1500e6 in the contract's six decimals.
+# CHECK: uint256 whole = 1500 [stack+{{[0-9]+}}]
+# CHECK: uint256 amount = 1500 [stack+{{[0-9]+}}, decimals:6]
+# CHECK: State:
+# CHECK-NEXT: uint8 decimals = 6 [slot 0x0]
+# CHECK-NEXT: uint256 totalSupply = 1500 [slot 0x1, decimals:6]
+# CHECK-NEXT: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x2]
+# CHECK-NEXT: uint256 deadline = 2023-11-14T22:13:20Z [slot 0x3, timestamp]
+# CHECK: uint256 balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266] = 1500 [slot 0x{{[0-9a-f]+}}, decimals:6]
+# CHECK: uint256 amount = 0x59682f00 [stack+{{[0-9]+}}, hex]
+
+# `--all` formats every value; the decimals the rule reads stay as they are, and a later,
+# narrower rule makes an exception.
+# RUN: printf 'type format add -f decimals:@decimals --all\ntype format add -f default --var whole --var deadline\nbreak Formats.sol:36\ncontinue\nvars\ntype format list\nquit\n' | %soldb run %t.out/Formats.bin "mint(address,uint256)" 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 1500 --ethdebug-dir 0x5FbDB2315678afecB367f032d93F642f64180aa3:Formats:%t.out -i 2>&1 | FileCheck %s --check-prefix=ALL
+
+# ALL: Format #1 added: decimals:@decimals for --all
+# ALL: uint256 whole = 1500 [stack+{{[0-9]+}}]
+# ALL: uint256 amount = 1500 [stack+{{[0-9]+}}, decimals:6]
+# ALL: State:
+# ALL-NEXT: uint8 decimals = 6 [slot 0x0]
+# ALL-NEXT: uint256 totalSupply = 1500 [slot 0x1, decimals:6]
+# ALL-NEXT: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x2]
+# ALL-NEXT: uint256 deadline = 1700000000 [slot 0x3]
+# ALL-NEXT: uint16 feeBps = 0.00025 [slot 0x4, decimals:6]
+# ALL: #1 decimals:@decimals for --all
+# ALL-NEXT: #2 default for --var whole --var deadline

@@ -339,6 +339,26 @@ fn attaches_debug_info_and_keeps_the_trace() {
 }
 
 #[wasm_bindgen_test]
+fn format_commands_change_how_step_variables_read() {
+    let mut trace = canned_trace();
+    trace
+        .attach_ethdebug(&artifacts().to_string())
+        .expect("attach");
+    let answers = parse(
+        &trace
+            .format_commands("# as a .soldbinit holds it\ntype format add -f hex --var count\n")
+            .expect("answers"),
+    );
+    assert_eq!(answers[0]["kind"], "formatter");
+    assert_eq!(answers[0]["label"], "hex for --var count");
+    assert_eq!(answers[0]["line"], 2);
+    let step = parse(&trace.step(1).expect("step").expect("in range"));
+    assert_eq!(step["variables"][0]["value"]["display"], "0x40");
+    assert_eq!(step["variables"][0]["value"]["raw"], "0x40");
+    assert_eq!(step["variables"][0]["format"], "hex");
+}
+
+#[wasm_bindgen_test]
 fn round_trips_trace_json_and_builds_simulations() {
     let trace = canned_trace();
     let reloaded = Trace::from_json(&trace.to_json().expect("json")).expect("reloaded");

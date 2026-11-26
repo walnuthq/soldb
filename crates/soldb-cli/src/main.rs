@@ -36,7 +36,9 @@ use soldb_ethdebug::{
     parse_contract_mapping, parse_ethdebug_spec, parse_event_abis, parse_signature, DecodedEvent,
     ErrorRegistry, EthdebugMetadata, EventRegistry, SourceMapEnvironment,
 };
-use soldb_repl::{DebuggerCommand, DebuggerInfoCommand, DebuggerState, Output, Renderer, Session};
+use soldb_repl::{
+    DebuggerCommand, DebuggerInfoCommand, DebuggerState, Level, Output, Renderer, Session,
+};
 use soldb_rpc::{RpcLog, TraceBackend};
 use std::collections::BTreeSet;
 use std::env;
@@ -250,6 +252,11 @@ struct CompileArgs {
     output_dir: String,
     #[arg(long)]
     dual_compile: bool,
+    /// Compile for debugging without ETHDebug, with any solc: `combined.json` with the
+    /// legacy pipeline's source maps and storage layout. Lines, functions, frames, and
+    /// state variables come from those; locals are read off the stack.
+    #[arg(long, conflicts_with = "verify_version")]
+    legacy: bool,
     /// The directory relative imports resolve against. Found from the project the
     /// contract is in when not given.
     #[arg(long)]
@@ -346,6 +353,19 @@ struct ListEventsArgs {
     json_events: bool,
 }
 
+/// Where a debugging session reads the commands it starts with.
+#[derive(Debug, Clone, Default, Args)]
+struct InitArgs {
+    /// Debugger commands to run when the session starts, one per line, such as
+    /// `type format add -f decimals:6 --var balances`; without it, `.soldbinit` in the
+    /// current directory is read when there is one.
+    #[arg(long, value_name = "FILE", conflicts_with = "no_init")]
+    init: Option<PathBuf>,
+    /// Do not read `.soldbinit`.
+    #[arg(long)]
+    no_init: bool,
+}
+
 #[derive(Debug, Args)]
 struct TraceArgs {
     tx_hash: String,
@@ -390,6 +410,8 @@ struct TraceArgs {
     /// Start the debugger in the full-screen view (the `tui` command opens it later).
     #[arg(long)]
     tui: bool,
+    #[command(flatten)]
+    init: InitArgs,
     #[arg(long)]
     cross_env_bridge: Option<String>,
     #[arg(long)]
@@ -432,7 +454,8 @@ impl TraceView {
             interactive: args.interactive,
             json: args.json,
             raw: args.raw,
-            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+                .with_init(&args.init),
             save_trace: args.save_trace.clone(),
         }
     }
@@ -448,7 +471,8 @@ impl TraceView {
             interactive: args.interactive,
             json: args.json,
             raw: args.raw,
-            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+                .with_init(&args.init),
             save_trace: args.save_trace.clone(),
         }
     }
@@ -521,7 +545,8 @@ impl SimulationView {
             json: args.json,
             raw: args.raw,
             max_steps: args.max_steps,
-            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+                .with_init(&args.init),
             save_trace: args.save_trace.clone(),
         }
     }
@@ -547,7 +572,8 @@ impl SimulationView {
             json: args.json,
             raw: args.raw,
             max_steps: args.max_steps,
-            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+                .with_init(&args.init),
             save_trace: args.save_trace.clone(),
         }
     }
@@ -574,7 +600,8 @@ impl SimulationView {
             json: args.json,
             raw: args.raw,
             max_steps: args.max_steps,
-            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui),
+            session: SessionOptions::new(&args.commands, args.batch, args.json, args.tui)
+                .with_init(&args.init),
             save_trace: args.save_trace.clone(),
         }
     }
@@ -618,6 +645,8 @@ struct ReplayArgs {
     /// Start the debugger in the full-screen view (the `tui` command opens it later).
     #[arg(long)]
     tui: bool,
+    #[command(flatten)]
+    init: InitArgs,
 }
 
 #[derive(Debug, Args)]
@@ -701,6 +730,8 @@ struct RunArgs {
     /// Start the debugger in the full-screen view (the `tui` command opens it later).
     #[arg(long)]
     tui: bool,
+    #[command(flatten)]
+    init: InitArgs,
     #[arg(long, short = 'm', default_value_t = 50)]
     max_steps: i64,
 }
@@ -765,6 +796,8 @@ struct SimulateArgs {
     /// Start the debugger in the full-screen view (the `tui` command opens it later).
     #[arg(long)]
     tui: bool,
+    #[command(flatten)]
+    init: InitArgs,
     #[arg(long, short = 'm', default_value_t = 50)]
     max_steps: i64,
     #[arg(long)]
@@ -1012,7 +1045,18 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
     }
 
     if args.dual_compile {
-        let result = soldb_compiler::dual_compile(contract_file, &config);
+        let result = if args.legacy {
+            soldb_compiler::DualCompileResult {
+                production: config
+                    .compile_for_production(contract_file, None)
+                    .map_err(|error| error.to_string()),
+                debug: config
+                    .compile_with_source_maps(contract_file, None)
+                    .map_err(|error| error.to_string()),
+            }
+        } else {
+            soldb_compiler::dual_compile(contract_file, &config)
+        };
         if args.json {
             print_json(&result)?;
         } else {
@@ -1028,7 +1072,12 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
             match &result.debug {
                 Ok(debug) => print_compile_result(debug),
                 Err(error) => {
-                    println!("ETHDebug build failed: {error}");
+                    let build = if args.legacy {
+                        "Source map"
+                    } else {
+                        "ETHDebug"
+                    };
+                    println!("{build} build failed: {error}");
                     return Err(soldb_core::SoldbError::Message(error.clone()));
                 }
             }
@@ -1036,7 +1085,11 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
         return Ok(());
     }
 
-    let result = config.compile_with_ethdebug(contract_file, None)?;
+    let result = if args.legacy {
+        config.compile_with_source_maps(contract_file, None)?
+    } else {
+        config.compile_with_ethdebug(contract_file, None)?
+    };
     if args.json {
         print_json(&result)?;
     } else {
@@ -1046,10 +1099,17 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
 }
 
 fn print_compile_result(result: &soldb_compiler::CompilationResult) {
-    println!("ETHDebug compilation successful");
+    if result.files.combined_json.is_some() {
+        println!("Source map compilation successful");
+    } else {
+        println!("ETHDebug compilation successful");
+    }
     println!("Output directory: {}", result.output_dir.display());
     if result.files.ethdebug.is_some() {
         println!("  - ethdebug.json");
+    }
+    if let Some(path) = &result.files.combined_json {
+        println!("  - {}", path.display());
     }
     for (contract_name, files) in &result.files.contracts {
         println!("Contract: {contract_name}");
@@ -1686,10 +1746,27 @@ impl NodeStorage {
 /// What a session reads untouched slots through.
 type ChainReader = CachedChain<ChainRead>;
 
+/// The init file a session reads when `--init` names none.
+const DEFAULT_INIT_FILE: &str = ".soldbinit";
+
+/// The commands a session starts with, before the `-x` ones.
+#[derive(Debug, Clone, Default)]
+enum InitFile {
+    /// `.soldbinit` in the current directory, when there is one.
+    #[default]
+    Default,
+    /// The file `--init` names, which must exist.
+    Named(PathBuf),
+    /// `--no-init`.
+    Skipped,
+}
+
 /// How a debugging session is driven, from the flags of `trace`, `replay`, `simulate`,
 /// and `run`.
 #[derive(Debug, Clone, Default)]
 struct SessionOptions {
+    /// Where the commands the session starts with are read from.
+    init: InitFile,
     /// Commands to run before any are read from stdin (`-x`).
     commands: Vec<String>,
     /// Leave after the `-x` commands instead of reading stdin.
@@ -1703,11 +1780,21 @@ struct SessionOptions {
 impl SessionOptions {
     fn new(commands: &[String], batch: bool, json: bool, tui: bool) -> Self {
         Self {
+            init: InitFile::Default,
             commands: commands.to_vec(),
             batch,
             json,
             tui,
         }
+    }
+
+    fn with_init(mut self, args: &InitArgs) -> Self {
+        self.init = match (&args.init, args.no_init) {
+            (Some(path), _) => InitFile::Named(path.clone()),
+            (None, true) => InitFile::Skipped,
+            (None, false) => InitFile::Default,
+        };
+        self
     }
 
     /// Whether the flags ask for a debugging session at all: `-i`, or anything that
@@ -1794,6 +1881,7 @@ fn run_debugger_session(
         }
     };
 
+    run_init_file(&mut session, &options.init, json)?;
     emit(vec![session.loaded()])?;
     if !json && terminal {
         println!(
@@ -1852,6 +1940,63 @@ fn run_debugger_session(
             }
             Flow::Continue => {}
         }
+    }
+    Ok(())
+}
+
+/// Runs the commands of the session's init file, quietly: what they answer is not
+/// printed, except a warning, which goes to stderr with the file and line it came from.
+fn run_init_file(session: &mut Session, init: &InitFile, json: bool) -> SoldbResult<()> {
+    let path = match init {
+        InitFile::Skipped => return Ok(()),
+        InitFile::Named(path) => path.clone(),
+        InitFile::Default => {
+            let path = PathBuf::from(DEFAULT_INIT_FILE);
+            if !path.is_file() {
+                return Ok(());
+            }
+            path
+        }
+    };
+    let text = fs::read_to_string(&path).map_err(|error| {
+        soldb_core::SoldbError::Message(format!(
+            "cannot read the init file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let mut count = 0;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let at = format!("{}:{}:", path.display(), index + 1);
+        let command = DebuggerCommand::parse(line);
+        if matches!(command, DebuggerCommand::Quit | DebuggerCommand::Tui) {
+            eprintln!("{at} `{line}` does not run from an init file");
+            continue;
+        }
+        count += 1;
+        for output in session.execute(command) {
+            if let Output::Message {
+                level: Level::Warning,
+                text,
+                note,
+            } = output
+            {
+                eprintln!("{at} {text}");
+                if let Some(note) = note {
+                    eprintln!("{at} note: {note}");
+                }
+            }
+        }
+    }
+    if !json && count > 0 {
+        let noun = if count == 1 { "command" } else { "commands" };
+        println!(
+            "{}",
+            dim(format!("Read {count} {noun} from `{}`", path.display()))
+        );
     }
     Ok(())
 }
@@ -3861,6 +4006,7 @@ mod tests {
             commands: Vec::new(),
             batch: false,
             tui: false,
+            init: InitArgs::default(),
             save_trace: None,
             contract_address: "0x2".to_owned(),
             function_signature: None,

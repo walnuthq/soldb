@@ -7,8 +7,11 @@
 
 use std::fmt::Write as _;
 
+use soldb_debugger::FormatterKind;
+
 use crate::response::{
-    BreakpointEvent, Level, Output, StateInfo, Stop, StopReason, ValueStatus, VariableInfo,
+    BreakpointEvent, FormatterEvent, Level, Output, StateInfo, Stop, StopReason, ValueStatus,
+    VariableInfo,
 };
 
 /// Renders [`Output`] as lines of text.
@@ -98,6 +101,38 @@ impl Renderer {
                         .collect()
                 }
             }
+            Output::Formatter {
+                event,
+                formatter,
+                id,
+                label,
+            } => {
+                let title = match formatter {
+                    FormatterKind::Format => "Format",
+                    FormatterKind::Summary => "Summary",
+                };
+                vec![match event {
+                    FormatterEvent::Added => {
+                        format!("{} {label}", self.success(format!("{title} #{id} added:")))
+                    }
+                    FormatterEvent::Deleted => self.info(format!("{title} #{id} deleted")),
+                }]
+            }
+            Output::Formatters { formatter, rules } => {
+                if rules.is_empty() {
+                    let noun = formatter.noun();
+                    let hint = match formatter {
+                        FormatterKind::Format => "type format add -f <format> <type>",
+                        FormatterKind::Summary => "type summary add -s <template> <type>",
+                    };
+                    vec![self.dim(format!("No {noun} set; add one with `{hint}`"))]
+                } else {
+                    rules
+                        .iter()
+                        .map(|rule| format!("#{} {}", self.number(rule.id), rule.label))
+                        .collect()
+                }
+            }
             Output::Backtrace {
                 warning,
                 note,
@@ -120,7 +155,15 @@ impl Renderer {
                         let arguments = frame
                             .arguments
                             .iter()
-                            .map(|argument| format!("{} = {}", argument.name, argument.value))
+                            .map(|argument| match &argument.format {
+                                Some(format) => format!(
+                                    "{} = {} {}",
+                                    argument.name,
+                                    argument.value,
+                                    self.dim(format!("[{format}]"))
+                                ),
+                                None => format!("{} = {}", argument.name, argument.value),
+                            })
                             .collect::<Vec<_>>()
                             .join(", ");
                         let _ = write!(line, "({arguments})");
@@ -468,11 +511,14 @@ impl Renderer {
             ValueStatus::Unavailable => self.warning(&variable.value),
             _ => self.success(&variable.value),
         };
-        let place = variable
-            .place
-            .as_ref()
-            .map(|place| self.dim(format!(" [{place}]")))
-            .unwrap_or_default();
+        // Where the value was read from, and what it is written in when not as decoded, so
+        // a scaled `1500` is not taken for the integer 1500.
+        let place = match (&variable.place, &variable.format) {
+            (Some(place), Some(format)) => self.dim(format!(" [{place}, {format}]")),
+            (Some(place), None) => self.dim(format!(" [{place}]")),
+            (None, Some(format)) => self.dim(format!(" [{format}]")),
+            (None, None) => String::new(),
+        };
         format!(
             "{} {} = {value}{place}",
             self.info(&variable.ty),
@@ -621,6 +667,7 @@ mod tests {
                 raw: None,
                 status: ValueStatus::Decoded,
                 place: Some("stack+1".to_owned()),
+                format: None,
             }],
             unavailable: None,
             state,
@@ -631,6 +678,7 @@ mod tests {
                 raw: None,
                 status: ValueStatus::Decoded,
                 place: Some("transient slot 0x0".to_owned()),
+                format: None,
             }],
         };
         // A layout with no storage variables does not say the contract has none.
@@ -642,6 +690,35 @@ mod tests {
         assert!(renderer
             .render(&variables(StateInfo::NoLayout))
             .contains("no storage layout loaded"));
+    }
+
+    #[test]
+    fn a_formatted_value_says_its_format_beside_its_place() {
+        let renderer = Renderer::new(false);
+        let variable = |place: Option<&str>, format: Option<&str>| Output::Variable {
+            warning: None,
+            variable: VariableInfo {
+                name: "amount".to_owned(),
+                ty: "uint256".to_owned(),
+                value: "1500".to_owned(),
+                raw: Some("0x59682f00".to_owned()),
+                status: ValueStatus::Decoded,
+                place: place.map(str::to_owned),
+                format: format.map(str::to_owned),
+            },
+        };
+        assert_eq!(
+            renderer.render(&variable(Some("stack+4"), Some("decimals:6"))),
+            "uint256 amount = 1500 [stack+4, decimals:6]\n"
+        );
+        assert_eq!(
+            renderer.render(&variable(None, Some("decimals:6"))),
+            "uint256 amount = 1500 [decimals:6]\n"
+        );
+        assert_eq!(
+            renderer.render(&variable(Some("stack+4"), None)),
+            "uint256 amount = 1500 [stack+4]\n"
+        );
     }
 
     #[test]

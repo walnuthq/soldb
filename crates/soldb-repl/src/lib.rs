@@ -31,18 +31,19 @@ pub use command::{
 };
 pub use render::{shorten_hex, Renderer};
 pub use response::{
-    ArgumentInfo, BreakpointEvent, BreakpointInfo, FrameInfo, Level, ListedLine, LoadedContract,
-    MemoryInfo, MemoryWord, Output, ResourceInfo, SlotInfo, StateInfo, Stop, StopLocation,
-    StopReason, ValueStatus, VariableInfo,
+    ArgumentInfo, BreakpointEvent, BreakpointInfo, FormatterEvent, FormatterInfo, FrameInfo, Level,
+    ListedLine, LoadedContract, MemoryInfo, MemoryWord, Output, ResourceInfo, SlotInfo, StateInfo,
+    Stop, StopLocation, StopReason, ValueStatus, VariableInfo,
 };
 pub use session::{
-    breakpoint_lines, Session, FRAME_ARGUMENTS_NOTE, FRAME_ARGUMENTS_WARNING, LISTING_RADIUS,
+    breakpoint_lines, type_command, Session, FRAME_ARGUMENTS_NOTE, FRAME_ARGUMENTS_WARNING,
+    LISTING_RADIUS,
 };
 use soldb_debugger::{
     call_target, check_root_calls, normalize_address, variables_for_step, ChainStorage, Condition,
-    ConditionContext, ContractDebugInfo, DebugVariable, ErrorRegistry, Evaluation, Frame,
-    FrameState, LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation, StepMap,
-    StorageLayout, StorageTape, StorageWords,
+    ConditionContext, ContractDebugInfo, DebugVariable, ErrorRegistry, Evaluation, Formatters,
+    Frame, FrameState, LocalsStatus, ResolvedFunction, ResolvedLine, SourceListing, StepLocation,
+    StepMap, StorageLayout, StorageTape, StorageWords,
 };
 
 /// Where a step's variables came from.
@@ -245,6 +246,8 @@ pub struct DebuggerState {
     /// cannot be hit, or a condition that could not be evaluated. Both are silent traps
     /// otherwise.
     note: RefCell<Option<String>>,
+    /// How values are shown: the formats and summaries `type … add` set.
+    formatters: Formatters,
 }
 
 impl Default for DebuggerState {
@@ -260,6 +263,7 @@ impl Default for DebuggerState {
             transient_tape: None,
             errors: ErrorRegistry::default(),
             note: RefCell::new(None),
+            formatters: Formatters::default(),
         }
     }
 }
@@ -959,6 +963,25 @@ impl DebuggerState {
             .source_listing(self.current_step, radius)
     }
 
+    /// The formats and summaries values are shown with.
+    #[must_use]
+    pub fn formatters(&self) -> &Formatters {
+        &self.formatters
+    }
+
+    pub fn formatters_mut(&mut self) -> &mut Formatters {
+        &mut self.formatters
+    }
+
+    /// The name of the contract whose code executes at the current step.
+    #[must_use]
+    pub fn contract_name(&self) -> Option<&str> {
+        self.step_map
+            .as_ref()?
+            .contract_at_step(self.current_step)
+            .map(|contract| contract.name.as_str())
+    }
+
     /// The variables of the function executing at the current step, or why there are
     /// none: the artifact's ETHDebug variable locations when it carries any, otherwise
     /// the legacy stack layout when the contract's code generator keeps one.
@@ -1058,6 +1081,8 @@ impl DebuggerState {
             | DebuggerCommand::Stack { .. }
             | DebuggerCommand::Mode(None)
             | DebuggerCommand::Print(_)
+            | DebuggerCommand::PrintAs { .. }
+            | DebuggerCommand::Type(_)
             | DebuggerCommand::Tui
             | DebuggerCommand::Quit
             | DebuggerCommand::Unknown(_)
@@ -1132,7 +1157,8 @@ mod tests {
     use serde_json::json;
     use soldb_core::{StepSnapshot, TraceStep, TransactionTrace};
     use soldb_debugger::{
-        CodeGenerator, ContractDebugInfo, FunctionId, LineKey, ResolvedFunction, ResolvedLine,
+        CodeGenerator, ContractDebugInfo, FormatterKind, FunctionId, LineKey, ResolvedFunction,
+        ResolvedLine,
     };
     use soldb_ethdebug::{source_range, EthdebugInfo, Instruction};
 
@@ -2489,6 +2515,131 @@ contract C {
             note.contains("`c` is not a step value, a local, or an argument here"),
             "{note}"
         );
+    }
+
+    #[test]
+    fn formats_and_summaries_change_how_values_read() {
+        use soldb_core::StorageChange;
+
+        use crate::response::{FormatterEvent, Output, StateInfo};
+        use crate::Session;
+
+        let layout = soldb_ethdebug::StorageLayout::parse(&json!({
+            "storage": [
+                {"astId": 1, "contract": "C.sol:C", "label": "decimals", "offset": 0, "slot": "0", "type": "t_uint8"},
+                {"astId": 2, "contract": "C.sol:C", "label": "totalSupply", "offset": 0, "slot": "1", "type": "t_uint256"},
+                {"astId": 3, "contract": "C.sol:C", "label": "deadline", "offset": 0, "slot": "2", "type": "t_uint256"}
+            ],
+            "types": {
+                "t_uint8": {"encoding": "inplace", "label": "uint8", "numberOfBytes": "1"},
+                "t_uint256": {"encoding": "inplace", "label": "uint256", "numberOfBytes": "32"}
+            }
+        }))
+        .expect("layout");
+        let mut state = source_state();
+        let mut trace = state.trace().expect("trace").clone();
+        let mut steps = trace.steps.to_steps();
+        for (step, slot, value) in [
+            (1, "0x0", "0x6"),
+            (2, "0x1", "0xbebc20"),
+            (3, "0x2", "0x6553f100"),
+        ] {
+            steps[step].op = "SSTORE".into();
+            steps[step].snapshot.storage_diff = BTreeMap::from([(
+                slot.to_owned(),
+                StorageChange {
+                    before: None,
+                    after: Some(value.to_owned()),
+                },
+            )]);
+        }
+        trace.steps = steps.into();
+        let contracts = state.step_map().expect("map").contracts().to_vec();
+        state
+            .load_trace(trace)
+            .expect("top-level calls must start at different steps");
+        state.attach_debug_info(
+            contracts
+                .into_iter()
+                .map(|contract| contract.with_storage_layout(Some(layout.clone())))
+                .collect(),
+        );
+        let mut session = Session::new(state);
+        session.execute(DebuggerCommand::Goto(9));
+        let mut run = |line: &str| session.execute(DebuggerCommand::parse(line));
+        let state_values = |outputs: Vec<Output>| {
+            let [Output::Variables {
+                state: StateInfo::Variables { variables },
+                ..
+            }] = &outputs[..]
+            else {
+                panic!("vars: {outputs:?}");
+            };
+            variables
+                .iter()
+                .map(|variable| variable.value.clone())
+                .collect::<Vec<_>>()
+        };
+        let printed = |outputs: Vec<Output>| match &outputs[..] {
+            [Output::Variable { variable, .. }] => variable.value.clone(),
+            [Output::Message { text, .. }] => text.clone(),
+            other => panic!("print: {other:?}"),
+        };
+
+        assert_eq!(state_values(run("vars")), ["6", "12500000", "1700000000"]);
+        assert_eq!(
+            run("type format add -f decimals:@decimals --var totalSupply"),
+            [Output::Formatter {
+                event: FormatterEvent::Added,
+                formatter: FormatterKind::Format,
+                id: 1,
+                label: "decimals:@decimals for --var totalSupply".to_owned(),
+            }]
+        );
+        run("type format add -f timestamp --var dead*");
+        run(r#"type summary add -s "${var} USDC" --var totalSupply --contract C"#);
+        assert_eq!(
+            state_values(run("vars")),
+            ["6", "12.5 USDC", "2023-11-14T22:13:20Z"]
+        );
+        assert_eq!(printed(run("print totalSupply")), "12.5 USDC");
+        // A format given to `print` writes every number in it, and nothing else applies.
+        assert_eq!(printed(run("p/x totalSupply")), "0xbebc20");
+        assert_eq!(printed(run("p/duration deadline")), "19675d 22h 13m 20s");
+        let [Output::Formatters { rules, .. }] = &run("type format list")[..] else {
+            panic!("list");
+        };
+        assert_eq!(
+            rules
+                .iter()
+                .map(|rule| (rule.id, rule.label.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (1, "decimals:@decimals for --var totalSupply"),
+                (2, "timestamp for --var dead*")
+            ]
+        );
+        run("type summary delete 3");
+        assert_eq!(printed(run("print totalSupply")), "12.5");
+        // Decimals the contract does not hold are said to be unknown, next to the value.
+        run("type format add -f decimals:@missing --var totalSupply");
+        assert_eq!(
+            printed(run("print totalSupply")),
+            "12500000 <decimals unknown: no state variable named `missing` in the storage layout>"
+        );
+        assert_eq!(printed(run("type format clear")), "Deleted 3 formats");
+        assert_eq!(printed(run("print totalSupply")), "12500000");
+        assert!(printed(run("type format add -f nope uint256"))
+            .starts_with("Cannot add the format: unknown format `nope`"));
+        assert!(printed(run("type summary add -s plain uint256"))
+            .starts_with("Cannot add the summary: `plain` shows nothing"));
+        assert!(printed(run("type format add -f hex")).contains("one or more types"));
+        assert!(printed(run("p/nope totalSupply")).starts_with("Cannot print: unknown format"));
+        assert_eq!(
+            printed(run("type format delete 9")),
+            "No format 9; `type format list` shows them"
+        );
+        assert!(printed(run("type frobnicate")).starts_with("Cannot set the format:"));
     }
 
     fn sample_trace() -> TransactionTrace {

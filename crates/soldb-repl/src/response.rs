@@ -8,6 +8,8 @@
 
 use serde::Serialize;
 
+use soldb_debugger::FormatterKind;
+
 /// One item of a command's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -35,6 +37,21 @@ pub enum Output {
     },
     Breakpoints {
         breakpoints: Vec<BreakpointInfo>,
+    },
+    /// A format or a summary was added or deleted.
+    Formatter {
+        event: FormatterEvent,
+        /// Whether it is a format or a summary.
+        formatter: FormatterKind,
+        id: u32,
+        /// What it is and what it applies to, as `type … add` would set it again.
+        label: String,
+    },
+    /// The formats or the summaries set, in the order they were added; of those that
+    /// match a value, the last one is used.
+    Formatters {
+        formatter: FormatterKind,
+        rules: Vec<FormatterInfo>,
     },
     Backtrace {
         /// Said once a session, when frames carry arguments read off the stack: a
@@ -199,6 +216,19 @@ pub enum BreakpointEvent {
     Cleared,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatterEvent {
+    Added,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FormatterInfo {
+    pub id: u32,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BreakpointInfo {
     pub id: u32,
@@ -227,6 +257,9 @@ pub struct FrameInfo {
 pub struct ArgumentInfo {
     pub name: String,
     pub value: String,
+    /// The formats or summary the value is written with, when any applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -273,6 +306,10 @@ pub struct VariableInfo {
     /// chain at block 42`. Absent when the value could not be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place: Option<String>,
+    /// The formats or summary `value` is written with, such as `decimals:6`, when any
+    /// applied; `raw` is the word either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

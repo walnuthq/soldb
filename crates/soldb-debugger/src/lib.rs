@@ -26,6 +26,7 @@ use crate::stepping::calldata_for_step;
 pub mod condition;
 pub mod debug_diff;
 mod decode;
+pub mod format;
 mod locals;
 mod roots;
 pub mod state;
@@ -38,8 +39,15 @@ pub use debug_diff::{
     DebugDifference, DebugDifferenceKind, DebugExecution, DebugTrace, DebugTraceEvent,
     DebugTraceSummary,
 };
+pub use format::{
+    Decimals, FormatRule, FormatterAnswer, FormatterCommand, FormatterKind, Formatters, Matcher,
+    Rendered, Summary, SummaryRule, ValueFormat, ValueFormatter,
+};
 pub use roots::{check_root_calls, root_calls, RootCall, RootRecord};
-pub use soldb_ethdebug::{error_abis, CodeGenerator, ErrorAbi, ErrorRegistry, StorageLayout};
+pub use soldb_ethdebug::{
+    error_abis, CodeGenerator, ErrorAbi, ErrorRegistry, Scalar, ScalarKind, StorageLayout,
+    ValueShape,
+};
 pub use state::{
     short_hex, state_value, state_variables, CachedChain, ChainRead, ChainStorage, StateSource,
     StateVariable, StorageTape, StorageWords,
@@ -313,6 +321,10 @@ pub struct DebugVariable {
     pub ty: String,
     pub location: DebugLocation,
     pub value: DebugValue,
+    /// The formats or summary `value.display` was written with, when a frontend applied
+    /// any; see [`Rendered::format`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +338,10 @@ pub struct DebugValue {
     pub display: String,
     pub raw: Option<String>,
     pub status: DebugValueStatus,
+    /// What the value is made of, when it was decoded into parts a format can show
+    /// another way; it renders back to `display`.
+    #[serde(skip)]
+    pub shape: Option<Box<ValueShape>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +391,7 @@ fn decode_variable(
             display: "<unavailable>".to_owned(),
             raw: None,
             status: DebugValueStatus::Unavailable,
+            shape: None,
         },
         |raw| decode_debug_value(&raw, &variable.ty),
     );
@@ -386,6 +403,7 @@ fn decode_variable(
             offset: variable.offset,
         },
         value,
+        format: None,
     }
 }
 
@@ -414,6 +432,14 @@ pub(crate) fn decode_debug_value(raw: &str, ty: &str) -> DebugValue {
     let decoded = decode_static_word(word, ty);
     match decoded {
         Some(display) => DebugValue {
+            shape: hex_bytes(&left_pad_word(word), 0, 32).map(|word| {
+                Box::new(ValueShape::Scalar(Scalar::new(
+                    ty,
+                    ty,
+                    &word,
+                    display.clone(),
+                )))
+            }),
             display,
             raw: Some(normalized),
             status: DebugValueStatus::Decoded,
@@ -422,6 +448,7 @@ pub(crate) fn decode_debug_value(raw: &str, ty: &str) -> DebugValue {
             display: normalized.clone(),
             raw: Some(normalized),
             status: DebugValueStatus::Raw,
+            shape: None,
         },
     }
 }
@@ -560,6 +587,7 @@ fn argument_value(
             display: "<unreadable stack word>".to_owned(),
             raw: Some(word.to_owned()),
             status: DebugValueStatus::Unavailable,
+            shape: None,
         };
     };
     let reader = ValueReader {
@@ -577,12 +605,23 @@ fn argument_value(
             display: format!("<{} in {location} at {}>", param.ty, short_hex(&parsed)),
             raw,
             status: DebugValueStatus::Raw,
+            shape: None,
         },
-        None => DebugValue {
-            display: decode_value(value_bytes(&parsed, &param.ty), &param.ty),
-            raw,
-            status: DebugValueStatus::Decoded,
-        },
+        None => {
+            let bytes = value_bytes(&parsed, &param.ty);
+            let display = decode_value(bytes, &param.ty);
+            DebugValue {
+                shape: Some(Box::new(ValueShape::Scalar(Scalar::new(
+                    &param.ty,
+                    &param.ty,
+                    bytes,
+                    display.clone(),
+                )))),
+                display,
+                raw,
+                status: DebugValueStatus::Decoded,
+            }
+        }
     }
 }
 
@@ -1691,7 +1730,11 @@ mod tests {
             types: &types,
             scope: None,
         };
-        let read = |offset: usize, ty: &str| reader.read_memory(offset, ty, 0);
+        let read = |offset: usize, ty: &str| {
+            reader
+                .read_memory(offset, ty, 0)
+                .map(|shape| shape.render())
+        };
         assert_eq!(read(0, "string").as_deref(), Some("\"hello\""));
         assert_eq!(read(0, "bytes").as_deref(), Some("0x68656c6c6f"));
         assert_eq!(read(64, "uint256[]").as_deref(), Some("[7, 8, 9]"));

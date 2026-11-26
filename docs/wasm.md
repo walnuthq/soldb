@@ -40,8 +40,8 @@ feature:
 
 | package | output | REVM | size | budget |
 | --- | --- | --- | --- | --- |
-| lean | `crates/soldb-wasm/pkg/` | no | about 360 KB, 150 KB gzipped | 400,000 bytes |
-| replay-capable | `crates/soldb-wasm/pkg-replay/` | yes | about 960 KB, 400 KB gzipped | 1,100,000 bytes |
+| lean | `crates/soldb-wasm/pkg/` | no | about 435 KB, 185 KB gzipped | 445,000 bytes |
+| replay-capable | `crates/soldb-wasm/pkg-replay/` | yes | about 1,035 KB, 440 KB gzipped | 1,100,000 bytes |
 
 Both export `Trace` and `version()`; only the replay-capable one exports `Replay`.
 `replayAvailable()` tells a host which it loaded. Pick the lean package when every node
@@ -93,6 +93,7 @@ throw a JavaScript `Error` whose message is the debugger's own error text.
 | `trace.hasEthdebug()` | whether steps carry source spans and variables |
 | `trace.stepCount()` | number of opcode steps |
 | `trace.step(index)` | one step as JSON, or `undefined` past the end |
+| `trace.formatCommands(commands)` | `type format` and `type summary` commands, one per line as in a `.soldbinit`; answers as JSON |
 | `trace.summary()` | header as JSON: hash, parties, gas, status, backend, capabilities, step count, attached debug info |
 | `trace.toJson()` | the trace as JSON, the input `fromJson` accepts and the native CLI's `--save-trace` writes |
 | `trace.free()` | release the trace; it lives outside the JavaScript heap |
@@ -109,6 +110,18 @@ statuses the CLI and DAP server report when the debug info does not cover a valu
 `summary().debugInfo.pcsWithVariables` tells the host up front whether the compiler
 emitted variable locations at all; when it is zero, every step's `variables` list is
 empty by design. That dependence on the compiler is the same in the native tool.
+
+How a variable's value reads is the host's to choose, with the commands the REPL takes
+(see [Formats and Summaries](commands.md#formats-and-summaries)): pass
+`formatCommands` the text of a project's `.soldbinit`, or the lines a user types, and
+every `step()` after shows `value.display` in the formats and summaries that match, with
+`value.raw` still the word and the variable's `format` saying what was applied, such as
+`decimals:6`. Blank lines and `#` comments are skipped. The answer is a
+JSON array with one object per command, tagged by `kind` as the CLI's `--json` answers
+are (`formatter`, `formatters`, or a `message` saying what went wrong), each with the
+`line` it answers. These bindings read no state variables, so a `decimals:@<name>`
+format says beside the value that the decimals are unknown; name them instead, as in
+`-f decimals:6`.
 
 ### Contract artifacts
 
@@ -164,6 +177,13 @@ const counter = {
   abi: JSON.parse(await file("out/Counter.abi")),
 };
 trace.attachEthdebug(JSON.stringify(counter));
+
+// Optional: the project's formats, as the CLI reads them from `.soldbinit`.
+for (const answer of JSON.parse(trace.formatCommands(await file(".soldbinit")))) {
+  if (answer.kind === "message" && answer.level === "warning") {
+    console.warn(`.soldbinit:${answer.line}: ${answer.text}`);
+  }
+}
 
 const summary = JSON.parse(trace.summary());
 console.log(summary.status, summary.stepCount, summary.debugInfo.pcsWithVariables);
@@ -377,6 +397,12 @@ Where the bytes go, from a build with symbol names kept:
 - The replay-capable package adds REVM: the interpreter, the precompiles with their
   elliptic-curve and hashing code, and the state journal. That is what the second budget
   pays for.
+- The value formats (`formatCommands`, and the shapes the decoders keep so a value can be
+  shown another way) cost about 45 KB in each package: the rule matching, the command
+  and summary parsers, and exact 256-bit decimal and fixed-point arithmetic, plus the
+  iterator and collection code they instantiate. The lean budget was raised from
+  400,000 to 445,000 bytes for them, after cutting what did not need to be there:
+  answers built as `serde_json::Value`s, and 128-bit division.
 - Gating REVM behind the `replay` feature did not shrink the lean package by itself,
   because the linker had already been discarding unreachable replay code; it saved
   compile time and dependencies. The size-oriented build profile is what brought the
