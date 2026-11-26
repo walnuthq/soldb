@@ -19,7 +19,7 @@ jobs:
     name: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         run: |
@@ -48,7 +48,7 @@ jobs:
     name: wasm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         run: |
@@ -57,7 +57,7 @@ jobs:
 
       - name: Restore wasm-pack
         id: wasm-pack-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/wasm-pack
           key: wasm-pack-${{ runner.os }}-${{ env.WASM_PACK_VERSION }}
@@ -122,9 +122,9 @@ jobs:
           # The newest release, resolved from the solc binaries list when the job runs.
           - version: latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -243,9 +243,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -267,14 +267,14 @@ jobs:
 
       - name: Restore the cached solc build
         id: solc-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.local/bin/solc-develop
           key: solc-develop-${{ runner.os }}-${{ steps.solc-develop.outputs.commit }}
 
       - name: Restore the compiler ccache
         if: steps.solc-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.ccache
           key: solc-develop-ccache-${{ runner.os }}-${{ steps.solc-develop.outputs.commit }}
@@ -414,12 +414,12 @@ jobs:
     env:
       SOLAR_REF: v0.3.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
       - name: Check out Solar ${{ env.SOLAR_REF }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: paradigmxyz/solar
           ref: ${{ env.SOLAR_REF }}
@@ -432,7 +432,7 @@ jobs:
           git -C target/solar rev-parse HEAD | tee target/solar-ci/solar-commit.txt
           echo "Solar $SOLAR_REF: $(cat target/solar-ci/solar-commit.txt)" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -506,7 +506,7 @@ jobs:
             fi
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: solar-compatibility
@@ -518,7 +518,7 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         run: |
@@ -531,7 +531,7 @@ jobs:
       - name: Run Rust coverage
         run: cargo llvm-cov --workspace --all-targets --cobertura --output-path rust-coverage.xml --fail-under-lines 80
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: rust-coverage
           path: rust-coverage.xml
