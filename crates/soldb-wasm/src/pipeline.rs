@@ -232,7 +232,9 @@ impl Trace {
                 .map(|info| info.contract_name.as_str());
             let view = self.formatters.view(contract, &no_state);
             for variable in &mut step.variables {
-                variable.value.display = view.render(&variable.name, &variable.value);
+                let rendered = view.render(&variable.name, &variable.value);
+                variable.value.display = rendered.text;
+                variable.format = rendered.format;
             }
         }
         to_json(&step).map(Some)
@@ -792,6 +794,8 @@ mod tests {
         let step = step_at(&trace, 1);
         assert_eq!(step.variables[0].value.display, "0x40 wei");
         assert_eq!(step.variables[0].value.raw.as_deref(), Some("0x40"));
+        assert_eq!(step.variables[0].format.as_deref(), Some("summary"));
+        assert_eq!(step.variables[1].format, None);
         assert_eq!(step.variables[1].value.display, SENDER);
 
         // Without the summary, the decimals format reads the contract's state, which these

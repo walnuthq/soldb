@@ -15,7 +15,9 @@
 //! later, narrower rule overrides an earlier, broader one.
 //!
 //! Formats change what is shown and nothing else: a breakpoint condition still compares
-//! the word, and `raw` still carries it.
+//! the word, and `raw` still carries it. What a view applied comes back with the text
+//! ([`Rendered::format`]), so a frontend can say that `1500` is a scaled amount rather
+//! than leave it looking like the integer 1500.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -802,6 +804,7 @@ impl Formatters {
             contract,
             state,
             decimals: RefCell::new(BTreeMap::new()),
+            applied: RefCell::new(Vec::new()),
         }
     }
 
@@ -822,6 +825,22 @@ impl Formatters {
     }
 }
 
+/// A value as a view shows it, and what was applied to show it so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub text: String,
+    /// The formats and summaries applied, as the decimals were resolved (`decimals:6`,
+    /// `timestamp`, `summary`), joined with `, `; `None` when the value is shown as
+    /// decoded.
+    pub format: Option<String>,
+}
+
+impl Rendered {
+    fn decoded(text: String) -> Self {
+        Self { text, format: None }
+    }
+}
+
 /// The formats of a session applied at one step.
 pub struct ValueFormatter<'a> {
     formatters: &'a Formatters,
@@ -829,33 +848,64 @@ pub struct ValueFormatter<'a> {
     state: &'a dyn Fn(&str) -> Result<DebugValue, String>,
     /// The decimals each `decimals:@<name>` read, once per view.
     decimals: RefCell<BTreeMap<String, Result<u32, String>>>,
+    /// What the value being rendered was shown with so far.
+    applied: RefCell<Vec<String>>,
 }
 
 impl ValueFormatter<'_> {
     /// The value shown under `name` (a variable or a path into one, such as
     /// `balances[0xabc]`), with the formats and summaries that match it applied.
     #[must_use]
-    pub fn render(&self, name: &str, value: &DebugValue) -> String {
+    pub fn render(&self, name: &str, value: &DebugValue) -> Rendered {
         match value.shape.as_deref() {
-            Some(shape) if !self.formatters.is_empty() => self.node(leaf_name(name), shape, true),
-            _ => value.display.clone(),
+            Some(shape) if !self.formatters.is_empty() => {
+                self.applied.borrow_mut().clear();
+                let text = self.node(leaf_name(name), shape, true);
+                self.rendered(text)
+            }
+            _ => Rendered::decoded(value.display.clone()),
         }
     }
 
     /// The value with every number in it written in `format`, the way `print/x` writes
     /// it; rules and summaries do not apply.
     #[must_use]
-    pub fn render_as(&self, value: &DebugValue, format: &ValueFormat) -> String {
+    pub fn render_as(&self, value: &DebugValue, format: &ValueFormat) -> Rendered {
         match value.shape.as_deref() {
-            Some(shape) => self.forced(shape, format),
-            None => value.display.clone(),
+            Some(shape) => {
+                self.applied.borrow_mut().clear();
+                let text = self.forced(shape, format);
+                self.rendered(text)
+            }
+            None => Rendered::decoded(value.display.clone()),
+        }
+    }
+
+    fn rendered(&self, text: String) -> Rendered {
+        let applied = std::mem::take(&mut *self.applied.borrow_mut());
+        Rendered {
+            text,
+            format: (!applied.is_empty()).then(|| applied.join(", ")),
+        }
+    }
+
+    /// Notes that `label` was applied to the value being rendered.
+    fn note(&self, label: String) {
+        let mut applied = self.applied.borrow_mut();
+        if !applied.contains(&label) {
+            applied.push(label);
         }
     }
 
     fn node(&self, name: &str, shape: &ValueShape, summaries: bool) -> String {
         if summaries {
             if let Some(summary) = self.summary(name, shape) {
-                return self.summarize(name, shape, summary);
+                // A summary is what was applied, whatever formats its parts were written in.
+                let before = self.applied.borrow().len();
+                let text = self.summarize(name, shape, summary);
+                self.applied.borrow_mut().truncate(before);
+                self.note("summary".to_owned());
+                return text;
             }
         }
         match shape {
@@ -929,7 +979,16 @@ impl ValueFormatter<'_> {
             _ => None,
         };
         match write_scalar(scalar, format, places) {
-            Ok(text) => text,
+            Ok(text) => {
+                match (format, places) {
+                    (ValueFormat::Default, _) => {}
+                    (ValueFormat::Decimals(_), Some(places)) => {
+                        self.note(format!("decimals:{places}"));
+                    }
+                    (format, _) => self.note(format.to_string()),
+                }
+                text
+            }
             Err(reason) => format!("{} <{reason}>", scalar.shown),
         }
     }
@@ -1319,6 +1378,7 @@ mod tests {
         formatters
             .view(None, &no_state)
             .render_as(&value(shape.clone()), &format)
+            .text
     }
 
     #[test]
@@ -1505,7 +1565,7 @@ mod tests {
         let view_state = no_state;
         let view = formatters.view(None, &view_state);
         assert_eq!(
-            view.render("order", &value(order)),
+            view.render("order", &value(order)).text,
             "{ price: 2.5, nonce: 7, usdcPaid: 2.5, count: 3 }"
         );
         let amounts = ValueShape::Array {
@@ -1516,7 +1576,7 @@ mod tests {
             more: 4,
         };
         assert_eq!(
-            view.render("usdcAmounts", &value(amounts)),
+            view.render("usdcAmounts", &value(amounts)).text,
             "[1, 0.000001, ... 4 more]"
         );
         // A mapping entry is shown under the mapping's name.
@@ -1524,7 +1584,8 @@ mod tests {
             view.render(
                 "usdcBalances[0xabc]",
                 &value(scalar("uint256", word(5_000_000)))
-            ),
+            )
+            .text,
             "5"
         );
         let text = DebugValue {
@@ -1534,7 +1595,7 @@ mod tests {
             shape: None,
         };
         assert_eq!(
-            view.render("usdcBalances", &text),
+            view.render("usdcBalances", &text).text,
             "<mapping; index it with [key]>"
         );
     }
@@ -1557,17 +1618,22 @@ mod tests {
         assert_eq!(
             formatters
                 .view(Some("USDC"), &no_state)
-                .render("balance", &balance),
+                .render("balance", &balance)
+                .text,
             "1"
         );
         assert_eq!(
             formatters
                 .view(Some("WETH"), &no_state)
-                .render("balance", &balance),
+                .render("balance", &balance)
+                .text,
             "1000000"
         );
         assert_eq!(
-            formatters.view(None, &no_state).render("balance", &balance),
+            formatters
+                .view(None, &no_state)
+                .render("balance", &balance)
+                .text,
             "1000000"
         );
         assert_eq!(
@@ -1599,8 +1665,8 @@ mod tests {
         };
         let view = formatters.view(Some("USDC"), &state);
         let balance = value(scalar("uint256", word(12_500_000)));
-        assert_eq!(view.render("balanceOf[0x1]", &balance), "12.5");
-        assert_eq!(view.render("balances[0x2]", &balance), "12.5");
+        assert_eq!(view.render("balanceOf[0x1]", &balance).text, "12.5");
+        assert_eq!(view.render("balances[0x2]", &balance).text, "12.5");
         assert_eq!(reads.get(), 1, "the state is read once a view");
         let missing = |path: &str| {
             Err(format!(
@@ -1610,7 +1676,8 @@ mod tests {
         assert_eq!(
             formatters
                 .view(Some("Vault"), &missing)
-                .render("balance", &balance),
+                .render("balance", &balance)
+                .text,
             "12500000 <decimals unknown: no state variable named `decimals` in the storage layout>"
         );
     }
@@ -1648,11 +1715,12 @@ mod tests {
         };
         let view = formatters.view(None, &no_state);
         assert_eq!(
-            view.render("position", &value(position.clone())),
+            view.render("position", &value(position.clone())).text,
             "3 in [-10, 0xa]"
         );
         assert_eq!(
-            view.render("fee", &value(scalar("uint256", word(1_500_000)))),
+            view.render("fee", &value(scalar("uint256", word(1_500_000))))
+                .text,
             "1.5 USDC"
         );
         formatters.add_summary(
@@ -1662,9 +1730,64 @@ mod tests {
         assert_eq!(
             formatters
                 .view(None, &no_state)
-                .render("position", &value(position)),
+                .render("position", &value(position))
+                .text,
             "<no var.missing>!"
         );
+    }
+
+    #[test]
+    fn a_rendered_value_says_what_was_applied_to_it() {
+        let mut formatters = Formatters::new();
+        formatters.add_format(
+            ValueFormat::parse("decimals:@decimals").expect("a format"),
+            matcher(&[], &["amount", "order"]),
+        );
+        formatters.add_format(ValueFormat::Timestamp, matcher(&[], &["deadline"]));
+        formatters.add_format(ValueFormat::Default, matcher(&[], &["count"]));
+        let state = |_: &str| Ok(value(scalar("uint8", vec![6])));
+        let view = formatters.view(None, &state);
+        let amount = value(scalar("uint256", word(1_500_000)));
+        assert_eq!(
+            view.render("amount", &amount),
+            super::Rendered {
+                text: "1.5".to_owned(),
+                format: Some("decimals:6".to_owned())
+            }
+        );
+        // `default` shows the value as decoded, and says nothing was applied.
+        assert_eq!(view.render("count", &amount).format, None);
+        assert_eq!(view.render("other", &amount).format, None);
+        let order = ValueShape::Struct {
+            ty: "Order".to_owned(),
+            members: vec![
+                ("amount".to_owned(), scalar("uint256", word(1_500_000))),
+                ("deadline".to_owned(), scalar("uint256", word(0))),
+            ],
+        };
+        assert_eq!(
+            view.render("order", &value(order.clone()))
+                .format
+                .as_deref(),
+            Some("decimals:6, timestamp")
+        );
+        assert_eq!(
+            view.render_as(&amount, &ValueFormat::Hex).format.as_deref(),
+            Some("hex")
+        );
+        formatters.add_summary(
+            Summary::parse("${amount%wad} by ${deadline}").expect("a summary"),
+            matcher(&["Order"], &[]),
+        );
+        let view = formatters.view(None, &state);
+        assert_eq!(
+            view.render("order", &value(order)).format.as_deref(),
+            Some("summary")
+        );
+        // A format that could not be applied says why in the text, and is not claimed.
+        let missing = |_: &str| Err("no storage layout is loaded".to_owned());
+        let view = formatters.view(None, &missing);
+        assert_eq!(view.render("amount", &amount).format, None);
     }
 
     #[test]

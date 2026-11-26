@@ -19,11 +19,11 @@
 # CHECK: warning: local variables are inferred from the legacy source map
 # `whole` is as decoded; `amount` is 1500e6 in the contract's six decimals.
 # CHECK: uint256 whole = 1500 [stack+{{[0-9]+}}]
-# CHECK: uint256 amount = 1500 [stack+{{[0-9]+}}]
+# CHECK: uint256 amount = 1500 [stack+{{[0-9]+}}, decimals:6]
 # CHECK: State:
 # CHECK-NEXT: uint8 decimals = 6 [slot 0x0]
-# CHECK-NEXT: uint256 totalSupply = 1500 [slot 0x1]
+# CHECK-NEXT: uint256 totalSupply = 1500 [slot 0x1, decimals:6]
 # CHECK-NEXT: mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x2]
-# CHECK-NEXT: uint256 deadline = 2023-11-14T22:13:20Z [slot 0x3]
-# CHECK: uint256 balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266] = 1500 [slot 0x{{[0-9a-f]+}}]
-# CHECK: uint256 amount = 0x59682f00 [stack+{{[0-9]+}}]
+# CHECK-NEXT: uint256 deadline = 2023-11-14T22:13:20Z [slot 0x3, timestamp]
+# CHECK: uint256 balances[0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266] = 1500 [slot 0x{{[0-9a-f]+}}, decimals:6]
+# CHECK: uint256 amount = 0x59682f00 [stack+{{[0-9]+}}, hex]

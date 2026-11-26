@@ -2460,6 +2460,7 @@ impl StepMap {
                 offset: slot as u64,
             },
             value,
+            format: None,
         }))
     }
 
@@ -2613,6 +2614,7 @@ impl StepMap {
                         offset: variable.slot.unwrap_or_default() as u64,
                     },
                     value,
+                    format: None,
                 }
             })
             .collect()

@@ -115,7 +115,8 @@ How a variable's value reads is the host's to choose, with the commands the REPL
 (see [Formats and Summaries](commands.md#formats-and-summaries)): pass
 `formatCommands` the text of a project's `.soldbinit`, or the lines a user types, and
 every `step()` after shows `value.display` in the formats and summaries that match, with
-`value.raw` still the word. Blank lines and `#` comments are skipped. The answer is a
+`value.raw` still the word and the variable's `format` saying what was applied, such as
+`decimals:6`. Blank lines and `#` comments are skipped. The answer is a
 JSON array with one object per command, tagged by `kind` as the CLI's `--json` answers
 are (`formatter`, `formatters`, or a `message` saying what went wrong), each with the
 `line` it answers. These bindings read no state variables, so a `decimals:@<name>`

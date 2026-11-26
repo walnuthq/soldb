@@ -872,7 +872,8 @@ impl DapServer {
     }
 
     /// `value`, shown under `name`, with the session's formats and summaries, or with
-    /// every number in `format` when one is given.
+    /// every number in `format` when one is given. What was applied follows in brackets,
+    /// as the REPL shows it, so a scaled `1500` is not taken for the integer 1500.
     fn shown(&self, name: &str, value: &DebugValue, format: Option<&ValueFormat>) -> String {
         if format.is_none() && self.debugger.formatters().is_empty() {
             return value.display.clone();
@@ -885,9 +886,13 @@ impl DapServer {
             .debugger
             .formatters()
             .view(self.debugger.contract_name(), &read);
-        match format {
+        let rendered = match format {
             Some(format) => view.render_as(value, format),
             None => view.render(name, value),
+        };
+        match rendered.format {
+            Some(format) => format!("{} [{format}]", rendered.text),
+            None => rendered.text,
         }
     }
 
@@ -1705,13 +1710,17 @@ mod tests {
             evaluate(&mut server, 5, "type format add -f hex --var x"),
             "Format #1 added: hex for --var x\n"
         );
+        // What was applied follows the value, so `0x2a` is not taken for the decoded text.
         let messages = server.handle_message(&variables);
         assert_eq!(
             messages[0].body.as_ref().expect("body")["variables"][0]["value"],
-            "0x2a"
+            "0x2a [hex]"
         );
-        assert_eq!(evaluate(&mut server, 6, "x"), "0x2a");
-        assert_eq!(evaluate(&mut server, 7, "p/decimals:1 x"), "4.2");
+        assert_eq!(evaluate(&mut server, 6, "x"), "0x2a [hex]");
+        assert_eq!(
+            evaluate(&mut server, 7, "p/decimals:1 x"),
+            "4.2 [decimals:1]"
+        );
         assert!(evaluate(&mut server, 8, "type format add -f nope x").contains("unknown format"));
     }
 

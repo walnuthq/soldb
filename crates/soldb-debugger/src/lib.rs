@@ -41,7 +41,7 @@ pub use debug_diff::{
 };
 pub use format::{
     Decimals, FormatRule, FormatterAnswer, FormatterCommand, FormatterKind, Formatters, Matcher,
-    Summary, SummaryRule, ValueFormat, ValueFormatter,
+    Rendered, Summary, SummaryRule, ValueFormat, ValueFormatter,
 };
 pub use roots::{check_root_calls, root_calls, RootCall, RootRecord};
 pub use soldb_ethdebug::{
@@ -321,6 +321,10 @@ pub struct DebugVariable {
     pub ty: String,
     pub location: DebugLocation,
     pub value: DebugValue,
+    /// The formats or summary `value.display` was written with, when a frontend applied
+    /// any; see [`Rendered::format`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +403,7 @@ fn decode_variable(
             offset: variable.offset,
         },
         value,
+        format: None,
     }
 }
 

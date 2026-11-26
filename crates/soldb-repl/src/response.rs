@@ -257,6 +257,9 @@ pub struct FrameInfo {
 pub struct ArgumentInfo {
     pub name: String,
     pub value: String,
+    /// The formats or summary the value is written with, when any applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -303,6 +306,10 @@ pub struct VariableInfo {
     /// chain at block 42`. Absent when the value could not be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place: Option<String>,
+    /// The formats or summary `value` is written with, such as `decimals:6`, when any
+    /// applied; `raw` is the word either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

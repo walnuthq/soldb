@@ -9,8 +9,8 @@
 use soldb_core::encode_hex;
 use soldb_debugger::{
     state_value, state_variables, ChainStorage, DebugValue, DebugValueStatus, DebugVariable,
-    FormatterAnswer, FormatterCommand, Formatters, StateSource, StateVariable, StorageWords,
-    ValueFormat, ValueFormatter, INFERRED_LOCALS_WARNING,
+    FormatterAnswer, FormatterCommand, Formatters, Rendered, StateSource, StateVariable,
+    StorageWords, ValueFormat, ValueFormatter, INFERRED_LOCALS_WARNING,
 };
 
 use crate::command::{command_spec, CommandGroup, COMMANDS};
@@ -357,9 +357,13 @@ impl Session {
                     frame
                         .arguments
                         .iter()
-                        .map(|argument| ArgumentInfo {
-                            name: argument.name.clone(),
-                            value: view.render(&argument.name, &argument.value),
+                        .map(|argument| {
+                            let shown = view.render(&argument.name, &argument.value);
+                            ArgumentInfo {
+                                name: argument.name.clone(),
+                                value: shown.text,
+                                format: shown.format,
+                            }
                         })
                         .collect()
                 },
@@ -856,7 +860,7 @@ struct Shown<'a> {
 }
 
 impl Shown<'_> {
-    fn value(&self, name: &str, value: &DebugValue) -> String {
+    fn value(&self, name: &str, value: &DebugValue) -> Rendered {
         match self.format {
             Some(format) => self.view.render_as(value, format),
             None => self.view.render(name, value),
@@ -883,10 +887,12 @@ fn status(status: DebugValueStatus) -> ValueStatus {
 /// A local, parameter, or return value with the stack slot it was read from, or without
 /// one when it could not be read.
 fn local_info(variable: &DebugVariable, shown: &Shown<'_>) -> VariableInfo {
+    let rendered = shown.value(&variable.name, &variable.value);
     VariableInfo {
         name: variable.name.clone(),
         ty: variable.ty.clone(),
-        value: shown.value(&variable.name, &variable.value),
+        value: rendered.text,
+        format: rendered.format,
         raw: variable.value.raw.clone(),
         status: status(variable.value.status),
         place: (variable.value.status != DebugValueStatus::Unavailable)
@@ -907,10 +913,12 @@ fn state_info(
     if variable.source == StateSource::Chain {
         place.push_str(&format!(", from {}", chain_label.unwrap_or("the chain")));
     }
+    let rendered = shown.value(&variable.name, &variable.value);
     VariableInfo {
         name: variable.name.clone(),
         ty: variable.ty.clone(),
-        value: shown.value(&variable.name, &variable.value),
+        value: rendered.text,
+        format: rendered.format,
         raw: variable.value.raw.clone(),
         status: status(variable.value.status),
         place: Some(place),

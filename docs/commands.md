@@ -763,11 +763,11 @@ Print one variable with every number in it written in a [format](#formats), what
 
 ```text
 soldb> p/x counter
-uint256 counter = 0x4 [slot 0x0]
+uint256 counter = 0x4 [slot 0x0, hex]
 soldb> p/decimals:6 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]
-uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = 25.5 [slot 0xa3c1…9502]
+uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = 25.5 [slot 0xa3c1…9502, decimals:6]
 soldb> p/timestamp deadline
-uint256 deadline = 2026-11-26T09:30:00Z [slot 0x4]
+uint256 deadline = 2026-11-26T09:30:00Z [slot 0x4, timestamp]
 ```
 
 ## Formats and Summaries
@@ -779,6 +779,17 @@ same value as `25.5`. A *summary* goes further and writes a whole value as a one
 template. Both follow LLDB's `type format` and `type summary`, and both change only what is
 shown: `raw` in the JSON answers still carries the word, and a breakpoint condition still
 compares the value itself.
+
+A value written in a format says so after where it was read from, so a scaled amount is not
+taken for the integer it shows; `decimals:@decimals` says the decimals it read:
+
+```text
+uint256 whole = 1500 [stack+3]
+uint256 amount = 1500 [stack+4, decimals:6]
+```
+
+The JSON answers carry it as `format`, the DAP server writes it after the value, and the
+WebAssembly bindings set `format` on the variable.
 
 ### `type format add -f <format> [<type>...] [--var <name>]... [--contract <name>]`
 
@@ -792,13 +803,13 @@ Format #2 added: decimals:18 for UD60x18
 soldb> type format add -f timestamp --var '*deadline*' --var expiry
 Format #3 added: timestamp for --var *deadline* --var expiry
 soldb> vars
-uint256 value = 25.5 [stack+2]
+uint256 value = 25.5 [stack+2, decimals:6]
 State:
 uint8 decimals = 6 [slot 0x0]
-uint256 totalSupply = 1000000.5 [slot 0x1]
+uint256 totalSupply = 1000000.5 [slot 0x1, decimals:6]
 mapping(address => uint256) balances = <mapping; index it with [key]> [slot 0x2]
 soldb> print balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266]
-uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = 25.5 [slot 0xa3c1…9502]
+uint256 balances[0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266] = 25.5 [slot 0xa3c1…9502, decimals:6]
 ```
 
 A rule selects values in up to three ways, and a value has to meet every one given:
@@ -874,7 +885,7 @@ in `%<format>` to write that part in a format:
 soldb> type summary add -s "${liquidity%wad} in [${tickLower}, ${tickUpper}]" Position
 Summary #4 added: "${liquidity%wad} in [${tickLower}, ${tickUpper}]" for Position
 soldb> print position
-struct Pool.Position position = 3 in [-10, 10] [slot 0x3]
+struct Pool.Position position = 3 in [-10, 10] [slot 0x3, summary]
 soldb> type summary add -s "${var%decimals:6} USDC" --var balances --contract USDC
 ```
 

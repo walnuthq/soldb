@@ -355,6 +355,7 @@ fn format_commands_change_how_step_variables_read() {
     let step = parse(&trace.step(1).expect("step").expect("in range"));
     assert_eq!(step["variables"][0]["value"]["display"], "0x40");
     assert_eq!(step["variables"][0]["value"]["raw"], "0x40");
+    assert_eq!(step["variables"][0]["format"], "hex");
 }
 
 #[wasm_bindgen_test]
