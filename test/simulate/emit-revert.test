@@ -1,0 +1,35 @@
+# A simulated call has no receipt, so its events are read off the recording: each in the
+# frame that emitted it, an anonymous one by its data, one a delegatecall emitted under
+# that call, and each marked when a revert undid it, in a call the caller caught and in a
+# call that fails as a whole.
+# REQUIRES: soldb
+# RUN: cd %{project_root}/examples && rm -rf out_emit_revert && %S/deploy-contract.sh --solc=%{solc_path} --rpc=%{rpc_url} --private-key=%{private_key} EmitRevert EmitRevert.sol --debug-dir=out_emit_revert >/dev/null 2>&1 && ADDR=$(jq -r '.address' out_emit_revert/deployment.json) && %soldb simulate $ADDR "run(uint256)" 1 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir $ADDR:EmitRevert:%{project_root}/examples/out_emit_revert --rpc %{rpc_url} 2>&1 | FileCheck --check-prefix=CAUGHT %s
+# RUN: cd %{project_root}/examples && ADDR=$(jq -r '.address' out_emit_revert/deployment.json) && %soldb simulate $ADDR "run(uint256)" 20 --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --ethdebug-dir $ADDR:EmitRevert:%{project_root}/examples/out_emit_revert --rpc %{rpc_url} 2>&1 | FileCheck --check-prefix=FAILED %s
+
+# The call succeeds; only the event of the call it caught is undone.
+# CAUGHT: Status: SUCCESS
+# CAUGHT: #1 run(uint256 value = 1) at EmitRevert.sol:29
+# CAUGHT-NEXT:   EmitRevert::Started(value = 1) [event]{{$}}
+# CAUGHT-NEXT:   <anonymous>(data = 0x{{0+}}1) [event]{{$}}
+# CAUGHT-NEXT:   #2 EmitRevert::note(uint256 value = 1) at EmitRevert.sol:18
+# CAUGHT-NEXT:     EmitRevert::Noted(value = 1) [event]{{$}}
+# CAUGHT-NEXT:   #3 EmitRevert::inner(uint256 value = 1) at EmitRevert.sol:22
+# CAUGHT-NEXT:     EmitRevert::Inner(value = 1) [event] (reverted)
+# CAUGHT-NEXT:     ← revert inner failed
+# CAUGHT-NEXT:   EmitRevert::Caught(reason = inner failed) [event]{{$}}
+# CAUGHT-NEXT:   EmitRevert::Finished(value = 1) [event]{{$}}
+
+# The call reverts after every event, so all of them are undone.
+# FAILED: Status: REVERTED
+# FAILED: #1 run(uint256 value = 20) at EmitRevert.sol:29
+# FAILED-NEXT:   EmitRevert::Started(value = 20) [event] (reverted)
+# FAILED-NEXT:   <anonymous>(data = 0x{{0+}}14) [event] (reverted)
+# FAILED-NEXT:   #2 EmitRevert::note(uint256 value = 20) at EmitRevert.sol:18
+# FAILED-NEXT:     EmitRevert::Noted(value = 20) [event] (reverted)
+# FAILED-NEXT:   #3 EmitRevert::inner(uint256 value = 20) at EmitRevert.sol:22
+# FAILED-NEXT:     EmitRevert::Inner(value = 20) [event] (reverted)
+# FAILED-NEXT:     ← revert inner failed
+# FAILED-NEXT:   EmitRevert::Caught(reason = inner failed) [event] (reverted)
+# FAILED-NEXT:   ← revert started here at EmitRevert.sol:37
+# FAILED-NEXT:   ← revert value too large
+# FAILED-NOT: Finished

@@ -1,10 +1,14 @@
 # A transaction recorded on OP Sepolia, replayed from its bundle with no node: an
 # orchestrator without debug info calls a logger without debug info and three contracts
 # that have it. The call stack nests every call under its caller, names each from its own
-# contract's debug info, and shows what each returned. Recorded with
+# contract's debug info, and shows the events each emitted and what it returned. Recorded with
 # `soldb trace 0x1362ee… --backend replay --save-replay`.
 # REQUIRES: soldb
 # RUN: %soldb replay %{project_root}/test/fixtures/replay/process-order-sepolia.json --ethdebug-dir 0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd:TaxCalculator:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0x6a85ebf0Eba5307943bDF27D02d198Bc64e9ffEd/debug --ethdebug-dir 0xbE734aD6434E16f6bE04706005faED6fD38eb2B2:ShippingManager:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xbE734aD6434E16f6bE04706005faED6fD38eb2B2/debug --ethdebug-dir 0xf776FF56e2400e31f3070c1ac70Ab80433B01823:PaymentProcessor:%{project_root}/test/walnut_0x75964ba0087ff8ae69bd7c17c8c4db66bc0c8e75603f79de1265c61ddfd98f2e_1756985337815_2zvewt/0xf776FF56e2400e31f3070c1ac70Ab80433B01823/debug 2>&1 | FileCheck %s
+
+# The call succeeded, so no event is marked as undone: a sub-call that returned is
+# not a frame that reverted.
+# RUN: %soldb replay %{project_root}/test/fixtures/replay/process-order-sepolia.json 2>&1 | not grep -F "(reverted)"
 
 # CHECK: Contract: 0x59a714559b46c823d87986b5c5b7c630e2f5668d
 # CHECK: Status: SUCCESS
@@ -12,21 +16,33 @@
 # CHECK-NEXT: ---
 # CHECK-NEXT: #0 0x59a714559b46c823d87986b5c5b7c630e2f5668d::runtime_dispatcher
 # CHECK-NEXT:   #1 0xdcdd1dd0ff17043f8bcd1ac9e5be20bbed4fac0a::0x41304fac
+# CHECK-NEXT:     0xdf2f43000ad262ff{{.*}} [event]
 # CHECK-NEXT:   #2 TaxCalculator::calculateTax(uint256 value = 1000, string orderType = physical) at {{.*}}TaxCalculator.sol:7
 # CHECK-NEXT:     #3 getBaseRate(string orderType) [internal] at {{.*}}TaxCalculator.sol:18
 # CHECK-NEXT:       raw entry stack:
 # CHECK-NEXT:       ← return (uint256 = 8)
+# CHECK-NEXT:     TaxCalculator::TaxComputed(caller = 0x59a714559b46c823d87986b5c5b7c630e2f5668d, orderValue = 1000, taxAmount = 80) [event]
 # CHECK-NEXT:     ← return (uint256 = 80)
 # CHECK-NEXT:   #4 0xdcdd1dd0ff17043f8bcd1ac9e5be20bbed4fac0a::0xfc8a475f
+# CHECK-NEXT:     0x29c44a39e8532b42{{.*}} [event]
 # CHECK-NEXT:   #5 ShippingManager::initiateShipping(address customer = 0x286af310ea3303c80ebe9a66f6998b21bd8c1c29, string method = express) at {{.*}}ShippingManager.sol:8
+# CHECK-NEXT:     ShippingManager::ShippingStarted(to = 0x286af310ea3303c80ebe9a66f6998b21bd8c1c29, method = express) [event]
 # CHECK-NEXT:     #6 estimateShipping(string method) [internal] at {{.*}}ShippingManager.sol:17
 # CHECK-NEXT:       raw entry stack:
 # CHECK-NEXT:       ← return (uint256 = 50)
+# CHECK-NEXT:     ShippingManager::ShippingEstimate(cost = 50) [event]
 # CHECK-NEXT:     ← return (uint256 = 50)
 # CHECK-NEXT:   #7 0xdcdd1dd0ff17043f8bcd1ac9e5be20bbed4fac0a::0xfc8a475f
+# CHECK-NEXT:     0x29c44a39e8532b42{{.*}} [event]
 # CHECK-NEXT:   #8 PaymentProcessor::processPayment(address from = 0x286af310ea3303c80ebe9a66f6998b21bd8c1c29, uint256 amount = 1080) at {{.*}}PaymentProcessor.sol:7
+# CHECK-NEXT:     PaymentProcessor::PaymentReceived(from = 0x286af310ea3303c80ebe9a66f6998b21bd8c1c29, amount = 1080) [event]
 # CHECK-NEXT:   #9 0xdcdd1dd0ff17043f8bcd1ac9e5be20bbed4fac0a::0xe4af64b1
+# CHECK-NEXT:     0xdf2f43000ad262ff{{.*}} [event]
+# CHECK-NEXT:     0x29c44a39e8532b42{{.*}} [event]
+# An event the orchestrator emits itself sits level with the calls it made.
+# CHECK-NEXT:   0x092776ba01c21f36{{.*}} [event]
 # CHECK-NEXT:   ← return 0x{{0+}}438
+# CHECK-NEXT: ---
 # CHECK-NOT: Backtrace:
 
 # Without debug info every call is an address and the selector it was called with.
@@ -37,5 +53,7 @@
 # PLAIN-NEXT: ---
 # PLAIN-NEXT: #0 0x59a714559b46c823d87986b5c5b7c630e2f5668d::runtime_dispatcher
 # PLAIN-NEXT:   #1 0xdcdd1dd0ff17043f8bcd1ac9e5be20bbed4fac0a::0x41304fac
+# PLAIN-NEXT:     0xdf2f43000ad262ff{{.*}} [event]
 # PLAIN-NEXT:   #2 0x6a85ebf0eba5307943bdf27d02d198bc64e9ffed::0x55ec8a03
+# PLAIN-NEXT:     0x02d5554e2af60251{{.*}} [event]
 # PLAIN-NEXT:     ← return 0x{{0+}}50

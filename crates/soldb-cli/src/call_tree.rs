@@ -1,25 +1,26 @@
 //! The `Call Stack:` block of a summary: every call the trace made, nested under its
-//! caller, with the arguments it was called with and what it returned or reverted with,
-//! and where a failed transaction's revert started.
+//! caller, with the arguments it was called with, the events it emitted, and what it
+//! returned or reverted with, and where a failed transaction's revert started.
 //!
 //! The frames are [`StepMap::call_tree`]'s, so they are the frames `backtrace` shows at
 //! any step inside them; this module only words them.
 
 use soldb_core::TransactionTrace;
 use soldb_debugger::{
-    CallExit, CallNode, ContractDebugInfo, FrameArgument, SourceFunction, StepMap,
+    CallExit, CallNode, ContractDebugInfo, FrameArgument, PlacedLog, SourceFunction, StepMap,
 };
-use soldb_ethdebug::ErrorRegistry;
+use soldb_ethdebug::{ErrorRegistry, EventRegistry};
 
 use crate::{
-    decode_calldata_word, descriptor_from_source_function, dim, error_color, format_decoded_call,
-    format_raw_stack, format_source_prototype, function_color, info, number_color, CallDescriptor,
-    DecodedCallParam,
+    decode_calldata_word, descriptor_from_source_function, dim, error_color, event_color,
+    format_decoded_call, format_raw_stack, format_source_prototype, format_trace_event,
+    function_color, info, number_color, CallDescriptor, DecodedCallParam,
 };
 
 /// What the summary needs besides the trace and its map.
 pub(crate) struct CallTreeContext<'a> {
     pub(crate) errors: &'a ErrorRegistry,
+    pub(crate) events: &'a EventRegistry,
     /// The top-level call as the command line or an ABI describes it, for a root whose
     /// code has no debug info.
     pub(crate) root_call: Option<CallDescriptor>,
@@ -35,7 +36,8 @@ struct Line {
     text: String,
 }
 
-/// The call tree's lines, then where a failed transaction's revert started.
+/// The call tree's lines, then the logs nothing places in it, then where a failed
+/// transaction's revert started.
 pub(crate) fn call_tree_lines(
     trace: &TransactionTrace,
     map: &StepMap,
@@ -43,12 +45,22 @@ pub(crate) fn call_tree_lines(
 ) -> Vec<String> {
     let nodes = map.call_tree(trace);
     let origin = map.revert_origin(trace, &nodes);
+    let logs = map.logs(trace);
+    let mut emitted = vec![Vec::new(); nodes.len()];
+    let mut unplaced = Vec::new();
+    for log in &logs {
+        match log.step.and_then(|step| innermost_node(&nodes, step)) {
+            Some(node) => emitted[node].push(log),
+            None => unplaced.push(log),
+        }
+    }
     let tree = Tree {
         trace,
         map,
         nodes: &nodes,
         context,
         children: children_of(&nodes),
+        emitted,
         origin_node: origin.and_then(|step| innermost_node(&nodes, step)),
         origin,
     };
@@ -56,6 +68,7 @@ pub(crate) fn call_tree_lines(
     for root in (0..nodes.len()).filter(|&index| nodes[index].parent.is_none()) {
         lines.extend(tree.root(root));
     }
+    lines.extend(unplaced.into_iter().map(|log| tree.emit_line(log, 1)));
     let mut number = 0;
     let mut output = lines
         .into_iter()
@@ -84,6 +97,8 @@ struct Tree<'a> {
     nodes: &'a [CallNode],
     context: &'a CallTreeContext<'a>,
     children: Vec<Vec<usize>>,
+    /// The logs each frame emitted itself, in the order emitted.
+    emitted: Vec<Vec<&'a PlacedLog>>,
     origin: Option<usize>,
     /// The innermost frame the revert started in.
     origin_node: Option<usize>,
@@ -108,6 +123,7 @@ impl Tree<'_> {
                 lines.push(numbered(0, line));
                 lines.extend(self.body(function, 1));
                 lines.extend(self.inlined_lines(index, 1));
+                lines.extend(self.emit_lines(index, 1));
             }
             None => {
                 if let Some(call) = &self.context.root_call {
@@ -167,10 +183,16 @@ impl Tree<'_> {
         lines
     }
 
-    /// The calls `index` made, at `level`, with identical calls in a row shown once.
+    /// The calls `index` made and the events it emitted between them, at `level`, with
+    /// identical calls in a row shown once.
     fn callees(&self, index: usize, level: usize) -> Vec<Line> {
         let mut blocks = Vec::<(Vec<Line>, usize)>::new();
+        let mut logs = self.emitted[index].iter().peekable();
         for &callee in &self.children[index] {
+            let entered = self.nodes[callee].frame.entry_step;
+            while let Some(log) = logs.next_if(|log| log.step < Some(entered)) {
+                blocks.push((vec![self.emit_line(log, level)], 1));
+            }
             if self.nodes[callee].inlined {
                 if let Some(line) = self.inlined_line(callee, level) {
                     blocks.push((vec![line], 1));
@@ -178,12 +200,13 @@ impl Tree<'_> {
                 continue;
             }
             let block = self.callee(callee, level);
-            let leaf = self.children[callee].is_empty();
+            let leaf = self.children[callee].is_empty() && self.emitted[callee].is_empty();
             match blocks.last_mut() {
                 Some((last, count)) if leaf && *last == block => *count += 1,
                 _ => blocks.push((block, 1)),
             }
         }
+        blocks.extend(logs.map(|log| (vec![self.emit_line(log, level)], 1)));
         blocks
             .into_iter()
             .flat_map(|(mut block, count)| {
@@ -193,6 +216,26 @@ impl Tree<'_> {
                 block
             })
             .collect()
+    }
+
+    /// The events `index` emitted itself, for a frame whose calls are shown as another's.
+    fn emit_lines(&self, index: usize, level: usize) -> Vec<Line> {
+        self.emitted[index]
+            .iter()
+            .map(|log| self.emit_line(log, level))
+            .collect()
+    }
+
+    /// One event, decoded when an ABI declares it, tagged `[event]` as a call is
+    /// `[internal]`, and marked when a revert undid it.
+    fn emit_line(&self, log: &PlacedLog, level: usize) -> Line {
+        let event = event_color(format_trace_event(&log.log, self.context.events));
+        let undone = if log.reverted {
+            format!(" {}", dim("(reverted)"))
+        } else {
+            String::new()
+        };
+        plain(level, format!("{event} {}{undone}", dim("[event]")))
     }
 
     fn callee(&self, index: usize, level: usize) -> Vec<Line> {
@@ -209,6 +252,7 @@ impl Tree<'_> {
                 let mut lines = vec![numbered(level, format!("{contract}::{line}"))];
                 lines.extend(self.body(function, level + 1));
                 lines.extend(self.inlined_lines(index, level + 1));
+                lines.extend(self.emit_lines(index, level + 1));
                 lines
             }
             None => {
@@ -506,11 +550,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use soldb_core::{Bytes, StepSnapshot, TraceStep, TransactionTrace};
+    use soldb_core::{Bytes, ExecutionLog, StepSnapshot, TraceStep, TransactionTrace};
     use soldb_debugger::{ContractDebugInfo, StepMap};
     use soldb_ethdebug::{
         encode_function_call, function_selector, source_range, ErrorRegistry, EthdebugInfo,
-        Instruction,
+        EventRegistry, Instruction,
     };
 
     use super::{call_tree_lines, CallTreeContext};
@@ -679,6 +723,7 @@ contract C {
             &map,
             &CallTreeContext {
                 errors: &errors,
+                events: &EventRegistry::default(),
                 root_call: None,
                 root_name: "Root",
             },
@@ -690,6 +735,52 @@ contract C {
         (1, "JUMP", &["0xa"]),
         (10, "JUMPDEST", &["0x7"]),
     ];
+
+    #[test]
+    fn an_event_is_shown_in_the_frame_that_emitted_it() {
+        const TOPIC: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+        // The callee emits one log inside `run`: offset, size, and the topic from the top.
+        let emits: &[(u64, &str, &[&str])] = &[
+            (0, "PUSH1", &[]),
+            (1, "JUMP", &["0xa"]),
+            (10, "JUMPDEST", &["0x7"]),
+            (11, "LOG1", &[TOPIC, "0x0", "0x0"]),
+        ];
+        let emit = format!("{TOPIC}(data = 0x) [event]");
+        let contracts = || vec![contract(ROOT), contract(CALLEE)];
+
+        let kept = trace(emits, ("RETURN", &word(1)), 1, ("STOP", &[]));
+        assert_eq!(
+            lines(&kept, contracts())[4..7],
+            [
+                "  #3 C::run(uint256 a = 7) at C.sol:2".to_owned(),
+                format!("    {emit}"),
+                "    ← return (uint256 = 1)".to_owned(),
+            ]
+        );
+
+        // A log the callee's revert undid is still where it was emitted, and says so.
+        let undone = trace(emits, ("REVERT", &[]), 1, ("STOP", &[]));
+        assert_eq!(
+            lines(&undone, contracts())[5..7],
+            [format!("    {emit} (reverted)"), "    ← revert".to_owned()]
+        );
+
+        // Logs the backend reported that the recording cannot place follow the tree.
+        let mut unplaced = kept;
+        unplaced.artifacts.logs = (0..2)
+            .map(|index| ExecutionLog {
+                index,
+                depth: 0,
+                address: CALLEE.to_owned(),
+                topics: vec![TOPIC.to_owned()],
+                data: "0x".to_owned(),
+            })
+            .collect();
+        let lines = lines(&unplaced, contracts());
+        assert_eq!(lines[5], "    ← return (uint256 = 1)");
+        assert_eq!(lines[7..], [format!("  {emit}"), format!("  {emit}")]);
+    }
 
     #[test]
     fn a_revert_is_decoded_where_it_started_and_backtraced() {

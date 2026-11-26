@@ -95,6 +95,8 @@ The system analyzes the execution trace to reconstruct function calls:
    `StepMap::call_tree` lists every frame as it was entered and left: external calls by
    the EVM depth, internal functions by the jumps onto their entry points, each under the
    frame that made it. The REPL's `backtrace` is the same frames at one step.
+   `StepMap::logs` places each event at the `LOG` step that emitted it, so the summary
+   shows it inside the frame it came from.
    ```
    #1 pay(uint256 amount = 5000) at Payroll.sol:37
      #2 _fee(uint256 amount = 5000) [internal] at Payroll.sol:43

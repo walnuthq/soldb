@@ -194,6 +194,9 @@ that both would want belongs in `soldb-debugger`, not in a second copy.
   on optimized via-IR code three quarters of the span changes are not calls. A jump the
   artifact marks as a return is never a call, even onto a `JUMPDEST` that carries a
   whole declaration.
+  `StepMap::logs` puts every log at the `LOG` step that emitted it: a backend's logs
+  keep what it reported and are only placed, by how many it kept, and a run without any,
+  as a simulated call on a node is, has them read off the recording.
   `state.rs` reads state variables: `StorageTape` indexes every storage word the trace
   recorded by the account whose storage it belongs to (a `DELEGATECALL` writes
   the caller's, which `StepMap::storage_context_index` decides) and by the step it holds

@@ -25,7 +25,9 @@ mod profile;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
-use soldb_core::{encode_hex, opcode, EvmWord, SoldbResult, StepView, TransactionTrace};
+use soldb_core::{
+    encode_hex, opcode, EvmWord, ExecutionLog, SoldbResult, StepView, TransactionTrace,
+};
 use soldb_debugger::{
     CachedChain, ChainRead, ChainStorage, ContractDebugInfo, SourceFunction, SourceParam, StepMap,
 };
@@ -154,6 +156,10 @@ fn number_color(value: impl Display) -> String {
 
 fn function_color(value: impl Display) -> String {
     paint(value, "95")
+}
+
+fn event_color(value: impl Display) -> String {
+    paint(value, "32")
 }
 
 fn separator(width: usize) -> String {
@@ -2102,7 +2108,14 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
     let root_name = root_address.map_or("<unknown>", String::as_str);
     if specs.is_empty() {
         print_plain_trace_summary(trace, &errors);
-        print_call_stack(trace, &map, &errors, None, root_name);
+        print_call_stack(
+            trace,
+            &map,
+            &errors,
+            None,
+            root_name,
+            &trace_event_registry(args),
+        );
         return;
     }
     let spec = spec_for_address(&specs, root_address.map(String::as_str));
@@ -2140,7 +2153,14 @@ fn print_trace_summary(trace: &TransactionTrace, args: &TraceView) {
     println!("{} {}", info("Status:"), status);
     print_trace_error(trace, &errors);
     let root_call = spec.and_then(|spec| abi_descriptor_for_calldata(spec, &trace.input_data));
-    print_call_stack(trace, &map, &errors, root_call, contract_name);
+    print_call_stack(
+        trace,
+        &map,
+        &errors,
+        root_call,
+        contract_name,
+        &trace_event_registry(args),
+    );
 }
 
 /// The `Call Stack:` block that ends a summary.
@@ -2150,12 +2170,14 @@ fn print_call_stack(
     errors: &ErrorRegistry,
     root_call: Option<CallDescriptor>,
     root_name: &str,
+    events: &EventRegistry,
 ) {
     println!();
     println!("{}", bold(info("Call Stack:")));
     println!("{}", separator(60));
     let context = CallTreeContext {
         errors,
+        events,
         root_call,
         root_name,
     };
@@ -2382,7 +2404,14 @@ fn print_simulation_summary(
     let root_call = spec
         .and_then(|spec| abi_descriptor_for_calldata(spec, raw_data))
         .or_else(|| simulated_call_descriptor(args, raw_data, function_name));
-    print_call_stack(trace, &map, &errors, root_call, &contract_name);
+    print_call_stack(
+        trace,
+        &map,
+        &errors,
+        root_call,
+        &contract_name,
+        &simulate_event_registry(args),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2481,6 +2510,37 @@ impl TraceSourceIndex {
                 .then(|| descriptor_from_source_function(function, calldata))
         })
     }
+}
+
+fn format_trace_event(log: &ExecutionLog, events: &EventRegistry) -> String {
+    if let Some(decoded) = events.decode_log(&log.topics, &log.data) {
+        return format_decoded_event_inline(&decoded);
+    }
+    let topic = log.topics.first().map_or("<anonymous>", String::as_str);
+    format!("{topic}(data = {})", normalize_hex(&log.data))
+}
+
+fn format_decoded_event_inline(decoded: &DecodedEvent) -> String {
+    let name = decoded.contract_name.as_ref().map_or_else(
+        || decoded.event.clone(),
+        |contract| format!("{contract}::{}", decoded.event),
+    );
+    format!(
+        "{}({})",
+        name,
+        decoded
+            .args
+            .iter()
+            .map(|arg| {
+                if arg.name.is_empty() {
+                    display_json_value(&arg.value)
+                } else {
+                    format!("{} = {}", arg.name, display_json_value(&arg.value))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn call_descriptor_for_calldata(
@@ -2988,6 +3048,38 @@ fn load_event_registry(args: &ListEventsArgs) -> SoldbResult<EventRegistry> {
         args.contracts.as_deref(),
         &args.source_path,
     )?)
+}
+
+fn trace_event_registry(args: &TraceView) -> EventRegistry {
+    event_registry_reporting(resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    ))
+}
+
+fn simulate_event_registry(args: &SimulationView) -> EventRegistry {
+    event_registry_reporting(resolve_contract_specs_reporting(
+        &args.ethdebug_dir,
+        args.contracts.as_deref(),
+        &args.source_path,
+    ))
+}
+
+/// Builds the event registry, reporting a failure instead of decoding nothing in silence.
+fn event_registry_reporting(specs: Vec<ResolvedContractSpec>) -> EventRegistry {
+    match event_registry_for_specs(specs) {
+        Ok(registry) => registry,
+        Err(error) => {
+            report_once(
+                format!("events:{error}"),
+                &format!("could not load event ABIs: {error}"),
+                "logs are shown without decoded names or arguments",
+                None,
+            );
+            EventRegistry::default()
+        }
+    }
 }
 
 fn event_registry_for_specs(specs: Vec<ResolvedContractSpec>) -> SoldbResult<EventRegistry> {
@@ -4031,6 +4123,7 @@ contract Counter {
             &map,
             &CallTreeContext {
                 errors: &errors,
+                events: &EventRegistry::default(),
                 root_call: None,
                 root_name: "Counter",
             },

@@ -898,6 +898,23 @@ impl<'a> StepView<'a> {
         }
     }
 
+    /// The topics and the data a `LOG` instruction emits, read off its stack and from
+    /// memory at the offset and size there; `None` for other steps or without stack or
+    /// memory.
+    #[must_use]
+    pub fn emitted_log(&self) -> Option<(Vec<EvmWord>, String)> {
+        let op = self.op();
+        if !(opcode::LOG0..=opcode::LOG4).contains(&op) {
+            return None;
+        }
+        let data = self.memory_range(0, 1)?;
+        let stack = self.stack();
+        let topics = (0..usize::from(op - opcode::LOG0))
+            .map(|topic| stack.peek(2 + topic))
+            .collect::<Option<Vec<_>>>()?;
+        Some((topics, data))
+    }
+
     /// The memory bytes at the offset and size the stack holds `offset_at` and `size_at`
     /// words from the top, as `0x`-prefixed hex.
     fn memory_range(&self, offset_at: usize, size_at: usize) -> Option<String> {
@@ -1506,12 +1523,27 @@ mod tests {
             step("STATICCALL", &["0x2", "0x2", "0xb", "0x5"]),
             // A range no frame could pay for is refused rather than allocated.
             step("RETURN", &["0xffffffffffff", "0x0"]),
+            // LOG2: offset, size, then the topics from the top; bottom first here.
+            step("LOG2", &["0x7", "0x9", "0x2", "0x1"]),
+            // A stack too short for the topics the instruction takes.
+            step("LOG2", &["0x9", "0x2", "0x1"]),
         ]);
+        let logs = table
+            .iter()
+            .map(|step| step.emitted_log())
+            .collect::<Vec<_>>();
+        let topics = ["0x9", "0x7"].map(|topic| topic.parse::<EvmWord>().expect("word"));
+        assert_eq!(logs[5], Some((topics.to_vec(), "0x31ba".to_owned())));
+        assert!(logs
+            .iter()
+            .enumerate()
+            .all(|(index, log)| index == 5 || log.is_none()));
         let halts = table
             .iter()
             .map(|step| step.halt_data())
             .collect::<Vec<_>>();
-        assert_eq!(halts, [Some("0x31ba".to_owned()), None, None, None, None]);
+        assert_eq!(halts[0], Some("0x31ba".to_owned()));
+        assert!(halts[1..].iter().all(Option::is_none));
         let inputs = table
             .iter()
             .map(|step| step.call_input())
@@ -1523,6 +1555,8 @@ mod tests {
                 None,
                 Some("0x31bad4".to_owned()),
                 Some("0xbad4".to_owned()),
+                None,
+                None,
                 None
             ]
         );

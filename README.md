@@ -155,12 +155,14 @@ Call Stack:
     #3 increment3(uint256 amount, uint256 amount2) [internal] at TestContract.sol:54
 ```
 
-Every call is nested under its caller, with the arguments it was called with and what it
-returned. A call into another contract is named from that contract's debug info, and
-one without debug info shows its address and selector. A modifier is shown as a frame of
-its own around the function, marked `[modifier]`, and a function the optimizer put in
-line is listed in the frame it ran in, marked `[inlined]`: it was not called, so it has
-no arguments and no return value.
+Every call is nested under its caller, with the arguments it was called with, the events
+it emitted, and what it returned. A call into another contract is named from that
+contract's debug info, and one without debug info shows its address and selector. An
+event is marked `[event]`, and one a revert undid is still shown where it was emitted,
+marked `(reverted)`. A modifier
+is shown as a frame of its own around the function, marked `[modifier]`, and a function
+the optimizer put in line is listed in the frame it ran in, marked `[inlined]`: it was
+not called, so it has no arguments and no return value.
 
 When the transaction calls other contracts, give each one its debug info, either with
 one `--ethdebug-dir <address>:<name>:<dir>` per contract or with a mapping file:

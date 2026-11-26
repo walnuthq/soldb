@@ -536,8 +536,7 @@ mod tests {
     use super::{
         contract_name_from_program_path, ethdebug_resources_from_metadata, find_ethdebug_metadata,
         find_program_ethdebug, load_abi, load_debug_program, load_ethdebug_metadata,
-        load_storage_layout,
-        load_transient_storage_layout, read_debug_source, read_json_file,
+        load_storage_layout, load_transient_storage_layout, read_debug_source, read_json_file,
     };
     use crate::errors::load_error_abis;
     use crate::events::event_abis;

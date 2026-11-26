@@ -19,3 +19,6 @@
 # CHECK: increment2(uint256 amount = 4) [internal] at TestContract.sol:39
 # CHECK: increment3(uint256 amount, uint256 amount2) [internal] at TestContract.sol:54
 # CHECK-NEXT: raw entry stack:
+
+# Check decoded event artifacts are included in the human trace
+# CHECK: TestContract::CounterIncremented(newValue = 13) [event]

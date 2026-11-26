@@ -513,7 +513,7 @@ fn trace_summary_prints_status_and_step_count() {
 }
 
 #[test]
-fn trace_summary_prints_no_event_lines() {
+fn trace_summary_prints_decoded_event_lines() {
     let rpc_url = start_rpc_server(3);
     let (_abi_dir, ethdebug_spec) = write_function_abi(
         "TestContract",
@@ -537,10 +537,55 @@ fn trace_summary_prints_no_event_lines() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    // The summary is the call stack; `list-events` shows what the transaction emitted.
-    assert!(stdout.contains("Call Stack:"));
-    assert!(!stdout.contains("emit "), "{stdout}");
+    assert!(stdout.contains("TestContract::CounterIncremented(newValue = 4) [event]"));
     assert!(!stdout.contains("Artifacts:"));
+}
+
+#[test]
+fn trace_shows_an_event_the_receipt_dropped_where_a_caught_call_emitted_it() {
+    let rpc_url = start_caught_revert_rpc_server();
+    let output = Command::new(env!("CARGO_BIN_EXE_soldb"))
+        .args([
+            "trace",
+            "0xabc",
+            "--rpc",
+            &rpc_url,
+            "--backend",
+            "debug-rpc",
+        ])
+        .output()
+        .expect("run soldb");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    // Each event: its indent, its topic, and whether it is marked as undone.
+    let events = stdout
+        .lines()
+        .filter(|line| line.contains("[event]"))
+        .map(|line| {
+            let indent = line.len() - line.trim_start().len();
+            let topic = [CAUGHT_PAID, CAUGHT_SENT, CAUGHT_CAUGHT]
+                .into_iter()
+                .find(|topic| line.contains(*topic))
+                .unwrap_or_else(|| panic!("unexpected event line: {line}"));
+            (indent, topic, line.ends_with("(reverted)"))
+        })
+        .collect::<Vec<_>>();
+    // The receipt keeps the two logs of the caller; the callee's, which its revert undid,
+    // is read off the recording, in the callee's frame.
+    assert_eq!(
+        events,
+        [
+            (2, CAUGHT_PAID, false),
+            (4, CAUGHT_SENT, true),
+            (2, CAUGHT_CAUGHT, false)
+        ],
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -1324,6 +1369,19 @@ fn run_with_stdin(command: &mut Command, input: &str) -> std::process::Output {
     child.wait_with_output().expect("wait for soldb")
 }
 
+/// A transaction to `0x2` that emits, calls `0x3`, which emits and reverts, catches the
+/// revert, and emits again. The receipt has the caller's two logs only.
+fn start_caught_revert_rpc_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc server");
+    let address = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            respond_to_caught_revert_rpc_request(stream.expect("accept rpc request"));
+        }
+    });
+    format!("http://{address}")
+}
+
 fn start_decoded_event_rpc_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc server");
     let address = listener.local_addr().expect("local addr");
@@ -1421,15 +1479,7 @@ fn respond_to_rpc_request(mut stream: TcpStream) {
         json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "unknown method"}})
     };
 
-    let body = response.to_string();
-    let http_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream
-        .write_all(http_response.as_bytes())
-        .expect("write response");
+    write_json_response(&mut stream, &response);
 }
 
 #[cfg(unix)]
@@ -1481,15 +1531,7 @@ fn respond_to_auto_deploy_rpc_request(mut stream: TcpStream) {
         json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "unknown method"}})
     };
 
-    let body = response.to_string();
-    let http_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream
-        .write_all(http_response.as_bytes())
-        .expect("write response");
+    write_json_response(&mut stream, &response);
 }
 
 fn respond_to_decoded_event_rpc_request(mut stream: TcpStream) {
@@ -1512,15 +1554,55 @@ fn respond_to_decoded_event_rpc_request(mut stream: TcpStream) {
         json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "unknown method"}})
     };
 
-    let body = response.to_string();
-    let http_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
+    write_json_response(&mut stream, &response);
+}
+
+const CAUGHT_PAID: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+const CAUGHT_SENT: &str = "0x00000000000000000000000000000000000000000000000000000000000000b2";
+const CAUGHT_CAUGHT: &str = "0x00000000000000000000000000000000000000000000000000000000000000c3";
+
+fn respond_to_caught_revert_rpc_request(mut stream: TcpStream) {
+    let request = read_http_request(&mut stream);
+    let log = |topic: &str| json!({"address": "0x2", "topics": [topic], "data": "0x"});
+    // LOG1 pops offset, size, and topic from the top; `structLogs` lists the stack bottom first.
+    let log_step = |pc: u64, depth: u64, topic: &str| {
+        json!({"pc": pc, "op": "LOG1", "gas": 90, "gasCost": 750, "depth": depth,
+               "stack": [topic, "0x0", "0x0"], "memory": ["0".repeat(64)]})
+    };
+    let result = if request.contains("\"eth_getTransactionByHash\"") {
+        json!({"hash": "0xabc", "from": "0x1", "to": "0x2", "value": "0x0", "input": "0x"})
+    } else if request.contains("\"eth_getTransactionReceipt\"") {
+        json!({
+            "gasUsed": "0x5208",
+            "status": "0x1",
+            "contractAddress": null,
+            "logs": [log(CAUGHT_PAID), log(CAUGHT_CAUGHT)]
+        })
+    } else if request.contains("\"debug_traceTransaction\"") {
+        json!({
+            "returnValue": "",
+            "structLogs": [
+                log_step(0, 1, CAUGHT_PAID),
+                {"pc": 1, "op": "CALL", "gas": 90, "gasCost": 100, "depth": 1,
+                 "stack": ["0x0", "0x0", "0x0", "0x0", "0x0", "0x3", "0xffff"]},
+                log_step(0, 2, CAUGHT_SENT),
+                {"pc": 1, "op": "REVERT", "gas": 80, "gasCost": 0, "depth": 2,
+                 "stack": ["0x0", "0x0"]},
+                log_step(2, 1, CAUGHT_CAUGHT),
+                {"pc": 3, "op": "STOP", "gas": 70, "gasCost": 0, "depth": 1}
+            ]
+        })
+    } else {
+        write_json_response(
+            &mut stream,
+            &json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "unknown method"}}),
+        );
+        return;
+    };
+    write_json_response(
+        &mut stream,
+        &json!({"jsonrpc": "2.0", "id": 1, "result": result}),
     );
-    stream
-        .write_all(http_response.as_bytes())
-        .expect("write response");
 }
 
 fn respond_to_contract_call_rpc_request(mut stream: TcpStream) {
@@ -1572,6 +1654,10 @@ fn respond_to_contract_call_rpc_request(mut stream: TcpStream) {
         json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "unknown method"}})
     };
 
+    write_json_response(&mut stream, &response);
+}
+
+fn write_json_response(stream: &mut TcpStream, response: &serde_json::Value) {
     let body = response.to_string();
     let http_response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

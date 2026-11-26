@@ -32,6 +32,7 @@
 //! Everything here is a search over the recording. Nothing re-executes.
 
 mod calls;
+mod logs;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -56,6 +57,7 @@ use crate::{
 };
 
 pub use calls::{CallExit, CallNode};
+pub use logs::PlacedLog;
 
 /// The warning a frontend shows once when it presents inferred local variables.
 pub const INFERRED_LOCALS_WARNING: &str = "local variables are inferred from the legacy source \

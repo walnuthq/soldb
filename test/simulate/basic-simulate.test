@@ -23,6 +23,10 @@
 # CHECK: increment3(uint256 amount, uint256 amount2) [internal] at TestContract.sol:54
 # CHECK-NEXT: raw entry stack:
 
+# A simulated call has no receipt, so its events are read off the recording, in the frame
+# that emitted them.
+# CHECK: TestContract::CounterIncremented(newValue = {{[0-9]+}}) [event]
+
 # Check for the footer
 # CHECK: ------------------------------------------------------------
 # CHECK: Use --raw flag to see detailed instruction trace

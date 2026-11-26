@@ -1681,6 +1681,8 @@ where
                 .action()
                 .as_ref()
                 .and_then(|action| action.instruction_result())
+                // A halt that succeeded is no error, and a node reports none for it.
+                .filter(|result| !result.is_ok())
                 .map(|result| format!("{result:?}"));
             record_replay_storage_touch(&mut log, interp);
             self.struct_logs.push(log);
@@ -2838,6 +2840,8 @@ mod tests {
         assert_eq!(trace.backend.as_deref(), Some("replay"));
         assert!(trace.success, "{:?}", trace.error);
         assert_eq!(trace.steps.len(), 10);
+        // The halt that ends a successful run is not a step error.
+        assert!(trace.steps.iter().all(|step| step.error().is_none()));
         assert_eq!(trace.steps.step(4).storage()["0x0"], "0x29");
         assert_eq!(trace.steps.step(8).storage()["0x0"], "0x2a");
         // Accounts never described, the fee recipient here, are simply empty.
@@ -2908,6 +2912,7 @@ mod tests {
         let trace = chain.deploy(&deployment).expect("trace");
         assert!(!trace.success);
         assert!(trace.error.is_some());
+        assert!(trace.steps.iter().any(|step| step.error().is_some()));
         assert!(chain.deployment("0x12", "0x", "0", 0).is_err());
         assert!(LocalChain::new()
             .with_account(SENDER, "lots", 0, "0x")
