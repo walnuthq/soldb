@@ -865,7 +865,8 @@ two's complement as it is stored.
 
 `decimals:@decimals` takes the number of decimal places from a state variable of the
 contract executing, which is how a token's amounts read in its own decimals without saying
-what they are. It works where the contract keeps them in storage, as USDC does; a token
+what they are. Such a rule never applies to the variable it reads, so a broad one leaves
+`decimals = 6` as it is. It works where the contract keeps them in storage, as USDC does; a token
 that returns a constant from `decimals()`, as OpenZeppelin's `ERC20` does, keeps nothing to
 read, and the value says so next to the number rather than guessing:
 

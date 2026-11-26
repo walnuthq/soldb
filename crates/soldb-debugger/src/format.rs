@@ -911,6 +911,14 @@ impl ValueFormatter<'_> {
         match shape {
             ValueShape::Scalar(scalar) => {
                 match self.formatters.format_for(self.contract, name, &scalar.ty) {
+                    // The variable the decimals are read from is not scaled by them: a
+                    // broad `decimals:@decimals` rule would show `decimals = 6` as
+                    // `0.000006`, which is never what anyone wants.
+                    Some(ValueFormat::Decimals(Decimals::State(path)))
+                        if leaf_name(path) == name =>
+                    {
+                        scalar.shown.clone()
+                    }
                     Some(format) => self.scalar(scalar, format),
                     None => scalar.shown.clone(),
                 }
@@ -1680,6 +1688,17 @@ mod tests {
                 .text,
             "12500000 <decimals unknown: no state variable named `decimals` in the storage layout>"
         );
+
+        // The rule leaves the variable it reads alone, even when it matches it.
+        formatters.add_format(
+            ValueFormat::parse("decimals:@decimals").expect("a format"),
+            matcher(&["uint*"], &[]),
+        );
+        let six = value(scalar("uint8", vec![6]));
+        let broad = formatters.view(Some("USDC"), &state);
+        assert_eq!(broad.render("decimals", &six).text, "6");
+        assert_eq!(broad.render("decimals", &six).format, None);
+        assert_eq!(broad.render("fee", &six).text, "0.000006");
     }
 
     #[test]
