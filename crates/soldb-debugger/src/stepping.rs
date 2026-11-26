@@ -1790,7 +1790,16 @@ impl StepMap {
                 });
                 next_frame_id += 1;
             }
-            if step.op() == opcode::REVERT || step.error().is_some() {
+            // Only the step a frame ends on says how it ended: some nodes put an error such
+            // as `CallOrCreate` on every call instruction, which then carries on.
+            let ends_frame = trace
+                .steps
+                .get(index + 1)
+                .is_none_or(|next| next.depth() < step.depth())
+                || upcoming_roots
+                    .peek()
+                    .is_some_and(|(_, root)| root.entry_step == index + 1);
+            if ends_frame && halts_with_failure(step) {
                 let entry_step = evm_frames
                     .last()
                     .expect("the root frame is never popped")

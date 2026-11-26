@@ -202,8 +202,12 @@ mod tests {
     /// The root emits `PAID`, calls the callee, which emits `SENT` and halts with
     /// `callee_halt`, and stops.
     fn trace(callee_halt: &str, logs: Vec<ExecutionLog>) -> TransactionTrace {
+        trace_of(steps(callee_halt), logs)
+    }
+
+    fn steps(callee_halt: &str) -> Vec<TraceStep> {
         let callee = format!("0x{}", CALLEE.trim_start_matches("0x"));
-        let steps = vec![
+        vec![
             // LOG1: offset, size, topic from the top; bottom first here.
             step(1, "LOG1", &[PAID, "0x2", "0x1"]),
             step(
@@ -214,7 +218,10 @@ mod tests {
             step(2, "LOG1", &[SENT, "0x1", "0x0"]),
             step(2, callee_halt, &["0x0", "0x0"]),
             step(1, "STOP", &[]),
-        ];
+        ]
+    }
+
+    fn trace_of(steps: Vec<TraceStep>, logs: Vec<ExecutionLog>) -> TransactionTrace {
         let artifacts = TraceArtifacts {
             logs,
             ..Default::default()
@@ -281,6 +288,20 @@ mod tests {
             [
                 (Some(0), false, PAID.to_owned()),
                 (Some(2), true, SENT.to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn an_error_on_a_call_that_carries_on_undoes_nothing() {
+        // Some nodes put `CallOrCreate` on every call instruction; the frame goes on.
+        let mut steps = steps("RETURN");
+        steps[1].error = Some("CallOrCreate".to_owned());
+        assert_eq!(
+            placed(&trace_of(steps, Vec::new())),
+            [
+                (Some(0), false, PAID.to_owned()),
+                (Some(2), false, SENT.to_owned())
             ]
         );
     }
