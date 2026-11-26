@@ -126,8 +126,16 @@ for imports. `--base-path`, `--include-path`, `--remapping`, and `--no-project` 
 that.
 
 Contracts built by older compilers work through their legacy source maps: SolDB reads
-`combined.json` when ETHDebug programs are absent. If the sources are not next to the
-artifacts, pass `--source-path <dir>`.
+`combined.json` when ETHDebug programs are absent. `soldb compile --legacy` builds one with
+any solc, ETHDebug or not: the legacy pipeline's source maps and storage layout, with
+`<Contract>.bin` and `<Contract>.abi` beside them. Lines, functions, frames, and state
+variables come from those, and locals are read off the stack:
+
+```bash
+soldb compile src/Token.sol -o out --legacy --solc solc-0.8.16
+```
+
+If the sources are not next to the artifacts, pass `--source-path <dir>`.
 
 Trace a transaction:
 

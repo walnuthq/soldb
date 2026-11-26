@@ -671,7 +671,9 @@ live.
 
 *State* variables come from the storage layout, the `<Contract>_storage.json` (or the
 `storage-layout` entry of a legacy `combined.json`) that `solc --storage-layout` writes.
-`soldb compile` and the test harness pass that flag; for a directory compiled without it,
+`soldb compile` and the test harness pass that flag, and `soldb compile --legacy` asks for
+the `combined.json` entry, which compilers from before ETHDebug write too; for a directory
+compiled without it,
 SolDB says so instead of guessing where a variable lives. The slot arithmetic behind
 mappings, arrays, and structs is Solidity's own rule, so the values are read, never
 inferred.

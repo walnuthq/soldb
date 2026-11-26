@@ -252,6 +252,11 @@ struct CompileArgs {
     output_dir: String,
     #[arg(long)]
     dual_compile: bool,
+    /// Compile for debugging without ETHDebug, with any solc: `combined.json` with the
+    /// legacy pipeline's source maps and storage layout. Lines, functions, frames, and
+    /// state variables come from those; locals are read off the stack.
+    #[arg(long, conflicts_with = "verify_version")]
+    legacy: bool,
     /// The directory relative imports resolve against. Found from the project the
     /// contract is in when not given.
     #[arg(long)]
@@ -1040,7 +1045,18 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
     }
 
     if args.dual_compile {
-        let result = soldb_compiler::dual_compile(contract_file, &config);
+        let result = if args.legacy {
+            soldb_compiler::DualCompileResult {
+                production: config
+                    .compile_for_production(contract_file, None)
+                    .map_err(|error| error.to_string()),
+                debug: config
+                    .compile_with_source_maps(contract_file, None)
+                    .map_err(|error| error.to_string()),
+            }
+        } else {
+            soldb_compiler::dual_compile(contract_file, &config)
+        };
         if args.json {
             print_json(&result)?;
         } else {
@@ -1056,7 +1072,12 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
             match &result.debug {
                 Ok(debug) => print_compile_result(debug),
                 Err(error) => {
-                    println!("ETHDebug build failed: {error}");
+                    let build = if args.legacy {
+                        "Source map"
+                    } else {
+                        "ETHDebug"
+                    };
+                    println!("{build} build failed: {error}");
                     return Err(soldb_core::SoldbError::Message(error.clone()));
                 }
             }
@@ -1064,7 +1085,11 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
         return Ok(());
     }
 
-    let result = config.compile_with_ethdebug(contract_file, None)?;
+    let result = if args.legacy {
+        config.compile_with_source_maps(contract_file, None)?
+    } else {
+        config.compile_with_ethdebug(contract_file, None)?
+    };
     if args.json {
         print_json(&result)?;
     } else {
@@ -1074,10 +1099,17 @@ fn compile_command(args: &CompileArgs) -> SoldbResult<()> {
 }
 
 fn print_compile_result(result: &soldb_compiler::CompilationResult) {
-    println!("ETHDebug compilation successful");
+    if result.files.combined_json.is_some() {
+        println!("Source map compilation successful");
+    } else {
+        println!("ETHDebug compilation successful");
+    }
     println!("Output directory: {}", result.output_dir.display());
     if result.files.ethdebug.is_some() {
         println!("  - ethdebug.json");
+    }
+    if let Some(path) = &result.files.combined_json {
+        println!("  - {}", path.display());
     }
     for (contract_name, files) in &result.files.contracts {
         println!("Contract: {contract_name}");

@@ -12,6 +12,11 @@
 //! hardcoded cutoff.
 //! Artifact discovery is version-tolerant for the same reason and accepts either the
 //! `ethdebug.json` or the `ethdebug_resources.json` spelling of the resources file.
+//!
+//! A compiler from before ETHDebug still says where every instruction came from and
+//! where every state variable lives: [`CompilerConfig::compile_with_source_maps`] asks
+//! it for the legacy source maps and the storage layout in `combined.json`, which is
+//! what the debugger reads for such a compiler.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -310,14 +315,91 @@ impl CompilerConfig {
                 )
                 .inspect(|_| drop_stale_metadata(output_dir, started))
                 .map_err(|modern_error| {
-                    SoldbError::Message(format!(
+                    let modern_error = modern_error.to_string();
+                    let message = format!(
                         "Compilation failed with legacy ETHDebug flags ({legacy_error}); \
                              retry with modern ETHDebug flags also failed ({modern_error})"
-                    ))
+                    );
+                    // Neither spelling is known: the compiler predates ETHDebug.
+                    if is_unrecognised_option(&modern_error, "--experimental")
+                        || is_unrecognised_option(&modern_error, "--ethdebug-program")
+                    {
+                        SoldbError::WithHelp {
+                            message,
+                            help: "this compiler predates ETHDebug; `soldb compile --legacy` \
+                                   compiles for its source maps and storage layout instead"
+                                .to_owned(),
+                        }
+                    } else {
+                        SoldbError::Message(message)
+                    }
                 })
             }
             Err(other) => Err(other),
         }
+    }
+
+    /// Compiles for debugging without ETHDebug, with any solc: `combined.json` holding
+    /// the legacy pipeline's source maps, the ABI, and the storage layouts, which is what
+    /// the debugger reads for a compiler that predates ETHDebug, and beside it the
+    /// `<Contract>.bin`, `<Contract>.abi`, and `<Contract>_storage.json` an ETHDebug build
+    /// writes, so the rest of the workflow is the same.
+    ///
+    /// ETHDebug artifacts that an earlier compilation left in the directory are removed:
+    /// the debugger prefers them, and they describe other code.
+    pub fn compile_with_source_maps(
+        &self,
+        contract_file: impl AsRef<Path>,
+        output_dir: Option<&Path>,
+    ) -> SoldbResult<CompilationResult> {
+        let output_dir = output_dir.unwrap_or(&self.debug_output_dir);
+        self.ensure_directories()?;
+        let started = SystemTime::now();
+        let flags = |outputs: &[&str]| {
+            vec![
+                "--combined-json".to_owned(),
+                outputs.join(","),
+                "--overwrite".to_owned(),
+            ]
+        };
+        let compiled = match run_solc(
+            &self.solc_path,
+            &flags(SOURCE_MAP_OUTPUTS),
+            &self.project,
+            contract_file.as_ref(),
+            output_dir,
+        ) {
+            // A release from before transient storage does not know that output.
+            Err(SoldbError::Message(error))
+                if error.contains("Invalid option to --combined-json")
+                    && error.contains(TRANSIENT_STORAGE_LAYOUT_OUTPUT) =>
+            {
+                let outputs = SOURCE_MAP_OUTPUTS
+                    .iter()
+                    .copied()
+                    .filter(|output| *output != TRANSIENT_STORAGE_LAYOUT_OUTPUT)
+                    .collect::<Vec<_>>();
+                run_solc(
+                    &self.solc_path,
+                    &flags(&outputs),
+                    &self.project,
+                    contract_file.as_ref(),
+                    output_dir,
+                )
+            }
+            other => other,
+        }?;
+        let combined_json = output_dir.join("combined.json");
+        let names = write_contract_files(&combined_json, output_dir, started)?;
+        drop_stale_metadata(output_dir, started);
+        for name in &names {
+            for suffix in ["_ethdebug.json", "_ethdebug-runtime.json"] {
+                drop_if_stale(&output_dir.join(format!("{name}{suffix}")), started);
+            }
+        }
+        let mut files = discover_output_files(output_dir)?;
+        files.combined_json = Some(combined_json);
+        Ok(CompilationResult { files, ..compiled })
     }
 
     pub fn compile_for_production(
@@ -419,6 +501,9 @@ pub struct CompilationResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilerOutputFiles {
     pub ethdebug: Option<PathBuf>,
+    /// The `combined.json` of a build for source maps, without ETHDebug.
+    #[serde(default)]
+    pub combined_json: Option<PathBuf>,
     /// The compilation record newer compilers write apart from the resources.
     #[serde(default)]
     pub ethdebug_compilation: Option<PathBuf>,
@@ -578,6 +663,85 @@ pub fn auto_deploy(config: &AutoDeployConfig) -> SoldbResult<AutoDeployResult> {
 /// The flag that asks solc for `<Contract>_transient_storage.json`.
 const TRANSIENT_STORAGE_LAYOUT_FLAG: &str = "--transient-storage-layout";
 
+/// What a build for source maps asks `--combined-json` for: the code and its legacy
+/// source maps, the ABI and metadata, and the storage layouts.
+const SOURCE_MAP_OUTPUTS: &[&str] = &[
+    "bin",
+    "bin-runtime",
+    "abi",
+    "srcmap",
+    "srcmap-runtime",
+    "metadata",
+    "storage-layout",
+    // Left out where solc does not know it; see `compile_with_source_maps`.
+    TRANSIENT_STORAGE_LAYOUT_OUTPUT,
+];
+
+/// The `--combined-json` output releases from before transient storage reject.
+const TRANSIENT_STORAGE_LAYOUT_OUTPUT: &str = "transient-storage-layout";
+
+/// Writes `<Contract>.bin`, `<Contract>.abi`, and the storage layout files of every
+/// contract in `combined.json`, as an ETHDebug build writes them, and removes a
+/// transient layout file an earlier build left for a contract this one gave none.
+/// Returns the contract names.
+fn write_contract_files(
+    combined_json: &Path,
+    output_dir: &Path,
+    started: SystemTime,
+) -> SoldbResult<Vec<String>> {
+    let read_error = |error: String| {
+        SoldbError::Message(format!(
+            "Failed to read {}: {error}",
+            combined_json.display()
+        ))
+    };
+    let text = fs::read_to_string(combined_json).map_err(|error| read_error(error.to_string()))?;
+    let document =
+        serde_json::from_str::<Value>(&text).map_err(|error| read_error(error.to_string()))?;
+    let contracts = document
+        .get("contracts")
+        .and_then(Value::as_object)
+        .ok_or_else(|| read_error("it has no `contracts` object".to_owned()))?;
+    let write = |name: String, contents: String| {
+        let path = output_dir.join(name);
+        fs::write(&path, contents).map_err(|error| {
+            SoldbError::Message(format!("Failed to write {}: {error}", path.display()))
+        })
+    };
+    let mut names = Vec::new();
+    for (key, contract) in contracts {
+        // Keys are `<source>:<Contract>`; the source may itself hold a colon.
+        let name = key.rsplit(':').next().unwrap_or(key).to_owned();
+        if let Some(bin) = contract.get("bin").and_then(Value::as_str) {
+            write(format!("{name}.bin"), bin.to_owned())?;
+        }
+        if let Some(abi) = contract.get("abi") {
+            write(format!("{name}.abi"), json_text(abi))?;
+        }
+        if let Some(layout) = contract.get("storage-layout") {
+            write(format!("{name}_storage.json"), json_text(layout))?;
+        }
+        match contract.get(TRANSIENT_STORAGE_LAYOUT_OUTPUT) {
+            Some(layout) => write(format!("{name}_transient_storage.json"), json_text(layout))?,
+            None => drop_if_stale(
+                &output_dir.join(format!("{name}_transient_storage.json")),
+                started,
+            ),
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// A `combined.json` value as the JSON text of its own file. Older releases write some
+/// of them, the ABI among them, as a string holding the JSON.
+fn json_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Runs solc, retrying without `--transient-storage-layout` when solc does not know it.
 fn run_solc_dropping_unsupported(
     solc_path: &str,
@@ -656,15 +820,20 @@ fn drop_stale_metadata(output_dir: &Path, started: SystemTime) {
         "ethdebug_resources.json",
         "ethdebug_compilation.json",
     ] {
-        let path = output_dir.join(name);
-        // Only a file that is certainly older than this run is removed; a timestamp that
-        // cannot be read leaves it alone.
-        let stale = fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|modified| modified < started);
-        if stale {
-            let _ = fs::remove_file(&path);
-        }
+        drop_if_stale(&output_dir.join(name), started);
+    }
+}
+
+/// Removes `path` when it is certainly older than a run that started at `started`; a
+/// timestamp that cannot be read leaves it alone.
+fn drop_if_stale(path: &Path, started: SystemTime) {
+    let stale = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified < started);
+    if stale {
+        // A file that cannot be removed is reported by the load that finds it, which is
+        // where it matters.
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -715,6 +884,7 @@ fn discover_output_files(output_dir: &Path) -> SoldbResult<CompilerOutputFiles> 
     .find(|path| path.exists());
     let mut files = CompilerOutputFiles {
         ethdebug: global_ethdebug,
+        combined_json: None,
         ethdebug_compilation: existing_path(output_dir.join("ethdebug_compilation.json")),
         contracts: BTreeMap::new(),
     };
@@ -1258,6 +1428,11 @@ mod tests {
             for (version, constructor) in FAKE_SOLCS {
                 write_fake_solc(&root, version, constructor);
             }
+            // Written with the others, before any test runs one: a script written while
+            // another thread forks can be busy when it is executed.
+            for knows_transient in [false, true] {
+                write_fake_legacy_solc(&root, knows_transient);
+            }
             root
         });
         let path = root.join(format!("solc-{version}-{constructor}"));
@@ -1266,6 +1441,165 @@ mod tests {
             "no fake solc {version} (constructor: {constructor}); add it to FAKE_SOLCS"
         );
         path
+    }
+
+    /// A compiler from before ETHDebug: it rejects every ETHDebug flag and writes a
+    /// `combined.json`, with the ABI as a JSON string as old releases do. Without
+    /// `knows_transient` it is also from before transient storage and rejects that output.
+    fn fake_legacy_solc(knows_transient: bool) -> std::path::PathBuf {
+        let any = fake_solc("0.8.31", false);
+        any.with_file_name(format!("solc-legacy-{knows_transient}"))
+    }
+
+    fn write_fake_legacy_solc(root: &std::path::Path, knows_transient: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join(format!("solc-legacy-{knows_transient}"));
+        let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "solc, the solidity compiler"
+  echo "Version: 0.8.16+commit.test"
+  exit 0
+fi
+out=""
+prev=""
+outputs=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    out="$arg"
+  fi
+  if [ "$prev" = "--combined-json" ]; then
+    outputs="$arg"
+  fi
+  case "$arg" in
+    --ethdebug|--experimental)
+      echo "unrecognised option '$arg'" >&2
+      exit 1
+      ;;
+  esac
+  prev="$arg"
+done
+case "$outputs" in
+  *transient-storage-layout*)
+    if ! KNOWS_TRANSIENT; then
+      echo "Invalid option to --combined-json: transient-storage-layout" >&2
+      exit 1
+    fi
+    ;;
+esac
+mkdir -p "$out"
+echo "$@" > "$out/solc-args.txt"
+cat > "$out/combined.json" <<'JSON'
+{"contracts":{"src/Counter.sol:Counter":{"abi":"[{\"type\":\"function\",\"name\":\"get\",\"inputs\":[]}]","bin":"6001600055","bin-runtime":"600160005500","srcmap":"0:1:0:-:0","srcmap-runtime":"0:1:0:-:0","metadata":"{}","storage-layout":{"storage":[],"types":null}TRANSIENT_LAYOUT}},"version":"0.8.16+commit.test"}
+JSON
+"#
+        .replace("KNOWS_TRANSIENT", if knows_transient { "true" } else { "false" })
+        .replace(
+            "TRANSIENT_LAYOUT",
+            if knows_transient {
+                r#","transient-storage-layout":{"storage":[],"types":null}"#
+            } else {
+                ""
+            },
+        );
+        std::fs::write(&path, script).expect("write solc");
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compiles_for_source_maps_with_a_compiler_from_before_ethdebug() {
+        for knows_transient in [false, true] {
+            let temp = temp_dir(&format!("source-maps-{knows_transient}"));
+            let contract = temp.join("Counter.sol");
+            std::fs::write(&contract, "contract Counter {}").expect("write contract");
+            let out = temp.join("out");
+            std::fs::create_dir_all(&out).expect("create out");
+            // What an earlier ETHDebug build left there, which the debugger would prefer
+            // to the new source maps.
+            let stale = [
+                "ethdebug_resources.json",
+                "ethdebug_compilation.json",
+                "Counter_ethdebug.json",
+                "Counter_ethdebug-runtime.json",
+                "Counter_transient_storage.json",
+            ];
+            let earlier = SystemTime::now() - std::time::Duration::from_secs(60);
+            for name in stale {
+                let file = std::fs::File::create(out.join(name)).expect("write stale file");
+                file.set_modified(earlier).expect("age stale file");
+            }
+            let cfg = CompilerConfig::with_paths(
+                fake_legacy_solc(knows_transient).to_string_lossy(),
+                &out,
+                temp.join("build"),
+            );
+
+            let result = cfg
+                .compile_with_source_maps(&contract, None)
+                .expect("a source map build works with any solc");
+
+            let args = std::fs::read_to_string(out.join("solc-args.txt")).expect("args");
+            assert!(args.contains("--combined-json bin,bin-runtime,abi,srcmap,srcmap-runtime,metadata,storage-layout"), "{args}");
+            assert_eq!(
+                args.contains("transient-storage-layout"),
+                knows_transient,
+                "{args}"
+            );
+            assert!(
+                !args.contains("--via-ir"),
+                "the legacy pipeline keeps locals on the stack: {args}"
+            );
+            assert_eq!(result.files.combined_json, Some(out.join("combined.json")));
+            assert_eq!(
+                std::fs::read_to_string(out.join("Counter.bin")).expect("bin"),
+                "6001600055"
+            );
+            // The ABI an old release wrote as a string is a JSON array in its own file.
+            let abi: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(out.join("Counter.abi")).expect("abi"),
+            )
+            .expect("abi json");
+            assert_eq!(abi[0]["name"], "get");
+            assert!(out.join("Counter_storage.json").exists());
+            assert_eq!(
+                out.join("Counter_transient_storage.json").exists(),
+                knows_transient
+            );
+            for name in &stale[..4] {
+                assert!(!out.join(name).exists(), "{name} is stale");
+            }
+            let counter = &result.files.contracts["Counter"];
+            assert_eq!(counter.bytecode, Some(out.join("Counter.bin")));
+            assert_eq!(counter.ethdebug_runtime, None);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_ethdebug_build_with_a_compiler_from_before_it_points_to_the_legacy_one() {
+        let temp = temp_dir("predates-ethdebug");
+        let contract = temp.join("Counter.sol");
+        std::fs::write(&contract, "contract Counter {}").expect("write contract");
+        let cfg = CompilerConfig::with_paths(
+            fake_legacy_solc(false).to_string_lossy(),
+            temp.join("out"),
+            temp.join("build"),
+        );
+        let error = cfg
+            .compile_with_ethdebug(&contract, None)
+            .expect_err("no ETHDebug flag is known");
+        assert!(error
+            .summary()
+            .contains("unrecognised option '--experimental'"));
+        assert!(
+            error
+                .help()
+                .is_some_and(|help| help.contains("`soldb compile --legacy`")),
+            "{error}"
+        );
     }
 
     fn write_fake_solc(root: &std::path::Path, version: &str, constructor: bool) {

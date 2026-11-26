@@ -325,6 +325,9 @@ Artifacts produced per contract in the output directory:
   `soldb compile` passes the flag (`CompilerConfig::ethdebug_flags`), and so does
   `test/deploy-contract.sh` for both ETHDebug flag generations and for the legacy
   `--combined-json` set, which carries it per contract as `storage-layout` instead.
+  `soldb compile --legacy` (`CompilerConfig::compile_with_source_maps`) asks for that set
+  with any solc and writes `<Contract>.bin`, `.abi`, and `_storage.json` from it, removing
+  ETHDebug artifacts an earlier build left, since the loader prefers those.
 - `<Contract>_ethdebug.json` — creation-code debug info.
 - `<Contract>_ethdebug-runtime.json` — runtime debug info; this is what PC-to-source
   mapping uses for an ordinary call.
